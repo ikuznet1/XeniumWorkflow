@@ -78,6 +78,54 @@ _baysor_lock  = threading.Lock()
 _spage_state: dict = {"status": "idle", "message": "", "result": None}
 _spage_lock   = threading.Lock()
 
+# ─── Server log capture ────────────────────────────────────────────────────────
+import collections
+_log_buffer: collections.deque = collections.deque(maxlen=200)
+_log_lock = threading.Lock()
+
+class _LogCapture:
+    """Tee writes to the original stream and to _log_buffer."""
+    def __init__(self, original):
+        self._orig = original
+
+    def write(self, s):
+        self._orig.write(s)
+        if s.strip():
+            with _log_lock:
+                _log_buffer.append(s.rstrip())
+        return len(s)
+
+    def flush(self):
+        self._orig.flush()
+
+    def fileno(self):
+        return self._orig.fileno()
+
+    def isatty(self):
+        return self._orig.isatty()
+
+    # Forward all other attribute lookups to the original stream
+    def __getattr__(self, name):
+        return getattr(self._orig, name)
+
+sys.stdout = _LogCapture(sys.stdout)
+sys.stderr = _LogCapture(sys.stderr)
+
+
+def _redirect_rpy2_console():
+    """Call once inside any thread that uses rpy2 to capture R console output."""
+    try:
+        import rpy2.rinterface_lib.callbacks as rpy2_cb
+        def _r_write(x):
+            x = x.rstrip()
+            if x:
+                with _log_lock:
+                    _log_buffer.append(f"[R] {x}")
+        rpy2_cb.consolewrite_print     = _r_write
+        rpy2_cb.consolewrite_warnerror = _r_write
+    except Exception:
+        pass
+
 CELLTYPIST_MODELS = {
     "Healthy_Adult_Heart.pkl": "Healthy Adult Heart (Azimuth/CellTypist)",
     "Immune_All_Low.pkl":      "Immune All – Low (CellTypist)",
@@ -97,6 +145,7 @@ def _cache_path(model_name: str) -> str:
 
 def _run_celltypist(model_name: str) -> None:
     """Background thread: annotate cells with CellTypist and store results."""
+    _redirect_rpy2_console()
     import anndata as ad
     import celltypist
     from celltypist import models as ct_models
@@ -171,6 +220,175 @@ def _run_celltypist(model_name: str) -> None:
 
     except Exception as exc:
         _set("error", str(exc))
+
+
+def _run_seurat_annotation(rds_path: str, label_col: str = "Names") -> None:
+    """
+    Background thread: transfer cell type labels from a Seurat RDS reference
+    to Xenium cells via PCA + cosine kNN majority voting.
+    Uses the same rpy2 + SpaGE PV alignment already set up for SpaGE.
+    """
+    _redirect_rpy2_console()
+    def _set(status, message, labels=None):
+        with _annot_lock:
+            _annot_state["status"]  = status
+            _annot_state["message"] = message
+            if labels is not None:
+                _annot_state["labels"] = labels
+
+    try:
+        cache_key = f"seurat_{os.path.basename(rds_path)}_{label_col}"
+        cache_file = _cache_path(cache_key)
+        if os.path.exists(cache_file):
+            _set("running", "Loading cached annotation…")
+            cached = pd.read_parquet(cache_file)
+            labels = cached["label"].astype(str)
+            labels.index = labels.index.astype(str)
+            unique_types = labels.unique().tolist()
+            print(f"  Loaded annotation from cache: {len(unique_types)} cell types", flush=True)
+            _set("done", f"Done (cached) — {len(unique_types)} cell types", labels=labels)
+            return
+
+        # ── 1. Load Seurat object via rpy2 ───────────────────────────────
+        _set("running", "Loading Seurat RDS (may take ~30s)…")
+        import rpy2.robjects as ro
+        from rpy2.robjects import pandas2ri
+        from rpy2.robjects.packages import importr
+        pandas2ri.activate()
+
+        base = importr("base")
+        rds  = base.readRDS(rds_path)
+
+        # ── 2. Extract metadata → label vector ──────────────────────────
+        _set("running", f"Extracting '{label_col}' labels…")
+        meta_r = ro.r['slot'](rds, "meta.data")
+        meta_df = pandas2ri.rpy2py(meta_r)
+        if label_col not in meta_df.columns:
+            cols = list(meta_df.columns)
+            _set("error", f"Column '{label_col}' not found. Available: {cols[:10]}")
+            return
+
+        ref_labels = meta_df[label_col].astype(str)  # index = ref cell barcodes
+
+        unique_types = ref_labels.unique().tolist()
+        print(f"  Reference: {len(ref_labels)} cells, {len(unique_types)} cell types", flush=True)
+
+        # ── 3. Find shared genes first (before loading any matrix) ──────
+        import scipy.sparse as sp_
+        import tempfile
+
+        importr("SeuratObject")
+        importr("Matrix")
+
+        _set("running", "Reading reference gene list…")
+        ro.r.assign("._annot_rds_tmp", rds)
+        mat_r = ro.r("slot(slot(._annot_rds_tmp, 'assays')[['RNA']], 'data')")
+        ref_genes_all = list(ro.r['rownames'](mat_r))
+        ref_bcs = list(ro.r['colnames'](mat_r))
+
+        xenium_genes = list(DATA["gene_names"])
+        shared = sorted(set(xenium_genes) & set(ref_genes_all))
+        if len(shared) < 10:
+            _set("error", f"Only {len(shared)} shared genes — not enough for label transfer.")
+            return
+        print(f"  Shared genes for label transfer: {len(shared)}", flush=True)
+
+        # ── 4. Export ONLY shared-gene rows via rpy2 (no subprocess) ────
+        _set("running", f"Extracting {len(shared)} shared-gene submatrix…")
+        tmpdir = tempfile.mkdtemp(prefix="xenium_annot_")
+        ro.r.assign("._annot_mat",   mat_r)
+        ro.r.assign("._annot_genes", ro.StrVector(shared))
+        ro.r.assign("._annot_dir",   tmpdir)
+        ro.r("""
+mat_sub <- ._annot_mat[._annot_genes, , drop = FALSE]
+Matrix::writeMM(mat_sub, file.path(._annot_dir, "matrix.mtx"))
+write.table(data.frame(gene = rownames(mat_sub)),
+            file.path(._annot_dir, "genes.txt"),
+            row.names = FALSE, col.names = FALSE, quote = FALSE)
+write.table(data.frame(bc = colnames(mat_sub)),
+            file.path(._annot_dir, "barcodes.txt"),
+            row.names = FALSE, col.names = FALSE, quote = FALSE)
+# Clean up temp R objects
+rm(._annot_mat, ._annot_genes, ._annot_dir, ._annot_rds_tmp, mat_sub)
+""")
+
+        _set("running", "Loading reference sub-matrix…")
+        import scipy.io as sio_
+        ref_mat = sio_.mmread(os.path.join(tmpdir, "matrix.mtx")).T.tocsr().astype("float32")
+        # ref_mat is now (n_ref_cells × n_shared), rows in order of ref_bcs, cols = shared
+        ref_genes = pd.read_csv(os.path.join(tmpdir, "genes.txt"), header=None)[0].tolist()
+        ref_bcs   = pd.read_csv(os.path.join(tmpdir, "barcodes.txt"), header=None)[0].tolist()
+
+        xen_gene_idx = {g: i for i, g in enumerate(xenium_genes)}
+        shared_xen_idx = [xen_gene_idx[g] for g in ref_genes]  # ref_genes == shared after subset
+
+        # Reference matrix for shared genes (cells × shared) — already subset
+        ref_shared = ref_mat
+
+        # Xenium matrix for shared genes — build from sparse expr
+        xen_expr = DATA["expr"]  # (n_cells × n_genes) CSR
+        xen_shared = xen_expr[:, shared_xen_idx].toarray().astype("float32")
+        # CP10K + log1p normalize Xenium
+        row_sums = xen_shared.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1.0
+        xen_shared = np.log1p(xen_shared / row_sums * 10_000)
+
+        # Also normalize reference (already log-normalized from Seurat @data, but z-score both)
+        import scipy.stats as st_
+        from sklearn.decomposition import TruncatedSVD
+        from sklearn.neighbors import NearestNeighbors
+
+        _set("running", "Z-scoring and fitting PCA…")
+        # Z-score across cells (per gene)
+        ref_dense = ref_shared.toarray() if sp_.issparse(ref_shared) else ref_shared
+        ref_mean = ref_dense.mean(axis=0, keepdims=True)
+        ref_std  = ref_dense.std(axis=0, keepdims=True) + 1e-8
+        ref_z = (ref_dense - ref_mean) / ref_std
+
+        xen_mean = xen_shared.mean(axis=0, keepdims=True)
+        xen_std  = xen_shared.std(axis=0, keepdims=True) + 1e-8
+        xen_z = (xen_shared - xen_mean) / xen_std
+
+        # PCA on reference, project Xenium
+        n_comp = min(50, len(shared) - 1, ref_dense.shape[0] - 1)
+        _set("running", f"PCA ({n_comp} components)…")
+        svd = TruncatedSVD(n_components=n_comp, random_state=0)
+        ref_pca = svd.fit_transform(ref_z)   # (n_ref × n_comp)
+        xen_pca = xen_z @ svd.components_.T  # (n_xen × n_comp)
+
+        # ── 5. kNN label transfer ────────────────────────────────────────
+        _set("running", "kNN label transfer (50 neighbours)…")
+        # Align ref_labels to ref_bcs order
+        ref_label_series = pd.Series(ref_labels.values, index=ref_bcs)
+
+        k = min(50, len(ref_bcs))
+        nbrs = NearestNeighbors(n_neighbors=k, metric="cosine").fit(ref_pca)
+        _, indices = nbrs.kneighbors(xen_pca)
+
+        # Majority vote
+        ref_label_arr = ref_label_series.values  # ordered by ref_bcs
+        xen_labels = []
+        for row in indices:
+            votes = ref_label_arr[row]
+            winner = pd.Series(votes).mode()[0]
+            xen_labels.append(winner)
+
+        xen_barcodes = DATA["barcodes"]
+        pred_labels = pd.Series(xen_labels, index=xen_barcodes, name="label")
+        unique_final = pred_labels.unique().tolist()
+        print(f"  Label transfer done: {len(unique_final)} cell types", flush=True)
+
+        # Cache
+        try:
+            pd.DataFrame({"label": pred_labels}).to_parquet(cache_file)
+        except Exception as ce:
+            print(f"  Warning: cache failed: {ce}", flush=True)
+
+        _set("done", f"Done — {len(unique_final)} cell types", labels=pred_labels)
+
+    except Exception as exc:
+        import traceback
+        _set("error", f"{exc}\n{traceback.format_exc()[-300:]}")
 
 
 def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float) -> None:
@@ -385,6 +603,7 @@ def _vectorized_spage(spatial_df: pd.DataFrame, rna_df: pd.DataFrame,
 
 def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str) -> None:
     """Background thread: run SpaGE gene imputation and store results."""
+    _redirect_rpy2_console()
 
     def _set(status, message, result=None):
         with _spage_lock:
@@ -570,6 +789,80 @@ def _get_morph_zarr(data_dir: str, z_level: int):
     return _morph_zarr.get(z_level)
 
 
+def _overview_cache_path(data_dir: str, z_level: int) -> str:
+    tag = hashlib.md5(data_dir.encode()).hexdigest()[:8]
+    cache_dir = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, f"morph_overview_{tag}_z{z_level}.npz")
+
+
+def _load_or_generate_overview(data_dir: str, z_level: int):
+    """Load overview from disk cache, or generate in background. Returns overview or None."""
+    with _morph_overview_lock:
+        if z_level in _morph_overview:
+            return _morph_overview[z_level]
+
+    # Try disk cache
+    ov_path = _overview_cache_path(data_dir, z_level)
+    if os.path.exists(ov_path):
+        try:
+            data = np.load(ov_path)
+            ov = {
+                "channels": [data[f"ch{i}"] for i in range(4)],
+                "stride": int(data["stride"]),
+            }
+            with _morph_overview_lock:
+                _morph_overview[z_level] = ov
+            print(f"  Overview z{z_level}: loaded from disk cache", flush=True)
+            return ov
+        except Exception as exc:
+            print(f"  Warning: could not load overview cache: {exc}", flush=True)
+
+    # Kick off background generation (if not already running)
+    with _morph_overview_lock:
+        if z_level in _overview_generating:
+            return None
+        _overview_generating.add(z_level)
+
+    def _gen():
+        try:
+            import tifffile, zarr as zarr_mod
+            fname = f"morphology_focus_{z_level:04d}.ome.tif"
+            path = os.path.join(data_dir, "morphology_focus", fname)
+            if not os.path.exists(path):
+                return
+            # Open a SEPARATE tifffile handle to avoid concurrent access issues
+            tif_ov = tifffile.TiffFile(path)
+            zarr_ov = zarr_mod.open(tif_ov.aszarr(), mode="r")
+            H, W = zarr_ov.shape[1], zarr_ov.shape[2]
+            ov_stride = max(1, max(H, W) // 4096)
+            print(f"  Generating overview z{z_level} (stride={ov_stride})…", flush=True)
+            channels = []
+            for ch in range(zarr_ov.shape[0]):
+                arr = zarr_ov[ch, ::ov_stride, ::ov_stride].astype(np.uint16)
+                channels.append(arr)
+                print(f"    ch{ch}: {arr.shape}", flush=True)
+            tif_ov.close()
+            np.savez_compressed(
+                ov_path,
+                ch0=channels[0], ch1=channels[1],
+                ch2=channels[2], ch3=channels[3],
+                stride=np.array(ov_stride),
+            )
+            ov = {"channels": channels, "stride": ov_stride}
+            with _morph_overview_lock:
+                _morph_overview[z_level] = ov
+            print(f"  Overview z{z_level}: generated and cached ({ov_path})", flush=True)
+        except Exception as exc:
+            print(f"  Overview generation error: {exc}", flush=True)
+        finally:
+            with _morph_overview_lock:
+                _overview_generating.discard(z_level)
+
+    threading.Thread(target=_gen, daemon=True).start()
+    return None
+
+
 def _compose_rgb(layers, p1p99_list, brightness, out_h, out_w, channels, crop=None):
     """Compose cached raw layers into an RGB uint8 array, applying brightness.
     If crop=(y0,y1,x0,x1), slice each layer before compositing (saves memory)."""
@@ -659,6 +952,40 @@ def make_morphology_overlay(data_dir, relayout, z_level, channels, brightness, i
     rh_vp = vp_px_y1 - vp_px_y0
     stride = max(1, max(rw_vp, rh_vp) // 800)
 
+    # ── Try low-res overview first (instant for large viewports) ─────────
+    # Kick off generation in background if not available; use overview when
+    # the viewport would require many tile decodes (stride >= overview stride)
+    ov = _load_or_generate_overview(data_dir, z_level)
+    if ov is not None and stride >= ov["stride"]:
+        ov_stride = ov["stride"]
+        ch_map = {c["value"]: c for c in MORPH_CHANNELS}
+        ov_y0 = vp_px_y0 // ov_stride
+        ov_y1 = min(ov["channels"][0].shape[0], vp_px_y1 // ov_stride + 1)
+        ov_x0 = vp_px_x0 // ov_stride
+        ov_x1 = min(ov["channels"][0].shape[1], vp_px_x1 // ov_stride + 1)
+        oh = ov_y1 - ov_y0
+        ow = ov_x1 - ov_x0
+        if oh > 0 and ow > 0:
+            rgb = np.zeros((oh, ow, 3), dtype=np.float32)
+            for ch_val in channels:
+                info = ch_map.get(ch_val)
+                if info is None:
+                    continue
+                region = ov["channels"][info["ch"]][ov_y0:ov_y1, ov_x0:ov_x1].astype(np.float32)
+                nonzero = region[region > 0]
+                if nonzero.size > 50:
+                    p1, p99 = np.percentile(nonzero, [1, 99])
+                    if p99 > p1:
+                        norm = np.clip((region - p1) / (p99 - p1) * brightness, 0, 1)
+                    else:
+                        norm = np.zeros_like(region)
+                else:
+                    norm = np.zeros_like(region)
+                color_f = np.array(info["color"], dtype=np.float32) / 255.0
+                rgb += norm[..., np.newaxis] * color_f
+            return _encode_overlay_jpeg(rgb, vp_px_x0, vp_px_y0,
+                                        rw_vp, rh_vp, img_opacity), " (overview)"
+
     sorted_ch = tuple(sorted(channels))
     cache_key = (z_level, sorted_ch, stride)
 
@@ -695,13 +1022,14 @@ def make_morphology_overlay(data_dir, relayout, z_level, channels, brightness, i
     out_h = (rh - 1) // stride + 1
     out_w = (rw - 1) // stride + 1
 
-    # ── Read channels in parallel (store raw, no brightness) ─────────────
+    # ── Read channels sequentially (tifffile zarr not thread-safe) ──────
     def read_channel(ch_val):
         ch_map = {c["value"]: c for c in MORPH_CHANNELS}
         info = ch_map.get(ch_val)
         if info is None:
             return None, (0, 0)
-        region = zarr_arr[info["ch"], px_y0:px_y1:stride, px_x0:px_x1:stride].astype(np.float32)
+        with _morph_lock:
+            region = zarr_arr[info["ch"], px_y0:px_y1:stride, px_x0:px_x1:stride].astype(np.float32)
         region = region[:out_h, :out_w]
         nonzero = region[region > 0]
         if nonzero.size > 100:
@@ -710,8 +1038,7 @@ def make_morphology_overlay(data_dir, relayout, z_level, channels, brightness, i
             p1, p99 = 0.0, 0.0
         return region, (float(p1), float(p99))
 
-    with ThreadPoolExecutor(max_workers=len(channels)) as pool:
-        results = list(pool.map(read_channel, channels))
+    results = [read_channel(ch) for ch in channels]
 
     layers  = [r[0] for r in results]
     p1p99   = [r[1] for r in results]
@@ -1404,19 +1731,58 @@ sidebar = html.Div([
 
     html.Hr(style={"borderColor": BORDER, "margin": "14px 0"}),
 
-    # ── Azimuth / CellTypist annotation ────────────────────────────────
+    # ── Cell type annotation ────────────────────────────────────────────
     ctrl_label("Cell Type Annotation"),
-    html.Div(
-        "Annotates via CellTypist (Azimuth-compatible models)",
-        style={"fontSize": "10px", "color": MUTED, "marginBottom": "8px", "lineHeight": "1.4"},
+    dcc.RadioItems(
+        id="annot-source",
+        options=[
+            {"label": html.Span(" CellTypist model", style={"fontSize": "12px", "color": TEXT}),
+             "value": "celltypist"},
+            {"label": html.Span(" Seurat RDS reference", style={"fontSize": "12px", "color": TEXT}),
+             "value": "seurat"},
+        ],
+        value="celltypist",
+        inputStyle={"marginRight": "5px"},
+        labelStyle={"display": "flex", "alignItems": "center", "marginBottom": "5px", "cursor": "pointer"},
+        style={"marginBottom": "8px"},
     ),
-    dcc.Dropdown(
-        id="annot-model",
-        options=[{"label": v, "value": k} for k, v in CELLTYPIST_MODELS.items()],
-        value="Healthy_Adult_Heart.pkl",
-        clearable=False,
-        style={"fontSize": "12px", "marginBottom": "8px"},
-    ),
+    # CellTypist controls
+    html.Div(id="annot-celltypist-div", children=[
+        dcc.Dropdown(
+            id="annot-model",
+            options=[{"label": v, "value": k} for k, v in CELLTYPIST_MODELS.items()],
+            value="Healthy_Adult_Heart.pkl",
+            clearable=False,
+            style={"fontSize": "12px", "marginBottom": "8px"},
+        ),
+    ]),
+    # Seurat RDS controls
+    html.Div(id="annot-seurat-div", style={"display": "none"}, children=[
+        ctrl_label("RDS File Path"),
+        dcc.Input(
+            id="annot-rds-path",
+            type="text",
+            value="/Users/ikuz/Documents/XeniumWorkflow/Post_R3_FINAL_with_counts.rds",
+            style={
+                "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                "padding": "4px 8px", "fontSize": "11px", "marginBottom": "8px",
+                "boxSizing": "border-box",
+            },
+        ),
+        ctrl_label("Label Column"),
+        dcc.Input(
+            id="annot-label-col",
+            type="text",
+            value="Names",
+            style={
+                "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                "padding": "4px 8px", "fontSize": "11px", "marginBottom": "8px",
+                "boxSizing": "border-box",
+            },
+        ),
+    ]),
     html.Button(
         "Run Annotation",
         id="annot-btn",
@@ -1593,9 +1959,23 @@ app.layout = html.Div([
     dcc.Store(id="annot-done",       data=0),
     dcc.Store(id="baysor-done",      data=0),
     dcc.Store(id="spage-done",       data=0),
+    # Fires once after 500 ms to guarantee initial plot render in Dash 4
+    dcc.Interval(id="startup-trigger", interval=500, max_intervals=1),
 
     html.Div([
-        sidebar,
+        # ── Hover-reveal sidebar ──────────────────────────────────────────────
+        # Outer zone covers the trigger strip + sidebar; hover on either reveals it
+        html.Div([
+            html.Div(
+                sidebar,
+                id="sidebar-wrapper",
+            ),
+        ], id="sidebar-hover-zone", style={
+            "position": "fixed", "top": "0", "left": "0",
+            "height": "100vh", "zIndex": "100",
+            # Wide enough to keep hover active while using sidebar
+            "width": "250px",
+        }),
 
         html.Div([
             # Plots row
@@ -1624,16 +2004,66 @@ app.layout = html.Div([
                 ], id="umap-panel", style={"flex": "1", "minWidth": "0"}),
             ], style={"display": "flex", "flex": "1", "gap": "10px", "minHeight": "0"}),
 
-            # Cell info panel
-            html.Div(
-                id="cell-info-panel",
-                children=[html.Div("Click a cell to see details",
-                                   style={"color": MUTED, "fontSize": "13px", "fontStyle": "italic"})],
-                style={
-                    "backgroundColor": CARD_BG, "border": f"1px solid {BORDER}",
-                    "borderRadius": "6px", "padding": "12px 16px", "minHeight": "30px",
-                },
-            ),
+            # ── Bottom info bar (collapsible) ───────────────────────────────
+            html.Div([
+                # Toggle arrow button
+                html.Button(
+                    "▼", id="info-bar-toggle", n_clicks=0,
+                    title="Hide/show info bar",
+                    style={
+                        "position": "absolute", "top": "-14px", "left": "50%",
+                        "transform": "translateX(-50%)",
+                        "background": CARD_BG, "border": f"1px solid {BORDER}",
+                        "borderRadius": "50%", "width": "24px", "height": "24px",
+                        "cursor": "pointer", "fontSize": "10px", "color": MUTED,
+                        "display": "flex", "alignItems": "center", "justifyContent": "center",
+                        "padding": "0", "lineHeight": "1",
+                    },
+                ),
+                # Collapsible body
+                html.Div(
+                    id="info-bar-body",
+                    style={"display": "flex", "gap": "10px", "height": "100%", "overflow": "hidden"},
+                    children=[
+                        # Left: cell info (scrollable)
+                        html.Div(
+                            id="cell-info-panel",
+                            children=[html.Div("Click a cell to see details",
+                                               style={"color": MUTED, "fontSize": "13px", "fontStyle": "italic"})],
+                            style={"flex": "1", "minWidth": "0", "overflowY": "auto"},
+                        ),
+                        # Divider
+                        html.Div(style={"width": "1px", "backgroundColor": BORDER, "flexShrink": "0"}),
+                        # Right: server log (fills remaining height)
+                        html.Div([
+                            html.Div("SERVER LOG", style={
+                                "fontSize": "10px", "color": MUTED, "fontWeight": "600",
+                                "letterSpacing": "1px", "marginBottom": "4px", "flexShrink": "0",
+                            }),
+                            html.Pre(
+                                id="server-log",
+                                style={
+                                    "flex": "1", "margin": "0", "fontSize": "11px", "color": "#8b949e",
+                                    "overflowY": "auto", "whiteSpace": "pre-wrap",
+                                    "wordBreak": "break-all",
+                                    "fontFamily": "'Fira Code','Consolas',monospace",
+                                },
+                            ),
+                            dcc.Interval(id="log-poll", interval=1500, n_intervals=0),
+                        ], style={
+                            "flex": "1", "minWidth": "0",
+                            "display": "flex", "flexDirection": "column", "overflow": "hidden",
+                        }),
+                    ],
+                ),
+            ], style={
+                "position": "relative",
+                "backgroundColor": CARD_BG, "border": f"1px solid {BORDER}",
+                "borderRadius": "6px", "padding": "10px 16px",
+                "height": "180px",  # fixed height — both columns scroll independently
+                "display": "flex", "flexDirection": "column",
+                "boxSizing": "border-box",
+            }),
         ], style={
             "flex": "1", "display": "flex", "flexDirection": "column",
             "padding": "12px", "gap": "10px",
@@ -1707,11 +2137,12 @@ def store_relayout(relayout_data, current):
     Input("baysor-done",        "data"),
     Input("baysor-active",      "value"),
     Input("spage-done",         "data"),
+    Input("startup-trigger",    "n_intervals"),
 )
 def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
                  _annot_done, morph_enable, morph_zlevel, morph_channels,
                  morph_brightness, morph_opacity, _refresh, relayout,
-                 _baysor_done, baysor_active, _spage_done):
+                 _baysor_done, baysor_active, _spage_done, _startup):
     # If only the viewport changed, avoid full figure rebuild
     triggered = callback_context.triggered_id
     boundaries_active = bool(boundary_toggles)
@@ -1865,21 +2296,43 @@ def show_cell_info(cell_id, method):
 
 
 @app.callback(
-    Output("annot-poll", "disabled"),
-    Output("annot-status", "children"),
-    Output("annot-btn",  "disabled"),
-    Input("annot-btn",   "n_clicks"),
-    State("annot-model", "value"),
+    Output("annot-celltypist-div", "style"),
+    Output("annot-seurat-div",     "style"),
+    Input("annot-source",          "value"),
     prevent_initial_call=True,
 )
-def start_annotation(n_clicks, model_name):
+def toggle_annot_source(source):
+    show = {}
+    hide = {"display": "none"}
+    return (show, hide) if source == "celltypist" else (hide, show)
+
+
+@app.callback(
+    Output("annot-poll",    "disabled"),
+    Output("annot-status",  "children"),
+    Output("annot-btn",     "disabled"),
+    Input("annot-btn",      "n_clicks"),
+    State("annot-source",   "value"),
+    State("annot-model",    "value"),
+    State("annot-rds-path", "value"),
+    State("annot-label-col","value"),
+    prevent_initial_call=True,
+)
+def start_annotation(n_clicks, source, model_name, rds_path, label_col):
     """Kick off background annotation thread."""
     with _annot_lock:
         if _annot_state["status"] == "running":
             return False, "Already running…", True
         _annot_state.update({"status": "running", "message": "Starting…", "labels": None})
-    threading.Thread(target=_run_celltypist, args=(model_name,), daemon=True).start()
-    return False, "Starting…", True   # enable polling
+    if source == "seurat":
+        ctx = contextvars.copy_context()
+        threading.Thread(
+            target=lambda: ctx.run(_run_seurat_annotation, rds_path or "", label_col or "Names"),
+            daemon=True,
+        ).start()
+    else:
+        threading.Thread(target=_run_celltypist, args=(model_name,), daemon=True).start()
+    return False, "Starting…", True
 
 
 @app.callback(
@@ -2050,6 +2503,7 @@ def poll_spage(_, done_version):
 @app.callback(
     Output("gene-selector", "options"),
     Input("spage-done", "data"),
+    prevent_initial_call=True,
 )
 def update_gene_options(_spage_version):
     """Rebuild gene dropdown: native genes + imputed genes after SpaGE."""
@@ -2063,7 +2517,31 @@ def update_gene_options(_spage_version):
     return base
 
 
+@app.callback(
+    Output("info-bar-body",    "style"),
+    Output("info-bar-toggle",  "children"),
+    Input("info-bar-toggle",   "n_clicks"),
+    prevent_initial_call=True,
+)
+def toggle_info_bar(n):
+    if n % 2 == 1:  # collapsed
+        return {"display": "none"}, "▲"
+    return {"display": "flex", "gap": "10px", "height": "100%", "overflow": "hidden"}, "▼"
+
+
+@app.callback(
+    Output("server-log", "children"),
+    Input("log-poll", "n_intervals"),
+)
+def update_server_log(_):
+    with _log_lock:
+        lines = list(_log_buffer)
+    return "\n".join(lines[-60:])  # last 60 lines
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    import logging
+    logging.getLogger("werkzeug").setLevel(logging.WARNING)
     print("\nXenium Explorer running at http://localhost:8050\n", flush=True)
     app.run(debug=False, host="0.0.0.0", port=8050)
