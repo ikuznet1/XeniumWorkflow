@@ -42,3 +42,15 @@
 #tissue-info-section:hover .tissue-details {
     max-height: 300px;
 }
+
+/* Generic collapsible details (Baysor, etc.) */
+.collapsible-details {
+    overflow: hidden;
+    max-height: 0;
+    transition: max-height 0.4s ease;
+}
+
+#baysor-section:hover .collapsible-details,
+#proseg-section:hover .collapsible-details {
+    max-height: 900px;
+}

@@ -74,9 +74,16 @@ _annot_lock   = threading.Lock()
 _baysor_state: dict = {"status": "idle", "message": "", "result": None}
 _baysor_lock  = threading.Lock()
 
+# ─── Proseg segmentation state ────────────────────────────────────────────────
+_proseg_state: dict = {"status": "idle", "message": "", "result": None}
+_proseg_lock  = threading.Lock()
+
 # ─── SpaGE imputation state ───────────────────────────────────────────────────
 _spage_state: dict = {"status": "idle", "message": "", "result": None}
 _spage_lock   = threading.Lock()
+
+# ─── Subset state ─────────────────────────────────────────────────────────────
+_subset_version = 0   # incremented by subset()/unsubset() to trigger re-render
 
 # ─── Server log capture ────────────────────────────────────────────────────────
 import collections
@@ -559,15 +566,197 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
         _set("error", str(exc)[:300])
 
 
+# ─── Proseg segmentation ──────────────────────────────────────────────────────
+
+def _run_proseg(voxel_size=None, n_threads=None,
+                x_min=None, x_max=None, y_min=None, y_max=None) -> None:
+    """Background thread: run Proseg resegmentation and store results."""
+
+    def _set(status, message, result=None):
+        with _proseg_lock:
+            _proseg_state["status"]  = status
+            _proseg_state["message"] = message
+            if result is not None:
+                _proseg_state["result"] = result
+
+    PROSEG_CANDIDATES = [
+        "proseg",
+        os.path.expanduser("~/.cargo/bin/proseg"),
+        "/usr/local/bin/proseg",
+    ]
+
+    def _find_proseg():
+        # also search conda envs
+        import shutil
+        found = shutil.which("proseg")
+        if found:
+            return found
+        for candidate in PROSEG_CANDIDATES:
+            try:
+                r = subprocess.run([candidate, "--version"], capture_output=True, timeout=10)
+                if r.returncode == 0:
+                    return candidate
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+        return None
+
+    try:
+        proseg_bin = _find_proseg()
+        if proseg_bin is None:
+            _set("error", "proseg not found. Install via: conda install bioconda::rust-proseg")
+            return
+        print(f"  Using proseg: {proseg_bin}", flush=True)
+
+        out_dir = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache",
+                               "proseg_" + os.path.basename(DATA["data_dir"]))
+        os.makedirs(out_dir, exist_ok=True)
+
+        tx_src = os.path.join(DATA["data_dir"], "transcripts.parquet")
+
+        # Apply spatial region filter if specified — subset to a temp parquet
+        if any(v is not None for v in [x_min, x_max, y_min, y_max]):
+            _set("running", "Filtering transcripts to region…")
+            tx = pd.read_parquet(tx_src)
+            if x_min is not None: tx = tx[tx["x_location"] >= x_min]
+            if x_max is not None: tx = tx[tx["x_location"] <= x_max]
+            if y_min is not None: tx = tx[tx["y_location"] >= y_min]
+            if y_max is not None: tx = tx[tx["y_location"] <= y_max]
+            tx_path = os.path.join(out_dir, "transcripts_region.parquet")
+            tx.to_parquet(tx_path, index=False)
+            print(f"  Proseg: filtered to {len(tx):,} transcripts", flush=True)
+        else:
+            tx_path = tx_src
+
+        poly_out   = os.path.join(out_dir, "cell-polygons.geojson.gz")
+        meta_out   = os.path.join(out_dir, "cell-metadata.csv.gz")
+        tx_meta_out = os.path.join(out_dir, "transcript-metadata.csv.gz")
+
+        cmd = [proseg_bin, "--xenium", tx_path,
+               "--output-cell-polygons",        poly_out,
+               "--output-cell-metadata",        meta_out,
+               "--output-transcript-metadata",  tx_meta_out]
+        if voxel_size:
+            cmd += ["--voxel-size", str(voxel_size)]
+        if n_threads:
+            cmd += ["--nthreads", str(n_threads)]
+
+        print(f"  Proseg cmd: {' '.join(cmd)}", flush=True)
+        _set("running", "Running Proseg…")
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, cwd=out_dir,
+        )
+        last_line = ""
+        for line in proc.stdout:
+            line = line.rstrip()
+            if line:
+                print(f"  [proseg] {line}", flush=True)
+                last_line = line
+            _set("running", f"Running Proseg… {last_line[:60]}")
+        proc.wait()
+        if proc.returncode != 0:
+            _set("error", f"Proseg exited with code {proc.returncode}. Check console.")
+            return
+
+        # ── Parse transcript metadata → cell centroids & counts ──────────
+        _set("running", "Loading Proseg results…")
+        import gzip
+        tx_meta = pd.read_csv(tx_meta_out)
+        # Proseg transcript-metadata has columns: x, y, gene, cell (0 = unassigned)
+        assigned = tx_meta[tx_meta["cell"] > 0].copy()
+        cells_df = (
+            assigned.groupby("cell")
+            .agg(
+                x_centroid=("x", "mean"),
+                y_centroid=("y", "mean"),
+                transcript_counts=("x", "count"),
+            )
+            .rename_axis("cell_id")
+        )
+
+        # ── Parse cell polygons GeoJSON ───────────────────────────────────
+        cell_bounds: dict = {}
+        if os.path.exists(poly_out):
+            with gzip.open(poly_out, "rt") as f:
+                gj = json.load(f)
+            for feat in gj.get("features", []):
+                props = feat.get("properties", {})
+                cid   = props.get("cell") or props.get("id")
+                geom  = feat.get("geometry", {})
+                if cid is None or geom.get("type") != "Polygon":
+                    continue
+                ring = geom["coordinates"][0]
+                vx = np.array([p[0] for p in ring], dtype=np.float32)
+                vy = np.array([p[1] for p in ring], dtype=np.float32)
+                cell_bounds[cid] = (vx, vy)
+            print(f"  Proseg: loaded {len(cell_bounds):,} polygons", flush=True)
+
+        n_cells = len(cells_df)
+        _set("done", f"Done — {n_cells:,} cells", result={
+            "cells_df":    cells_df,
+            "cell_bounds": cell_bounds,
+            "out_dir":     out_dir,
+        })
+        print(f"  Proseg: {n_cells:,} cells segmented", flush=True)
+
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        _set("error", str(exc)[:300])
+
+
 # ─── SpaGE imputation ─────────────────────────────────────────────────────────
 SPAGE_REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SpaGE_repo")
 
 
+def _spage_cache_dir() -> str:
+    d = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _spage_index_path() -> str:
+    return os.path.join(_spage_cache_dir(), "spage_index.json")
+
+
 def _spage_cache_path(rds_path: str, genes_key: str) -> str:
     tag = hashlib.md5((rds_path + DATA["data_dir"] + genes_key).encode()).hexdigest()[:12]
-    cache_dir = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache")
-    os.makedirs(cache_dir, exist_ok=True)
-    return os.path.join(cache_dir, f"spage_{tag}.parquet")
+    return os.path.join(_spage_cache_dir(), f"spage_{tag}.parquet")
+
+
+def _spage_index_update(cache_file: str) -> None:
+    """Record the latest spage cache file for this dataset."""
+    import json
+    idx_path = _spage_index_path()
+    try:
+        with open(idx_path) as f:
+            idx = json.load(f)
+    except Exception:
+        idx = {}
+    idx[DATA["data_dir"]] = cache_file
+    with open(idx_path, "w") as f:
+        json.dump(idx, f, indent=2)
+
+
+def _spage_autoload() -> None:
+    """On startup, restore the most recent SpaGE result for this dataset (if cached)."""
+    import json
+    idx_path = _spage_index_path()
+    if not os.path.exists(idx_path):
+        return
+    try:
+        with open(idx_path) as f:
+            idx = json.load(f)
+        cache_file = idx.get(DATA["data_dir"])
+        if cache_file and os.path.exists(cache_file):
+            print(f"  SpaGE: auto-loading cached results from {cache_file}", flush=True)
+            imp_df = pd.read_parquet(cache_file)
+            with _spage_lock:
+                _spage_state["status"]  = "done"
+                _spage_state["message"] = f"Auto-loaded (cached) — {len(imp_df.columns):,} genes"
+                _spage_state["result"]  = imp_df
+    except Exception as exc:
+        print(f"  SpaGE: auto-load failed: {exc}", flush=True)
 
 
 def _vectorized_spage(spatial_df: pd.DataFrame, rna_df: pd.DataFrame,
@@ -681,6 +870,7 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str) -> None:
         if os.path.exists(cache_file):
             _set("running", "Loading cached SpaGE results…")
             imp_df = pd.read_parquet(cache_file)
+            _spage_index_update(cache_file)
             _set("done", f"Done (cached) — {len(imp_df.columns):,} genes imputed", result=imp_df)
             return
 
@@ -754,6 +944,7 @@ writeLines(colnames(mat_sub), "{cells_file}")
         # ── Cache ─────────────────────────────────────────────────────────
         _set("running", "Saving imputed results…")
         imp_df.to_parquet(cache_file)
+        _spage_index_update(cache_file)
         _set("done", f"Done — {len(imp_df.columns):,} genes imputed", result=imp_df)
         print(f"  SpaGE: {len(imp_df.columns)} genes cached to {cache_file}", flush=True)
 
@@ -761,6 +952,125 @@ writeLines(colnames(mat_sub), "{cells_file}")
         import traceback
         traceback.print_exc()
         _set("error", str(exc)[:300])
+
+
+# ─── Subset / unsubset ────────────────────────────────────────────────────────
+
+def subset(cluster=None, cell_type=None,
+           gene=None, min_expr=None, max_expr=None,
+           min_transcripts=None, max_transcripts=None,
+           min_cell_area=None,    max_cell_area=None,
+           min_nucleus_area=None, max_nucleus_area=None,
+           cell_ids=None, method=None):
+    """
+    Subset the displayed cells. All non-None filters are ANDed together.
+
+    Parameters
+    ----------
+    cluster : int | str | list
+        Cluster label(s) to keep (integer IDs from the selected clustering method).
+    method : str
+        Clustering method name (default: first available).
+        Use list(DATA['cluster_methods']) to see options.
+    cell_type : str | list
+        Cell type label(s) to keep (requires annotation to have been run).
+    gene : str
+        Gene name for expression-based filtering (use with min_expr / max_expr).
+    min_expr, max_expr : float
+        log1p expression thresholds for the selected gene.
+    min_transcripts, max_transcripts : float
+        Transcript count bounds.
+    min_cell_area, max_cell_area : float
+        Cell area bounds (µm²).
+    min_nucleus_area, max_nucleus_area : float
+        Nucleus area bounds (µm²).
+    cell_ids : list
+        Explicit list of cell IDs (barcodes) to keep.
+
+    Examples
+    --------
+    subset(cluster=3)
+    subset(cluster=[1, 2, 3], method='gene_expression_10_clusters')
+    subset(cell_type='Cardiomyocyte')
+    subset(gene='MYH7', min_expr=1.0)
+    subset(min_transcripts=50, max_cell_area=500)
+    """
+    global _subset_version
+
+    # Save originals on first subset call
+    if "_df_original" not in DATA:
+        DATA["_df_original"]      = DATA["df"]
+        DATA["_df_to_expr_orig"]  = DATA["df_to_expr"]
+
+    df   = DATA["_df_original"]
+    mask = pd.Series(True, index=df.index)
+
+    # ── Cluster filter ────────────────────────────────────────────────────
+    if cluster is not None:
+        _method = method or DATA["cluster_methods"][0]
+        col  = f"clust__{_method}"
+        vals = [cluster] if not isinstance(cluster, (list, tuple)) else list(cluster)
+        vals = [int(v) for v in vals]
+        mask &= df[col].isin(vals)
+
+    # ── Cell type filter ──────────────────────────────────────────────────
+    if cell_type is not None:
+        labels = _annot_state.get("labels")
+        if labels is None:
+            print("  subset: no cell type annotation loaded — skipping cell_type filter", flush=True)
+        else:
+            vals = [cell_type] if isinstance(cell_type, str) else list(cell_type)
+            mask &= labels.reindex(df.index).isin(vals)
+
+    # ── Gene expression filter ────────────────────────────────────────────
+    if gene is not None and (min_expr is not None or max_expr is not None):
+        expr_vals = pd.Series(get_gene_expression(gene), index=df.index)
+        if min_expr is not None: mask &= expr_vals >= min_expr
+        if max_expr is not None: mask &= expr_vals <= max_expr
+
+    # ── Numeric range filters ─────────────────────────────────────────────
+    if min_transcripts  is not None: mask &= df["transcript_counts"] >= min_transcripts
+    if max_transcripts  is not None: mask &= df["transcript_counts"] <= max_transcripts
+    if min_cell_area    is not None: mask &= df["cell_area"]          >= min_cell_area
+    if max_cell_area    is not None: mask &= df["cell_area"]          <= max_cell_area
+    if min_nucleus_area is not None: mask &= df["nucleus_area"]       >= min_nucleus_area
+    if max_nucleus_area is not None: mask &= df["nucleus_area"]       <= max_nucleus_area
+
+    # ── Explicit cell IDs ─────────────────────────────────────────────────
+    if cell_ids is not None:
+        mask &= df.index.isin(cell_ids)
+
+    df_sub = df[mask]
+
+    # Update active data
+    DATA["df"] = df_sub
+
+    # Rebuild df_to_expr for the subset (map subset row → expr matrix row)
+    orig_to_expr = DATA["_df_to_expr_orig"]
+    orig_pos     = {cid: i for i, cid in enumerate(df.index)}
+    DATA["df_to_expr"] = np.array(
+        [orig_to_expr[orig_pos[cid]] for cid in df_sub.index], dtype=np.int64
+    )
+
+    _umap_df_cache.clear()
+    _subset_version += 1
+    print(f"  subset: {len(df_sub):,} / {len(df):,} cells selected", flush=True)
+    return df_sub
+
+
+def unsubset():
+    """Restore the full dataset after subsetting."""
+    global _subset_version
+
+    if "_df_original" not in DATA:
+        print("  unsubset: no subset is active", flush=True)
+        return
+
+    DATA["df"]         = DATA.pop("_df_original")
+    DATA["df_to_expr"] = DATA.pop("_df_to_expr_orig")
+    _umap_df_cache.clear()
+    _subset_version += 1
+    print(f"  unsubset: restored {len(DATA['df']):,} cells", flush=True)
 
 
 # ─── Morphology image overlay ─────────────────────────────────────────────────
@@ -774,126 +1084,203 @@ MORPH_CHANNELS = [
     {"label": "18S",                    "value": "18s",      "color": (255, 60,  0),   "ch": 2},
     {"label": "αSMA/Vimentin",          "value": "sma",      "color": (255, 0,   220), "ch": 3},
 ]
+MORPH_MAX_UM = 5000
 
-_morph_zarr: dict  = {}   # {z_level: (TiffFile, zarr_array) | None}
-_morph_lock        = threading.Lock()
+# ── Change 1: reduced prefetch — only 15% extra on each side ──────────────────
+_PREFETCH_FRAC = 0.15   # was 0.50; smaller = faster first render, less pan buffer
 
-# Low-resolution overview: pre-decoded and cached on disk for fast zoomed-out views
-# {z_level: {"channels": [ndarray per ch], "stride": int, "H": int, "W": int}}
-_morph_overview: dict = {}
+# ── Change 2 & 3: per-channel handles with LRU store cache ────────────────────
+# One TiffFile + LRU-backed zarr per channel per z-level → parallel reads,
+# no shared-lock needed, LRU avoids re-reading the same tiles from disk.
+_morph_handles: dict = {}    # {z_level: {"handles": [(tif, arr)×n_ch], "H", "W", "n_ch"} | None}
+_morph_init_lock = threading.Lock()   # only held during one-time initialisation
+
+# Low-resolution overviews cached in memory and on disk
+# Coarse (stride ~26): for viewport > ~4,400 µm  — fast zoomed-out view
+# Medium (stride  ~8): for viewport 1,300–4,400 µm — eliminates mid-zoom tile reads
+_morph_overview: dict = {}        # {z_level: ov_dict, "med_z_level": ov_dict}
 _morph_overview_lock  = threading.Lock()
-_overview_generating  = set()  # z_levels currently being generated
+_overview_generating  = set()     # keys currently being generated in background
 
-# Viewport render cache: stores raw (pre-brightness) normalised channel data
-# so brightness changes are instant and don't re-read tiles.
-# {(z_level, channels_key, stride): {"px": (x0,y0,x1,y1), "layers": list[ndarray], "p1p99": list}}
+# Render cache: stores raw float32 channel data (brightness-independent)
+# so brightness/opacity changes are instant without re-reading tiles.
 _morph_render_cache: dict = {}
 _morph_render_lock  = threading.Lock()
 
-# Pre-fetch margin: read this fraction extra on each side to absorb panning
-_PREFETCH_FRAC = 0.50
+# ── Change 4: progressive rendering queue ─────────────────────────────────────
+# Background hires fetches append here; the Dash callback polls and pushes a Patch.
+_morph_hires_queue: list = []   # list of image-dict results; GIL protects appends/pops
 
 
-def _get_morph_zarr(data_dir: str, z_level: int):
-    """Lazily open and cache a zarr store for one morphology_focus z-level."""
-    with _morph_lock:
-        if z_level not in _morph_zarr:
-            import warnings, logging, tifffile, zarr as zarr_mod
-            warnings.filterwarnings("ignore", message=".*OME series cannot read multi-file pyramids.*")
-            logging.getLogger("tifffile").setLevel(logging.ERROR)
-            fname = f"morphology_focus_{z_level:04d}.ome.tif"
-            path  = os.path.join(data_dir, "morphology_focus", fname)
-            if os.path.exists(path):
+def _get_morph_handles(data_dir: str, z_level: int):
+    """Lazily open one TiffFile + LRU-backed zarr per channel for parallel reads."""
+    with _morph_init_lock:
+        if z_level in _morph_handles:
+            return _morph_handles[z_level]
+
+        import warnings, logging, tifffile, zarr as zarr_mod
+        warnings.filterwarnings("ignore", message=".*OME series cannot read multi-file pyramids.*")
+        logging.getLogger("tifffile").setLevel(logging.ERROR)
+
+        fname = f"morphology_focus_{z_level:04d}.ome.tif"
+        path  = os.path.join(data_dir, "morphology_focus", fname)
+
+        if not os.path.exists(path):
+            _morph_handles[z_level] = None
+            return None
+
+        try:
+            # Probe shape with one temporary handle
+            tif_probe = tifffile.TiffFile(path)
+            arr_probe  = zarr_mod.open(tif_probe.aszarr(), mode="r")
+            n_ch, H, W = arr_probe.shape
+            tif_probe.close()
+
+            # Open one handle per channel; wrap with LRU to cache compressed tiles
+            LRU_PER_CH = 50 * 1024 * 1024   # 50 MB compressed tiles per channel
+            handles = []
+            for _ in range(n_ch):
+                tif_ch = tifffile.TiffFile(path)
+                store  = tif_ch.aszarr()
                 try:
-                    tif  = tifffile.TiffFile(path)
-                    arr  = zarr_mod.open(tif.aszarr(), mode="r")
-                    _morph_zarr[z_level] = (tif, arr)
-                    print(f"  Opened morphology z{z_level}: {arr.shape}", flush=True)
-                except Exception as exc:
-                    print(f"  Warning: could not open {fname}: {exc}", flush=True)
-                    _morph_zarr[z_level] = None
-            else:
-                _morph_zarr[z_level] = None
-    return _morph_zarr.get(z_level)
+                    lru   = zarr_mod.storage.LRUStoreCache(store, max_size=LRU_PER_CH)
+                    arr   = zarr_mod.open(lru, mode="r")
+                except (AttributeError, TypeError):
+                    arr   = zarr_mod.open(store, mode="r")   # zarr v3 fallback
+                handles.append((tif_ch, arr))
+
+            _morph_handles[z_level] = {"handles": handles, "H": H, "W": W, "n_ch": n_ch}
+            print(f"  Morphology z{z_level}: {n_ch}ch × {H}×{W} px, {n_ch}× LRU handles", flush=True)
+        except Exception as exc:
+            print(f"  Warning: could not open {fname}: {exc}", flush=True)
+            _morph_handles[z_level] = None
+
+    return _morph_handles.get(z_level)
 
 
-def _overview_cache_path(data_dir: str, z_level: int) -> str:
+def _overview_cache_path(data_dir: str, z_level: int, medium: bool = False) -> str:
     tag = hashlib.md5(data_dir.encode()).hexdigest()[:8]
     cache_dir = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache")
     os.makedirs(cache_dir, exist_ok=True)
-    return os.path.join(cache_dir, f"morph_overview_{tag}_z{z_level}.npz")
+    suffix = "med_" if medium else ""
+    return os.path.join(cache_dir, f"morph_overview_{suffix}{tag}_z{z_level}.npz")
+
+
+def _load_overview_from_disk(path: str):
+    """Load an NPZ overview file. Returns dict or None."""
+    try:
+        data = np.load(path)
+        n_ch = sum(1 for k in data.files if k.startswith("ch"))
+        return {
+            "channels": [data[f"ch{i}"] for i in range(n_ch)],
+            "stride":   int(data["stride"]),
+        }
+    except Exception:
+        return None
 
 
 def _load_or_generate_overview(data_dir: str, z_level: int):
-    """Load overview from disk cache, or generate in background. Returns overview or None."""
+    """Return coarse (stride ~26) overview dict, or None if not yet ready."""
     with _morph_overview_lock:
         if z_level in _morph_overview:
             return _morph_overview[z_level]
 
-    # Try disk cache
-    ov_path = _overview_cache_path(data_dir, z_level)
+    ov_path = _overview_cache_path(data_dir, z_level, medium=False)
     if os.path.exists(ov_path):
-        try:
-            data = np.load(ov_path)
-            ov = {
-                "channels": [data[f"ch{i}"] for i in range(4)],
-                "stride": int(data["stride"]),
-            }
+        ov = _load_overview_from_disk(ov_path)
+        if ov:
             with _morph_overview_lock:
                 _morph_overview[z_level] = ov
-            print(f"  Overview z{z_level}: loaded from disk cache", flush=True)
+            print(f"  Overview z{z_level} (coarse): loaded from cache", flush=True)
             return ov
-        except Exception as exc:
-            print(f"  Warning: could not load overview cache: {exc}", flush=True)
 
-    # Kick off background generation (if not already running)
+    # Generate coarse + medium together in one background pass
     with _morph_overview_lock:
-        if z_level in _overview_generating:
+        if f"coarse_{z_level}" in _overview_generating:
             return None
-        _overview_generating.add(z_level)
+        _overview_generating.add(f"coarse_{z_level}")
 
-    def _gen():
+    def _gen_overviews():
         try:
             import tifffile, zarr as zarr_mod
             fname = f"morphology_focus_{z_level:04d}.ome.tif"
-            path = os.path.join(data_dir, "morphology_focus", fname)
+            path  = os.path.join(data_dir, "morphology_focus", fname)
             if not os.path.exists(path):
                 return
-            # Open a SEPARATE tifffile handle to avoid concurrent access issues
-            tif_ov = tifffile.TiffFile(path)
+
+            tif_ov  = tifffile.TiffFile(path)
             zarr_ov = zarr_mod.open(tif_ov.aszarr(), mode="r")
-            H, W = zarr_ov.shape[1], zarr_ov.shape[2]
-            ov_stride = max(1, max(H, W) // 4096)
-            print(f"  Generating overview z{z_level} (stride={ov_stride})…", flush=True)
-            channels = []
-            for ch in range(zarr_ov.shape[0]):
-                arr = zarr_ov[ch, ::ov_stride, ::ov_stride].astype(np.uint16)
-                channels.append(arr)
-                print(f"    ch{ch}: {arr.shape}", flush=True)
+            H, W    = zarr_ov.shape[1], zarr_ov.shape[2]
+            n_ch    = zarr_ov.shape[0]
+
+            # ── Change 5: read at medium stride, derive coarse from it ────
+            # Both reads touch all tiles anyway; reading medium first lets us
+            # subsample to coarse without a second zarr pass.
+            med_stride   = 8
+            coarse_factor = max(1, max(H, W) // 4096) // med_stride or 3
+            # Compute actual coarse stride as a multiple of med_stride
+            coarse_stride = med_stride * coarse_factor
+
+            print(f"  Generating overviews z{z_level} (medium stride={med_stride}, "
+                  f"coarse stride≈{coarse_stride})…", flush=True)
+
+            med_channels    = []
+            coarse_channels = []
+            for ch in range(n_ch):
+                arr_med = zarr_ov[ch, ::med_stride, ::med_stride].astype(np.uint16)
+                med_channels.append(arr_med)
+                coarse_channels.append(arr_med[::coarse_factor, ::coarse_factor])
+                print(f"    ch{ch}: medium {arr_med.shape}", flush=True)
             tif_ov.close()
-            np.savez_compressed(
-                ov_path,
-                ch0=channels[0], ch1=channels[1],
-                ch2=channels[2], ch3=channels[3],
-                stride=np.array(ov_stride),
-            )
-            ov = {"channels": channels, "stride": ov_stride}
+
+            # Save medium overview
+            med_path = _overview_cache_path(data_dir, z_level, medium=True)
+            np.savez_compressed(med_path,
+                                **{f"ch{i}": med_channels[i] for i in range(n_ch)},
+                                stride=np.array(med_stride))
+            ov_med = {"channels": med_channels, "stride": med_stride}
+
+            # Save coarse overview
+            ov_path_c = _overview_cache_path(data_dir, z_level, medium=False)
+            np.savez_compressed(ov_path_c,
+                                **{f"ch{i}": coarse_channels[i] for i in range(n_ch)},
+                                stride=np.array(coarse_stride))
+            ov_coarse = {"channels": coarse_channels, "stride": coarse_stride}
+
             with _morph_overview_lock:
-                _morph_overview[z_level] = ov
-            print(f"  Overview z{z_level}: generated and cached ({ov_path})", flush=True)
+                _morph_overview[z_level]              = ov_coarse
+                _morph_overview[f"med_{z_level}"]     = ov_med
+            print(f"  Overviews z{z_level}: generated and cached", flush=True)
         except Exception as exc:
-            print(f"  Overview generation error: {exc}", flush=True)
+            print(f"  Overview generation error z{z_level}: {exc}", flush=True)
         finally:
             with _morph_overview_lock:
-                _overview_generating.discard(z_level)
+                _overview_generating.discard(f"coarse_{z_level}")
 
-    threading.Thread(target=_gen, daemon=True).start()
+    threading.Thread(target=_gen_overviews, daemon=True).start()
+    return None
+
+
+def _load_or_get_medium_overview(data_dir: str, z_level: int):
+    """Return medium (stride ~8) overview dict, or None if not yet ready."""
+    key = f"med_{z_level}"
+    with _morph_overview_lock:
+        if key in _morph_overview:
+            return _morph_overview[key]
+
+    med_path = _overview_cache_path(data_dir, z_level, medium=True)
+    if os.path.exists(med_path):
+        ov = _load_overview_from_disk(med_path)
+        if ov:
+            with _morph_overview_lock:
+                _morph_overview[key] = ov
+            print(f"  Overview z{z_level} (medium): loaded from cache", flush=True)
+            return ov
     return None
 
 
 def _compose_rgb(layers, p1p99_list, brightness, out_h, out_w, channels, crop=None):
-    """Compose cached raw layers into an RGB uint8 array, applying brightness.
-    If crop=(y0,y1,x0,x1), slice each layer before compositing (saves memory)."""
+    """Composite raw float32 layers into an RGB array, applying brightness."""
     ch_map = {c["value"]: c for c in MORPH_CHANNELS}
     rgb = np.zeros((out_h, out_w, 3), dtype=np.float32)
     for i, ch_val in enumerate(channels):
@@ -913,10 +1300,39 @@ def _compose_rgb(layers, p1p99_list, brightness, out_h, out_w, channels, crop=No
     return rgb
 
 
+def _overview_to_image(ov, channels, vp_px_x0, vp_px_y0, vp_px_x1, vp_px_y1,
+                        rw_vp, rh_vp, brightness, img_opacity):
+    """Crop and composite an overview dict for the given pixel viewport."""
+    ov_stride = ov["stride"]
+    ch_map    = {c["value"]: c for c in MORPH_CHANNELS}
+    ov_y0 = vp_px_y0 // ov_stride
+    ov_y1 = min(ov["channels"][0].shape[0], vp_px_y1 // ov_stride + 1)
+    ov_x0 = vp_px_x0 // ov_stride
+    ov_x1 = min(ov["channels"][0].shape[1], vp_px_x1 // ov_stride + 1)
+    oh, ow = ov_y1 - ov_y0, ov_x1 - ov_x0
+    if oh <= 0 or ow <= 0:
+        return None
+    rgb = np.zeros((oh, ow, 3), dtype=np.float32)
+    for ch_val in channels:
+        info = ch_map.get(ch_val)
+        if info is None or info["ch"] >= len(ov["channels"]):
+            continue
+        region  = ov["channels"][info["ch"]][ov_y0:ov_y1, ov_x0:ov_x1].astype(np.float32)
+        nonzero = region[region > 0]
+        if nonzero.size > 50:
+            p1, p99 = np.percentile(nonzero, [1, 99])
+            norm = np.clip((region - p1) / (p99 - p1) * brightness, 0, 1) if p99 > p1 \
+                   else np.zeros_like(region)
+        else:
+            norm = np.zeros_like(region)
+        rgb += norm[..., np.newaxis] * (np.array(info["color"], dtype=np.float32) / 255.0)
+    return _encode_overlay_jpeg(rgb, vp_px_x0, vp_px_y0, rw_vp, rh_vp, img_opacity)
+
+
 def _encode_overlay_jpeg(rgb, vp_px_x0, vp_px_y0, rw_vp, rh_vp, img_opacity):
     """Clip, encode to JPEG base64, return plotly layout.images dict."""
     rgb_uint8 = (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
-    img_pil = Image.fromarray(rgb_uint8, mode="RGB")
+    img_pil   = Image.fromarray(rgb_uint8, mode="RGB")
     buf = io.BytesIO()
     img_pil.save(buf, format="JPEG", quality=80)
     b64 = base64.b64encode(buf.getvalue()).decode()
@@ -932,31 +1348,68 @@ def _encode_overlay_jpeg(rgb, vp_px_x0, vp_px_y0, rw_vp, rh_vp, img_opacity):
     )
 
 
+def _read_one_channel(ch_val, handles_info, py0, py1, px0, px1, stride, out_h, out_w):
+    """Read one channel from its dedicated zarr handle (no lock needed)."""
+    ch_map = {c["value"]: c for c in MORPH_CHANNELS}
+    info   = ch_map.get(ch_val)
+    if info is None or handles_info is None:
+        return None, (0.0, 0.0)
+    ch_idx = info["ch"]
+    if ch_idx >= handles_info["n_ch"]:
+        return None, (0.0, 0.0)
+    _, arr = handles_info["handles"][ch_idx]
+    # Each arr covers all channels; read only the one we need
+    region  = arr[ch_idx, py0:py1:stride, px0:px1:stride].astype(np.float32)
+    region  = region[:out_h, :out_w]
+    nonzero = region[region > 0]
+    if nonzero.size > 100:
+        p1, p99 = float(np.percentile(nonzero, 1)), float(np.percentile(nonzero, 99))
+    else:
+        p1, p99 = 0.0, 0.0
+    return region, (p1, p99)
+
+
+def _read_channels_parallel(channels, handles_info, py0, py1, px0, px1, stride, out_h, out_w):
+    """Read all requested channels in parallel threads (GIL released during JPEG2000 decode)."""
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(channels), 4)) as ex:
+        futs = {
+            ex.submit(_read_one_channel, ch, handles_info, py0, py1, px0, px1,
+                      stride, out_h, out_w): ch
+            for ch in channels
+        }
+        ordered = [concurrent.futures.as_completed  # silence linter
+                   and futs[f].result()
+                   for f in [next(f for f, c in futs.items() if c == ch)
+                              for ch in channels]]
+    layers = [r[0] for r in ordered]
+    p1p99  = [r[1] for r in ordered]
+    return layers, p1p99
+
+
 def make_morphology_overlay(data_dir, relayout, z_level, channels, brightness, img_opacity):
     """
-    Read morphology_focus tiles for the current viewport, composite selected
-    channels into an RGB image, and return a plotly layout.images dict.
+    Composite morphology tiles for the current viewport.
 
-    Speed optimisations:
-      1. Parallel channel reads via ThreadPoolExecutor (3–4× speedup).
-      2. Pre-fetch margin: read 50 % extra on each side so pans hit cache.
-      3. Raw-layer cache: stores pre-brightness data so brightness/opacity
-         changes are instant (no tile re-read).
-      4. Brightness applied as cheap post-process on cached data.
+    Performance optimisations (all five changes):
+      1. Prefetch fraction reduced 0.50 → 0.15 (3× fewer cold tiles).
+      2. Per-channel zarr handles: parallel reads without a shared lock.
+      3. LRU store cache: 50 MB per channel keeps compressed tiles in RAM.
+      4. Progressive rendering: overview returned instantly; hires queued in bg.
+      5. Medium-stride (stride~8) overview covers the 1,300–4,400 µm range.
     """
     if not channels or not relayout:
         return None, ""
 
-    pair = _get_morph_zarr(data_dir, z_level)
-    if pair is None:
+    handles_info = _get_morph_handles(data_dir, z_level)
+    if handles_info is None:
         return None, " · morphology images not found"
 
-    _, zarr_arr = pair
-    H, W = zarr_arr.shape[1], zarr_arr.shape[2]
+    H, W = handles_info["H"], handles_info["W"]
     full_w_um = W * PIXEL_SIZE_UM
     full_h_um = H * PIXEL_SIZE_UM
 
-    # ── Viewport bounds (plot µm, Y flipped) ─────────────────────────────
+    # ── Viewport bounds (µm, Y-flipped plot coords) ───────────────────────
     x0_um = float(relayout.get("xaxis.range[0]", 0))
     x1_um = float(relayout.get("xaxis.range[1]", full_w_um))
     y0_um = float(relayout.get("yaxis.range[0]", -full_h_um))
@@ -967,7 +1420,7 @@ def make_morphology_overlay(data_dir, relayout, z_level, channels, brightness, i
     if max(vp_w, vp_h) > MORPH_MAX_UM:
         return None, f" · zoom in to ≤{MORPH_MAX_UM:,} µm for image overlay"
 
-    # ── Exact viewport in image pixels ───────────────────────────────────
+    # ── Viewport in image pixels ──────────────────────────────────────────
     vp_px_x0 = max(0, int(x0_um / PIXEL_SIZE_UM))
     vp_px_x1 = min(W, int(x1_um / PIXEL_SIZE_UM) + 1)
     vp_px_y0 = max(0, int(-y1_um / PIXEL_SIZE_UM))
@@ -975,125 +1428,112 @@ def make_morphology_overlay(data_dir, relayout, z_level, channels, brightness, i
     if vp_px_x1 <= vp_px_x0 or vp_px_y1 <= vp_px_y0:
         return None, ""
 
-    # ── Stride (target ≤ 800 px output) ──────────────────────────────────
-    rw_vp = vp_px_x1 - vp_px_x0
-    rh_vp = vp_px_y1 - vp_px_y0
+    rw_vp  = vp_px_x1 - vp_px_x0
+    rh_vp  = vp_px_y1 - vp_px_y0
     stride = max(1, max(rw_vp, rh_vp) // 800)
 
-    # ── Try low-res overview first (instant for large viewports) ─────────
-    # Kick off generation in background if not available; use overview when
-    # the viewport would require many tile decodes (stride >= overview stride)
-    ov = _load_or_generate_overview(data_dir, z_level)
-    if ov is not None and stride >= ov["stride"]:
-        ov_stride = ov["stride"]
-        ch_map = {c["value"]: c for c in MORPH_CHANNELS}
-        ov_y0 = vp_px_y0 // ov_stride
-        ov_y1 = min(ov["channels"][0].shape[0], vp_px_y1 // ov_stride + 1)
-        ov_x0 = vp_px_x0 // ov_stride
-        ov_x1 = min(ov["channels"][0].shape[1], vp_px_x1 // ov_stride + 1)
-        oh = ov_y1 - ov_y0
-        ow = ov_x1 - ov_x0
-        if oh > 0 and ow > 0:
-            rgb = np.zeros((oh, ow, 3), dtype=np.float32)
-            for ch_val in channels:
-                info = ch_map.get(ch_val)
-                if info is None:
-                    continue
-                region = ov["channels"][info["ch"]][ov_y0:ov_y1, ov_x0:ov_x1].astype(np.float32)
-                nonzero = region[region > 0]
-                if nonzero.size > 50:
-                    p1, p99 = np.percentile(nonzero, [1, 99])
-                    if p99 > p1:
-                        norm = np.clip((region - p1) / (p99 - p1) * brightness, 0, 1)
-                    else:
-                        norm = np.zeros_like(region)
-                else:
-                    norm = np.zeros_like(region)
-                color_f = np.array(info["color"], dtype=np.float32) / 255.0
-                rgb += norm[..., np.newaxis] * color_f
-            return _encode_overlay_jpeg(rgb, vp_px_x0, vp_px_y0,
-                                        rw_vp, rh_vp, img_opacity), " (overview)"
+    # ── Path 1: coarse overview (instant, stride ≥ coarse_stride) ────────
+    ov_coarse = _load_or_generate_overview(data_dir, z_level)
+    if ov_coarse and stride >= ov_coarse["stride"]:
+        img = _overview_to_image(ov_coarse, channels, vp_px_x0, vp_px_y0,
+                                  vp_px_x1, vp_px_y1, rw_vp, rh_vp,
+                                  brightness, img_opacity)
+        return img, " (overview)"
 
-    sorted_ch = tuple(sorted(channels))
-    cache_key = (z_level, sorted_ch, stride)
+    # ── Path 1b: medium overview (instant, stride ≥ 8) ───────────────────
+    ov_med = _load_or_get_medium_overview(data_dir, z_level)
+    if ov_med and stride >= ov_med["stride"]:
+        img = _overview_to_image(ov_med, channels, vp_px_x0, vp_px_y0,
+                                  vp_px_x1, vp_px_y1, rw_vp, rh_vp,
+                                  brightness, img_opacity)
+        if img:
+            return img, " (medium overview)"
 
-    # ── Check render cache (raw layers, brightness-independent) ──────────
+    sorted_ch  = tuple(sorted(channels))
+    cache_key  = (z_level, sorted_ch, stride)
+
+    # ── Path 2: render cache hit (brightness-independent raw layers) ──────
     with _morph_render_lock:
         entry = _morph_render_cache.get(cache_key)
 
     if entry is not None:
         cpx_x0, cpx_y0, cpx_x1, cpx_y1 = entry["px"]
-        # Is the viewport fully inside the cached region?
         if (vp_px_x0 >= cpx_x0 and vp_px_y0 >= cpx_y0 and
                 vp_px_x1 <= cpx_x1 and vp_px_y1 <= cpx_y1):
-            crop_y0 = (vp_px_y0 - cpx_y0) // stride
-            crop_y1 = crop_y0 + (rh_vp - 1) // stride + 1
-            crop_x0 = (vp_px_x0 - cpx_x0) // stride
-            crop_x1 = crop_x0 + (rw_vp - 1) // stride + 1
-            out_h = crop_y1 - crop_y0
-            out_w = crop_x1 - crop_x0
+            cy0 = (vp_px_y0 - cpx_y0) // stride
+            cy1 = cy0 + (rh_vp - 1) // stride + 1
+            cx0 = (vp_px_x0 - cpx_x0) // stride
+            cx1 = cx0 + (rw_vp - 1) // stride + 1
             rgb = _compose_rgb(entry["layers"], entry["p1p99"],
-                               brightness, out_h, out_w, channels,
-                               crop=(crop_y0, crop_y1, crop_x0, crop_x1))
+                               brightness, cy1 - cy0, cx1 - cx0, channels,
+                               crop=(cy0, cy1, cx0, cx1))
             return _encode_overlay_jpeg(rgb, vp_px_x0, vp_px_y0,
                                         rw_vp, rh_vp, img_opacity), " (cached)"
 
-    # ── Expand read region by pre-fetch margin ────────────────────────────
+    # ── Path 3: tile read ─────────────────────────────────────────────────
+    # Prefetch region (Change 1: 15% instead of 50%)
     pad_x = int(rw_vp * _PREFETCH_FRAC)
     pad_y = int(rh_vp * _PREFETCH_FRAC)
-    px_x0 = max(0, vp_px_x0 - pad_x)
-    px_x1 = min(W, vp_px_x1 + pad_x)
-    px_y0 = max(0, vp_px_y0 - pad_y)
-    px_y1 = min(H, vp_px_y1 + pad_y)
+    px_x0 = max(0, vp_px_x0 - pad_x);  px_x1 = min(W, vp_px_x1 + pad_x)
+    px_y0 = max(0, vp_px_y0 - pad_y);  px_y1 = min(H, vp_px_y1 + pad_y)
+    rw, rh  = px_x1 - px_x0, px_y1 - px_y0
+    out_h   = (rh - 1) // stride + 1
+    out_w   = (rw - 1) // stride + 1
 
-    rw, rh = px_x1 - px_x0, px_y1 - px_y0
-    out_h = (rh - 1) // stride + 1
-    out_w = (rw - 1) // stride + 1
+    def _do_tile_read():
+        """Read tiles for the prefetch region, update render cache, queue hires result."""
+        # Change 2: parallel channel reads (each uses its own zarr handle)
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(channels), 4)) as ex:
+            futs    = {ex.submit(_read_one_channel, ch, handles_info,
+                                 px_y0, px_y1, px_x0, px_x1,
+                                 stride, out_h, out_w): ch
+                       for ch in channels}
+            results = {futs[f]: f.result() for f in concurrent.futures.as_completed(futs)}
 
-    # ── Read channels sequentially (tifffile zarr not thread-safe) ──────
-    def read_channel(ch_val):
-        ch_map = {c["value"]: c for c in MORPH_CHANNELS}
-        info = ch_map.get(ch_val)
-        if info is None:
-            return None, (0, 0)
-        with _morph_lock:
-            region = zarr_arr[info["ch"], px_y0:px_y1:stride, px_x0:px_x1:stride].astype(np.float32)
-        region = region[:out_h, :out_w]
-        nonzero = region[region > 0]
-        if nonzero.size > 100:
-            p1, p99 = np.percentile(nonzero, [1, 99])
-        else:
-            p1, p99 = 0.0, 0.0
-        return region, (float(p1), float(p99))
+        layers = [results[ch][0] for ch in channels]
+        p1p99  = [results[ch][1] for ch in channels]
 
-    results = [read_channel(ch) for ch in channels]
+        with _morph_render_lock:
+            _morph_render_cache[cache_key] = {
+                "px": (px_x0, px_y0, px_x1, px_y1),
+                "layers": layers, "p1p99": p1p99,
+            }
+            if len(_morph_render_cache) > 8:
+                del _morph_render_cache[next(iter(_morph_render_cache))]
 
-    layers  = [r[0] for r in results]
-    p1p99   = [r[1] for r in results]
+        # Crop to exact viewport and encode
+        cy0 = (vp_px_y0 - px_y0) // stride;  cy1 = cy0 + (rh_vp - 1) // stride + 1
+        cx0 = (vp_px_x0 - px_x0) // stride;  cx1 = cx0 + (rw_vp - 1) // stride + 1
+        rgb = _compose_rgb(layers, p1p99, brightness, cy1 - cy0, cx1 - cx0, channels,
+                           crop=(cy0, cy1, cx0, cx1))
+        img = _encode_overlay_jpeg(rgb, vp_px_x0, vp_px_y0, rw_vp, rh_vp, img_opacity)
+        _morph_hires_queue.append(img)   # picked up by push_hires_overlay callback
 
-    # ── Store raw layers in cache ─────────────────────────────────────────
-    with _morph_render_lock:
-        _morph_render_cache[cache_key] = {
-            "px":     (px_x0, px_y0, px_x1, px_y1),
-            "layers": layers,
-            "p1p99":  p1p99,
-        }
-        if len(_morph_render_cache) > 6:
-            oldest = next(iter(_morph_render_cache))
-            del _morph_render_cache[oldest]
+    # ── Change 4: progressive rendering ───────────────────────────────────
+    # If any overview is available, return it immediately (< 20 ms) and
+    # start a background thread to fetch the full-resolution tiles.
+    preview = None
+    if ov_med:
+        preview = _overview_to_image(ov_med, channels, vp_px_x0, vp_px_y0,
+                                     vp_px_x1, vp_px_y1, rw_vp, rh_vp,
+                                     brightness, img_opacity)
+    elif ov_coarse:
+        preview = _overview_to_image(ov_coarse, channels, vp_px_x0, vp_px_y0,
+                                     vp_px_x1, vp_px_y1, rw_vp, rh_vp,
+                                     brightness, img_opacity)
 
-    # ── Compose and encode the viewport sub-region ───────────────────────
-    crop_y0 = (vp_px_y0 - px_y0) // stride
-    crop_y1 = crop_y0 + (rh_vp - 1) // stride + 1
-    crop_x0 = (vp_px_x0 - px_x0) // stride
-    crop_x1 = crop_x0 + (rw_vp - 1) // stride + 1
-    c_h = crop_y1 - crop_y0
-    c_w = crop_x1 - crop_x0
-    rgb = _compose_rgb(layers, p1p99, brightness, c_h, c_w, channels,
-                       crop=(crop_y0, crop_y1, crop_x0, crop_x1))
+    if preview:
+        threading.Thread(target=_do_tile_read, daemon=True).start()
+        return preview, " (preview → loading…)"
 
-    return _encode_overlay_jpeg(rgb, vp_px_x0, vp_px_y0,
-                                rw_vp, rh_vp, img_opacity), ""
+    # No overview available yet — read tiles synchronously (first-ever render)
+    _do_tile_read()
+    # The result was queued by _do_tile_read; pop it and return directly
+    if _morph_hires_queue:
+        img = _morph_hires_queue.pop()
+        return img, ""
+    return None, ""
 
 
 # ─── UI micro-components ──────────────────────────────────────────────────────
@@ -1392,18 +1832,22 @@ def _cell_type_traces(x, y, df, size, opacity, mode="spatial"):
 
 def make_spatial_fig(color_by, method, gene, size, opacity,
                      show_cell_bounds, show_nuc_bounds, relayout,
-                     morph_image=None, extra_title="", baysor_active=False):
-    # Choose data source: Baysor result or original Xenium segmentation
+                     morph_image=None, extra_title="", baysor_active=False, proseg_active=False):
+    # Choose data source: Proseg > Baysor > original Xenium (priority order)
+    with _proseg_lock:
+        pres = _proseg_state["result"] if proseg_active and _proseg_state["result"] else None
     with _baysor_lock:
-        bres = _baysor_state["result"] if baysor_active and _baysor_state["result"] else None
+        bres = _baysor_state["result"] if baysor_active and not pres and _baysor_state["result"] else None
 
-    if bres is not None:
-        bdf = bres["cells_df"]
+    alt_res = pres or bres
+    if alt_res is not None:
+        source_label = " [Proseg]" if pres else " [Baysor]"
+        bdf = alt_res["cells_df"]
         x   =  bdf["x_centroid"].values
         y   = -bdf["y_centroid"].values
         cell_ids = bdf.index.tolist()
         tx_counts = bdf["transcript_counts"].values
-        source_label = " [Baysor]"
+        source_label = source_label
         # Baysor: always color by transcript counts (no cluster/gene data aligned)
         traces = [go.Scattergl(
             x=x, y=y, mode="markers",
@@ -1415,7 +1859,7 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
             name="Transcript Counts",
         )]
         show_legend = False
-        cell_bounds_src = bres["cell_bounds"]
+        cell_bounds_src = alt_res["cell_bounds"]
         nuc_bounds_src  = {}
     else:
         df  = DATA["df"]
@@ -1572,7 +2016,20 @@ def method_label(m):
 
 
 cluster_options = [{"label": method_label(m), "value": m} for m in cluster_methods]
-gene_options    = [{"label": g, "value": g} for g in sorted(gene_names)]
+
+# Auto-load any previously cached SpaGE results for this dataset
+_spage_autoload()
+
+with _spage_lock:
+    _spage_autoload_result = _spage_state.get("result")
+
+_base_gene_options = [{"label": g, "value": g} for g in sorted(gene_names)]
+if _spage_autoload_result is not None:
+    _imp_opts = [{"label": f"{g} [imp]", "value": f"{g} [imp]"}
+                 for g in sorted(_spage_autoload_result.columns)]
+    gene_options = _base_gene_options + _imp_opts
+else:
+    gene_options = _base_gene_options
 
 sidebar = html.Div([
     # Header + collapsible tissue info
@@ -1601,6 +2058,27 @@ sidebar = html.Div([
     ], id="tissue-info-section", style={"marginBottom": "14px"}),
 
     html.Hr(style={"borderColor": BORDER, "margin": "0 0 14px 0"}),
+
+    # Subset indicator (hidden when no subset is active)
+    html.Div(id="subset-indicator", style={"display": "none"},
+             children=[
+                 html.Div([
+                     html.Span("⬡ SUBSET ACTIVE", style={
+                         "fontSize": "10px", "fontWeight": "700", "letterSpacing": "1px",
+                         "color": "#f0a500",
+                     }),
+                     html.Span(id="subset-count", style={
+                         "fontSize": "10px", "color": MUTED, "marginLeft": "6px",
+                     }),
+                 ], style={"display": "flex", "alignItems": "center", "justifyContent": "space-between"}),
+                 html.Button("✕ Clear Subset", id="unsubset-btn", n_clicks=0, style={
+                     "width": "100%", "padding": "3px 0", "marginTop": "4px",
+                     "backgroundColor": CARD_BG, "color": "#f0a500",
+                     "border": "1px solid #f0a500", "borderRadius": "4px",
+                     "cursor": "pointer", "fontSize": "11px",
+                 }),
+                 html.Hr(style={"borderColor": BORDER, "margin": "10px 0 14px 0"}),
+             ]),
 
     # Color by
     ctrl_label("Color By"),
@@ -1666,21 +2144,6 @@ sidebar = html.Div([
         ),
     ], style={"marginBottom": "10px"}),
 
-    html.Button(
-        "↻  Refresh Overlay",
-        id="overlay-refresh-btn",
-        n_clicks=0,
-        style={
-            "width": "100%", "padding": "6px 0",
-            "backgroundColor": CARD_BG, "color": TEXT,
-            "border": f"1px solid {BORDER}", "borderRadius": "5px",
-            "cursor": "pointer", "fontSize": "12px", "marginBottom": "6px",
-        },
-    ),
-    html.Div(
-        "Click after zooming to reload boundaries / image tiles.",
-        style={"fontSize": "10px", "color": MUTED, "lineHeight": "1.4", "marginBottom": "14px"},
-    ),
 
     html.Hr(style={"borderColor": BORDER, "margin": "0 0 14px 0"}),
 
@@ -1828,111 +2291,214 @@ sidebar = html.Div([
     html.Hr(style={"borderColor": BORDER, "margin": "14px 0"}),
 
     # ── Baysor resegmentation ───────────────────────────────────────────
-    ctrl_label("Baysor Resegmentation"),
-    html.Div(
-        "Resegment cells using Baysor (must be installed). "
-        "See github.com/kharchenkolab/Baysor.",
-        style={"fontSize": "10px", "color": MUTED, "marginBottom": "8px", "lineHeight": "1.4"},
-    ),
-    # Spatial region filter
-    ctrl_label("Spatial Region (µm) — leave blank for full slide"),
     html.Div([
+        ctrl_label("Baysor Resegmentation"),
+
+        # Collapsible settings — expand on hover
         html.Div([
-            html.Div("X min", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
-            dcc.Input(id="baysor-xmin", type="number", placeholder="auto",
-                      style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
-                             "border": f"1px solid {BORDER}", "borderRadius": "4px",
-                             "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
-        ], style={"flex": "1"}),
-        html.Div([
-            html.Div("X max", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
-            dcc.Input(id="baysor-xmax", type="number", placeholder="auto",
-                      style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
-                             "border": f"1px solid {BORDER}", "borderRadius": "4px",
-                             "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
-        ], style={"flex": "1"}),
-    ], style={"display": "flex", "gap": "6px", "marginBottom": "6px"}),
-    html.Div([
-        html.Div([
-            html.Div("Y min", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
-            dcc.Input(id="baysor-ymin", type="number", placeholder="auto",
-                      style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
-                             "border": f"1px solid {BORDER}", "borderRadius": "4px",
-                             "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
-        ], style={"flex": "1"}),
-        html.Div([
-            html.Div("Y max", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
-            dcc.Input(id="baysor-ymax", type="number", placeholder="auto",
-                      style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
-                             "border": f"1px solid {BORDER}", "borderRadius": "4px",
-                             "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
-        ], style={"flex": "1"}),
-    ], style={"display": "flex", "gap": "6px", "marginBottom": "6px"}),
-    html.Button(
-        "Use Current Viewport", id="baysor-use-viewport", n_clicks=0,
-        style={"width": "100%", "padding": "4px 0", "backgroundColor": CARD_BG,
-               "color": MUTED, "border": f"1px solid {BORDER}", "borderRadius": "4px",
-               "cursor": "pointer", "fontSize": "11px", "marginBottom": "10px"},
-    ),
-    ctrl_label("Cell Radius (µm)"),
-    dcc.Slider(
-        id="baysor-scale", min=5, max=60, step=1, value=20,
-        marks={5: "5", 20: "20", 40: "40", 60: "60"},
-        tooltip={"placement": "bottom", "always_visible": False},
-    ),
-    html.Div(style={"marginBottom": "8px"}),
-    ctrl_label("Min Transcripts / Cell"),
-    dcc.Input(
-        id="baysor-min-mol", type="number", value=10, min=1, max=500, step=1,
-        style={
-            "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
-            "border": f"1px solid {BORDER}", "borderRadius": "4px",
-            "padding": "4px 8px", "fontSize": "12px", "marginBottom": "8px",
-        },
-    ),
-    dcc.Checklist(
-        id="baysor-use-prior",
-        options=[{"label": html.Span(
-            " Use Xenium prior segmentation",
-            style={"fontSize": "12px", "color": TEXT},
-        ), "value": "yes"}],
-        value=["yes"],
-        inputStyle={"marginRight": "6px"},
-        labelStyle={"display": "flex", "alignItems": "center", "marginBottom": "4px"},
-    ),
-    html.Div(id="baysor-prior-conf-div", children=[
-        ctrl_label("Prior Confidence"),
-        dcc.Slider(
-            id="baysor-prior-conf", min=0.0, max=1.0, step=0.05, value=0.5,
-            marks={0: "0", 0.5: "0.5", 1: "1"},
-            tooltip={"placement": "bottom", "always_visible": False},
+            html.Div(
+                "Resegment cells using Baysor (must be installed). "
+                "See github.com/kharchenkolab/Baysor.",
+                style={"fontSize": "10px", "color": MUTED, "marginBottom": "8px", "lineHeight": "1.4"},
+            ),
+            # Spatial region filter
+            ctrl_label("Spatial Region (µm) — leave blank for full slide"),
+            html.Div([
+                html.Div([
+                    html.Div("X min", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
+                    dcc.Input(id="baysor-xmin", type="number", placeholder="auto",
+                              style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                                     "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                     "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
+                ], style={"flex": "1"}),
+                html.Div([
+                    html.Div("X max", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
+                    dcc.Input(id="baysor-xmax", type="number", placeholder="auto",
+                              style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                                     "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                     "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
+                ], style={"flex": "1"}),
+            ], style={"display": "flex", "gap": "6px", "marginBottom": "6px"}),
+            html.Div([
+                html.Div([
+                    html.Div("Y min", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
+                    dcc.Input(id="baysor-ymin", type="number", placeholder="auto",
+                              style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                                     "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                     "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
+                ], style={"flex": "1"}),
+                html.Div([
+                    html.Div("Y max", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
+                    dcc.Input(id="baysor-ymax", type="number", placeholder="auto",
+                              style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                                     "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                     "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
+                ], style={"flex": "1"}),
+            ], style={"display": "flex", "gap": "6px", "marginBottom": "6px"}),
+            html.Button(
+                "Use Current Viewport", id="baysor-use-viewport", n_clicks=0,
+                style={"width": "100%", "padding": "4px 0", "backgroundColor": CARD_BG,
+                       "color": MUTED, "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                       "cursor": "pointer", "fontSize": "11px", "marginBottom": "10px"},
+            ),
+            ctrl_label("Cell Radius (µm)"),
+            dcc.Slider(
+                id="baysor-scale", min=5, max=60, step=1, value=20,
+                marks={5: "5", 20: "20", 40: "40", 60: "60"},
+                tooltip={"placement": "bottom", "always_visible": False},
+            ),
+            html.Div(style={"marginBottom": "8px"}),
+            ctrl_label("Min Transcripts / Cell"),
+            dcc.Input(
+                id="baysor-min-mol", type="number", value=10, min=1, max=500, step=1,
+                style={
+                    "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                    "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                    "padding": "4px 8px", "fontSize": "12px", "marginBottom": "8px",
+                },
+            ),
+            dcc.Checklist(
+                id="baysor-use-prior",
+                options=[{"label": html.Span(
+                    " Use Xenium prior segmentation",
+                    style={"fontSize": "12px", "color": TEXT},
+                ), "value": "yes"}],
+                value=["yes"],
+                inputStyle={"marginRight": "6px"},
+                labelStyle={"display": "flex", "alignItems": "center", "marginBottom": "4px"},
+            ),
+            html.Div(id="baysor-prior-conf-div", children=[
+                ctrl_label("Prior Confidence"),
+                dcc.Slider(
+                    id="baysor-prior-conf", min=0.0, max=1.0, step=0.05, value=0.5,
+                    marks={0: "0", 0.5: "0.5", 1: "1"},
+                    tooltip={"placement": "bottom", "always_visible": False},
+                ),
+                html.Div(style={"marginBottom": "6px"}),
+            ]),
+            html.Button(
+                "Run Baysor",
+                id="baysor-run-btn",
+                n_clicks=0,
+                style={
+                    "width": "100%", "padding": "7px 0",
+                    "backgroundColor": "#1f6feb", "color": "#fff",
+                    "border": "none", "borderRadius": "5px",
+                    "cursor": "pointer", "fontSize": "13px", "fontWeight": "600",
+                    "marginBottom": "8px",
+                },
+            ),
+            html.Div(id="baysor-status", style={"fontSize": "11px", "color": MUTED, "minHeight": "16px", "marginBottom": "6px"}),
+        ], className="collapsible-details"),
+
+        dcc.Interval(id="baysor-poll", interval=3000, disabled=True),
+        dcc.Checklist(
+            id="baysor-active",
+            options=[{"label": html.Span(
+                " Show Baysor segmentation",
+                style={"fontSize": "12px", "color": "#58a6ff"},
+            ), "value": "yes"}],
+            value=[],
+            inputStyle={"marginRight": "6px"},
+            labelStyle={"display": "flex", "alignItems": "center", "marginBottom": "4px"},
         ),
-        html.Div(style={"marginBottom": "6px"}),
-    ]),
-    html.Button(
-        "Run Baysor",
-        id="baysor-run-btn",
-        n_clicks=0,
-        style={
-            "width": "100%", "padding": "7px 0",
-            "backgroundColor": "#1f6feb", "color": "#fff",
-            "border": "none", "borderRadius": "5px",
-            "cursor": "pointer", "fontSize": "13px", "fontWeight": "600",
-            "marginBottom": "8px",
-        },
-    ),
-    html.Div(id="baysor-status", style={"fontSize": "11px", "color": MUTED, "minHeight": "16px", "marginBottom": "6px"}),
-    dcc.Interval(id="baysor-poll", interval=3000, disabled=True),
-    dcc.Checklist(
-        id="baysor-active",
-        options=[{"label": html.Span(
-            " Show Baysor segmentation",
-            style={"fontSize": "12px", "color": "#58a6ff"},
-        ), "value": "yes"}],
-        value=[],
-        inputStyle={"marginRight": "6px"},
-        labelStyle={"display": "flex", "alignItems": "center", "marginBottom": "4px"},
-    ),
+    ], id="baysor-section"),
+
+    html.Hr(style={"borderColor": BORDER, "margin": "14px 0"}),
+
+    # ── Proseg resegmentation ────────────────────────────────────────────
+    html.Div([
+        ctrl_label("Proseg Segmentation"),
+
+        html.Div([
+            html.Div(
+                "Probabilistic cell segmentation (faster than Baysor). "
+                "Install: conda install bioconda::rust-proseg",
+                style={"fontSize": "10px", "color": MUTED, "marginBottom": "8px", "lineHeight": "1.4"},
+            ),
+            # Spatial region filter
+            ctrl_label("Spatial Region (µm) — leave blank for full slide"),
+            html.Div([
+                html.Div([
+                    html.Div("X min", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
+                    dcc.Input(id="proseg-xmin", type="number", placeholder="auto",
+                              style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                                     "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                     "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
+                ], style={"flex": "1"}),
+                html.Div([
+                    html.Div("X max", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
+                    dcc.Input(id="proseg-xmax", type="number", placeholder="auto",
+                              style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                                     "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                     "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
+                ], style={"flex": "1"}),
+            ], style={"display": "flex", "gap": "6px", "marginBottom": "6px"}),
+            html.Div([
+                html.Div([
+                    html.Div("Y min", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
+                    dcc.Input(id="proseg-ymin", type="number", placeholder="auto",
+                              style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                                     "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                     "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
+                ], style={"flex": "1"}),
+                html.Div([
+                    html.Div("Y max", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
+                    dcc.Input(id="proseg-ymax", type="number", placeholder="auto",
+                              style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                                     "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                     "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
+                ], style={"flex": "1"}),
+            ], style={"display": "flex", "gap": "6px", "marginBottom": "6px"}),
+            html.Button(
+                "Use Current Viewport", id="proseg-use-viewport", n_clicks=0,
+                style={"width": "100%", "padding": "4px 0", "backgroundColor": CARD_BG,
+                       "color": MUTED, "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                       "cursor": "pointer", "fontSize": "11px", "marginBottom": "10px"},
+            ),
+            ctrl_label("Voxel Size (µm) — leave blank for auto"),
+            dcc.Input(
+                id="proseg-voxel-size", type="number", placeholder="auto", min=0.1, max=10, step=0.1,
+                style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                       "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                       "padding": "4px 8px", "fontSize": "12px", "marginBottom": "8px",
+                       "boxSizing": "border-box"},
+            ),
+            ctrl_label("Threads"),
+            dcc.Input(
+                id="proseg-nthreads", type="number", placeholder="all", min=1, max=128, step=1,
+                style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                       "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                       "padding": "4px 8px", "fontSize": "12px", "marginBottom": "8px",
+                       "boxSizing": "border-box"},
+            ),
+            html.Button(
+                "Run Proseg",
+                id="proseg-run-btn",
+                n_clicks=0,
+                style={
+                    "width": "100%", "padding": "7px 0",
+                    "backgroundColor": "#2d6a4f", "color": "#fff",
+                    "border": "none", "borderRadius": "5px",
+                    "cursor": "pointer", "fontSize": "13px", "fontWeight": "600",
+                    "marginBottom": "8px",
+                },
+            ),
+            html.Div(id="proseg-status", style={"fontSize": "11px", "color": MUTED, "minHeight": "16px", "marginBottom": "6px"}),
+        ], className="collapsible-details"),
+
+        dcc.Interval(id="proseg-poll", interval=3000, disabled=True),
+        dcc.Checklist(
+            id="proseg-active",
+            options=[{"label": html.Span(
+                " Show Proseg segmentation",
+                style={"fontSize": "12px", "color": "#52b788"},
+            ), "value": "yes"}],
+            value=[],
+            inputStyle={"marginRight": "6px"},
+            labelStyle={"display": "flex", "alignItems": "center", "marginBottom": "4px"},
+        ),
+    ], id="proseg-section"),
 
     html.Hr(style={"borderColor": BORDER, "margin": "14px 0"}),
 
@@ -2025,7 +2591,11 @@ app.layout = html.Div([
     dcc.Store(id="spatial-relayout", data={}),
     dcc.Store(id="annot-done",       data=0),
     dcc.Store(id="baysor-done",      data=0),
+    dcc.Store(id="proseg-done",      data=0),
     dcc.Store(id="spage-done",       data=0),
+    dcc.Store(id="subset-version",   data=0),
+    dcc.Interval(id="subset-poll",   interval=500,  n_intervals=0),
+    dcc.Interval(id="morph-hires-poll", interval=400, n_intervals=0),
     # Fires once after 500 ms to guarantee initial plot render in Dash 4
     dcc.Interval(id="startup-trigger", interval=500, max_intervals=1),
 
@@ -2101,7 +2671,7 @@ app.layout = html.Div([
                         ),
                         # Divider
                         html.Div(style={"width": "1px", "backgroundColor": BORDER, "flexShrink": "0"}),
-                        # Right: server log (fills remaining height)
+                        # Right: server log + REPL input
                         html.Div([
                             html.Div("SERVER LOG", style={
                                 "fontSize": "10px", "color": MUTED, "fontWeight": "600",
@@ -2116,6 +2686,36 @@ app.layout = html.Div([
                                     "fontFamily": "'Fira Code','Consolas',monospace",
                                 },
                             ),
+                            # Python REPL input
+                            html.Div([
+                                html.Span(">>>", style={
+                                    "color": ACCENT, "fontFamily": "'Fira Code','Consolas',monospace",
+                                    "fontSize": "12px", "flexShrink": "0", "lineHeight": "28px",
+                                }),
+                                dcc.Input(
+                                    id="repl-input",
+                                    type="text",
+                                    debounce=False,
+                                    placeholder="Python expression or statement (e.g. _run_seurat_annotation(...))",
+                                    style={
+                                        "flex": "1", "backgroundColor": "#0d1117",
+                                        "color": TEXT, "border": "none", "outline": "none",
+                                        "fontSize": "12px", "padding": "0 6px",
+                                        "fontFamily": "'Fira Code','Consolas',monospace",
+                                    },
+                                    n_submit=0,
+                                ),
+                                html.Button("Run", id="repl-run", n_clicks=0, style={
+                                    "padding": "2px 10px", "fontSize": "11px", "flexShrink": "0",
+                                    "backgroundColor": CARD_BG, "color": TEXT,
+                                    "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                    "cursor": "pointer",
+                                }),
+                            ], style={
+                                "display": "flex", "alignItems": "center", "gap": "6px",
+                                "borderTop": f"1px solid {BORDER}", "paddingTop": "4px",
+                                "flexShrink": "0",
+                            }),
                             dcc.Interval(id="log-poll", interval=1500, n_intervals=0),
                         ], style={
                             "flex": "1", "minWidth": "0",
@@ -2199,17 +2799,20 @@ def store_relayout(relayout_data, current):
     Input("morph-channels",     "value"),
     Input("morph-brightness",   "value"),
     Input("morph-opacity",      "value"),
-    Input("overlay-refresh-btn","n_clicks"),
     Input("spatial-relayout",   "data"),
     Input("baysor-done",        "data"),
     Input("baysor-active",      "value"),
+    Input("proseg-done",        "data"),
+    Input("proseg-active",      "value"),
     Input("spage-done",         "data"),
+    Input("subset-version",     "data"),
     Input("startup-trigger",    "n_intervals"),
 )
 def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
                  _annot_done, morph_enable, morph_zlevel, morph_channels,
-                 morph_brightness, morph_opacity, _refresh, relayout,
-                 _baysor_done, baysor_active, _spage_done, _startup):
+                 morph_brightness, morph_opacity, relayout,
+                 _baysor_done, baysor_active, _proseg_done, proseg_active,
+                 _spage_done, _subset_ver, _startup):
     # If only the viewport changed, avoid full figure rebuild
     triggered = callback_context.triggered_id
     boundaries_active = bool(boundary_toggles)
@@ -2251,6 +2854,7 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
     opacity          = opacity  or 0.85
     boundary_toggles = boundary_toggles or []
     baysor_on        = "yes" in (baysor_active or [])
+    proseg_on        = "yes" in (proseg_active or [])
 
     show_cell_bounds = "cell"    in boundary_toggles
     show_nuc_bounds  = "nucleus" in boundary_toggles
@@ -2272,7 +2876,7 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
         make_spatial_fig(color_by, method, gene, size, opacity,
                          show_cell_bounds, show_nuc_bounds, relayout,
                          morph_image=morph_image, extra_title=morph_title,
-                         baysor_active=baysor_on),
+                         baysor_active=baysor_on, proseg_active=proseg_on),
         make_umap_fig(color_by, method, gene, size, opacity),
     )
 
@@ -2552,6 +3156,80 @@ def poll_baysor(_, done_version):
     return message, False, True, done_version
 
 
+# ─── Proseg callbacks ─────────────────────────────────────────────────────────
+
+@app.callback(
+    Output("proseg-xmin", "value"),
+    Output("proseg-xmax", "value"),
+    Output("proseg-ymin", "value"),
+    Output("proseg-ymax", "value"),
+    Input("proseg-use-viewport", "n_clicks"),
+    State("spatial-relayout", "data"),
+    prevent_initial_call=True,
+)
+def proseg_fill_viewport(_, relayout):
+    r = relayout or {}
+    x0 = r.get("xaxis.range[0]")
+    x1 = r.get("xaxis.range[1]")
+    y0 = r.get("yaxis.range[0]")
+    y1 = r.get("yaxis.range[1]")
+    if None in (x0, x1, y0, y1):
+        return no_update, no_update, no_update, no_update
+    ym_min = round(-float(y1), 1)
+    ym_max = round(-float(y0), 1)
+    return round(float(x0), 1), round(float(x1), 1), ym_min, ym_max
+
+
+@app.callback(
+    Output("proseg-poll",    "disabled"),
+    Output("proseg-status",  "children"),
+    Output("proseg-run-btn", "disabled"),
+    Input("proseg-run-btn",  "n_clicks"),
+    State("proseg-voxel-size", "value"),
+    State("proseg-nthreads",   "value"),
+    State("proseg-xmin",       "value"),
+    State("proseg-xmax",       "value"),
+    State("proseg-ymin",       "value"),
+    State("proseg-ymax",       "value"),
+    prevent_initial_call=True,
+)
+def start_proseg(n_clicks, voxel_size, n_threads, x_min, x_max, y_min, y_max):
+    with _proseg_lock:
+        if _proseg_state["status"] == "running":
+            return False, "Already running…", True
+        _proseg_state.update({"status": "running", "message": "Starting…", "result": None})
+    region = {k: v for k, v in
+              dict(x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max).items()
+              if v is not None}
+    threading.Thread(
+        target=_run_proseg,
+        kwargs=dict(voxel_size=voxel_size, n_threads=n_threads, **region),
+        daemon=True,
+    ).start()
+    return False, "Starting Proseg…", True
+
+
+@app.callback(
+    Output("proseg-status",  "children",  allow_duplicate=True),
+    Output("proseg-poll",    "disabled",  allow_duplicate=True),
+    Output("proseg-run-btn", "disabled",  allow_duplicate=True),
+    Output("proseg-done",    "data"),
+    Input("proseg-poll",     "n_intervals"),
+    State("proseg-done",     "data"),
+    prevent_initial_call=True,
+)
+def poll_proseg(_, done_version):
+    with _proseg_lock:
+        status  = _proseg_state["status"]
+        message = _proseg_state["message"]
+
+    if status == "done":
+        return f"✓ {message}", True, False, (done_version or 0) + 1
+    if status == "error":
+        return f"✗ {message}", True, False, done_version
+    return message, False, True, done_version
+
+
 # ─── SpaGE callbacks ──────────────────────────────────────────────────────────
 
 @app.callback(
@@ -2632,6 +3310,57 @@ def toggle_info_bar(n):
 
 
 @app.callback(
+    Output("spatial-plot", "figure", allow_duplicate=True),
+    Input("morph-hires-poll", "n_intervals"),
+    prevent_initial_call=True,
+)
+def push_hires_overlay(_):
+    """Apply the latest hires tile render to the spatial plot (progressive rendering)."""
+    if not _morph_hires_queue:
+        return no_update
+    img_dict = _morph_hires_queue.pop(0)
+    patched = Patch()
+    patched["layout"]["images"] = [img_dict] if img_dict else []
+    return patched
+
+
+@app.callback(
+    Output("subset-version", "data"),
+    Input("subset-poll",     "n_intervals"),
+    State("subset-version",  "data"),
+)
+def poll_subset(_, current):
+    """Push _subset_version into the Dash store to trigger plot refresh."""
+    if _subset_version != (current or 0):
+        return _subset_version
+    return no_update
+
+
+@app.callback(
+    Output("subset-indicator", "style"),
+    Output("subset-count",     "children"),
+    Input("subset-version",    "data"),
+)
+def update_subset_indicator(_):
+    active = "_df_original" in DATA
+    if active:
+        n_sub  = len(DATA["df"])
+        n_orig = len(DATA["_df_original"])
+        return {}, f"{n_sub:,} / {n_orig:,} cells"
+    return {"display": "none"}, ""
+
+
+@app.callback(
+    Output("subset-version", "data", allow_duplicate=True),
+    Input("unsubset-btn",    "n_clicks"),
+    prevent_initial_call=True,
+)
+def clear_subset_btn(_):
+    unsubset()
+    return _subset_version
+
+
+@app.callback(
     Output("server-log", "children"),
     Input("log-poll", "n_intervals"),
 )
@@ -2639,6 +3368,39 @@ def update_server_log(_):
     with _log_lock:
         lines = list(_log_buffer)
     return "\n".join(lines[-60:])  # last 60 lines
+
+
+_repl_globals = globals()  # share module namespace with REPL
+
+
+@app.callback(
+    Output("repl-input", "value"),
+    Input("repl-run",    "n_clicks"),
+    Input("repl-input",  "n_submit"),
+    State("repl-input",  "value"),
+    prevent_initial_call=True,
+)
+def run_repl(_, __, code):
+    if not code or not code.strip():
+        return ""
+    with _log_lock:
+        _log_buffer.append(f">>> {code}")
+
+    def _exec():
+        try:
+            # Try eval first (expression), fall back to exec (statement)
+            try:
+                result = eval(code, _repl_globals)
+                if result is not None:
+                    print(repr(result), flush=True)
+            except SyntaxError:
+                exec(code, _repl_globals)
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
+    threading.Thread(target=_exec, daemon=True).start()
+    return ""
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
