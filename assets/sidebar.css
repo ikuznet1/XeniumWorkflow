@@ -1,0 +1,44 @@
+/* Sidebar hover-reveal */
+
+/* By default, sidebar is slid off-screen to the left */
+#sidebar-wrapper {
+    transform: translateX(-240px);
+    transition: transform 0.25s ease;
+    /* Keep the shadow/indicator visible as a thin sliver */
+}
+
+/* When hovering the zone (trigger strip + sidebar area), slide in */
+#sidebar-hover-zone:hover #sidebar-wrapper {
+    transform: translateX(0);
+}
+
+/* Thin visible indicator tab on the left edge so user knows it's there */
+#sidebar-hover-zone::before {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 0;
+    transform: translateY(-50%);
+    width: 4px;
+    height: 60px;
+    background: #58a6ff;
+    border-radius: 0 4px 4px 0;
+    opacity: 0.6;
+    transition: opacity 0.2s ease;
+    pointer-events: none;
+}
+
+#sidebar-hover-zone:hover::before {
+    opacity: 0;
+}
+
+/* Collapsible tissue info stats */
+.tissue-details {
+    overflow: hidden;
+    max-height: 0;
+    transition: max-height 0.3s ease;
+}
+
+#tissue-info-section:hover .tissue-details {
+    max-height: 300px;
+}

@@ -114,6 +114,8 @@ sys.stderr = _LogCapture(sys.stderr)
 
 def _redirect_rpy2_console():
     """Call once inside any thread that uses rpy2 to capture R console output."""
+    import warnings
+    warnings.filterwarnings("ignore", message="R is not initialized by the main thread")
     try:
         import rpy2.rinterface_lib.callbacks as rpy2_cb
         def _r_write(x):
@@ -391,7 +393,8 @@ rm(._annot_mat, ._annot_genes, ._annot_dir, ._annot_rds_tmp, mat_sub)
         _set("error", f"{exc}\n{traceback.format_exc()[-300:]}")
 
 
-def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float) -> None:
+def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
+                x_min=None, x_max=None, y_min=None, y_max=None) -> None:
     """Background thread: run Baysor resegmentation and store results."""
 
     def _set(status, message, result=None):
@@ -437,6 +440,29 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float) 
             os.path.join(DATA["data_dir"], "transcripts.parquet"),
             columns=["x_location", "y_location", "feature_name", "cell_id"],
         )
+        # Convert cell_id: Xenium uses "UNASSIGNED" string; Baysor needs integer 0
+        cid = tx["cell_id"]
+        if cid.dtype == object or str(cid.dtype) == "string":
+            # String column — replace "UNASSIGNED" explicitly then parse
+            cid = cid.astype(str).replace({"UNASSIGNED": "0", "nan": "0", "<NA>": "0", "None": "0"})
+            cid = pd.to_numeric(cid, errors="coerce").fillna(0)
+        else:
+            cid = pd.to_numeric(cid, errors="coerce").fillna(0)
+        tx["cell_id"] = cid.astype("int64")
+
+        # Apply spatial region filter if specified
+        if x_min is not None: tx = tx[tx["x_location"] >= x_min]
+        if x_max is not None: tx = tx[tx["x_location"] <= x_max]
+        if y_min is not None: tx = tx[tx["y_location"] >= y_min]
+        if y_max is not None: tx = tx[tx["y_location"] <= y_max]
+
+        n_assigned = int((tx["cell_id"] != 0).sum())
+        print(f"  Baysor: {n_assigned:,} / {len(tx):,} transcripts have prior cell assignment", flush=True)
+        # Disable prior if no assigned transcripts (would crash Baysor with Vector{Missing})
+        if use_prior and n_assigned == 0:
+            print("  Baysor: no assigned transcripts in region — disabling prior segmentation", flush=True)
+            use_prior = False
+
         tx.to_csv(tx_csv, index=False)
         print(f"  Baysor: exported {len(tx):,} transcripts to {tx_csv}", flush=True)
 
@@ -772,7 +798,9 @@ def _get_morph_zarr(data_dir: str, z_level: int):
     """Lazily open and cache a zarr store for one morphology_focus z-level."""
     with _morph_lock:
         if z_level not in _morph_zarr:
-            import tifffile, zarr as zarr_mod
+            import warnings, logging, tifffile, zarr as zarr_mod
+            warnings.filterwarnings("ignore", message=".*OME series cannot read multi-file pyramids.*")
+            logging.getLogger("tifffile").setLevel(logging.ERROR)
             fname = f"morphology_focus_{z_level:04d}.ome.tif"
             path  = os.path.join(data_dir, "morphology_focus", fname)
             if os.path.exists(path):
@@ -1547,33 +1575,36 @@ cluster_options = [{"label": method_label(m), "value": m} for m in cluster_metho
 gene_options    = [{"label": g, "value": g} for g in sorted(gene_names)]
 
 sidebar = html.Div([
-    # Header
+    # Header + collapsible tissue info
     html.Div([
-        html.Div("XENIUM EXPLORER", style={
-            "fontSize": "11px", "fontWeight": "700",
-            "letterSpacing": "2px", "color": ACCENT, "marginBottom": "4px",
-        }),
-        html.Div(meta.get("run_name", "—"), style={"fontSize": "13px", "color": TEXT, "fontWeight": "600"}),
-        html.Div(meta.get("region_name", ""), style={"fontSize": "11px", "color": MUTED}),
-    ], style={"marginBottom": "18px"}),
+        html.Div([
+            html.Div("XENIUM EXPLORER", style={
+                "fontSize": "11px", "fontWeight": "700",
+                "letterSpacing": "2px", "color": ACCENT, "marginBottom": "4px",
+            }),
+            html.Div(meta.get("run_name", "—"), style={"fontSize": "13px", "color": TEXT, "fontWeight": "600"}),
+            html.Div(meta.get("region_name", ""), style={"fontSize": "11px", "color": MUTED}),
+        ], style={"marginBottom": "10px"}),
 
-    html.Hr(style={"borderColor": BORDER, "margin": "0 0 14px 0"}),
-
-    # Stats
-    html.Div([
-        stat_row("Cells",       f"{meta.get('num_cells', 0):,}"),
-        stat_row("Transcripts", f"{meta.get('num_transcripts', 0):,}"),
-        stat_row("Panel",       meta.get("panel_name", "—")),
-        stat_row("Genes",       str(len(gene_names))),
-        stat_row("Tissue",      meta.get("panel_tissue_type", "—")),
-        stat_row("Pixel",       f"{meta.get('pixel_size', PIXEL_SIZE_UM)} µm"),
-    ], style={"marginBottom": "14px"}),
+        # Collapsible stats — expand on hover over the tissue section
+        html.Div([
+            html.Hr(style={"borderColor": BORDER, "margin": "0 0 10px 0"}),
+            html.Div([
+                stat_row("Cells",       f"{meta.get('num_cells', 0):,}"),
+                stat_row("Transcripts", f"{meta.get('num_transcripts', 0):,}"),
+                stat_row("Panel",       meta.get("panel_name", "—")),
+                stat_row("Genes",       str(len(gene_names))),
+                stat_row("Tissue",      meta.get("panel_tissue_type", "—")),
+                stat_row("Pixel",       f"{meta.get('pixel_size', PIXEL_SIZE_UM)} µm"),
+            ], style={"marginBottom": "6px"}),
+        ], className="tissue-details"),
+    ], id="tissue-info-section", style={"marginBottom": "14px"}),
 
     html.Hr(style={"borderColor": BORDER, "margin": "0 0 14px 0"}),
 
     # Color by
     ctrl_label("Color By"),
-    dcc.RadioItems(
+    dcc.Dropdown(
         id="color-by",
         options=[
             {"label": "Cluster",           "value": "cluster"},
@@ -1584,12 +1615,8 @@ sidebar = html.Div([
             {"label": "Nucleus Area",      "value": "nucleus_area"},
         ],
         value="cluster",
-        inputStyle={"marginRight": "6px"},
-        labelStyle={
-            "display": "flex", "alignItems": "center",
-            "marginBottom": "7px", "fontSize": "13px", "color": TEXT, "cursor": "pointer",
-        },
-        style={"marginBottom": "14px"},
+        clearable=False,
+        style={"fontSize": "12px", "marginBottom": "14px"},
     ),
 
     html.Div(id="cluster-ctrl", children=[
@@ -1807,6 +1834,46 @@ sidebar = html.Div([
         "See github.com/kharchenkolab/Baysor.",
         style={"fontSize": "10px", "color": MUTED, "marginBottom": "8px", "lineHeight": "1.4"},
     ),
+    # Spatial region filter
+    ctrl_label("Spatial Region (µm) — leave blank for full slide"),
+    html.Div([
+        html.Div([
+            html.Div("X min", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
+            dcc.Input(id="baysor-xmin", type="number", placeholder="auto",
+                      style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                             "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                             "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
+        ], style={"flex": "1"}),
+        html.Div([
+            html.Div("X max", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
+            dcc.Input(id="baysor-xmax", type="number", placeholder="auto",
+                      style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                             "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                             "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
+        ], style={"flex": "1"}),
+    ], style={"display": "flex", "gap": "6px", "marginBottom": "6px"}),
+    html.Div([
+        html.Div([
+            html.Div("Y min", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
+            dcc.Input(id="baysor-ymin", type="number", placeholder="auto",
+                      style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                             "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                             "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
+        ], style={"flex": "1"}),
+        html.Div([
+            html.Div("Y max", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
+            dcc.Input(id="baysor-ymax", type="number", placeholder="auto",
+                      style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                             "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                             "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
+        ], style={"flex": "1"}),
+    ], style={"display": "flex", "gap": "6px", "marginBottom": "6px"}),
+    html.Button(
+        "Use Current Viewport", id="baysor-use-viewport", n_clicks=0,
+        style={"width": "100%", "padding": "4px 0", "backgroundColor": CARD_BG,
+               "color": MUTED, "border": f"1px solid {BORDER}", "borderRadius": "4px",
+               "cursor": "pointer", "fontSize": "11px", "marginBottom": "10px"},
+    ),
     ctrl_label("Cell Radius (µm)"),
     dcc.Slider(
         id="baysor-scale", min=5, max=60, step=1, value=20,
@@ -1929,9 +1996,9 @@ sidebar = html.Div([
 
     # UMAP toggle
     html.Button(
-        "Hide UMAP",
+        "Show UMAP",
         id="umap-toggle",
-        n_clicks=0,
+        n_clicks=1,
         style={
             "width": "100%", "padding": "7px 0",
             "backgroundColor": CARD_BG, "color": TEXT,
@@ -1990,7 +2057,7 @@ app.layout = html.Div([
                         },
                         style={"height": "100%"},
                     )
-                ], id="spatial-panel", style={"flex": "1.65", "minWidth": "0"}),
+                ], id="spatial-panel", style={"flex": "1", "minWidth": "0"}),
 
                 html.Div([
                     dcc.Graph(
@@ -2001,7 +2068,7 @@ app.layout = html.Div([
                         },
                         style={"height": "100%"},
                     )
-                ], id="umap-panel", style={"flex": "1", "minWidth": "0"}),
+                ], id="umap-panel", style={"display": "none"}),
             ], style={"display": "flex", "flex": "1", "gap": "10px", "minHeight": "0"}),
 
             # ── Bottom info bar (collapsible) ───────────────────────────────
@@ -2402,6 +2469,29 @@ def toggle_prior_conf(use_prior):
 
 
 @app.callback(
+    Output("baysor-xmin", "value"),
+    Output("baysor-xmax", "value"),
+    Output("baysor-ymin", "value"),
+    Output("baysor-ymax", "value"),
+    Input("baysor-use-viewport", "n_clicks"),
+    State("spatial-relayout", "data"),
+    prevent_initial_call=True,
+)
+def baysor_fill_viewport(_, relayout):
+    r = relayout or {}
+    x0 = r.get("xaxis.range[0]")
+    x1 = r.get("xaxis.range[1]")
+    y0 = r.get("yaxis.range[0]")  # negated in plot; y_plot = -y_µm
+    y1 = r.get("yaxis.range[1]")
+    if None in (x0, x1, y0, y1):
+        return no_update, no_update, no_update, no_update
+    # Convert plot Y back to µm (plot y = -y_µm)
+    ym_min = round(-float(y1), 1)
+    ym_max = round(-float(y0), 1)
+    return round(float(x0), 1), round(float(x1), 1), ym_min, ym_max
+
+
+@app.callback(
     Output("baysor-poll",       "disabled"),
     Output("baysor-status",     "children"),
     Output("baysor-run-btn",    "disabled"),
@@ -2410,23 +2500,35 @@ def toggle_prior_conf(use_prior):
     State("baysor-min-mol",     "value"),
     State("baysor-use-prior",   "value"),
     State("baysor-prior-conf",  "value"),
+    State("baysor-xmin",        "value"),
+    State("baysor-xmax",        "value"),
+    State("baysor-ymin",        "value"),
+    State("baysor-ymax",        "value"),
     prevent_initial_call=True,
 )
-def start_baysor(n_clicks, scale, min_mol, use_prior, prior_conf):
+def start_baysor(n_clicks, scale, min_mol, use_prior, prior_conf,
+                 x_min, x_max, y_min, y_max):
     with _baysor_lock:
         if _baysor_state["status"] == "running":
             return False, "Already running…", True
         _baysor_state.update({"status": "running", "message": "Starting…", "result": None})
-    scale     = scale     or 20
-    min_mol   = min_mol   or 10
-    prior_conf= prior_conf or 0.5
+    scale      = float(scale      or 20)
+    min_mol    = int(min_mol      or 10)
+    prior_conf = float(prior_conf or 0.5)
     use_prior_bool = "yes" in (use_prior or [])
+    region = {k: v for k, v in
+              dict(x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max).items()
+              if v is not None}
     threading.Thread(
         target=_run_baysor,
-        args=(float(scale), int(min_mol), use_prior_bool, float(prior_conf)),
+        args=(scale, min_mol, use_prior_bool, prior_conf),
+        kwargs=region,
         daemon=True,
     ).start()
-    return False, "Starting Baysor…", True
+    region_str = (f" [{region.get('x_min',''):.0f}–{region.get('x_max',''):.0f} ×"
+                  f" {region.get('y_min',''):.0f}–{region.get('y_max',''):.0f} µm]"
+                  if region else "")
+    return False, f"Starting Baysor…{region_str}", True
 
 
 @app.callback(
