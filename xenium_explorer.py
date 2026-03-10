@@ -2617,11 +2617,22 @@ def to_spatialdata(qv_threshold: int = 20, force: bool = False) -> None:
             # ── Read from raw Xenium files ────────────────────────────────
             _set("running", f"Reading Xenium data (qv≥{qv_threshold})…")
             print(f"  to_spatialdata: reading from {DATA['data_dir']} …", flush=True)
-            import warnings
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message=".*feature_key.*categorical.*")
-                warnings.filterwarnings("ignore", message=".*OME series.*")
-                sdata = sopa.io.xenium(DATA["data_dir"], qv_threshold=qv_threshold)
+            import warnings, logging
+            # Suppress spatialdata logging warnings (uses Python logging, not warnings module)
+            _sd_loggers = [logging.getLogger(n) for n in ("spatialdata", "spatialdata._logging")]
+            _sd_prev_levels = [lg.level for lg in _sd_loggers]
+            for lg in _sd_loggers:
+                lg.setLevel(logging.ERROR)
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message=".*feature_key.*categorical.*")
+                    warnings.filterwarnings("ignore", message=".*OME series.*")
+                    warnings.filterwarnings("ignore", category=FutureWarning)
+                    warnings.filterwarnings("ignore", category=UserWarning)
+                    sdata = sopa.io.xenium(DATA["data_dir"], qv_threshold=qv_threshold)
+            finally:
+                for lg, lvl in zip(_sd_loggers, _sd_prev_levels):
+                    lg.setLevel(lvl)
 
             _sdata_fix_categories(sdata)
 
@@ -2632,7 +2643,10 @@ def to_spatialdata(qv_threshold: int = 20, force: bool = False) -> None:
                 import shutil
                 if os.path.isdir(cache):
                     shutil.rmtree(cache)
-                sdata.write(cache)
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=FutureWarning)
+                    warnings.filterwarnings("ignore", category=UserWarning)
+                    sdata.write(cache)
                 print(f"  to_spatialdata: cache saved ✓", flush=True)
             except Exception as save_exc:
                 print(f"  to_spatialdata: cache save failed: {save_exc}", flush=True)
@@ -3097,195 +3111,27 @@ sidebar = html.Div([
 
     html.Hr(style={"borderColor": BORDER, "margin": "14px 0"}),
 
-    # ── Baysor resegmentation ───────────────────────────────────────────
-    html.Div([
-        ctrl_label("Baysor Resegmentation"),
-
-        # Collapsible settings — expand on hover
-        html.Div([
-            html.Div(
-                "Resegment cells using Baysor (must be installed). "
-                "See github.com/kharchenkolab/Baysor.",
-                style={"fontSize": "10px", "color": MUTED, "marginBottom": "8px", "lineHeight": "1.4"},
-            ),
-            # Spatial region filter
-            ctrl_label("Spatial Region (µm) — leave blank for full slide"),
-            html.Div([
-                html.Div([
-                    html.Div("X min", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
-                    dcc.Input(id="baysor-xmin", type="number", placeholder="auto",
-                              style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
-                                     "border": f"1px solid {BORDER}", "borderRadius": "4px",
-                                     "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
-                ], style={"flex": "1"}),
-                html.Div([
-                    html.Div("X max", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
-                    dcc.Input(id="baysor-xmax", type="number", placeholder="auto",
-                              style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
-                                     "border": f"1px solid {BORDER}", "borderRadius": "4px",
-                                     "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
-                ], style={"flex": "1"}),
-            ], style={"display": "flex", "gap": "6px", "marginBottom": "6px"}),
-            html.Div([
-                html.Div([
-                    html.Div("Y min", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
-                    dcc.Input(id="baysor-ymin", type="number", placeholder="auto",
-                              style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
-                                     "border": f"1px solid {BORDER}", "borderRadius": "4px",
-                                     "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
-                ], style={"flex": "1"}),
-                html.Div([
-                    html.Div("Y max", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
-                    dcc.Input(id="baysor-ymax", type="number", placeholder="auto",
-                              style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
-                                     "border": f"1px solid {BORDER}", "borderRadius": "4px",
-                                     "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
-                ], style={"flex": "1"}),
-            ], style={"display": "flex", "gap": "6px", "marginBottom": "6px"}),
-            html.Button(
-                "Use Current Viewport", id="baysor-use-viewport", n_clicks=0,
-                style={"width": "100%", "padding": "4px 0", "backgroundColor": CARD_BG,
-                       "color": MUTED, "border": f"1px solid {BORDER}", "borderRadius": "4px",
-                       "cursor": "pointer", "fontSize": "11px", "marginBottom": "10px"},
-            ),
-            ctrl_label("Cell Radius (µm)"),
-            dcc.Slider(
-                id="baysor-scale", min=5, max=60, step=1, value=20,
-                marks={5: "5", 20: "20", 40: "40", 60: "60"},
-                tooltip={"placement": "bottom", "always_visible": False},
-            ),
-            html.Div(style={"marginBottom": "8px"}),
-            ctrl_label("Min Transcripts / Cell"),
-            dcc.Input(
-                id="baysor-min-mol", type="number", value=10, min=1, max=500, step=1,
-                style={
-                    "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
-                    "border": f"1px solid {BORDER}", "borderRadius": "4px",
-                    "padding": "4px 8px", "fontSize": "12px", "marginBottom": "8px",
-                },
-            ),
-            dcc.Checklist(
-                id="baysor-use-prior",
-                options=[{"label": html.Span(
-                    " Use Xenium prior segmentation",
-                    style={"fontSize": "12px", "color": TEXT},
-                ), "value": "yes"}],
-                value=["yes"],
-                inputStyle={"marginRight": "6px"},
-                labelStyle={"display": "flex", "alignItems": "center", "marginBottom": "4px"},
-            ),
-            html.Div(id="baysor-prior-conf-div", children=[
-                ctrl_label("Prior Confidence"),
-                dcc.Slider(
-                    id="baysor-prior-conf", min=0.0, max=1.0, step=0.05, value=0.5,
-                    marks={0: "0", 0.5: "0.5", 1: "1"},
-                    tooltip={"placement": "bottom", "always_visible": False},
-                ),
-                html.Div(style={"marginBottom": "6px"}),
-            ]),
-            html.Button(
-                "Run Baysor",
-                id="baysor-run-btn",
-                n_clicks=0,
-                style={
-                    "width": "100%", "padding": "7px 0",
-                    "backgroundColor": "#1f6feb", "color": "#fff",
-                    "border": "none", "borderRadius": "5px",
-                    "cursor": "pointer", "fontSize": "13px", "fontWeight": "600",
-                    "marginBottom": "8px",
-                },
-            ),
-            html.Div(id="baysor-status", style={"fontSize": "11px", "color": MUTED, "minHeight": "16px", "marginBottom": "6px"}),
-        ], className="collapsible-details"),
-
-        dcc.Interval(id="baysor-poll", interval=3000, disabled=True),
-    ], id="baysor-section"),
-
-    html.Hr(style={"borderColor": BORDER, "margin": "14px 0"}),
-
-    # ── Proseg resegmentation ────────────────────────────────────────────
-    html.Div([
-        ctrl_label("Proseg Segmentation"),
-
-        html.Div([
-            html.Div(
-                "Probabilistic cell segmentation (faster than Baysor). "
-                "Install: conda install bioconda::rust-proseg",
-                style={"fontSize": "10px", "color": MUTED, "marginBottom": "8px", "lineHeight": "1.4"},
-            ),
-            # Spatial region filter
-            ctrl_label("Spatial Region (µm) — leave blank for full slide"),
-            html.Div([
-                html.Div([
-                    html.Div("X min", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
-                    dcc.Input(id="proseg-xmin", type="number", placeholder="auto",
-                              style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
-                                     "border": f"1px solid {BORDER}", "borderRadius": "4px",
-                                     "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
-                ], style={"flex": "1"}),
-                html.Div([
-                    html.Div("X max", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
-                    dcc.Input(id="proseg-xmax", type="number", placeholder="auto",
-                              style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
-                                     "border": f"1px solid {BORDER}", "borderRadius": "4px",
-                                     "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
-                ], style={"flex": "1"}),
-            ], style={"display": "flex", "gap": "6px", "marginBottom": "6px"}),
-            html.Div([
-                html.Div([
-                    html.Div("Y min", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
-                    dcc.Input(id="proseg-ymin", type="number", placeholder="auto",
-                              style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
-                                     "border": f"1px solid {BORDER}", "borderRadius": "4px",
-                                     "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
-                ], style={"flex": "1"}),
-                html.Div([
-                    html.Div("Y max", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
-                    dcc.Input(id="proseg-ymax", type="number", placeholder="auto",
-                              style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
-                                     "border": f"1px solid {BORDER}", "borderRadius": "4px",
-                                     "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
-                ], style={"flex": "1"}),
-            ], style={"display": "flex", "gap": "6px", "marginBottom": "6px"}),
-            html.Button(
-                "Use Current Viewport", id="proseg-use-viewport", n_clicks=0,
-                style={"width": "100%", "padding": "4px 0", "backgroundColor": CARD_BG,
-                       "color": MUTED, "border": f"1px solid {BORDER}", "borderRadius": "4px",
-                       "cursor": "pointer", "fontSize": "11px", "marginBottom": "10px"},
-            ),
-            ctrl_label("Voxel Size (µm) — leave blank for auto"),
-            dcc.Input(
-                id="proseg-voxel-size", type="number", placeholder="auto", min=0.1, max=10, step=0.1,
-                style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
-                       "border": f"1px solid {BORDER}", "borderRadius": "4px",
-                       "padding": "4px 8px", "fontSize": "12px", "marginBottom": "8px",
-                       "boxSizing": "border-box"},
-            ),
-            ctrl_label("Threads"),
-            dcc.Input(
-                id="proseg-nthreads", type="number", placeholder="all", min=1, max=128, step=1,
-                style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
-                       "border": f"1px solid {BORDER}", "borderRadius": "4px",
-                       "padding": "4px 8px", "fontSize": "12px", "marginBottom": "8px",
-                       "boxSizing": "border-box"},
-            ),
-            html.Button(
-                "Run Proseg",
-                id="proseg-run-btn",
-                n_clicks=0,
-                style={
-                    "width": "100%", "padding": "7px 0",
-                    "backgroundColor": "#2d6a4f", "color": "#fff",
-                    "border": "none", "borderRadius": "5px",
-                    "cursor": "pointer", "fontSize": "13px", "fontWeight": "600",
-                    "marginBottom": "8px",
-                },
-            ),
-            html.Div(id="proseg-status", style={"fontSize": "11px", "color": MUTED, "minHeight": "16px", "marginBottom": "6px"}),
-        ], className="collapsible-details"),
-
-        dcc.Interval(id="proseg-poll", interval=3000, disabled=True),
-    ], id="proseg-section"),
+    # ── Resegmentation ──────────────────────────────────────────────────
+    ctrl_label("Resegmentation"),
+    html.Button(
+        "Resegment Cells",
+        id="reseg-modal-open-btn",
+        n_clicks=0,
+        style={
+            "width": "100%", "padding": "7px 0",
+            "backgroundColor": "#1f6feb", "color": "#fff",
+            "border": "none", "borderRadius": "5px",
+            "cursor": "pointer", "fontSize": "13px", "fontWeight": "600",
+            "marginBottom": "8px",
+        },
+    ),
+    # Status line (shows whichever tool is running/done)
+    html.Div(id="reseg-status", style={"fontSize": "11px", "color": MUTED, "minHeight": "16px", "marginBottom": "6px"}),
+    # Hidden status divs for existing poll callbacks
+    html.Div(id="baysor-status", style={"display": "none"}),
+    html.Div(id="proseg-status", style={"display": "none"}),
+    dcc.Interval(id="baysor-poll", interval=3000, disabled=True),
+    dcc.Interval(id="proseg-poll", interval=3000, disabled=True),
 
     html.Hr(style={"borderColor": BORDER, "margin": "14px 0"}),
 
@@ -3511,6 +3357,185 @@ app.layout = html.Div([
     dcc.Interval(id="morph-hires-poll", interval=400, n_intervals=0),
     # Fires once after 500 ms to guarantee initial plot render in Dash 4
     dcc.Interval(id="startup-trigger", interval=500, max_intervals=1),
+
+    # ── Resegmentation modal ─────────────────────────────────────────────────────
+    dbc.Modal([
+        dbc.ModalHeader(dbc.ModalTitle("Resegment Cells"), close_button=True),
+        dbc.ModalBody([
+            # Algorithm selector tabs
+            dcc.Tabs(id="reseg-algo-tabs", value="baysor", children=[
+                dcc.Tab(label="Baysor", value="baysor", style={"color": TEXT, "backgroundColor": CARD_BG},
+                        selected_style={"color": "#fff", "backgroundColor": "#1f6feb", "fontWeight": "600"}),
+                dcc.Tab(label="Proseg", value="proseg", style={"color": TEXT, "backgroundColor": CARD_BG},
+                        selected_style={"color": "#fff", "backgroundColor": "#2d6a4f", "fontWeight": "600"}),
+            ], style={"marginBottom": "16px"}),
+
+            # ── Baysor settings panel ────────────────────────────────────
+            html.Div(id="modal-baysor-panel", children=[
+                html.Div(
+                    "Resegment cells using Baysor (must be installed). "
+                    "See github.com/kharchenkolab/Baysor.",
+                    style={"fontSize": "10px", "color": MUTED, "marginBottom": "8px", "lineHeight": "1.4"},
+                ),
+                ctrl_label("Spatial Region (µm) — leave blank for full slide"),
+                html.Div([
+                    html.Div([
+                        html.Div("X min", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
+                        dcc.Input(id="baysor-xmin", type="number", placeholder="auto",
+                                  style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                                         "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                         "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
+                    ], style={"flex": "1"}),
+                    html.Div([
+                        html.Div("X max", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
+                        dcc.Input(id="baysor-xmax", type="number", placeholder="auto",
+                                  style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                                         "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                         "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
+                    ], style={"flex": "1"}),
+                ], style={"display": "flex", "gap": "6px", "marginBottom": "6px"}),
+                html.Div([
+                    html.Div([
+                        html.Div("Y min", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
+                        dcc.Input(id="baysor-ymin", type="number", placeholder="auto",
+                                  style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                                         "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                         "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
+                    ], style={"flex": "1"}),
+                    html.Div([
+                        html.Div("Y max", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
+                        dcc.Input(id="baysor-ymax", type="number", placeholder="auto",
+                                  style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                                         "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                         "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
+                    ], style={"flex": "1"}),
+                ], style={"display": "flex", "gap": "6px", "marginBottom": "6px"}),
+                html.Button(
+                    "Use Current Viewport", id="baysor-use-viewport", n_clicks=0,
+                    style={"width": "100%", "padding": "4px 0", "backgroundColor": CARD_BG,
+                           "color": MUTED, "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                           "cursor": "pointer", "fontSize": "11px", "marginBottom": "10px"},
+                ),
+                ctrl_label("Cell Radius (µm)"),
+                dcc.Slider(
+                    id="baysor-scale", min=5, max=60, step=1, value=20,
+                    marks={5: "5", 20: "20", 40: "40", 60: "60"},
+                    tooltip={"placement": "bottom", "always_visible": False},
+                ),
+                html.Div(style={"marginBottom": "8px"}),
+                ctrl_label("Min Transcripts / Cell"),
+                dcc.Input(
+                    id="baysor-min-mol", type="number", value=10, min=1, max=500, step=1,
+                    style={
+                        "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                        "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                        "padding": "4px 8px", "fontSize": "12px", "marginBottom": "8px",
+                    },
+                ),
+                dcc.Checklist(
+                    id="baysor-use-prior",
+                    options=[{"label": html.Span(
+                        " Use Xenium prior segmentation",
+                        style={"fontSize": "12px", "color": TEXT},
+                    ), "value": "yes"}],
+                    value=["yes"],
+                    inputStyle={"marginRight": "6px"},
+                    labelStyle={"display": "flex", "alignItems": "center", "marginBottom": "4px"},
+                ),
+                html.Div(id="baysor-prior-conf-div", children=[
+                    ctrl_label("Prior Confidence"),
+                    dcc.Slider(
+                        id="baysor-prior-conf", min=0.0, max=1.0, step=0.05, value=0.5,
+                        marks={0: "0", 0.5: "0.5", 1: "1"},
+                        tooltip={"placement": "bottom", "always_visible": False},
+                    ),
+                    html.Div(style={"marginBottom": "6px"}),
+                ]),
+            ]),
+
+            # ── Proseg settings panel ────────────────────────────────────
+            html.Div(id="modal-proseg-panel", children=[
+                html.Div(
+                    "Probabilistic cell segmentation (faster than Baysor). "
+                    "Install: conda install bioconda::rust-proseg",
+                    style={"fontSize": "10px", "color": MUTED, "marginBottom": "8px", "lineHeight": "1.4"},
+                ),
+                ctrl_label("Spatial Region (µm) — leave blank for full slide"),
+                html.Div([
+                    html.Div([
+                        html.Div("X min", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
+                        dcc.Input(id="proseg-xmin", type="number", placeholder="auto",
+                                  style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                                         "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                         "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
+                    ], style={"flex": "1"}),
+                    html.Div([
+                        html.Div("X max", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
+                        dcc.Input(id="proseg-xmax", type="number", placeholder="auto",
+                                  style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                                         "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                         "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
+                    ], style={"flex": "1"}),
+                ], style={"display": "flex", "gap": "6px", "marginBottom": "6px"}),
+                html.Div([
+                    html.Div([
+                        html.Div("Y min", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
+                        dcc.Input(id="proseg-ymin", type="number", placeholder="auto",
+                                  style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                                         "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                         "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
+                    ], style={"flex": "1"}),
+                    html.Div([
+                        html.Div("Y max", style={"fontSize": "10px", "color": MUTED, "marginBottom": "2px"}),
+                        dcc.Input(id="proseg-ymax", type="number", placeholder="auto",
+                                  style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                                         "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                         "padding": "3px 6px", "fontSize": "11px", "boxSizing": "border-box"}),
+                    ], style={"flex": "1"}),
+                ], style={"display": "flex", "gap": "6px", "marginBottom": "6px"}),
+                html.Button(
+                    "Use Current Viewport", id="proseg-use-viewport", n_clicks=0,
+                    style={"width": "100%", "padding": "4px 0", "backgroundColor": CARD_BG,
+                           "color": MUTED, "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                           "cursor": "pointer", "fontSize": "11px", "marginBottom": "10px"},
+                ),
+                ctrl_label("Voxel Size (µm) — leave blank for auto"),
+                dcc.Input(
+                    id="proseg-voxel-size", type="number", placeholder="auto", min=0.1, max=10, step=0.1,
+                    style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                           "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                           "padding": "4px 8px", "fontSize": "12px", "marginBottom": "8px",
+                           "boxSizing": "border-box"},
+                ),
+                ctrl_label("Threads"),
+                dcc.Input(
+                    id="proseg-nthreads", type="number", placeholder="all", min=1, max=128, step=1,
+                    style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                           "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                           "padding": "4px 8px", "fontSize": "12px", "marginBottom": "8px",
+                           "boxSizing": "border-box"},
+                ),
+            ], style={"display": "none"}),  # hidden by default; shown when proseg tab is active
+        ]),
+        dbc.ModalFooter([
+            html.Div(id="reseg-modal-run-status", style={"fontSize": "11px", "color": MUTED, "flex": "1"}),
+            html.Button(
+                "Run",
+                id="reseg-modal-run-btn",
+                n_clicks=0,
+                style={
+                    "padding": "7px 20px",
+                    "backgroundColor": "#1f6feb", "color": "#fff",
+                    "border": "none", "borderRadius": "5px",
+                    "cursor": "pointer", "fontSize": "13px", "fontWeight": "600",
+                },
+            ),
+            dbc.Button("Close", id="reseg-modal-close-btn", color="secondary", size="sm"),
+        ], style={"display": "flex", "alignItems": "center", "gap": "8px"}),
+    ], id="reseg-modal", is_open=False, size="lg",
+       style={"color": TEXT},
+       content_style={"backgroundColor": DARK_BG, "color": TEXT},
+       backdrop=True),
 
     html.Div([
         # ── Hover-reveal sidebar ──────────────────────────────────────────────
@@ -4120,49 +4145,8 @@ def baysor_fill_viewport(_, relayout):
 
 
 @app.callback(
-    Output("baysor-poll",       "disabled"),
-    Output("baysor-status",     "children"),
-    Output("baysor-run-btn",    "disabled"),
-    Input("baysor-run-btn",     "n_clicks"),
-    State("baysor-scale",       "value"),
-    State("baysor-min-mol",     "value"),
-    State("baysor-use-prior",   "value"),
-    State("baysor-prior-conf",  "value"),
-    State("baysor-xmin",        "value"),
-    State("baysor-xmax",        "value"),
-    State("baysor-ymin",        "value"),
-    State("baysor-ymax",        "value"),
-    prevent_initial_call=True,
-)
-def start_baysor(n_clicks, scale, min_mol, use_prior, prior_conf,
-                 x_min, x_max, y_min, y_max):
-    with _baysor_lock:
-        if _baysor_state["status"] == "running":
-            return False, "Already running…", True
-        _baysor_state.update({"status": "running", "message": "Starting…", "result": None})
-    scale      = float(scale      or 20)
-    min_mol    = int(min_mol      or 10)
-    prior_conf = float(prior_conf or 0.5)
-    use_prior_bool = "yes" in (use_prior or [])
-    region = {k: v for k, v in
-              dict(x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max).items()
-              if v is not None}
-    threading.Thread(
-        target=_run_baysor,
-        args=(scale, min_mol, use_prior_bool, prior_conf),
-        kwargs=region,
-        daemon=True,
-    ).start()
-    region_str = (f" [{region.get('x_min',''):.0f}–{region.get('x_max',''):.0f} ×"
-                  f" {region.get('y_min',''):.0f}–{region.get('y_max',''):.0f} µm]"
-                  if region else "")
-    return False, f"Starting Baysor…{region_str}", True
-
-
-@app.callback(
-    Output("baysor-status",  "children",  allow_duplicate=True),
+    Output("baysor-status",  "children"),
     Output("baysor-poll",    "disabled",  allow_duplicate=True),
-    Output("baysor-run-btn", "disabled",  allow_duplicate=True),
     Output("baysor-done",    "data"),
     Output("seg-source",     "value",     allow_duplicate=True),
     Input("baysor-poll",     "n_intervals"),
@@ -4175,10 +4159,10 @@ def poll_baysor(_, done_version):
         message = _baysor_state["message"]
 
     if status == "done":
-        return f"✓ {message}", True, False, (done_version or 0) + 1, "baysor"
+        return f"✓ {message}", True, (done_version or 0) + 1, "baysor"
     if status == "error":
-        return f"✗ {message}", True, False, done_version, no_update
-    return message, False, True, done_version, no_update
+        return f"✗ {message}", True, done_version, no_update
+    return message, False, done_version, no_update
 
 
 # ─── Proseg callbacks ─────────────────────────────────────────────────────────
@@ -4206,38 +4190,8 @@ def proseg_fill_viewport(_, relayout):
 
 
 @app.callback(
-    Output("proseg-poll",    "disabled"),
     Output("proseg-status",  "children"),
-    Output("proseg-run-btn", "disabled"),
-    Input("proseg-run-btn",  "n_clicks"),
-    State("proseg-voxel-size", "value"),
-    State("proseg-nthreads",   "value"),
-    State("proseg-xmin",       "value"),
-    State("proseg-xmax",       "value"),
-    State("proseg-ymin",       "value"),
-    State("proseg-ymax",       "value"),
-    prevent_initial_call=True,
-)
-def start_proseg(n_clicks, voxel_size, n_threads, x_min, x_max, y_min, y_max):
-    with _proseg_lock:
-        if _proseg_state["status"] == "running":
-            return False, "Already running…", True
-        _proseg_state.update({"status": "running", "message": "Starting…", "result": None})
-    region = {k: v for k, v in
-              dict(x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max).items()
-              if v is not None}
-    threading.Thread(
-        target=_run_proseg,
-        kwargs=dict(voxel_size=voxel_size, n_threads=n_threads, **region),
-        daemon=True,
-    ).start()
-    return False, "Starting Proseg…", True
-
-
-@app.callback(
-    Output("proseg-status",  "children",  allow_duplicate=True),
     Output("proseg-poll",    "disabled",  allow_duplicate=True),
-    Output("proseg-run-btn", "disabled",  allow_duplicate=True),
     Output("proseg-done",    "data"),
     Output("seg-source",     "value",     allow_duplicate=True),
     Input("proseg-poll",     "n_intervals"),
@@ -4250,10 +4204,128 @@ def poll_proseg(_, done_version):
         message = _proseg_state["message"]
 
     if status == "done":
-        return f"✓ {message}", True, False, (done_version or 0) + 1, "proseg"
+        return f"✓ {message}", True, (done_version or 0) + 1, "proseg"
     if status == "error":
-        return f"✗ {message}", True, False, done_version, no_update
-    return message, False, True, done_version, no_update
+        return f"✗ {message}", True, done_version, no_update
+    return message, False, done_version, no_update
+
+
+# ─── Resegmentation modal callbacks ───────────────────────────────────────────
+
+@app.callback(
+    Output("reseg-modal", "is_open"),
+    Input("reseg-modal-open-btn", "n_clicks"),
+    Input("reseg-modal-close-btn", "n_clicks"),
+    State("reseg-modal", "is_open"),
+    prevent_initial_call=True,
+)
+def toggle_reseg_modal(open_clicks, close_clicks, is_open):
+    triggered = callback_context.triggered_id
+    if triggered == "reseg-modal-open-btn":
+        return True
+    return False
+
+
+@app.callback(
+    Output("modal-baysor-panel", "style"),
+    Output("modal-proseg-panel", "style"),
+    Output("reseg-modal-run-btn", "style"),
+    Input("reseg-algo-tabs", "value"),
+    prevent_initial_call=True,
+)
+def switch_reseg_tab(algo):
+    show = {}
+    hide = {"display": "none"}
+    run_btn_baysor_style = {"padding": "7px 20px", "backgroundColor": "#1f6feb", "color": "#fff",
+                            "border": "none", "borderRadius": "5px", "cursor": "pointer",
+                            "fontSize": "13px", "fontWeight": "600"}
+    run_btn_proseg_style = {**run_btn_baysor_style, "backgroundColor": "#2d6a4f"}
+    if algo == "proseg":
+        return hide, show, run_btn_proseg_style
+    return show, hide, run_btn_baysor_style
+
+
+@app.callback(
+    Output("reseg-modal-run-status", "children"),
+    Output("reseg-modal", "is_open", allow_duplicate=True),
+    Output("baysor-poll", "disabled", allow_duplicate=True),
+    Output("proseg-poll", "disabled", allow_duplicate=True),
+    Input("reseg-modal-run-btn", "n_clicks"),
+    State("reseg-algo-tabs", "value"),
+    # Baysor states
+    State("baysor-xmin", "value"),
+    State("baysor-xmax", "value"),
+    State("baysor-ymin", "value"),
+    State("baysor-ymax", "value"),
+    State("baysor-scale", "value"),
+    State("baysor-min-mol", "value"),
+    State("baysor-use-prior", "value"),
+    State("baysor-prior-conf", "value"),
+    # Proseg states
+    State("proseg-xmin", "value"),
+    State("proseg-xmax", "value"),
+    State("proseg-ymin", "value"),
+    State("proseg-ymax", "value"),
+    State("proseg-voxel-size", "value"),
+    State("proseg-nthreads", "value"),
+    prevent_initial_call=True,
+)
+def run_reseg_modal(n_clicks, algo,
+                    bxmin, bxmax, bymin, bymax, bscale, bmin_mol, buse_prior, bprior_conf,
+                    pxmin, pxmax, pymin, pymax, pvoxel, pthreads):
+    if algo == "baysor":
+        with _baysor_lock:
+            if _baysor_state["status"] == "running":
+                return "Already running…", True, False, no_update
+            _baysor_state.update({"status": "running", "message": "Starting…", "result": None})
+        scale      = float(bscale      or 20)
+        min_mol    = int(bmin_mol      or 10)
+        prior_conf = float(bprior_conf or 0.5)
+        use_prior_bool = "yes" in (buse_prior or [])
+        region = {k: v for k, v in
+                  dict(x_min=bxmin, x_max=bxmax, y_min=bymin, y_max=bymax).items()
+                  if v is not None}
+        threading.Thread(
+            target=_run_baysor,
+            args=(scale, min_mol, use_prior_bool, prior_conf),
+            kwargs=region,
+            daemon=True,
+        ).start()
+        return "Baysor starting…", False, False, True
+    else:  # proseg
+        with _proseg_lock:
+            if _proseg_state["status"] == "running":
+                return "Already running…", True, no_update, False
+            _proseg_state.update({"status": "running", "message": "Starting…", "result": None})
+        region = {k: v for k, v in
+                  dict(x_min=pxmin, x_max=pxmax, y_min=pymin, y_max=pymax).items()
+                  if v is not None}
+        threading.Thread(
+            target=_run_proseg,
+            kwargs=dict(voxel_size=pvoxel, n_threads=pthreads, **region),
+            daemon=True,
+        ).start()
+        return "Proseg starting…", False, no_update, False
+
+
+@app.callback(
+    Output("reseg-status", "children"),
+    Input("baysor-done", "data"),
+    Input("proseg-done", "data"),
+    prevent_initial_call=True,
+)
+def update_reseg_status(baysor_done, proseg_done):
+    with _baysor_lock:
+        b_status = _baysor_state["status"]
+        b_msg    = _baysor_state["message"]
+    with _proseg_lock:
+        p_status = _proseg_state["status"]
+        p_msg    = _proseg_state["message"]
+    if b_status == "done":
+        return f"\u2713 Baysor: {b_msg}"
+    if p_status == "done":
+        return f"\u2713 Proseg: {p_msg}"
+    return ""
 
 
 # ─── Reseg UMAP callbacks ─────────────────────────────────────────────────────
@@ -4296,7 +4368,7 @@ def poll_reseg_umap(_):
 
 @app.callback(
     Output("boundary-toggles", "options"),
-    Output("seg-source",       "options", allow_duplicate=True),
+    Output("seg-source",       "options"),
     Input("baysor-done",       "data"),
     Input("proseg-done",       "data"),
     State("boundary-toggles",  "options"),
@@ -4384,7 +4456,7 @@ def poll_spage(_, done_version):
     Output("spage-done",    "data",      allow_duplicate=True),
     Input("spage-repl-poll", "n_intervals"),
     State("spage-done",      "data"),
-    prevent_initial_call=True,
+    prevent_initial_call=True,  # required because spage-done has allow_duplicate
 )
 def poll_spage_repl(_, done_version):
     """Always-on poll: picks up SpaGE runs triggered from the REPL."""
