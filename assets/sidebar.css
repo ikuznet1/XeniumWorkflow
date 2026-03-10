@@ -51,6 +51,7 @@
 }
 
 #baysor-section:hover .collapsible-details,
-#proseg-section:hover .collapsible-details {
+#proseg-section:hover .collapsible-details,
+#sdata-section:hover .collapsible-details {
     max-height: 900px;
 }

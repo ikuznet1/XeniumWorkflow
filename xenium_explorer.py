@@ -9,6 +9,7 @@ Usage:
 """
 
 import os
+import re
 import sys
 import json
 import io
@@ -30,6 +31,12 @@ from dash import dcc, html, Input, Output, State, callback_context
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 from plotly.colors import qualitative
+
+_ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]|\x1b\[[?][0-9;]*[A-Za-z]|\x1b[()][0-9A-Za-z]|[\x00-\x08\x0b\x0e-\x1f\x7f]')
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_ESCAPE.sub('', text)
+
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 PIXEL_SIZE_UM = 0.2125
@@ -67,7 +74,7 @@ COLORSCALES = {
 
 
 # ─── Annotation state (shared across callbacks via background thread) ─────────
-_annot_state: dict = {"status": "idle", "message": "", "labels": None}
+_annot_state: dict = {"status": "idle", "message": "", "labels": None, "labels_proseg": None, "labels_baysor": None}
 _annot_lock   = threading.Lock()
 
 # ─── Baysor segmentation state ────────────────────────────────────────────────
@@ -81,9 +88,19 @@ _proseg_lock  = threading.Lock()
 # ─── SpaGE imputation state ───────────────────────────────────────────────────
 _spage_state: dict = {"status": "idle", "message": "", "result": None}
 _spage_lock   = threading.Lock()
+_spage_repl_pending = False   # set by run_spage(); cleared once poll_spage_repl fires
+
+# ─── Reseg UMAP state ─────────────────────────────────────────────────────────
+_umap_reseg_state: dict = {"status": "idle", "message": "", "result": None}
+_umap_reseg_lock  = threading.Lock()
 
 # ─── Subset state ─────────────────────────────────────────────────────────────
 _subset_version = 0   # incremented by subset()/unsubset() to trigger re-render
+
+# ─── SpatialData / Sopa state ─────────────────────────────────────────────────
+_sdata_state: dict = {"status": "idle", "message": "", "sdata": None, "roi": None, "patches": None}
+_sdata_lock   = threading.Lock()
+_sdata_version = 0  # incremented when ROI/patches change, to trigger overlay refresh
 
 # ─── Server log capture ────────────────────────────────────────────────────────
 import collections
@@ -152,7 +169,8 @@ def _cache_path(model_name: str) -> str:
     return os.path.join(cache_dir, f"{safe}_{tag}.parquet")
 
 
-def _run_celltypist(model_name: str) -> None:
+def _run_celltypist(model_name: str, labels_key: str = "labels",
+                    expr_override=None, cell_ids_override=None) -> None:
     """Background thread: annotate cells with CellTypist and store results."""
     _redirect_rpy2_console()
     import anndata as ad
@@ -164,11 +182,12 @@ def _run_celltypist(model_name: str) -> None:
             _annot_state["status"]  = status
             _annot_state["message"] = message
             if labels is not None:
-                _annot_state["labels"] = labels
+                _annot_state[labels_key] = labels
 
     try:
         # ── Check disk cache first ───────────────────────────────────────
-        cache_file = _cache_path(model_name)
+        _cache_key = model_name if labels_key == "labels" else f"{model_name}_{labels_key}"
+        cache_file = _cache_path(_cache_key)
         if os.path.exists(cache_file):
             _set("running", "Loading cached annotation…")
             cached = pd.read_parquet(cache_file)
@@ -184,9 +203,9 @@ def _run_celltypist(model_name: str) -> None:
 
         _set("running", "Building expression matrix…")
         # Build AnnData aligned to barcode order (expr rows = barcodes)
-        expr     = DATA["expr"]           # (n_barcodes × n_genes) CSR
+        expr     = expr_override if expr_override is not None else DATA["expr"]
         genes    = DATA["gene_names"]
-        barcodes = DATA["barcodes"]
+        barcodes = cell_ids_override if cell_ids_override is not None else DATA["barcodes"]
 
         # Normalize to 10,000 counts per cell then log1p (CP10K + log1p)
         # CellTypist requires log1p-normalized input
@@ -219,7 +238,7 @@ def _run_celltypist(model_name: str) -> None:
 
         # ── Save to disk cache ───────────────────────────────────────────
         try:
-            cache_file = _cache_path(model_name)
+            cache_file = _cache_path(_cache_key)
             pd.DataFrame({"label": pred_labels}).to_parquet(cache_file)
             print(f"  Annotation cached to {cache_file}", flush=True)
         except Exception as ce:
@@ -231,7 +250,8 @@ def _run_celltypist(model_name: str) -> None:
         _set("error", str(exc))
 
 
-def _run_seurat_annotation(rds_path: str, label_col: str = "Names") -> None:
+def _run_seurat_annotation(rds_path: str, label_col: str = "Names", labels_key: str = "labels",
+                            expr_override=None, cell_ids_override=None) -> None:
     """
     Background thread: transfer cell type labels from a Seurat RDS reference
     to Xenium cells via PCA + cosine kNN majority voting.
@@ -243,10 +263,12 @@ def _run_seurat_annotation(rds_path: str, label_col: str = "Names") -> None:
             _annot_state["status"]  = status
             _annot_state["message"] = message
             if labels is not None:
-                _annot_state["labels"] = labels
+                _annot_state[labels_key] = labels
 
     try:
         cache_key = f"seurat_{os.path.basename(rds_path)}_{label_col}"
+        if labels_key != "labels":
+            cache_key += f"_{labels_key}"
         cache_file = _cache_path(cache_key)
         if os.path.exists(cache_file):
             _set("running", "Loading cached annotation…")
@@ -334,8 +356,8 @@ rm(._annot_mat, ._annot_genes, ._annot_dir, ._annot_rds_tmp, mat_sub)
         # Reference matrix for shared genes (cells × shared) — already subset
         ref_shared = ref_mat
 
-        # Xenium matrix for shared genes — build from sparse expr
-        xen_expr = DATA["expr"]  # (n_cells × n_genes) CSR
+        # Xenium/reseg matrix for shared genes — build from sparse expr
+        xen_expr = expr_override if expr_override is not None else DATA["expr"]
         xen_shared = xen_expr[:, shared_xen_idx].toarray().astype("float32")
         # CP10K + log1p normalize Xenium
         row_sums = xen_shared.sum(axis=1, keepdims=True)
@@ -382,8 +404,8 @@ rm(._annot_mat, ._annot_genes, ._annot_dir, ._annot_rds_tmp, mat_sub)
             winner = pd.Series(votes).mode()[0]
             xen_labels.append(winner)
 
-        xen_barcodes = DATA["barcodes"]
-        pred_labels = pd.Series(xen_labels, index=xen_barcodes, name="label")
+        xen_barcodes = cell_ids_override if cell_ids_override is not None else DATA["barcodes"]
+        pred_labels = pd.Series(xen_labels, index=[str(b) for b in xen_barcodes], name="label")
         unique_final = pred_labels.unique().tolist()
         print(f"  Label transfer done: {len(unique_final)} cell types", flush=True)
 
@@ -497,7 +519,7 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
         # Stream output to console and update status with last line
         last_line = ""
         for line in proc.stdout:
-            line = line.rstrip()
+            line = _strip_ansi(line).rstrip()
             if line:
                 print(f"  [baysor] {line}", flush=True)
                 last_line = line
@@ -515,24 +537,28 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
             return
 
         seg = pd.read_csv(seg_csv)
-        # Baysor uses 0 for unassigned transcripts
-        seg = seg[seg["cell"] != 0].copy()
+        # Baysor cell IDs are strings (e.g. 'CRbd5368ffe-6'); NaN = unassigned
+        seg = seg[seg["cell"].notna()].copy()
 
         # Compute cell centroids and transcript counts
+        # Baysor segmentation.csv uses 'x'/'y' columns
+        x_col = "x" if "x" in seg.columns else "x_location"
+        y_col = "y" if "y" in seg.columns else "y_location"
         cells_df = (
             seg.groupby("cell")
             .agg(
-                x_centroid=("x_location", "mean"),
-                y_centroid=("y_location", "mean"),
-                transcript_counts=("x_location", "count"),
+                x_centroid=(x_col, "mean"),
+                y_centroid=(y_col, "mean"),
+                transcript_counts=(x_col, "count"),
             )
             .rename_axis("cell_id")
         )
 
         # ── Parse polygon GeoJSON ────────────────────────────────────────
         cell_bounds: dict = {}
-        # Baysor 0.7.x uses segmentation_polygons.json; older versions may differ
-        for poly_name in ("segmentation_polygons.json", "polygons.json", "cell_polygons.json"):
+        # Baysor 0.7.x output names vary by version; ID is feat["id"], no "properties"
+        for poly_name in ("segmentation_polygons_2d.json", "segmentation_polygons.json",
+                          "polygons.json", "cell_polygons.json"):
             poly_path = os.path.join(out_dir, poly_name)
             if os.path.exists(poly_path):
                 break
@@ -541,22 +567,49 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
             with open(poly_path) as f:
                 gj = json.load(f)
             for feat in gj.get("features", []):
-                props = feat.get("properties", {})
-                cid   = props.get("cell") or props.get("id")
+                # Cell ID is feat["id"] in newer Baysor; fall back to properties
+                props = feat.get("properties") or {}
+                cid   = feat.get("id") or props.get("cell") or props.get("id")
                 geom  = feat.get("geometry", {})
-                if cid is None or geom.get("type") != "Polygon":
+                gtype = geom.get("type")
+                if cid is None:
                     continue
-                ring = geom["coordinates"][0]   # outer ring
+                if gtype == "Polygon":
+                    ring = geom["coordinates"][0]
+                elif gtype == "MultiPolygon":
+                    ring = max((poly[0] for poly in geom["coordinates"]), key=len)
+                else:
+                    continue
                 vx = np.array([p[0] for p in ring], dtype=np.float32)
                 vy = np.array([p[1] for p in ring], dtype=np.float32)
                 cell_bounds[cid] = (vx, vy)
             print(f"  Baysor: loaded {len(cell_bounds):,} polygons", flush=True)
+
+        # Build cell × gene expression matrix from transcript assignments
+        _set("running", "Building expression matrix…")
+        expr_mat = None
+        gene_names_list = list(DATA["gene_names"])
+        gene_to_idx = {g: i for i, g in enumerate(gene_names_list)}
+        if "gene" in seg.columns:
+            cell_to_row = {c: i for i, c in enumerate(cells_df.index)}
+            seg_panel = seg[seg["gene"].isin(gene_to_idx)].copy()
+            valid_mask = seg_panel["cell"].isin(cell_to_row)
+            seg_panel = seg_panel[valid_mask]
+            rows = seg_panel["cell"].map(cell_to_row).astype(int).values
+            cols = seg_panel["gene"].map(gene_to_idx).astype(int).values
+            expr_mat = sp.csr_matrix(
+                (np.ones(len(rows), dtype=np.float32), (rows, cols)),
+                shape=(len(cells_df), len(gene_names_list))
+            )
+            print(f"  Baysor: built expression matrix {expr_mat.shape}", flush=True)
 
         n_cells = len(cells_df)
         _set("done", f"Done — {n_cells:,} cells", result={
             "cells_df":    cells_df,
             "cell_bounds": cell_bounds,
             "out_dir":     out_dir,
+            "expr":        expr_mat,
+            "source":      "baysor",
         })
         print(f"  Baysor: {n_cells:,} cells segmented", flush=True)
 
@@ -648,7 +701,7 @@ def _run_proseg(voxel_size=None, n_threads=None,
         )
         last_line = ""
         for line in proc.stdout:
-            line = line.rstrip()
+            line = _strip_ansi(line).rstrip()
             if line:
                 print(f"  [proseg] {line}", flush=True)
                 last_line = line
@@ -658,44 +711,77 @@ def _run_proseg(voxel_size=None, n_threads=None,
             _set("error", f"Proseg exited with code {proc.returncode}. Check console.")
             return
 
-        # ── Parse transcript metadata → cell centroids & counts ──────────
+        # ── Parse cell metadata → centroids & counts ─────────────────────
         _set("running", "Loading Proseg results…")
         import gzip
-        tx_meta = pd.read_csv(tx_meta_out)
-        # Proseg transcript-metadata has columns: x, y, gene, cell (0 = unassigned)
-        assigned = tx_meta[tx_meta["cell"] > 0].copy()
-        cells_df = (
-            assigned.groupby("cell")
-            .agg(
-                x_centroid=("x", "mean"),
-                y_centroid=("y", "mean"),
-                transcript_counts=("x", "count"),
-            )
-            .rename_axis("cell_id")
-        )
+        cell_meta = pd.read_csv(meta_out)
+        # cell-metadata.csv.gz columns: cell, centroid_x, centroid_y, population, …
+        cells_df = cell_meta.rename(columns={
+            "cell":        "cell_id",
+            "centroid_x":  "x_centroid",
+            "centroid_y":  "y_centroid",
+            "population":  "transcript_counts",
+        }).set_index("cell_id")[["x_centroid", "y_centroid", "transcript_counts"]]
 
         # ── Parse cell polygons GeoJSON ───────────────────────────────────
+        # Geometry type is MultiPolygon; take the largest ring per cell.
         cell_bounds: dict = {}
         if os.path.exists(poly_out):
             with gzip.open(poly_out, "rt") as f:
                 gj = json.load(f)
             for feat in gj.get("features", []):
                 props = feat.get("properties", {})
-                cid   = props.get("cell") or props.get("id")
+                cid   = props.get("cell") if props.get("cell") is not None else props.get("id")
                 geom  = feat.get("geometry", {})
-                if cid is None or geom.get("type") != "Polygon":
+                gtype = geom.get("type")
+                if cid is None:
                     continue
-                ring = geom["coordinates"][0]
+                if gtype == "Polygon":
+                    rings = [geom["coordinates"][0]]
+                elif gtype == "MultiPolygon":
+                    # Flatten all rings; pick the largest by point count
+                    rings = [poly[0] for poly in geom["coordinates"]]
+                else:
+                    continue
+                ring = max(rings, key=len)
                 vx = np.array([p[0] for p in ring], dtype=np.float32)
                 vy = np.array([p[1] for p in ring], dtype=np.float32)
                 cell_bounds[cid] = (vx, vy)
             print(f"  Proseg: loaded {len(cell_bounds):,} polygons", flush=True)
+
+        # Build cell × gene expression matrix from transcript metadata
+        _set("running", "Building expression matrix…")
+        expr_mat = None
+        gene_names_list = list(DATA["gene_names"])
+        tx_meta_path = os.path.join(out_dir, "transcript-metadata.csv.gz")
+        if os.path.exists(tx_meta_path):
+            try:
+                tx_meta = pd.read_csv(tx_meta_path)
+                gene_col = "gene" if "gene" in tx_meta.columns else None
+                cell_col = "cell" if "cell" in tx_meta.columns else None
+                if gene_col and cell_col:
+                    gene_to_idx = {g: i for i, g in enumerate(gene_names_list)}
+                    cell_to_row = {c: i for i, c in enumerate(cells_df.index)}
+                    tx_assigned = tx_meta[tx_meta[cell_col].notna()]
+                    valid_mask = tx_assigned[gene_col].isin(gene_to_idx) & tx_assigned[cell_col].isin(cell_to_row)
+                    tx_valid = tx_assigned[valid_mask]
+                    rows = tx_valid[cell_col].map(cell_to_row).astype(int).values
+                    cols = tx_valid[gene_col].map(gene_to_idx).astype(int).values
+                    expr_mat = sp.csr_matrix(
+                        (np.ones(len(rows), dtype=np.float32), (rows, cols)),
+                        shape=(len(cells_df), len(gene_names_list))
+                    )
+                    print(f"  Proseg: built expression matrix {expr_mat.shape}", flush=True)
+            except Exception as exc:
+                print(f"  Proseg: could not build expression matrix: {exc}", flush=True)
 
         n_cells = len(cells_df)
         _set("done", f"Done — {n_cells:,} cells", result={
             "cells_df":    cells_df,
             "cell_bounds": cell_bounds,
             "out_dir":     out_dir,
+            "expr":        expr_mat,
+            "source":      "proseg",
         })
         print(f"  Proseg: {n_cells:,} cells segmented", flush=True)
 
@@ -703,6 +789,75 @@ def _run_proseg(voxel_size=None, n_threads=None,
         import traceback
         traceback.print_exc()
         _set("error", str(exc)[:300])
+
+
+# ─── Reseg UMAP computation ───────────────────────────────────────────────────
+
+def _run_reseg_umap() -> None:
+    """Background thread: compute UMAP for the active resegmented cells."""
+    def _set(status, message, result=None):
+        with _umap_reseg_lock:
+            _umap_reseg_state["status"]  = status
+            _umap_reseg_state["message"] = message
+            if result is not None:
+                _umap_reseg_state["result"] = result
+
+    try:
+        # Get the active reseg result (Proseg > Baysor)
+        with _proseg_lock:
+            pres = _proseg_state["result"] if _proseg_state["status"] == "done" else None
+        with _baysor_lock:
+            bres = _baysor_state["result"] if not pres and _baysor_state["status"] == "done" else None
+        alt_res = pres or bres
+
+        if alt_res is None or alt_res.get("expr") is None:
+            _set("error", "No expression matrix — re-run segmentation first")
+            return
+
+        expr      = alt_res["expr"]   # (n_cells × n_genes) CSR
+        cell_ids  = [str(c) for c in alt_res["cells_df"].index]
+        n_cells   = len(cell_ids)
+        _set("running", f"Normalising {n_cells:,} cells…")
+
+        # CP10K + log1p normalise
+        mat = expr.astype("float32").tocsr()
+        row_sums = np.asarray(mat.sum(axis=1)).flatten()
+        row_sums[row_sums == 0] = 1.0
+        mat = sp.diags(1e4 / row_sums).dot(mat).tocsr()
+        mat.data = np.log1p(mat.data)
+
+        # PCA (TruncatedSVD) — reduce to 50 dims before UMAP
+        from sklearn.decomposition import TruncatedSVD
+        n_comp = min(50, n_cells - 1, mat.shape[1] - 1)
+        _set("running", f"PCA ({n_comp} components)…")
+        svd = TruncatedSVD(n_components=n_comp, random_state=0)
+        pca_coords = svd.fit_transform(mat)   # (n_cells × n_comp)
+
+        # UMAP — prefer umap-learn, fall back to t-SNE
+        _set("running", "Running UMAP…")
+        try:
+            import umap as umap_lib
+            reducer = umap_lib.UMAP(n_neighbors=min(15, n_cells - 1),
+                                    min_dist=0.1, random_state=0)
+            embedding = reducer.fit_transform(pca_coords)
+        except ImportError:
+            from sklearn.manifold import TSNE
+            _set("running", "Running t-SNE (umap-learn not installed)…")
+            perp = min(30, max(5, n_cells // 10))
+            embedding = TSNE(n_components=2, perplexity=perp,
+                             random_state=0).fit_transform(pca_coords)
+
+        umap_df = pd.DataFrame(
+            {"umap_1": embedding[:, 0], "umap_2": embedding[:, 1]},
+            index=cell_ids,
+        )
+        _set("done", f"Done — {n_cells:,} cells", result=umap_df)
+        print(f"  Reseg UMAP: computed for {n_cells:,} cells", flush=True)
+
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        _set("error", str(exc)[:200])
 
 
 # ─── SpaGE imputation ─────────────────────────────────────────────────────────
@@ -736,6 +891,33 @@ def _spage_index_update(cache_file: str) -> None:
     idx[DATA["data_dir"]] = cache_file
     with open(idx_path, "w") as f:
         json.dump(idx, f, indent=2)
+
+
+def _annot_autoload() -> None:
+    """On startup, load the most recently cached Xenium annotation for this dataset."""
+    import glob
+    tag       = hashlib.md5(DATA["data_dir"].encode()).hexdigest()[:8]
+    cache_dir = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache")
+    # Xenium annotation files: {model}_{tag}.parquet (no "labels_proseg" / "labels_baysor" prefix)
+    pattern   = os.path.join(cache_dir, f"*_{tag}.parquet")
+    files     = [f for f in glob.glob(pattern)
+                 if not os.path.basename(f).startswith(("labels_proseg", "labels_baysor",
+                                                         "spage_", "spatialdata_"))]
+    if not files:
+        return
+    latest = max(files, key=os.path.getmtime)
+    try:
+        cached       = pd.read_parquet(latest)
+        labels       = cached["label"].astype(str)
+        labels.index = labels.index.astype(str)
+        unique_types = labels.unique().tolist()
+        with _annot_lock:
+            _annot_state["labels"]  = labels
+            _annot_state["status"]  = "done"
+            _annot_state["message"] = f"Auto-loaded — {len(unique_types)} cell types"
+        print(f"  Annotation: auto-loaded {len(unique_types)} types from {os.path.basename(latest)}", flush=True)
+    except Exception as exc:
+        print(f"  Annotation: auto-load failed: {exc}", flush=True)
 
 
 def _spage_autoload() -> None:
@@ -1073,6 +1255,85 @@ def unsubset():
     print(f"  unsubset: restored {len(DATA['df']):,} cells", flush=True)
 
 
+def get_genes(file: str = None) -> list:
+    """
+    Print and return all non-imputed Xenium panel genes.
+
+    Parameters
+    ----------
+    file : str, optional
+        If provided, save the gene list to this file path (one gene per line).
+
+    Returns
+    -------
+    list of gene name strings.
+    """
+    genes = sorted(DATA["gene_names"])
+    print(f"  {len(genes)} panel genes:", flush=True)
+    for g in genes:
+        print(f"    {g}", flush=True)
+    if file:
+        with open(file, "w") as fh:
+            fh.write("\n".join(genes) + "\n")
+        print(f"  Saved to {file}", flush=True)
+    return genes
+
+
+def run_spage(rds_path: str, genes_file: str = None, n_pv: int = 50) -> None:
+    """
+    Run SpaGE gene imputation from the REPL.
+
+    Parameters
+    ----------
+    rds_path : str
+        Path to the Seurat RDS reference file.
+    genes_file : str, optional
+        Path to a .txt file with gene names to impute (one per line, or
+        comma-separated). If None, the top-200 highly variable genes from
+        the reference are auto-selected.
+    n_pv : int
+        Number of principal vectors for cross-dataset alignment (default 50).
+
+    Example
+    -------
+    run_spage(
+        rds_path="/Users/ikuz/Documents/XeniumWorkflow/Post_R3_FINAL_with_counts.rds",
+        genes_file="/Users/ikuz/Documents/XeniumWorkflow/to_impute.txt",
+        n_pv=50,
+    )
+    """
+    global _spage_repl_pending
+    with _spage_lock:
+        if _spage_state["status"] == "running":
+            print("  SpaGE is already running.", flush=True)
+            return
+
+    # Build genes_input string (same format _run_spage_imputation expects)
+    genes_input = ""
+    if genes_file:
+        try:
+            with open(genes_file) as fh:
+                genes_input = fh.read()
+            n_genes = len([g for line in genes_input.replace(",", "\n").splitlines()
+                           for g in [line.strip()] if g])
+            print(f"  SpaGE: loaded {n_genes} genes from {genes_file}", flush=True)
+        except FileNotFoundError:
+            print(f"  SpaGE: file not found: {genes_file}", flush=True)
+            return
+
+    print(f"  SpaGE: starting imputation (n_pv={n_pv})…", flush=True)
+    with _spage_lock:
+        _spage_state.update({"status": "running", "message": "Starting…", "result": None})
+    _spage_repl_pending = True
+
+    import contextvars
+    ctx = contextvars.copy_context()
+    threading.Thread(
+        target=lambda: ctx.run(_run_spage_imputation, rds_path, n_pv, genes_input),
+        daemon=True,
+    ).start()
+
+
 # ─── Morphology image overlay ─────────────────────────────────────────────────
 # Max viewport width (µm) for which image tiles will load automatically
 MORPH_MAX_UM = 5000
@@ -1112,13 +1373,85 @@ _morph_render_lock  = threading.Lock()
 _morph_hires_queue: list = []   # list of image-dict results; GIL protects appends/pops
 
 
+class _ZarrTiffArray:
+    """Thin array adapter over tifffile's ZarrTiffStore.
+
+    Zarr ≥ 3 no longer accepts ZarrTiffStore (a plain MutableMapping) in
+    zarr.open().  This class wraps the store directly, assembling tiles on
+    demand and applying any stride requested via slice notation.
+
+    Supports indexing of the form  arr[channel_int, y_slice, x_slice]
+    which is all that _read_one_channel and _gen_overviews require.
+    """
+
+    def __init__(self, store):
+        import json
+        meta = json.loads(store[".zarray"])
+        self.shape   = tuple(meta["shape"])   # (n_ch, H, W)
+        self._csize  = meta["chunks"]         # [1, tile_h, tile_w]
+        self._dtype  = np.dtype(meta["dtype"])
+        self._store  = store
+
+    def __getitem__(self, idx):
+        if not isinstance(idx, tuple) or len(idx) != 3:
+            raise IndexError(f"_ZarrTiffArray: expected (ch, y_slice, x_slice), got {idx!r}")
+        c_idx, ys, xs = idx
+        _, H, W = self.shape
+        cy, cx   = self._csize[1], self._csize[2]
+
+        # Resolve slices to (start, stop, step)
+        y0, y1, dy = ys.indices(H) if isinstance(ys, slice) else (int(ys), int(ys) + 1, 1)
+        x0, x1, dx = xs.indices(W) if isinstance(xs, slice) else (int(xs), int(xs) + 1, 1)
+        y0 = max(0, y0);  y1 = min(H, y1)
+        x0 = max(0, x0);  x1 = min(W, x1)
+        h, w = y1 - y0, x1 - x0
+        if h <= 0 or w <= 0:
+            out_h = len(range(y0, y1, dy)) if h > 0 else 0
+            out_w = len(range(x0, x1, dx)) if w > 0 else 0
+            return np.zeros((out_h, out_w), dtype=self._dtype)
+
+        out = np.zeros((h, w), dtype=self._dtype)
+        cy0_blk = y0 // cy;  cy1_blk = (y1 - 1) // cy + 1
+        cx0_blk = x0 // cx;  cx1_blk = (x1 - 1) // cx + 1
+
+        for bcy in range(cy0_blk, cy1_blk):
+            for bcx in range(cx0_blk, cx1_blk):
+                raw = self._store.get(f"{c_idx}.{bcy}.{bcx}")
+                if raw is None:
+                    continue
+                tile = np.asarray(raw).reshape(cy, cx)
+                ty0 = max(y0, bcy * cy) - bcy * cy
+                ty1 = min(y1, (bcy + 1) * cy) - bcy * cy
+                tx0 = max(x0, bcx * cx) - bcx * cx
+                tx1 = min(x1, (bcx + 1) * cx) - bcx * cx
+                oy0 = max(y0, bcy * cy) - y0
+                oy1 = min(y1, (bcy + 1) * cy) - y0
+                ox0 = max(x0, bcx * cx) - x0
+                ox1 = min(x1, (bcx + 1) * cx) - x0
+                out[oy0:oy1, ox0:ox1] = tile[ty0:ty1, tx0:tx1]
+
+        return out[::dy, ::dx]
+
+
+def _open_tiff_as_array(tif):
+    """Open a TiffFile as an array-like, falling back to _ZarrTiffArray for zarr v3."""
+    import warnings
+    warnings.filterwarnings("ignore", message=".*OME series cannot read multi-file pyramids.*")
+    store = tif.aszarr()
+    try:
+        import zarr as zarr_mod
+        return zarr_mod.open(store, mode="r")
+    except (TypeError, AttributeError):
+        return _ZarrTiffArray(store)
+
+
 def _get_morph_handles(data_dir: str, z_level: int):
-    """Lazily open one TiffFile + LRU-backed zarr per channel for parallel reads."""
+    """Lazily open one TiffFile per channel with a direct-tile array adapter."""
     with _morph_init_lock:
         if z_level in _morph_handles:
             return _morph_handles[z_level]
 
-        import warnings, logging, tifffile, zarr as zarr_mod
+        import warnings, logging, tifffile
         warnings.filterwarnings("ignore", message=".*OME series cannot read multi-file pyramids.*")
         logging.getLogger("tifffile").setLevel(logging.ERROR)
 
@@ -1130,27 +1463,22 @@ def _get_morph_handles(data_dir: str, z_level: int):
             return None
 
         try:
-            # Probe shape with one temporary handle
+            # Probe shape
             tif_probe = tifffile.TiffFile(path)
-            arr_probe  = zarr_mod.open(tif_probe.aszarr(), mode="r")
+            arr_probe = _open_tiff_as_array(tif_probe)
             n_ch, H, W = arr_probe.shape
             tif_probe.close()
 
-            # Open one handle per channel; wrap with LRU to cache compressed tiles
-            LRU_PER_CH = 50 * 1024 * 1024   # 50 MB compressed tiles per channel
+            # Open one handle per channel
             handles = []
             for _ in range(n_ch):
                 tif_ch = tifffile.TiffFile(path)
-                store  = tif_ch.aszarr()
-                try:
-                    lru   = zarr_mod.storage.LRUStoreCache(store, max_size=LRU_PER_CH)
-                    arr   = zarr_mod.open(lru, mode="r")
-                except (AttributeError, TypeError):
-                    arr   = zarr_mod.open(store, mode="r")   # zarr v3 fallback
+                arr    = _open_tiff_as_array(tif_ch)
                 handles.append((tif_ch, arr))
 
             _morph_handles[z_level] = {"handles": handles, "H": H, "W": W, "n_ch": n_ch}
-            print(f"  Morphology z{z_level}: {n_ch}ch × {H}×{W} px, {n_ch}× LRU handles", flush=True)
+            adapter = type(handles[0][1]).__name__
+            print(f"  Morphology z{z_level}: {n_ch}ch × {H}×{W} px [{adapter}]", flush=True)
         except Exception as exc:
             print(f"  Warning: could not open {fname}: {exc}", flush=True)
             _morph_handles[z_level] = None
@@ -1202,14 +1530,14 @@ def _load_or_generate_overview(data_dir: str, z_level: int):
 
     def _gen_overviews():
         try:
-            import tifffile, zarr as zarr_mod
+            import tifffile
             fname = f"morphology_focus_{z_level:04d}.ome.tif"
             path  = os.path.join(data_dir, "morphology_focus", fname)
             if not os.path.exists(path):
                 return
 
             tif_ov  = tifffile.TiffFile(path)
-            zarr_ov = zarr_mod.open(tif_ov.aszarr(), mode="r")
+            zarr_ov = _open_tiff_as_array(tif_ov)
             H, W    = zarr_ov.shape[1], zarr_ov.shape[2]
             n_ch    = zarr_ov.shape[0]
 
@@ -1830,8 +2158,22 @@ def _cell_type_traces(x, y, df, size, opacity, mode="spatial"):
     return traces
 
 
+def _get_reseg_expr_values(gene: str, alt_res: dict) -> "np.ndarray | None":
+    """log1p expression for *gene* in resegmented cells, or None if not available."""
+    expr = alt_res.get("expr")
+    if expr is None:
+        return None
+    gene_names_list = list(DATA["gene_names"])
+    if gene not in gene_names_list:
+        return None
+    idx = gene_names_list.index(gene)
+    col = expr.getcol(idx)
+    vals = np.asarray(col.todense()).flatten().astype(np.float32)
+    return np.log1p(vals)
+
+
 def make_spatial_fig(color_by, method, gene, size, opacity,
-                     show_cell_bounds, show_nuc_bounds, relayout,
+                     boundary_toggles, relayout,
                      morph_image=None, extra_title="", baysor_active=False, proseg_active=False):
     # Choose data source: Proseg > Baysor > original Xenium (priority order)
     with _proseg_lock:
@@ -1842,32 +2184,71 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
     alt_res = pres or bres
     if alt_res is not None:
         source_label = " [Proseg]" if pres else " [Baysor]"
-        bdf = alt_res["cells_df"]
-        x   =  bdf["x_centroid"].values
-        y   = -bdf["y_centroid"].values
-        cell_ids = bdf.index.tolist()
-        tx_counts = bdf["transcript_counts"].values
-        source_label = source_label
-        # Baysor: always color by transcript counts (no cluster/gene data aligned)
-        traces = [go.Scattergl(
-            x=x, y=y, mode="markers",
-            marker=dict(size=size, color=tx_counts,
-                        colorscale="Viridis", opacity=opacity, showscale=True,
-                        colorbar=dict(title="Transcript<br>Counts", thickness=12, len=0.5, x=1.02)),
-            text=cell_ids, customdata=cell_ids,
-            hovertemplate="<b>Cell %{text}</b><br>Transcripts: %{marker.color}<extra></extra>",
-            name="Transcript Counts",
-        )]
-        show_legend = False
-        cell_bounds_src = alt_res["cell_bounds"]
-        nuc_bounds_src  = {}
+        labels_key   = _annot_state.get("_active_labels_key") or ("labels_proseg" if pres else "labels_baysor")
+        bdf      = alt_res["cells_df"]
+        x        =  bdf["x_centroid"].values
+        y        = -bdf["y_centroid"].values
+        cell_ids     = bdf.index.tolist()
+        cell_ids_str = [str(c) for c in cell_ids]
+        show_legend  = False
+        traces       = None   # filled below
+
+        if color_by == "cell_type":
+            with _annot_lock:
+                labels = _annot_state.get(labels_key)
+            if labels is not None:
+                aligned = labels.reindex(pd.Index(cell_ids_str)).fillna("Unknown")
+                cell_types = sorted(aligned.unique())
+                cmap = {ct: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, ct in enumerate(cell_types)}
+                traces = []
+                for ct in cell_types:
+                    mask = (aligned == ct).values
+                    traces.append(go.Scattergl(
+                        x=x[mask], y=y[mask], mode="markers",
+                        marker=dict(size=size, color=cmap[ct], opacity=opacity),
+                        name=ct, legendgroup=ct, showlegend=True,
+                        text=np.array(cell_ids_str)[mask].tolist(),
+                        customdata=np.array(cell_ids_str)[mask].tolist(),
+                        hovertemplate="<b>%{text}</b><extra>" + ct + "</extra>",
+                    ))
+                show_legend = True
+
+        elif color_by == "gene":
+            vals = _get_reseg_expr_values(gene, alt_res)
+            if vals is not None:
+                traces = [go.Scattergl(
+                    x=x, y=y, mode="markers",
+                    marker=dict(size=size, color=vals, colorscale="Plasma", opacity=opacity,
+                                showscale=True,
+                                colorbar=dict(title=f"{gene}<br>(log1p)", thickness=12, len=0.5, x=1.02)),
+                    text=cell_ids_str, customdata=cell_ids_str,
+                    hovertemplate="<b>%{text}</b><br>" + gene + ": %{marker.color:.2f}<extra></extra>",
+                    name=gene,
+                )]
+
+        if traces is None:
+            # Fallback: QC column if available, otherwise transcript counts
+            if color_by in bdf.columns:
+                vals  = bdf[color_by].values
+                label = QC_METRICS.get(color_by, color_by)
+                cs    = COLORSCALES.get(color_by, "Viridis")
+            else:
+                vals  = bdf["transcript_counts"].values
+                label = "Transcript Counts"
+                cs    = "Viridis"
+            traces = [go.Scattergl(
+                x=x, y=y, mode="markers",
+                marker=dict(size=size, color=vals, colorscale=cs, opacity=opacity, showscale=True,
+                            colorbar=dict(title=label, thickness=12, len=0.5, x=1.02)),
+                text=cell_ids_str, customdata=cell_ids_str,
+                hovertemplate="<b>Cell %{text}</b><br>" + label + ": %{marker.color:.2f}<extra></extra>",
+                name=label,
+            )]
     else:
         df  = DATA["df"]
         x   =  df["x_centroid"].values   # x_centroid is in µm
         y   = -df["y_centroid"].values   # y_centroid is in µm, negate for plot
         source_label    = ""
-        cell_bounds_src = DATA["cell_bounds"]
-        nuc_bounds_src  = DATA["nucleus_bounds"]
 
         # ── Cell scatter traces ──────────────────────────────────────────
         if color_by == "cluster":
@@ -1901,35 +2282,59 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
             show_legend = False
 
     # ── Boundary overlay traces ──────────────────────────────────────────
+    boundary_toggles = boundary_toggles or []
     boundary_status = ""
-    if show_cell_bounds or show_nuc_bounds:
-        visible_ids = viewport_cell_ids(relayout or {})
-        if visible_ids is None and bres is None:
-            boundary_status = " · zoom in to see boundaries"
+
+    # Each boundary source is rendered independently
+    _needs_zoom_msg = False
+
+    def _add_boundary(bounds_dict, color, name, small_set=False):
+        """Render a boundary set; small_set=True skips viewport requirement."""
+        nonlocal _needs_zoom_msg, show_legend
+        if not bounds_dict:
+            return
+        if small_set:
+            ids = list(bounds_dict.keys())[:BOUNDARY_CELL_LIMIT]
         else:
-            # For Baysor, use all cells (no viewport filter needed for small sets)
-            if bres is not None:
-                ids_to_render = list(cell_bounds_src.keys())[:BOUNDARY_CELL_LIMIT]
-            else:
-                ids_to_render = visible_ids or []
-            if len(ids_to_render) > BOUNDARY_CELL_LIMIT:
-                boundary_status = f" · zoom in further ({len(ids_to_render):,} cells visible, limit {BOUNDARY_CELL_LIMIT:,})"
-            else:
-                if show_cell_bounds:
-                    t = build_boundary_trace(
-                        ids_to_render, cell_bounds_src, "#00d4ff", "Cell Boundaries"
-                    )
-                    if t:
-                        traces.append(t)
-                        show_legend = True
-                if show_nuc_bounds and nuc_bounds_src:
-                    t = build_boundary_trace(
-                        ids_to_render if bres is None else [],
-                        nuc_bounds_src, "#ff9f43", "Nucleus Boundaries"
-                    )
-                    if t:
-                        traces.append(t)
-                        show_legend = True
+            visible = viewport_cell_ids(relayout or {})
+            if visible is None:
+                _needs_zoom_msg = True
+                return
+            ids = visible
+            if len(ids) > BOUNDARY_CELL_LIMIT:
+                return  # too many, status set below
+        t = build_boundary_trace(ids, bounds_dict, color, name)
+        if t:
+            traces.append(t)
+            show_legend = True
+
+    # "Cell Boundaries" follows the active source:
+    # if Proseg/Baysor is active → show their boundaries (no zoom needed);
+    # otherwise show Xenium boundaries (zoom required).
+    if "cell" in boundary_toggles:
+        if alt_res is not None:
+            _add_boundary(alt_res["cell_bounds"], "#00d4ff", "Cell Boundaries", small_set=True)
+        else:
+            _add_boundary(DATA["cell_bounds"], "#00d4ff", "Cell Boundaries")
+    if "nucleus" in boundary_toggles:
+        _add_boundary(DATA.get("nucleus_bounds", {}), "#ff9f43", "Nucleus Boundaries")
+
+    # Proseg boundaries (small set, no zoom required)
+    if "proseg" in boundary_toggles:
+        with _proseg_lock:
+            _pres_local = _proseg_state.get("result")
+        if _pres_local:
+            _add_boundary(_pres_local["cell_bounds"], "#2ed573", "Proseg Boundaries", small_set=True)
+
+    # Baysor boundaries (small set, no zoom required)
+    if "baysor" in boundary_toggles:
+        with _baysor_lock:
+            _bres_local = _baysor_state.get("result")
+        if _bres_local:
+            _add_boundary(_bres_local["cell_bounds"], "#a29bfe", "Baysor Boundaries", small_set=True)
+
+    if _needs_zoom_msg:
+        boundary_status = " · zoom in to see Xenium boundaries"
 
     title_text = "Spatial View" + source_label + boundary_status + extra_title
 
@@ -1962,42 +2367,122 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
 
 _umap_df_cache = {}
 
-def make_umap_fig(color_by, method, gene, size, opacity):
-    if "df" not in _umap_df_cache:
-        _umap_df_cache["df"] = DATA["df"].dropna(subset=["umap_1", "umap_2"])
-    df = _umap_df_cache["df"]
-    xu = df["umap_1"].values
-    yu = df["umap_2"].values
+def make_umap_fig(color_by, method, gene, size, opacity,
+                  baysor_active=False, proseg_active=False):
     mk = max(2, size * 1.2)
 
-    if color_by == "cluster":
-        traces = _categorical_traces(xu, yu, df, method, mk, opacity, mode="umap")
-    elif color_by == "cell_type":
-        traces = _cell_type_traces(xu, yu, df, mk, opacity, mode="umap")
-    elif color_by == "gene":
-        has_umap = DATA["df"]["umap_1"].notna()
-        vals = get_gene_expression(gene)[has_umap.values]
-        traces = [go.Scattergl(
-            x=xu, y=yu, mode="markers",
-            marker=dict(size=mk, color=vals, colorscale="Plasma", opacity=opacity, showscale=False),
-            text=df.index.tolist(), customdata=df.index.tolist(),
-            hovertemplate="<b>%{text}</b><extra></extra>", name=gene,
-        )]
+    # Check if reseg UMAP is available and the matching source is active
+    with _umap_reseg_lock:
+        reseg_umap = _umap_reseg_state["result"] if _umap_reseg_state["status"] == "done" else None
+
+    # Determine active reseg source
+    with _proseg_lock:
+        pres = _proseg_state["result"] if proseg_active and _proseg_state["result"] else None
+    with _baysor_lock:
+        bres = _baysor_state["result"] if baysor_active and not pres and _baysor_state["result"] else None
+    alt_res = pres or bres
+
+    if alt_res is not None and reseg_umap is not None:
+        # Reseg UMAP: color by whatever is available
+        udf       = reseg_umap
+        xu        = udf["umap_1"].values
+        yu        = udf["umap_2"].values
+        cell_ids  = udf.index.tolist()
+        labels_key = _annot_state.get("_active_labels_key") or ("labels_proseg" if pres else "labels_baysor")
+
+        if color_by == "cell_type":
+            with _annot_lock:
+                labels = _annot_state.get(labels_key)
+            if labels is not None:
+                aligned    = labels.reindex(pd.Index(cell_ids)).fillna("Unknown")
+                cell_types = sorted(aligned.unique())
+                cmap = {ct: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, ct in enumerate(cell_types)}
+                traces = []
+                for ct in cell_types:
+                    mask = (aligned == ct).values
+                    traces.append(go.Scattergl(
+                        x=xu[mask], y=yu[mask], mode="markers",
+                        marker=dict(size=mk, color=cmap[ct], opacity=opacity),
+                        name=ct, showlegend=False,
+                        text=np.array(cell_ids)[mask].tolist(),
+                        customdata=np.array(cell_ids)[mask].tolist(),
+                        hovertemplate="<b>%{text}</b><extra>" + ct + "</extra>",
+                    ))
+            else:
+                color_by = "transcript_counts"  # fall through
+
+        if color_by == "gene":
+            vals = _get_reseg_expr_values(gene, alt_res)
+            if vals is not None:
+                traces = [go.Scattergl(
+                    x=xu, y=yu, mode="markers",
+                    marker=dict(size=mk, color=vals, colorscale="Plasma",
+                                opacity=opacity, showscale=False),
+                    text=cell_ids, customdata=cell_ids,
+                    hovertemplate="<b>%{text}</b><extra></extra>", name=gene,
+                )]
+            else:
+                color_by = "transcript_counts"
+
+        if color_by not in ("cell_type", "gene"):
+            bdf = alt_res["cells_df"]
+            if color_by in bdf.columns:
+                vals  = bdf["transcript_counts"].values if color_by == "transcript_counts" \
+                        else bdf[color_by].values
+                label = QC_METRICS.get(color_by, color_by)
+                cs    = COLORSCALES.get(color_by, "Viridis")
+            else:
+                vals  = bdf["transcript_counts"].values
+                label = "Transcript Counts"
+                cs    = "Viridis"
+            traces = [go.Scattergl(
+                x=xu, y=yu, mode="markers",
+                marker=dict(size=mk, color=vals, colorscale=cs,
+                            opacity=opacity, showscale=False),
+                text=cell_ids, customdata=cell_ids,
+                hovertemplate="<b>%{text}</b><br>" + label + ": %{marker.color:.2f}<extra></extra>",
+                name=label,
+            )]
+
+        title = "UMAP [Proseg]" if pres else "UMAP [Baysor]"
     else:
-        label = QC_METRICS.get(color_by, color_by)
-        traces = [go.Scattergl(
-            x=xu, y=yu, mode="markers",
-            marker=dict(size=mk, color=df[color_by].values,
-                        colorscale=COLORSCALES.get(color_by, "Viridis"),
-                        opacity=opacity, showscale=False),
-            text=df.index.tolist(), customdata=df.index.tolist(),
-            hovertemplate="<b>%{text}</b><br>" + label + ": %{marker.color:.2f}<extra></extra>",
-            name=label,
-        )]
+        # Original Xenium UMAP
+        if "df" not in _umap_df_cache:
+            _umap_df_cache["df"] = DATA["df"].dropna(subset=["umap_1", "umap_2"])
+        df = _umap_df_cache["df"]
+        xu = df["umap_1"].values
+        yu = df["umap_2"].values
+
+        if color_by == "cluster":
+            traces = _categorical_traces(xu, yu, df, method, mk, opacity, mode="umap")
+        elif color_by == "cell_type":
+            traces = _cell_type_traces(xu, yu, df, mk, opacity, mode="umap")
+        elif color_by == "gene":
+            has_umap = DATA["df"]["umap_1"].notna()
+            vals = get_gene_expression(gene)[has_umap.values]
+            traces = [go.Scattergl(
+                x=xu, y=yu, mode="markers",
+                marker=dict(size=mk, color=vals, colorscale="Plasma",
+                            opacity=opacity, showscale=False),
+                text=df.index.tolist(), customdata=df.index.tolist(),
+                hovertemplate="<b>%{text}</b><extra></extra>", name=gene,
+            )]
+        else:
+            label = QC_METRICS.get(color_by, color_by)
+            traces = [go.Scattergl(
+                x=xu, y=yu, mode="markers",
+                marker=dict(size=mk, color=df[color_by].values,
+                            colorscale=COLORSCALES.get(color_by, "Viridis"),
+                            opacity=opacity, showscale=False),
+                text=df.index.tolist(), customdata=df.index.tolist(),
+                hovertemplate="<b>%{text}</b><br>" + label + ": %{marker.color:.2f}<extra></extra>",
+                name=label,
+            )]
+        title = "UMAP"
 
     fig = go.Figure(data=traces)
     fig.update_layout(
-        **_base_layout("UMAP", "UMAP 1", "UMAP 2"),
+        **_base_layout(title, "UMAP 1", "UMAP 2"),
         showlegend=False, uirevision="umap",
     )
     return fig
@@ -2018,7 +2503,310 @@ def method_label(m):
 cluster_options = [{"label": method_label(m), "value": m} for m in cluster_methods]
 
 # Auto-load any previously cached SpaGE results for this dataset
+_annot_autoload()
 _spage_autoload()
+
+
+# ─── SpatialData / Sopa backend ───────────────────────────────────────────────
+
+def _sdata_cache_path() -> str:
+    """Return the directory path for the SpatialData Zarr cache for this dataset."""
+    tag = hashlib.md5(DATA["data_dir"].encode()).hexdigest()[:12]
+    cache_dir = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, f"spatialdata_{tag}.zarr")
+
+
+def _sdata_fix_categories(sdata) -> None:
+    """Eagerly compute feature_name categories to avoid dask performance issues."""
+    try:
+        for pts_key in sdata.points:
+            pts = sdata.points[pts_key]
+            if "feature_name" in pts.columns:
+                col = pts["feature_name"]
+                if hasattr(col, "cat") and not col.cat.known:
+                    sdata.points[pts_key]["feature_name"] = col.cat.as_known()
+    except Exception as exc:
+        print(f"  to_spatialdata: category fix skipped: {exc}", flush=True)
+
+
+def _sdata_summary(sdata) -> str:
+    n_tx = 0
+    try:
+        for k in sdata.points:
+            n_tx += len(sdata.points[k])
+    except Exception:
+        pass
+    images = list(sdata.images.keys())
+    return f"{n_tx:,} transcripts | images: {', '.join(images) or 'none'}"
+
+
+def _sdata_autoload() -> None:
+    """If a Zarr cache exists for this dataset, load it into _sdata_state at startup."""
+    cache = _sdata_cache_path()
+    if not os.path.isdir(cache):
+        return
+    try:
+        import spatialdata
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            sdata = spatialdata.read_zarr(cache)
+        _sdata_fix_categories(sdata)
+        summary = _sdata_summary(sdata)
+        with _sdata_lock:
+            _sdata_state["status"]  = "done"
+            _sdata_state["message"] = f"Auto-loaded (cached) — {summary}"
+            _sdata_state["sdata"]   = sdata
+        DATA["sdata"] = sdata
+        print(f"  SpatialData: auto-loaded from cache — {summary}", flush=True)
+    except Exception as exc:
+        print(f"  SpatialData: auto-load failed: {exc}", flush=True)
+
+
+def to_spatialdata(qv_threshold: int = 20, force: bool = False) -> None:
+    """Convert Xenium data to SpatialData format using sopa.io.xenium().
+
+    The result is cached to ~/.xenium_explorer_cache/spatialdata_<hash>.zarr
+    and auto-loaded on subsequent startups.
+
+    Callable from REPL:
+        to_spatialdata()                  # use cache if available
+        to_spatialdata(force=True)        # re-read from raw files and overwrite cache
+        to_spatialdata(qv_threshold=30)
+    """
+    global _sdata_version
+
+    def _run():
+        global _sdata_version
+
+        def _set(status, message, sdata=None):
+            with _sdata_lock:
+                _sdata_state["status"]  = status
+                _sdata_state["message"] = message
+                if sdata is not None:
+                    _sdata_state["sdata"] = sdata
+                    DATA["sdata"] = sdata
+
+        try:
+            _set("running", "Importing sopa…")
+            try:
+                import sopa, sopa.io, spatialdata
+            except ImportError as e:
+                _set("error", f"Missing package: {e}. Run: pip install sopa")
+                return
+
+            cache = _sdata_cache_path()
+
+            # ── Try cache first ───────────────────────────────────────────
+            if not force and os.path.isdir(cache):
+                _set("running", "Loading from cache…")
+                print(f"  to_spatialdata: loading from cache {cache} …", flush=True)
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    sdata = spatialdata.read_zarr(cache)
+                _sdata_fix_categories(sdata)
+                summary = _sdata_summary(sdata)
+                msg = f"Done (cached) — {summary}"
+                print(f"  to_spatialdata: {msg}", flush=True)
+                _sdata_version += 1
+                _set("done", msg, sdata=sdata)
+                return
+
+            # ── Read from raw Xenium files ────────────────────────────────
+            _set("running", f"Reading Xenium data (qv≥{qv_threshold})…")
+            print(f"  to_spatialdata: reading from {DATA['data_dir']} …", flush=True)
+            import warnings
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=".*feature_key.*categorical.*")
+                warnings.filterwarnings("ignore", message=".*OME series.*")
+                sdata = sopa.io.xenium(DATA["data_dir"], qv_threshold=qv_threshold)
+
+            _sdata_fix_categories(sdata)
+
+            # ── Save to Zarr cache ────────────────────────────────────────
+            _set("running", "Saving to cache…")
+            print(f"  to_spatialdata: saving to {cache} …", flush=True)
+            try:
+                import shutil
+                if os.path.isdir(cache):
+                    shutil.rmtree(cache)
+                sdata.write(cache)
+                print(f"  to_spatialdata: cache saved ✓", flush=True)
+            except Exception as save_exc:
+                print(f"  to_spatialdata: cache save failed: {save_exc}", flush=True)
+
+            summary = _sdata_summary(sdata)
+            msg = f"Done — {summary}"
+            print(f"  to_spatialdata: {msg}", flush=True)
+            _sdata_version += 1
+            _set("done", msg, sdata=sdata)
+
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            _set("error", str(exc)[:300])
+
+    threading.Thread(target=_run, daemon=True).start()
+    print("  to_spatialdata: started in background…", flush=True)
+
+
+def clear_sdata_cache() -> None:
+    """Delete the SpatialData Zarr cache for this dataset (callable from REPL)."""
+    import shutil
+    cache = _sdata_cache_path()
+    if os.path.isdir(cache):
+        shutil.rmtree(cache)
+        print(f"  SpatialData cache deleted: {cache}", flush=True)
+    else:
+        print(f"  SpatialData cache not found: {cache}", flush=True)
+
+
+# Auto-load SpatialData cache if it exists for this dataset
+_sdata_autoload()
+
+
+def segment_tissue_roi() -> None:
+    """Run sopa.segmentation.tissue() to detect tissue ROI in the SpatialData object.
+    Callable from REPL. Requires to_spatialdata() to have completed first.
+    """
+    global _sdata_version
+
+    def _run():
+        global _sdata_version
+        with _sdata_lock:
+            sdata = _sdata_state.get("sdata")
+        if sdata is None:
+            print("  segment_tissue_roi: no SpatialData. Run to_spatialdata() first.", flush=True)
+            return
+        try:
+            import sopa.segmentation
+            with _sdata_lock:
+                _sdata_state["status"]  = "running"
+                _sdata_state["message"] = "Segmenting tissue ROI…"
+            print("  segment_tissue_roi: running sopa.segmentation.tissue()…", flush=True)
+            sopa.segmentation.tissue(sdata, mode="staining")
+            # Find ROI shapes key (default key_added='region_of_interest')
+            roi_key = next(
+                (k for k in sdata.shapes
+                 if k == "region_of_interest" or "roi" in k.lower() or "tissue" in k.lower()),
+                None
+            )
+            if roi_key:
+                roi_shapes = sdata.shapes[roi_key]
+                with _sdata_lock:
+                    _sdata_state["roi"]     = roi_shapes
+                    _sdata_state["status"]  = "roi_done"
+                    _sdata_state["message"] = f"ROI done — {len(roi_shapes)} region(s)"
+                _sdata_version += 1
+                print(f"  segment_tissue_roi: done, {len(roi_shapes)} region(s)", flush=True)
+            else:
+                print("  segment_tissue_roi: no ROI shapes found in sdata", flush=True)
+                with _sdata_lock:
+                    _sdata_state["message"] = "No ROI shapes found after tissue segmentation"
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            with _sdata_lock:
+                _sdata_state["status"]  = "error"
+                _sdata_state["message"] = str(exc)[:300]
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def create_patches(width_um: float = 1000.0, min_transcripts: int = 10) -> None:
+    """Create transcript patches using sopa.make_transcript_patches().
+    Callable from REPL. Requires to_spatialdata() to have completed first.
+    """
+    global _sdata_version
+
+    def _run():
+        global _sdata_version
+        with _sdata_lock:
+            sdata = _sdata_state.get("sdata")
+        if sdata is None:
+            print("  create_patches: no SpatialData. Run to_spatialdata() first.", flush=True)
+            return
+        try:
+            import sopa
+            with _sdata_lock:
+                _sdata_state["status"]  = "running"
+                _sdata_state["message"] = "Creating transcript patches…"
+            print(f"  create_patches: width={width_um}µm, min_tx={min_transcripts}…", flush=True)
+            sopa.make_transcript_patches(
+                sdata,
+                patch_width=width_um,
+                min_points_per_patch=min_transcripts,
+            )
+            # Find patches key (default key_added='transcripts_patches')
+            patch_key = next(
+                (k for k in sdata.shapes
+                 if k == "transcripts_patches" or "patch" in k.lower()),
+                None
+            )
+            if patch_key:
+                patches = sdata.shapes[patch_key]
+                with _sdata_lock:
+                    _sdata_state["patches"] = patches
+                    _sdata_state["status"]  = "patches_done"
+                    _sdata_state["message"] = f"Patches done — {len(patches)} patches"
+                _sdata_version += 1
+                print(f"  create_patches: {len(patches)} patches created", flush=True)
+            else:
+                print("  create_patches: no patch shapes found in sdata", flush=True)
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            with _sdata_lock:
+                _sdata_state["status"]  = "error"
+                _sdata_state["message"] = str(exc)[:300]
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _sdata_overlays_to_shapes(show_roi: bool, show_patches: bool) -> list:
+    """Extract ROI polygon and/or patch grid as Plotly layout shapes."""
+    shapes = []
+    with _sdata_lock:
+        roi     = _sdata_state.get("roi")
+        patches = _sdata_state.get("patches")
+
+    if show_roi and roi is not None:
+        try:
+            for geom in roi.geometry:
+                coords = list(geom.exterior.coords)
+                xs = [c[0] for c in coords]
+                ys = [-c[1] for c in coords]  # negate Y for plot space
+                shapes.append(dict(
+                    type="path",
+                    path=" ".join(
+                        f"{'M' if i == 0 else 'L'}{x},{y}"
+                        for i, (x, y) in enumerate(zip(xs, ys))
+                    ) + " Z",
+                    line=dict(color="#52b788", width=2),
+                    fillcolor="rgba(82,183,136,0.05)",
+                    layer="above",
+                ))
+        except Exception as exc:
+            print(f"  ROI overlay error: {exc}", flush=True)
+
+    if show_patches and patches is not None:
+        try:
+            for geom in patches.geometry:
+                b = geom.bounds  # (minx, miny, maxx, maxy)
+                shapes.append(dict(
+                    type="rect",
+                    x0=b[0], y0=-b[3], x1=b[2], y1=-b[1],  # negate Y
+                    line=dict(color="rgba(255,170,0,0.6)", width=1),
+                    fillcolor="rgba(255,170,0,0.03)",
+                    layer="above",
+                ))
+        except Exception as exc:
+            print(f"  Patch overlay error: {exc}", flush=True)
+
+    return shapes
+
 
 with _spage_lock:
     _spage_autoload_result = _spage_state.get("result")
@@ -2080,6 +2868,21 @@ sidebar = html.Div([
                  html.Hr(style={"borderColor": BORDER, "margin": "10px 0 14px 0"}),
              ]),
 
+    ctrl_label("Segmentation Source"),
+    dcc.Dropdown(
+        id="seg-source",
+        options=[
+            {"label": "Xenium (original)", "value": "xenium"},
+            {"label": "Baysor",            "value": "baysor", "disabled": True},
+            {"label": "Proseg",            "value": "proseg", "disabled": True},
+        ],
+        value="xenium",
+        clearable=False,
+        style={"fontSize": "12px", "marginBottom": "14px"},
+    ),
+
+    html.Hr(style={"borderColor": BORDER, "margin": "0 0 14px 0"}),
+
     # Color by
     ctrl_label("Color By"),
     dcc.Dropdown(
@@ -2130,6 +2933,10 @@ sidebar = html.Div([
                  "value": "cell"},
                 {"label": html.Span(" Nucleus Boundaries", style={"color": "#ff9f43", "fontSize": "13px"}),
                  "value": "nucleus"},
+                {"label": html.Span(" Proseg Boundaries",  style={"color": "#2ed573", "fontSize": "13px"}),
+                 "value": "proseg", "disabled": True},
+                {"label": html.Span(" Baysor Boundaries",  style={"color": "#a29bfe", "fontSize": "13px"}),
+                 "value": "baysor", "disabled": True},
             ],
             value=[],
             inputStyle={"marginRight": "6px"},
@@ -2139,7 +2946,7 @@ sidebar = html.Div([
             },
         ),
         html.Div(
-            f"Renders up to {BOUNDARY_CELL_LIMIT:,} cells in view. Zoom in to activate.",
+            f"Xenium boundaries require zoom (limit {BOUNDARY_CELL_LIMIT:,} cells). Proseg/Baysor show all cells.",
             style={"fontSize": "10px", "color": MUTED, "marginTop": "4px", "lineHeight": "1.4"},
         ),
     ], style={"marginBottom": "10px"}),
@@ -2392,16 +3199,6 @@ sidebar = html.Div([
         ], className="collapsible-details"),
 
         dcc.Interval(id="baysor-poll", interval=3000, disabled=True),
-        dcc.Checklist(
-            id="baysor-active",
-            options=[{"label": html.Span(
-                " Show Baysor segmentation",
-                style={"fontSize": "12px", "color": "#58a6ff"},
-            ), "value": "yes"}],
-            value=[],
-            inputStyle={"marginRight": "6px"},
-            labelStyle={"display": "flex", "alignItems": "center", "marginBottom": "4px"},
-        ),
     ], id="baysor-section"),
 
     html.Hr(style={"borderColor": BORDER, "margin": "14px 0"}),
@@ -2488,16 +3285,6 @@ sidebar = html.Div([
         ], className="collapsible-details"),
 
         dcc.Interval(id="proseg-poll", interval=3000, disabled=True),
-        dcc.Checklist(
-            id="proseg-active",
-            options=[{"label": html.Span(
-                " Show Proseg segmentation",
-                style={"fontSize": "12px", "color": "#52b788"},
-            ), "value": "yes"}],
-            value=[],
-            inputStyle={"marginRight": "6px"},
-            labelStyle={"display": "flex", "alignItems": "center", "marginBottom": "4px"},
-        ),
     ], id="proseg-section"),
 
     html.Hr(style={"borderColor": BORDER, "margin": "14px 0"}),
@@ -2560,6 +3347,114 @@ sidebar = html.Div([
 
     html.Hr(style={"borderColor": BORDER, "margin": "14px 0"}),
 
+    # ── Sopa / SpatialData ─────────────────────────────────────────────────
+    html.Div([
+        ctrl_label("Sopa / SpatialData"),
+        html.Div(
+            "Convert to SpatialData for tissue ROI and patch-based resegmentation.",
+            style={"fontSize": "10px", "color": MUTED, "marginBottom": "6px", "lineHeight": "1.4"},
+        ),
+        html.Div([  # collapsible details
+            ctrl_label("QV Threshold"),
+            dcc.Slider(
+                id="sdata-qv", min=0, max=40, step=5, value=20,
+                marks={0: "0", 20: "20", 40: "40"},
+                tooltip={"placement": "bottom", "always_visible": False},
+            ),
+            html.Div(style={"marginBottom": "10px"}),
+            html.Div([
+                html.Button(
+                    "Convert to SpatialData",
+                    id="sdata-convert-btn", n_clicks=0,
+                    style={
+                        "flex": "1", "padding": "7px 0",
+                        "backgroundColor": "#1f6feb", "color": "#fff",
+                        "border": "none", "borderRadius": "5px",
+                        "cursor": "pointer", "fontSize": "13px", "fontWeight": "600",
+                    },
+                ),
+                html.Button(
+                    "↺",
+                    id="sdata-clear-cache-btn", n_clicks=0,
+                    title="Clear disk cache and re-read from raw files",
+                    style={
+                        "padding": "7px 10px", "marginLeft": "4px",
+                        "backgroundColor": CARD_BG, "color": MUTED,
+                        "border": f"1px solid {BORDER}", "borderRadius": "5px",
+                        "cursor": "pointer", "fontSize": "13px",
+                    },
+                ),
+            ], style={"display": "flex", "marginBottom": "8px"}),
+            html.Button(
+                "Segment Tissue ROI",
+                id="sdata-roi-btn", n_clicks=0,
+                style={
+                    "width": "100%", "padding": "7px 0",
+                    "backgroundColor": CARD_BG, "color": TEXT,
+                    "border": f"1px solid {BORDER}", "borderRadius": "5px",
+                    "cursor": "pointer", "fontSize": "13px", "fontWeight": "600",
+                    "marginBottom": "8px",
+                },
+            ),
+            ctrl_label("Patch Width (µm)"),
+            dcc.Input(
+                id="sdata-patch-width", type="number", value=1000, min=100, max=10000,
+                debounce=True,
+                style={
+                    "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                    "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                    "padding": "4px 8px", "fontSize": "11px", "marginBottom": "8px",
+                    "boxSizing": "border-box",
+                },
+            ),
+            ctrl_label("Min Transcripts / Patch"),
+            dcc.Input(
+                id="sdata-patch-min-tx", type="number", value=10, min=1, max=1000,
+                debounce=True,
+                style={
+                    "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                    "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                    "padding": "4px 8px", "fontSize": "11px", "marginBottom": "8px",
+                    "boxSizing": "border-box",
+                },
+            ),
+            html.Button(
+                "Create Patches",
+                id="sdata-patches-btn", n_clicks=0,
+                style={
+                    "width": "100%", "padding": "7px 0",
+                    "backgroundColor": CARD_BG, "color": TEXT,
+                    "border": f"1px solid {BORDER}", "borderRadius": "5px",
+                    "cursor": "pointer", "fontSize": "13px", "fontWeight": "600",
+                    "marginBottom": "8px",
+                },
+            ),
+            dcc.Checklist(
+                id="sdata-show-roi",
+                options=[{"label": html.Span(
+                    " Show tissue ROI", style={"fontSize": "12px", "color": "#52b788"},
+                ), "value": "yes"}],
+                value=[],
+                inputStyle={"marginRight": "6px"},
+                labelStyle={"display": "flex", "alignItems": "center", "marginBottom": "4px"},
+            ),
+            dcc.Checklist(
+                id="sdata-show-patches",
+                options=[{"label": html.Span(
+                    " Show patch grid", style={"fontSize": "12px", "color": "#ffa500"},
+                ), "value": "yes"}],
+                value=[],
+                inputStyle={"marginRight": "6px"},
+                labelStyle={"display": "flex", "alignItems": "center", "marginBottom": "4px"},
+            ),
+            dcc.Interval(id="sdata-poll", interval=2000, disabled=True),
+        ], className="collapsible-details"),
+        html.Div(id="sdata-status",
+                 style={"fontSize": "11px", "color": MUTED, "minHeight": "16px", "marginBottom": "6px"}),
+    ], id="sdata-section"),
+
+    html.Hr(style={"borderColor": BORDER, "margin": "14px 0"}),
+
     # UMAP toggle
     html.Button(
         "Show UMAP",
@@ -2570,8 +3465,24 @@ sidebar = html.Div([
             "backgroundColor": CARD_BG, "color": TEXT,
             "border": f"1px solid {BORDER}", "borderRadius": "5px",
             "cursor": "pointer", "fontSize": "13px", "fontWeight": "600",
+            "marginBottom": "6px",
         },
     ),
+    html.Button(
+        "Run UMAP on Reseg Cells",
+        id="umap-reseg-btn",
+        n_clicks=0,
+        style={
+            "width": "100%", "padding": "7px 0",
+            "backgroundColor": CARD_BG, "color": TEXT,
+            "border": f"1px solid {BORDER}", "borderRadius": "5px",
+            "cursor": "pointer", "fontSize": "12px", "fontWeight": "600",
+        },
+    ),
+    html.Div(id="umap-reseg-status",
+             style={"fontSize": "11px", "color": MUTED, "minHeight": "14px",
+                    "marginTop": "4px"}),
+    dcc.Interval(id="umap-reseg-poll", interval=1500, disabled=True),
 ], style={
     "width": "240px", "minWidth": "240px",
     "backgroundColor": PANEL_BG, "borderRight": f"1px solid {BORDER}",
@@ -2593,7 +3504,9 @@ app.layout = html.Div([
     dcc.Store(id="baysor-done",      data=0),
     dcc.Store(id="proseg-done",      data=0),
     dcc.Store(id="spage-done",       data=0),
+    dcc.Interval(id="spage-repl-poll", interval=4000, n_intervals=0),  # always-on for REPL-triggered runs
     dcc.Store(id="subset-version",   data=0),
+    dcc.Store(id="sdata-done",       data=0),
     dcc.Interval(id="subset-poll",   interval=500,  n_intervals=0),
     dcc.Interval(id="morph-hires-poll", interval=400, n_intervals=0),
     # Fires once after 500 ms to guarantee initial plot render in Dash 4
@@ -2620,6 +3533,24 @@ app.layout = html.Div([
                 html.Div([
                     dcc.Graph(
                         id="spatial-plot",
+                        responsive=True,
+                        figure={
+                            "data": [],
+                            "layout": {
+                                "paper_bgcolor": PLOT_BG,
+                                "plot_bgcolor": PLOT_BG,
+                                "xaxis": {"visible": False},
+                                "yaxis": {"visible": False},
+                                "annotations": [{
+                                    "text": "Loading…",
+                                    "x": 0.5, "y": 0.5,
+                                    "xref": "paper", "yref": "paper",
+                                    "showarrow": False,
+                                    "font": {"size": 18, "color": "#8b949e"},
+                                }],
+                                "margin": {"l": 0, "r": 0, "t": 0, "b": 0},
+                            },
+                        },
                         config={
                             "displayModeBar": True,
                             "modeBarButtonsToRemove": ["select2d", "lasso2d"],
@@ -2627,11 +3558,12 @@ app.layout = html.Div([
                         },
                         style={"height": "100%"},
                     )
-                ], id="spatial-panel", style={"flex": "1", "minWidth": "0"}),
+                ], id="spatial-panel", style={"flex": "2", "minWidth": "0"}),
 
                 html.Div([
                     dcc.Graph(
                         id="umap-plot",
+                        responsive=True,
                         config={
                             "displayModeBar": True,
                             "modeBarButtonsToRemove": ["select2d", "lasso2d"],
@@ -2801,9 +3733,8 @@ def store_relayout(relayout_data, current):
     Input("morph-opacity",      "value"),
     Input("spatial-relayout",   "data"),
     Input("baysor-done",        "data"),
-    Input("baysor-active",      "value"),
     Input("proseg-done",        "data"),
-    Input("proseg-active",      "value"),
+    Input("seg-source",         "value"),
     Input("spage-done",         "data"),
     Input("subset-version",     "data"),
     Input("startup-trigger",    "n_intervals"),
@@ -2811,7 +3742,7 @@ def store_relayout(relayout_data, current):
 def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
                  _annot_done, morph_enable, morph_zlevel, morph_channels,
                  morph_brightness, morph_opacity, relayout,
-                 _baysor_done, baysor_active, _proseg_done, proseg_active,
+                 _baysor_done, _proseg_done, seg_source,
                  _spage_done, _subset_ver, _startup):
     # If only the viewport changed, avoid full figure rebuild
     triggered = callback_context.triggered_id
@@ -2830,8 +3761,11 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
                 morph_brightness or 2,
                 morph_opacity if morph_opacity is not None else 0.85,
             )
+            if morph_image is None:
+                # Viewport too large or no valid range yet — preserve existing image
+                return no_update, no_update
             patched = Patch()
-            patched["layout"]["images"] = [morph_image] if morph_image else []
+            patched["layout"]["images"] = [morph_image]
             return patched, no_update
 
     if triggered in ("morph-brightness", "morph-opacity", "morph-channels",
@@ -2843,8 +3777,10 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
             morph_brightness or 2,
             morph_opacity if morph_opacity is not None else 0.85,
         )
+        if morph_image is None:
+            return no_update, no_update
         patched = Patch()
-        patched["layout"]["images"] = [morph_image] if morph_image else []
+        patched["layout"]["images"] = [morph_image]
         return patched, no_update
 
     color_by         = color_by or "cluster"
@@ -2853,11 +3789,9 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
     size             = size     or 2
     opacity          = opacity  or 0.85
     boundary_toggles = boundary_toggles or []
-    baysor_on        = "yes" in (baysor_active or [])
-    proseg_on        = "yes" in (proseg_active or [])
-
-    show_cell_bounds = "cell"    in boundary_toggles
-    show_nuc_bounds  = "nucleus" in boundary_toggles
+    seg_source  = seg_source or "xenium"
+    baysor_on   = (seg_source == "baysor")
+    proseg_on   = (seg_source == "proseg")
 
     # Morphology image overlay
     morph_image  = None
@@ -2874,10 +3808,11 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
 
     return (
         make_spatial_fig(color_by, method, gene, size, opacity,
-                         show_cell_bounds, show_nuc_bounds, relayout,
+                         boundary_toggles, relayout,
                          morph_image=morph_image, extra_title=morph_title,
                          baysor_active=baysor_on, proseg_active=proseg_on),
-        make_umap_fig(color_by, method, gene, size, opacity),
+        make_umap_fig(color_by, method, gene, size, opacity,
+                      baysor_active=baysor_on, proseg_active=proseg_on),
     )
 
 
@@ -2908,24 +3843,90 @@ def show_cell_info(cell_id, method):
                         style={"color": MUTED, "fontSize": "13px", "fontStyle": "italic"})
 
     df = DATA["df"]
-    if cell_id not in df.index:
-        return html.Div(f"Cell '{cell_id}' not found.", style={"color": "#f85149"})
 
-    row    = df.loc[cell_id]
-    method = method or cluster_methods[0]
-    col    = cluster_col(method)
-    clust  = int(row[col]) if col in row and not pd.isna(row[col]) else "—"
+    # ── Try Xenium cells first, then Proseg, then Baysor ─────────────────────
+    if cell_id in df.index:
+        # Original Xenium cell
+        row    = df.loc[cell_id]
+        method = method or cluster_methods[0]
+        col    = cluster_col(method)
+        clust  = int(row[col]) if col in row and not pd.isna(row[col]) else "—"
 
-    # Top expressed genes
-    cell_pos     = df.index.get_loc(cell_id)
-    expr_row_idx = DATA["df_to_expr"][cell_pos]
-    if expr_row_idx >= 0:
-        raw      = DATA["expr"][expr_row_idx, :].toarray().flatten()
-        top_idx  = np.argsort(raw)[::-1][:12]
-        top_genes = [(DATA["gene_names"][i], int(raw[i])) for i in top_idx if raw[i] > 0]
+        cell_pos     = df.index.get_loc(cell_id)
+        expr_row_idx = DATA["df_to_expr"][cell_pos]
+        if expr_row_idx >= 0:
+            raw       = DATA["expr"][expr_row_idx, :].toarray().flatten()
+            top_idx   = np.argsort(raw)[::-1][:12]
+            top_genes = [(DATA["gene_names"][i], int(raw[i])) for i in top_idx if raw[i] > 0]
+        else:
+            top_genes = []
+
+        umap_1 = row.get("umap_1", float("nan"))
+        umap_2 = row.get("umap_2", float("nan"))
+
+        chips = [
+            info_chip("Cluster",     str(clust)),
+            info_chip("X",           f"{row['x_centroid']:.1f} µm"),
+            info_chip("Y",           f"{row['y_centroid']:.1f} µm"),
+            info_chip("Transcripts", str(int(row["transcript_counts"]))),
+            info_chip("Cell Area",   f"{row['cell_area']:.0f} µm²"),
+            info_chip("Nuc Area",    f"{row['nucleus_area']:.0f} µm²"),
+            info_chip("UMAP 1",      f"{umap_1:.2f}" if not np.isnan(umap_1) else "—"),
+            info_chip("UMAP 2",      f"{umap_2:.2f}" if not np.isnan(umap_2) else "—"),
+        ]
+        source_tag = ""
+
     else:
-        top_genes = []
+        # Try reseg sources (Proseg cell IDs are ints, Baysor are strings)
+        row       = None
+        alt_expr  = None
+        source_tag = ""
+        for src_name, state, lock in (
+            ("Proseg", _proseg_state, _proseg_lock),
+            ("Baysor", _baysor_state, _baysor_lock),
+        ):
+            with lock:
+                res = state.get("result")
+            if res is None:
+                continue
+            bdf = res["cells_df"]
+            # Try direct match first, then type-coerced match
+            key = cell_id
+            if key not in bdf.index:
+                try:
+                    key = int(cell_id)
+                except (ValueError, TypeError):
+                    pass
+            if key in bdf.index:
+                row        = bdf.loc[key]
+                alt_expr   = res.get("expr")
+                source_tag = f" [{src_name}]"
+                break
 
+        if row is None:
+            return html.Div(f"Cell '{cell_id}' not found.", style={"color": "#f85149"})
+
+        # Top genes from reseg expression matrix
+        top_genes = []
+        if alt_expr is not None:
+            gene_names_list = list(DATA["gene_names"])
+            # Find row index in reseg cells_df
+            bdf = res["cells_df"]
+            key_for_idx = key
+            row_idx = bdf.index.get_loc(key_for_idx)
+            raw     = alt_expr[row_idx, :].toarray().flatten()
+            top_idx = np.argsort(raw)[::-1][:12]
+            top_genes = [(gene_names_list[i], int(raw[i])) for i in top_idx if raw[i] > 0]
+
+        chips = [
+            info_chip("X",           f"{row['x_centroid']:.1f} µm"),
+            info_chip("Y",           f"{row['y_centroid']:.1f} µm"),
+            info_chip("Transcripts", str(int(row["transcript_counts"]))),
+        ]
+        if "cell_area" in row.index:
+            chips.append(info_chip("Cell Area", f"{row['cell_area']:.0f} µm²"))
+
+    # ── Bar chart ─────────────────────────────────────────────────────────────
     bar_fig = go.Figure(go.Bar(
         x=[g for g, _ in top_genes],
         y=[v for _, v in top_genes],
@@ -2940,25 +3941,15 @@ def show_cell_info(cell_id, method):
         font=dict(color=TEXT),
     )
 
-    umap_1 = row.get("umap_1", float("nan"))
-    umap_2 = row.get("umap_2", float("nan"))
-
     return html.Div([
         html.Div([
             html.Span("Cell: ", style={"color": MUTED, "fontSize": "12px"}),
-            html.Span(cell_id, style={"color": ACCENT, "fontWeight": "700", "fontSize": "13px"}),
+            html.Span(str(cell_id) + source_tag,
+                      style={"color": ACCENT, "fontWeight": "700", "fontSize": "13px"}),
         ], style={"marginBottom": "8px"}),
 
-        html.Div([
-            info_chip("Cluster",     str(clust)),
-            info_chip("X",           f"{row['x_centroid']:.1f} µm"),
-            info_chip("Y",           f"{row['y_centroid']:.1f} µm"),
-            info_chip("Transcripts", str(int(row["transcript_counts"]))),
-            info_chip("Cell Area",   f"{row['cell_area']:.0f} µm²"),
-            info_chip("Nuc Area",    f"{row['nucleus_area']:.0f} µm²"),
-            info_chip("UMAP 1",      f"{umap_1:.2f}" if not np.isnan(umap_1) else "—"),
-            info_chip("UMAP 2",      f"{umap_2:.2f}" if not np.isnan(umap_2) else "—"),
-        ], style={"display": "flex", "gap": "8px", "flexWrap": "wrap", "marginBottom": "10px"}),
+        html.Div(chips, style={"display": "flex", "gap": "8px", "flexWrap": "wrap",
+                               "marginBottom": "10px"}),
 
         html.Div("Top Expressed Genes",
                  style={"fontSize": "11px", "color": MUTED, "marginBottom": "4px"}),
@@ -2987,22 +3978,59 @@ def toggle_annot_source(source):
     State("annot-model",    "value"),
     State("annot-rds-path", "value"),
     State("annot-label-col","value"),
+    State("seg-source",     "value"),
     prevent_initial_call=True,
 )
-def start_annotation(n_clicks, source, model_name, rds_path, label_col):
+def start_annotation(n_clicks, source, model_name, rds_path, label_col, seg_source):
     """Kick off background annotation thread."""
+    # Use the currently selected segmentation source
+    seg_source = seg_source or "xenium"
+    with _proseg_lock:
+        pres = _proseg_state["result"] if seg_source == "proseg" and _proseg_state["status"] == "done" else None
+    with _baysor_lock:
+        bres = _baysor_state["result"] if seg_source == "baysor" and _baysor_state["status"] == "done" else None
+    alt_res = pres or bres
+
+    if alt_res is not None:
+        # Reseg mode: require an expression matrix
+        if alt_res.get("expr") is None:
+            return False, "✗ No expression matrix for reseg cells — re-run Proseg/Baysor", False
+        expr_override     = alt_res["expr"]
+        cell_ids_override = [str(c) for c in alt_res["cells_df"].index]
+        # Include out_dir hash so cache is invalidated when Proseg/Baysor is re-run
+        out_tag    = hashlib.md5((alt_res.get("out_dir", "")).encode()).hexdigest()[:8]
+        labels_key = f"labels_proseg_{out_tag}" if pres else f"labels_baysor_{out_tag}"
+        # Store which key to read at render time
+        _annot_state["_active_labels_key"] = labels_key
+    else:
+        expr_override     = None
+        cell_ids_override = None
+        labels_key        = "labels"
+        _annot_state["_active_labels_key"] = "labels"
+
     with _annot_lock:
         if _annot_state["status"] == "running":
             return False, "Already running…", True
-        _annot_state.update({"status": "running", "message": "Starting…", "labels": None})
+        _annot_state.update({"status": "running", "message": "Starting…", labels_key: None})
+
     if source == "seurat":
         ctx = contextvars.copy_context()
         threading.Thread(
-            target=lambda: ctx.run(_run_seurat_annotation, rds_path or "", label_col or "Names"),
+            target=lambda: ctx.run(
+                _run_seurat_annotation, rds_path or "", label_col or "Names",
+                labels_key=labels_key, expr_override=expr_override,
+                cell_ids_override=cell_ids_override,
+            ),
             daemon=True,
         ).start()
     else:
-        threading.Thread(target=_run_celltypist, args=(model_name,), daemon=True).start()
+        threading.Thread(
+            target=_run_celltypist,
+            args=(model_name,),
+            kwargs={"labels_key": labels_key, "expr_override": expr_override,
+                    "cell_ids_override": cell_ids_override},
+            daemon=True,
+        ).start()
     return False, "Starting…", True
 
 
@@ -3025,10 +4053,17 @@ def poll_annotation(_, current_options, done_version):
         done    = (status == "done")
         error   = (status == "error")
 
+    # Cell Type is available if any annotation labels exist (check all known keys)
+    with _annot_lock:
+        any_labels = any(
+            v is not None
+            for k, v in _annot_state.items()
+            if k.startswith("labels")
+        )
     options = []
     for opt in current_options:
         if opt["value"] == "cell_type":
-            options.append({**opt, "disabled": not done})
+            options.append({**opt, "disabled": not any_labels})
         else:
             options.append(opt)
 
@@ -3040,26 +4075,15 @@ def poll_annotation(_, current_options, done_version):
 
 
 @app.callback(
-    Output("umap-panel",   "style"),
-    Output("spatial-panel", "style"),
-    Output("umap-toggle",  "children"),
-    Input("umap-toggle",   "n_clicks"),
+    Output("umap-panel",  "style"),
+    Output("umap-toggle", "children"),
+    Input("umap-toggle",  "n_clicks"),
 )
 def toggle_umap(n_clicks):
     if n_clicks % 2 == 1:
-        # UMAP hidden — spatial takes full width
-        return (
-            {"display": "none"},
-            {"flex": "1", "minWidth": "0"},
-            "Show UMAP",
-        )
+        return {"display": "none"}, "Show UMAP"
     else:
-        # UMAP visible — default split
-        return (
-            {"flex": "1", "minWidth": "0"},
-            {"flex": "1.65", "minWidth": "0"},
-            "Hide UMAP",
-        )
+        return {"flex": "1", "minWidth": "0"}, "Hide UMAP"
 
 
 # ─── Baysor callbacks ─────────────────────────────────────────────────────────
@@ -3140,6 +4164,7 @@ def start_baysor(n_clicks, scale, min_mol, use_prior, prior_conf,
     Output("baysor-poll",    "disabled",  allow_duplicate=True),
     Output("baysor-run-btn", "disabled",  allow_duplicate=True),
     Output("baysor-done",    "data"),
+    Output("seg-source",     "value",     allow_duplicate=True),
     Input("baysor-poll",     "n_intervals"),
     State("baysor-done",     "data"),
     prevent_initial_call=True,
@@ -3150,10 +4175,10 @@ def poll_baysor(_, done_version):
         message = _baysor_state["message"]
 
     if status == "done":
-        return f"✓ {message}", True, False, (done_version or 0) + 1
+        return f"✓ {message}", True, False, (done_version or 0) + 1, "baysor"
     if status == "error":
-        return f"✗ {message}", True, False, done_version
-    return message, False, True, done_version
+        return f"✗ {message}", True, False, done_version, no_update
+    return message, False, True, done_version, no_update
 
 
 # ─── Proseg callbacks ─────────────────────────────────────────────────────────
@@ -3214,6 +4239,7 @@ def start_proseg(n_clicks, voxel_size, n_threads, x_min, x_max, y_min, y_max):
     Output("proseg-poll",    "disabled",  allow_duplicate=True),
     Output("proseg-run-btn", "disabled",  allow_duplicate=True),
     Output("proseg-done",    "data"),
+    Output("seg-source",     "value",     allow_duplicate=True),
     Input("proseg-poll",     "n_intervals"),
     State("proseg-done",     "data"),
     prevent_initial_call=True,
@@ -3224,10 +4250,83 @@ def poll_proseg(_, done_version):
         message = _proseg_state["message"]
 
     if status == "done":
-        return f"✓ {message}", True, False, (done_version or 0) + 1
+        return f"✓ {message}", True, False, (done_version or 0) + 1, "proseg"
     if status == "error":
-        return f"✗ {message}", True, False, done_version
-    return message, False, True, done_version
+        return f"✗ {message}", True, False, done_version, no_update
+    return message, False, True, done_version, no_update
+
+
+# ─── Reseg UMAP callbacks ─────────────────────────────────────────────────────
+
+@app.callback(
+    Output("umap-reseg-poll",    "disabled"),
+    Output("umap-reseg-status",  "children"),
+    Output("umap-reseg-btn",     "disabled"),
+    Input("umap-reseg-btn",      "n_clicks"),
+    prevent_initial_call=True,
+)
+def start_reseg_umap(_):
+    with _umap_reseg_lock:
+        if _umap_reseg_state["status"] == "running":
+            return False, "Already running…", True
+        _umap_reseg_state.update({"status": "running", "message": "Starting…", "result": None})
+    threading.Thread(target=_run_reseg_umap, daemon=True).start()
+    return False, "Starting UMAP…", True
+
+
+@app.callback(
+    Output("umap-reseg-status",  "children",  allow_duplicate=True),
+    Output("umap-reseg-poll",    "disabled",  allow_duplicate=True),
+    Output("umap-reseg-btn",     "disabled",  allow_duplicate=True),
+    Input("umap-reseg-poll",     "n_intervals"),
+    prevent_initial_call=True,
+)
+def poll_reseg_umap(_):
+    with _umap_reseg_lock:
+        status  = _umap_reseg_state["status"]
+        message = _umap_reseg_state["message"]
+    if status == "done":
+        return f"✓ {message}", True, False
+    if status == "error":
+        return f"✗ {message}", True, False
+    return message, False, True
+
+
+# ─── Boundary overlay options: enable Proseg/Baysor when results are ready ────
+
+@app.callback(
+    Output("boundary-toggles", "options"),
+    Output("seg-source",       "options", allow_duplicate=True),
+    Input("baysor-done",       "data"),
+    Input("proseg-done",       "data"),
+    State("boundary-toggles",  "options"),
+    State("seg-source",        "options"),
+)
+def update_boundary_options(baysor_done, proseg_done, boundary_opts, seg_opts):
+    baysor_ready = _baysor_state["status"] == "done" and _baysor_state["result"] is not None
+    proseg_ready = _proseg_state["status"] == "done" and _proseg_state["result"] is not None
+
+    updated_boundary = []
+    for opt in boundary_opts:
+        v = opt["value"]
+        if v == "proseg":
+            updated_boundary.append({**opt, "disabled": not proseg_ready})
+        elif v == "baysor":
+            updated_boundary.append({**opt, "disabled": not baysor_ready})
+        else:
+            updated_boundary.append(opt)
+
+    updated_seg = []
+    for opt in seg_opts:
+        v = opt["value"]
+        if v == "proseg":
+            updated_seg.append({**opt, "disabled": not proseg_ready})
+        elif v == "baysor":
+            updated_seg.append({**opt, "disabled": not baysor_ready})
+        else:
+            updated_seg.append(opt)
+
+    return updated_boundary, updated_seg
 
 
 # ─── SpaGE callbacks ──────────────────────────────────────────────────────────
@@ -3281,6 +4380,36 @@ def poll_spage(_, done_version):
 
 
 @app.callback(
+    Output("spage-status",  "children",  allow_duplicate=True),
+    Output("spage-done",    "data",      allow_duplicate=True),
+    Input("spage-repl-poll", "n_intervals"),
+    State("spage-done",      "data"),
+    prevent_initial_call=True,
+)
+def poll_spage_repl(_, done_version):
+    """Always-on poll: picks up SpaGE runs triggered from the REPL."""
+    global _spage_repl_pending
+    if not _spage_repl_pending:
+        return no_update, no_update
+    with _spage_lock:
+        status  = _spage_state["status"]
+        message = _spage_state["message"]
+    if status == "running":
+        print(f"  SpaGE progress: {message}", flush=True)
+        return message, no_update
+    if status == "done":
+        _spage_repl_pending = False
+        print(f"  SpaGE: done — {message}", flush=True)
+        print("  Imputed genes are now available in the Color By → Gene Expression dropdown.", flush=True)
+        return f"✓ {message}", (done_version or 0) + 1
+    if status == "error":
+        _spage_repl_pending = False
+        print(f"  SpaGE error: {message}", flush=True)
+        return f"✗ {message}", no_update
+    return no_update, no_update
+
+
+@app.callback(
     Output("gene-selector", "options"),
     Input("spage-done", "data"),
     prevent_initial_call=True,
@@ -3319,8 +4448,10 @@ def push_hires_overlay(_):
     if not _morph_hires_queue:
         return no_update
     img_dict = _morph_hires_queue.pop(0)
+    if not img_dict:
+        return no_update  # don't clear the preview if hires result is empty
     patched = Patch()
-    patched["layout"]["images"] = [img_dict] if img_dict else []
+    patched["layout"]["images"] = [img_dict]
     return patched
 
 
@@ -3401,6 +4532,123 @@ def run_repl(_, __, code):
 
     threading.Thread(target=_exec, daemon=True).start()
     return ""
+
+
+# ─── SpatialData / Sopa callbacks ─────────────────────────────────────────────
+
+@app.callback(
+    Output("sdata-poll",        "disabled"),
+    Output("sdata-status",      "children"),
+    Output("sdata-convert-btn", "disabled"),
+    Input("sdata-convert-btn",  "n_clicks"),
+    State("sdata-qv",           "value"),
+    prevent_initial_call=True,
+)
+def start_sdata_convert(n_clicks, qv):
+    with _sdata_lock:
+        if _sdata_state["status"] == "running":
+            return False, "Already running…", True
+        _sdata_state.update({"status": "running", "message": "Starting…"})
+    to_spatialdata(qv_threshold=int(qv or 20))
+    return False, "Converting…", True
+
+
+@app.callback(
+    Output("sdata-poll",             "disabled",  allow_duplicate=True),
+    Output("sdata-status",           "children",  allow_duplicate=True),
+    Output("sdata-convert-btn",      "disabled",  allow_duplicate=True),
+    Output("sdata-clear-cache-btn",  "disabled",  allow_duplicate=True),
+    Input("sdata-clear-cache-btn",   "n_clicks"),
+    State("sdata-qv",                "value"),
+    prevent_initial_call=True,
+)
+def clear_and_reconvert(n_clicks, qv):
+    """Delete cache then trigger a forced re-read from raw files."""
+    with _sdata_lock:
+        if _sdata_state["status"] == "running":
+            return False, "Already running…", True, True
+        _sdata_state.update({"status": "running", "message": "Clearing cache…"})
+    clear_sdata_cache()
+    to_spatialdata(qv_threshold=int(qv or 20), force=True)
+    return False, "Re-reading from raw files…", True, True
+    to_spatialdata(qv_threshold=int(qv or 20))
+    return False, "Converting…", True
+
+
+@app.callback(
+    Output("sdata-status",          "children",  allow_duplicate=True),
+    Output("sdata-poll",            "disabled",  allow_duplicate=True),
+    Output("sdata-convert-btn",     "disabled",  allow_duplicate=True),
+    Output("sdata-clear-cache-btn", "disabled",  allow_duplicate=True),
+    Output("sdata-done",            "data"),
+    Input("sdata-poll",             "n_intervals"),
+    State("sdata-done",             "data"),
+    prevent_initial_call=True,
+)
+def poll_sdata(_, done_version):
+    with _sdata_lock:
+        status  = _sdata_state["status"]
+        message = _sdata_state["message"]
+    if status in ("done", "roi_done", "patches_done"):
+        return f"✓ {message}", True, False, False, (done_version or 0) + 1
+    if status == "error":
+        return f"✗ {message}", True, False, False, done_version
+    # Still running
+    return message, False, True, True, done_version
+
+
+@app.callback(
+    Output("sdata-status",      "children",  allow_duplicate=True),
+    Output("sdata-poll",        "disabled",  allow_duplicate=True),
+    Output("sdata-roi-btn",     "disabled",  allow_duplicate=True),
+    Input("sdata-roi-btn",      "n_clicks"),
+    prevent_initial_call=True,
+)
+def start_roi_segmentation(_):
+    with _sdata_lock:
+        if _sdata_state.get("sdata") is None:
+            return "✗ Run 'Convert to SpatialData' first", True, False
+        if _sdata_state["status"] == "running":
+            return "Already running…", False, True
+        _sdata_state.update({"status": "running", "message": "Segmenting tissue ROI…"})
+    segment_tissue_roi()
+    return "Segmenting tissue ROI…", False, True
+
+
+@app.callback(
+    Output("sdata-status",       "children",  allow_duplicate=True),
+    Output("sdata-poll",         "disabled",  allow_duplicate=True),
+    Output("sdata-patches-btn",  "disabled",  allow_duplicate=True),
+    Input("sdata-patches-btn",   "n_clicks"),
+    State("sdata-patch-width",   "value"),
+    State("sdata-patch-min-tx",  "value"),
+    prevent_initial_call=True,
+)
+def start_create_patches(_, width_um, min_tx):
+    with _sdata_lock:
+        if _sdata_state.get("sdata") is None:
+            return "✗ Run 'Convert to SpatialData' first", True, False
+        if _sdata_state["status"] == "running":
+            return "Already running…", False, True
+        _sdata_state.update({"status": "running", "message": "Creating patches…"})
+    create_patches(width_um=float(width_um or 1000), min_transcripts=int(min_tx or 10))
+    return "Creating patches…", False, True
+
+
+@app.callback(
+    Output("spatial-plot", "figure", allow_duplicate=True),
+    Input("sdata-show-roi",     "value"),
+    Input("sdata-show-patches", "value"),
+    Input("sdata-done",         "data"),
+    prevent_initial_call=True,
+)
+def update_sdata_overlays(show_roi, show_patches, _sdata_ver):
+    roi_on     = "yes" in (show_roi     or [])
+    patches_on = "yes" in (show_patches or [])
+    shapes = _sdata_overlays_to_shapes(roi_on, patches_on)
+    patched = Patch()
+    patched["layout"]["shapes"] = shapes
+    return patched
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
