@@ -252,6 +252,201 @@ def _run_celltypist(model_name: str, labels_key: str = "labels",
         _set("error", str(exc))
 
 
+def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "full",
+                          n_cores: int = 4, labels_key: str = "labels",
+                          expr_override=None, cell_ids_override=None) -> None:
+    """
+    Background thread: run RCTD (spacexr) for cell-type assignment.
+    Requires the spacexr R package:
+        devtools::install_github('dmcable/spacexr')
+    In 'full' mode each cell is assigned the highest-weight type.
+    In 'doublet'/'multi' mode the first_type column is used.
+    """
+    _redirect_rpy2_console()
+
+    def _set(status, message, labels=None):
+        with _annot_lock:
+            _annot_state["status"]  = status
+            _annot_state["message"] = message
+            if labels is not None:
+                _annot_state[labels_key] = labels
+
+    try:
+        cache_key  = f"rctd_{os.path.basename(rds_path)}_{label_col}_{mode}"
+        if labels_key != "labels":
+            cache_key += f"_{labels_key}"
+        cache_file = _cache_path(cache_key)
+        if os.path.exists(cache_file):
+            _set("running", "Loading cached RCTD annotation…")
+            cached = pd.read_parquet(cache_file)
+            labels = cached["label"].astype(str)
+            labels.index = labels.index.astype(str)
+            unique_types = labels.unique().tolist()
+            print(f"  RCTD: loaded from cache — {len(unique_types)} cell types", flush=True)
+            _set("done", f"Done (cached) — {len(unique_types)} cell types", labels=labels)
+            return
+
+        import tempfile
+        import scipy.io as sio
+        import scipy.sparse as sp_
+        import rpy2.robjects as ro
+        import rpy2.robjects.conversion as _rconv
+        from rpy2.robjects import pandas2ri
+        from rpy2.robjects.packages import importr
+
+        # Ensure rpy2 conversion rules are active in this thread
+        try:
+            if _rconv._get_cv().get(None) is None:
+                _rconv.activate(ro.default_converter)
+        except Exception:
+            try:
+                _rconv.activate(ro.default_converter)
+            except Exception:
+                pass
+        pandas2ri.activate()
+
+        # ── 1. Check spacexr ─────────────────────────────────────────────
+        _set("running", "Loading spacexr…")
+        try:
+            importr("spacexr")
+        except Exception:
+            _set("error", "spacexr not installed. In R run: devtools::install_github('dmcable/spacexr')")
+            return
+
+        importr("SeuratObject")
+        importr("Matrix")
+        base = importr("base")
+
+        # ── 2. Load Seurat reference ─────────────────────────────────────
+        _set("running", "Loading Seurat reference…")
+        rds = base.readRDS(rds_path)
+        meta_r  = ro.r['slot'](rds, "meta.data")
+        meta_df = pandas2ri.rpy2py(meta_r)
+        if label_col not in meta_df.columns:
+            _set("error", f"Column '{label_col}' not found. Available: {list(meta_df.columns)[:10]}")
+            return
+
+        # ── 3. Determine shared genes ────────────────────────────────────
+        _set("running", "Finding shared genes…")
+        ro.r.assign("._rctd_rds", rds)
+        mat_r     = ro.r("slot(slot(._rctd_rds, 'assays')[['RNA']], 'counts')")
+        ref_genes = list(ro.r['rownames'](mat_r))
+        xenium_genes = list(DATA["gene_names"])
+        shared_genes = sorted(set(xenium_genes) & set(ref_genes))
+        if len(shared_genes) < 10:
+            _set("error", f"Only {len(shared_genes)} shared genes between reference and panel.")
+            return
+        print(f"  RCTD: {len(shared_genes)} shared genes", flush=True)
+
+        # ── 4. Build Reference object ────────────────────────────────────
+        _set("running", f"Building RCTD Reference ({len(meta_df):,} ref cells)…")
+        ro.r.assign("._rctd_genes", ro.StrVector(shared_genes))
+        ro.r("""
+._rctd_ref_mat <- slot(slot(._rctd_rds, 'assays')[['RNA']], 'counts')[._rctd_genes, , drop=FALSE]
+._rctd_ref_mat <- as(._rctd_ref_mat, 'dgCMatrix')
+""")
+        ref_labels_r       = ro.StrVector(meta_df[label_col].astype(str).tolist())
+        ref_labels_r.names = ro.StrVector(list(meta_df.index.astype(str)))
+        ro.r.assign("._rctd_ref_labels", ref_labels_r)
+        ro.r("""
+._rctd_ref_factor <- as.factor(._rctd_ref_labels)
+._rctd_numi_ref   <- colSums(._rctd_ref_mat)
+._rctd_reference  <- spacexr::Reference(
+    counts     = ._rctd_ref_mat,
+    cell_types = ._rctd_ref_factor,
+    nUMI       = ._rctd_numi_ref
+)
+""")
+
+        # ── 5. Build SpatialRNA from Xenium ──────────────────────────────
+        _set("running", "Building SpatialRNA object…")
+        df = DATA["df"]
+        if expr_override is not None:
+            xen_mat_full = expr_override.T        # genes × cells
+            cell_ids     = [str(c) for c in (cell_ids_override or range(expr_override.shape[0]))]
+            id_to_xy     = df.set_index("cell_id")[["x_centroid", "y_centroid"]]
+            coords_df    = id_to_xy.reindex(cell_ids).fillna(0.0)
+        else:
+            xen_mat_full = DATA["expr_matrix"].T  # genes × cells
+            cell_ids     = [str(c) for c in df["cell_id"].tolist()]
+            coords_df    = df[["x_centroid", "y_centroid"]].copy()
+            coords_df.index = cell_ids
+
+        gene_idx   = {g: i for i, g in enumerate(xenium_genes)}
+        shared_idx = [gene_idx[g] for g in shared_genes]
+        xen_sub    = sp_.csc_matrix(xen_mat_full[shared_idx, :])   # shared_genes × cells
+
+        tmpdir = tempfile.mkdtemp(prefix="xenium_rctd_")
+        sio.mmwrite(os.path.join(tmpdir, "xenium.mtx"), xen_sub)
+        with open(os.path.join(tmpdir, "genes.txt"),    "w") as f: f.write("\n".join(shared_genes))
+        with open(os.path.join(tmpdir, "barcodes.txt"), "w") as f: f.write("\n".join(cell_ids))
+        coords_df.to_csv(os.path.join(tmpdir, "coords.csv"))
+
+        ro.r.assign("._rctd_tmpdir", tmpdir)
+        ro.r("""
+._rctd_xen_mat  <- Matrix::readMM(file.path(._rctd_tmpdir, "xenium.mtx"))
+._rctd_xen_genes <- readLines(file.path(._rctd_tmpdir, "genes.txt"))
+._rctd_xen_bcs   <- readLines(file.path(._rctd_tmpdir, "barcodes.txt"))
+rownames(._rctd_xen_mat) <- ._rctd_xen_genes
+colnames(._rctd_xen_mat) <- ._rctd_xen_bcs
+._rctd_xen_mat  <- as(._rctd_xen_mat, 'dgCMatrix')
+._rctd_coords   <- read.csv(file.path(._rctd_tmpdir, "coords.csv"), row.names=1)
+colnames(._rctd_coords) <- c('x', 'y')
+._rctd_numi_xen <- colSums(._rctd_xen_mat)
+._rctd_puck     <- spacexr::SpatialRNA(
+    coords = ._rctd_coords,
+    counts = ._rctd_xen_mat,
+    nUMI   = ._rctd_numi_xen
+)
+""")
+
+        # ── 6. Create and run RCTD ───────────────────────────────────────
+        _set("running", f"Running RCTD ({mode} mode, {n_cores} cores)…")
+        ro.r.assign("._rctd_mode",  mode)
+        ro.r.assign("._rctd_cores", n_cores)
+        ro.r("""
+._rctd_obj <- spacexr::create.RCTD(._rctd_puck, ._rctd_reference, max_cores=._rctd_cores)
+._rctd_obj <- spacexr::run.RCTD(._rctd_obj, doublet_mode=._rctd_mode)
+""")
+        print("  RCTD: run complete — extracting results…", flush=True)
+
+        # ── 7. Extract per-cell labels ────────────────────────────────────
+        _set("running", "Extracting RCTD results…")
+        if mode == "full":
+            ro.r("""
+._rctd_weights <- ._rctd_obj@results$weights
+._rctd_types   <- colnames(._rctd_weights)[apply(._rctd_weights, 1, which.max)]
+names(._rctd_types) <- rownames(._rctd_weights)
+""")
+        else:  # doublet / multi
+            ro.r("""
+._rctd_res   <- ._rctd_obj@results$results_df
+._rctd_types <- as.character(._rctd_res$first_type)
+names(._rctd_types) <- rownames(._rctd_res)
+""")
+
+        types_r       = ro.r("._rctd_types")
+        cell_type_map = dict(zip(list(types_r.names), list(types_r)))
+        labels        = pd.Series(cell_type_map, name="label").astype(str)
+        labels.index  = labels.index.astype(str)
+
+        unique_types = labels.unique().tolist()
+        print(f"  RCTD: {len(labels):,} cells → {len(unique_types)} types", flush=True)
+
+        pd.DataFrame({"label": labels}).to_parquet(cache_file)
+
+        # Cleanup R temporaries
+        ro.r("rm(list=ls(pattern='^\\._rctd_'))")
+        import shutil; shutil.rmtree(tmpdir, ignore_errors=True)
+
+        _set("done", f"Done — {len(unique_types)} cell types in {len(labels):,} cells",
+             labels=labels)
+
+    except Exception as exc:
+        import traceback; traceback.print_exc()
+        _set("error", str(exc)[:300])
+
+
 def _run_seurat_annotation(rds_path: str, label_col: str = "Names", labels_key: str = "labels",
                             expr_override=None, cell_ids_override=None) -> None:
     """
@@ -4188,17 +4383,19 @@ app.layout = html.Div([
         dbc.ModalHeader(dbc.ModalTitle("Cell Type Annotation"), close_button=True),
         dbc.ModalBody([
             html.Div(
-                "Annotate cells using CellTypist or transfer labels from a Seurat RDS reference.",
+                "Annotate cells using CellTypist, Seurat label transfer, or RCTD (spacexr).",
                 style={"fontSize": "11px", "color": MUTED, "marginBottom": "12px", "lineHeight": "1.4"},
             ),
             ctrl_label("Method"),
             dcc.RadioItems(
                 id="annot-source",
                 options=[
-                    {"label": html.Span(" CellTypist model", style={"fontSize": "12px", "color": TEXT}),
+                    {"label": html.Span(" CellTypist", style={"fontSize": "12px", "color": TEXT}),
                      "value": "celltypist"},
-                    {"label": html.Span(" Seurat RDS reference", style={"fontSize": "12px", "color": TEXT}),
+                    {"label": html.Span(" Seurat kNN label transfer", style={"fontSize": "12px", "color": TEXT}),
                      "value": "seurat"},
+                    {"label": html.Span(" RCTD (spacexr)", style={"fontSize": "12px", "color": TEXT}),
+                     "value": "rctd"},
                 ],
                 value="celltypist",
                 inputStyle={"marginRight": "5px"},
@@ -4217,7 +4414,7 @@ app.layout = html.Div([
                            "backgroundColor": CARD_BG, "color": TEXT},
                 ),
             ]),
-            # Seurat RDS controls
+            # Seurat / RCTD shared RDS controls (shown for both)
             html.Div(id="annot-seurat-div", style={"display": "none"}, children=[
                 ctrl_label("RDS File Path"),
                 dcc.Input(
@@ -4231,7 +4428,7 @@ app.layout = html.Div([
                         "boxSizing": "border-box",
                     },
                 ),
-                ctrl_label("Label Column"),
+                ctrl_label("Cell Type Label Column"),
                 dcc.Input(
                     id="annot-label-col",
                     type="text",
@@ -4240,6 +4437,38 @@ app.layout = html.Div([
                         "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
                         "border": f"1px solid {BORDER}", "borderRadius": "4px",
                         "padding": "4px 8px", "fontSize": "11px", "marginBottom": "8px",
+                        "boxSizing": "border-box",
+                    },
+                ),
+            ]),
+            # RCTD-specific controls (shown only for rctd)
+            html.Div(id="annot-rctd-div", style={"display": "none"}, children=[
+                html.Div(
+                    "Requires the spacexr R package. In R: devtools::install_github('dmcable/spacexr')",
+                    style={"fontSize": "10px", "color": MUTED, "marginBottom": "8px",
+                           "lineHeight": "1.4", "fontStyle": "italic"},
+                ),
+                ctrl_label("RCTD Mode"),
+                dcc.Dropdown(
+                    id="annot-rctd-mode",
+                    options=[
+                        {"label": "full — weights across all types (best for single cells)", "value": "full"},
+                        {"label": "doublet — primary + secondary type",                      "value": "doublet"},
+                        {"label": "multi — multiple types per spot",                         "value": "multi"},
+                    ],
+                    value="full",
+                    clearable=False,
+                    style={"fontSize": "11px", "marginBottom": "8px",
+                           "backgroundColor": CARD_BG, "color": TEXT},
+                ),
+                ctrl_label("Max Cores"),
+                dcc.Input(
+                    id="annot-rctd-cores",
+                    type="number", value=4, min=1, max=64, step=1,
+                    style={
+                        "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                        "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                        "padding": "4px 8px", "fontSize": "11px", "marginBottom": "4px",
                         "boxSizing": "border-box",
                     },
                 ),
@@ -4935,13 +5164,19 @@ def toggle_annot_modal(open_clicks, close_clicks, is_open):
 @app.callback(
     Output("annot-celltypist-div", "style"),
     Output("annot-seurat-div",     "style"),
+    Output("annot-rctd-div",       "style"),
     Input("annot-source",          "value"),
     prevent_initial_call=True,
 )
 def toggle_annot_source(source):
     show = {}
     hide = {"display": "none"}
-    return (show, hide) if source == "celltypist" else (hide, show)
+    if source == "celltypist":
+        return show, hide, hide
+    elif source == "rctd":
+        return hide, show, show   # seurat-div (RDS/label) + rctd-div (mode/cores)
+    else:                          # seurat
+        return hide, show, hide
 
 
 @app.callback(
@@ -4954,12 +5189,14 @@ def toggle_annot_source(source):
     State("annot-model",         "value"),
     State("annot-rds-path",      "value"),
     State("annot-label-col",     "value"),
+    State("annot-rctd-mode",     "value"),
+    State("annot-rctd-cores",    "value"),
     State("seg-source",          "value"),
     prevent_initial_call=True,
 )
-def start_annotation(n_clicks, source, model_name, rds_path, label_col, seg_source):
+def start_annotation(n_clicks, source, model_name, rds_path, label_col,
+                     rctd_mode, rctd_cores, seg_source):
     """Kick off background annotation thread."""
-    # Use the currently selected segmentation source
     seg_source = seg_source or "xenium"
     with _proseg_lock:
         pres = _proseg_state["result"] if _seg_tool(seg_source) == "proseg" and _proseg_state["status"] == "done" else None
@@ -4968,16 +5205,13 @@ def start_annotation(n_clicks, source, model_name, rds_path, label_col, seg_sour
     alt_res = pres or bres
 
     if alt_res is not None:
-        # Reseg mode: require an expression matrix
         if alt_res.get("expr") is None:
             msg = "✗ No expression matrix for reseg cells — re-run Proseg/Baysor"
             return False, msg, False, msg
         expr_override     = alt_res["expr"]
         cell_ids_override = [str(c) for c in alt_res["cells_df"].index]
-        # Include out_dir hash so cache is invalidated when Proseg/Baysor is re-run
         out_tag    = hashlib.md5((alt_res.get("out_dir", "")).encode()).hexdigest()[:8]
         labels_key = f"labels_proseg_{out_tag}" if pres else f"labels_baysor_{out_tag}"
-        # Store which key to read at render time
         _annot_state["_active_labels_key"] = labels_key
     else:
         expr_override     = None
@@ -4995,6 +5229,18 @@ def start_annotation(n_clicks, source, model_name, rds_path, label_col, seg_sour
         threading.Thread(
             target=lambda: ctx.run(
                 _run_seurat_annotation, rds_path or "", label_col or "Names",
+                labels_key=labels_key, expr_override=expr_override,
+                cell_ids_override=cell_ids_override,
+            ),
+            daemon=True,
+        ).start()
+    elif source == "rctd":
+        ctx = contextvars.copy_context()
+        threading.Thread(
+            target=lambda: ctx.run(
+                _run_rctd_annotation,
+                rds_path or "", label_col or "Names",
+                rctd_mode or "full", int(rctd_cores or 4),
                 labels_key=labels_key, expr_override=expr_override,
                 cell_ids_override=cell_ids_override,
             ),
