@@ -100,6 +100,8 @@ _subset_version = 0   # incremented by subset()/unsubset() to trigger re-render
 # ─── SpatialData / Sopa state ─────────────────────────────────────────────────
 _sdata_state: dict = {"status": "idle", "message": "", "sdata": None, "roi": None, "patches": None}
 _sdata_lock   = threading.Lock()
+_save_sdata_state: dict = {"status": "idle", "message": ""}
+_save_sdata_lock  = threading.Lock()
 _sdata_version = 0  # incremented when ROI/patches change, to trigger overlay refresh
 
 # ─── Server log capture ────────────────────────────────────────────────────────
@@ -422,9 +424,334 @@ rm(._annot_mat, ._annot_genes, ._annot_dir, ._annot_rds_tmp, mat_sub)
         _set("error", f"{exc}\n{traceback.format_exc()[-300:]}")
 
 
+def _get_patch_bounds_um():
+    """Return list of (x0, y0, x1, y1) in µm for each sopa patch, or None if none available."""
+    with _sdata_lock:
+        patches = _sdata_state.get("patches")
+    if patches is None:
+        return None
+    try:
+        patches_um = _sdata_transform_to_um(patches)
+        return [geom.bounds for geom in patches_um.geometry]  # (minx, miny, maxx, maxy)
+    except Exception as exc:
+        print(f"  _get_patch_bounds_um: {exc}", flush=True)
+        return None
+
+
+def _baysor_run_single(tx_df, patch_dir, baysor_bin, scale, min_mol, use_prior, prior_conf):
+    """Run Baysor on tx_df, write outputs to patch_dir.
+    Returns (cells_df, cell_bounds_dict, seg_df) or raises on failure.
+    cells_df is indexed by string cell_id.
+    """
+    os.makedirs(patch_dir, exist_ok=True)
+    tx_csv = os.path.join(patch_dir, "transcripts.csv")
+    tx_df.to_csv(tx_csv, index=False)
+
+    n_assigned = int((tx_df["cell_id"] != 0).sum())
+    _use_prior = use_prior and n_assigned > 0
+    if use_prior and not _use_prior:
+        print(f"  Baysor [{patch_dir}]: no assigned transcripts — disabling prior", flush=True)
+
+    cmd = [
+        baysor_bin, "run",
+        "-s", str(scale),
+        "--min-molecules-per-cell", str(min_mol),
+        "--polygon-format", "FeatureCollection",
+        "-x", "x_location",
+        "-y", "y_location",
+        "-g", "feature_name",
+        "-o", patch_dir,
+        tx_csv,
+    ]
+    if _use_prior:
+        cmd += ["--prior-segmentation-confidence", str(prior_conf), ":cell_id"]
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, cwd=patch_dir)
+    for line in proc.stdout:
+        line = _strip_ansi(line).rstrip()
+        if line:
+            print(f"  [baysor] {line}", flush=True)
+    proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError(f"Baysor exited with code {proc.returncode}")
+
+    seg_csv = os.path.join(patch_dir, "segmentation.csv")
+    if not os.path.exists(seg_csv):
+        raise RuntimeError(f"segmentation.csv not found in {patch_dir}")
+
+    seg = pd.read_csv(seg_csv)
+    seg = seg[seg["cell"].notna()].copy()
+
+    x_col = "x" if "x" in seg.columns else "x_location"
+    y_col = "y" if "y" in seg.columns else "y_location"
+    cells_df = (
+        seg.groupby("cell")
+        .agg(x_centroid=(x_col, "mean"), y_centroid=(y_col, "mean"),
+             transcript_counts=(x_col, "count"))
+        .rename_axis("cell_id")
+    )
+
+    cell_bounds: dict = {}
+    for poly_name in ("segmentation_polygons_2d.json", "segmentation_polygons.json",
+                      "polygons.json", "cell_polygons.json"):
+        poly_path = os.path.join(patch_dir, poly_name)
+        if os.path.exists(poly_path):
+            break
+        poly_path = None
+    if poly_path:
+        with open(poly_path) as f:
+            gj = json.load(f)
+        for feat in gj.get("features", []):
+            props = feat.get("properties") or {}
+            cid   = feat.get("id") or props.get("cell") or props.get("id")
+            geom  = feat.get("geometry", {})
+            gtype = geom.get("type")
+            if cid is None:
+                continue
+            if gtype == "Polygon":
+                ring = geom["coordinates"][0]
+            elif gtype == "MultiPolygon":
+                ring = max((poly[0] for poly in geom["coordinates"]), key=len)
+            else:
+                continue
+            vx = np.array([p[0] for p in ring], dtype=np.float32)
+            vy = np.array([p[1] for p in ring], dtype=np.float32)
+            cell_bounds[cid] = (vx, vy)
+
+    return cells_df, cell_bounds, seg
+
+
+def _proseg_run_single(tx_df, patch_dir, proseg_bin, voxel_size, n_threads):
+    """Run Proseg on tx_df (written as parquet), write outputs to patch_dir.
+    Returns (cells_df, cell_bounds_dict, tx_meta_df) or raises on failure.
+    """
+    import gzip
+    os.makedirs(patch_dir, exist_ok=True)
+    tx_path = os.path.join(patch_dir, "transcripts.parquet")
+    tx_df.to_parquet(tx_path, index=False)
+
+    poly_out    = os.path.join(patch_dir, "cell-polygons.geojson.gz")
+    meta_out    = os.path.join(patch_dir, "cell-metadata.csv.gz")
+    tx_meta_out = os.path.join(patch_dir, "transcript-metadata.csv.gz")
+
+    cmd = [proseg_bin, "--xenium", tx_path,
+           "--output-cell-polygons",       poly_out,
+           "--output-cell-metadata",       meta_out,
+           "--output-transcript-metadata", tx_meta_out]
+    if voxel_size:
+        cmd += ["--voxel-size", str(voxel_size)]
+    if n_threads:
+        cmd += ["--nthreads", str(n_threads)]
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, cwd=patch_dir)
+    for line in proc.stdout:
+        line = _strip_ansi(line).rstrip()
+        if line:
+            print(f"  [proseg] {line}", flush=True)
+    proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError(f"Proseg exited with code {proc.returncode}")
+
+    cell_meta = pd.read_csv(meta_out)
+    cells_df = cell_meta.rename(columns={
+        "cell": "cell_id", "centroid_x": "x_centroid",
+        "centroid_y": "y_centroid", "population": "transcript_counts",
+    }).set_index("cell_id")[["x_centroid", "y_centroid", "transcript_counts"]]
+
+    cell_bounds: dict = {}
+    if os.path.exists(poly_out):
+        with gzip.open(poly_out, "rt") as f:
+            gj = json.load(f)
+        for feat in gj.get("features", []):
+            props = feat.get("properties", {})
+            cid   = props.get("cell") if props.get("cell") is not None else props.get("id")
+            geom  = feat.get("geometry", {})
+            gtype = geom.get("type")
+            if cid is None:
+                continue
+            if gtype == "Polygon":
+                rings = [geom["coordinates"][0]]
+            elif gtype == "MultiPolygon":
+                rings = [poly[0] for poly in geom["coordinates"]]
+            else:
+                continue
+            ring = max(rings, key=len)
+            vx = np.array([p[0] for p in ring], dtype=np.float32)
+            vy = np.array([p[1] for p in ring], dtype=np.float32)
+            cell_bounds[cid] = (vx, vy)
+
+    tx_meta_df = None
+    if os.path.exists(tx_meta_out):
+        try:
+            tx_meta_df = pd.read_csv(tx_meta_out)
+        except Exception:
+            pass
+
+    return cells_df, cell_bounds, tx_meta_df
+
+
+def _build_baysor_expr(seg_df, cells_df):
+    """Build cell×gene CSR expression matrix from merged Baysor segmentation DataFrame."""
+    gene_names_list = list(DATA["gene_names"])
+    gene_to_idx = {g: i for i, g in enumerate(gene_names_list)}
+    if "gene" not in seg_df.columns:
+        return None
+    cell_to_row = {c: i for i, c in enumerate(cells_df.index)}
+    panel = seg_df[seg_df["gene"].isin(gene_to_idx) & seg_df["cell"].isin(cell_to_row)].copy()
+    rows = panel["cell"].map(cell_to_row).astype(int).values
+    cols = panel["gene"].map(gene_to_idx).astype(int).values
+    mat = sp.csr_matrix(
+        (np.ones(len(rows), dtype=np.float32), (rows, cols)),
+        shape=(len(cells_df), len(gene_names_list))
+    )
+    print(f"  Baysor: built expression matrix {mat.shape}", flush=True)
+    return mat
+
+
+def _build_proseg_expr(tx_meta_df, cells_df):
+    """Build cell×gene CSR expression matrix from merged Proseg transcript-metadata."""
+    if tx_meta_df is None:
+        return None
+    gene_names_list = list(DATA["gene_names"])
+    gene_to_idx = {g: i for i, g in enumerate(gene_names_list)}
+    gene_col = "gene" if "gene" in tx_meta_df.columns else None
+    cell_col = "cell" if "cell" in tx_meta_df.columns else None
+    if not gene_col or not cell_col:
+        return None
+    cell_to_row = {c: i for i, c in enumerate(cells_df.index)}
+    assigned = tx_meta_df[tx_meta_df[cell_col].notna()]
+    valid = assigned[assigned[gene_col].isin(gene_to_idx) & assigned[cell_col].isin(cell_to_row)]
+    rows = valid[cell_col].map(cell_to_row).astype(int).values
+    cols = valid[gene_col].map(gene_to_idx).astype(int).values
+    mat = sp.csr_matrix(
+        (np.ones(len(rows), dtype=np.float32), (rows, cols)),
+        shape=(len(cells_df), len(gene_names_list))
+    )
+    print(f"  Proseg: built expression matrix {mat.shape}", flush=True)
+    return mat
+
+
+def _load_cached_baysor(out_dir: str) -> None:
+    """Load a cached Baysor result from disk into _baysor_state."""
+    def _set(status, message, result=None):
+        with _baysor_lock:
+            _baysor_state["status"]  = status
+            _baysor_state["message"] = message
+            if result is not None:
+                _baysor_state["result"] = result
+    try:
+        _set("running", "Loading cached Baysor result…")
+        # Collect all segmentation.csv files (may be one per patch subdir)
+        seg_parts = []
+        for root, dirs, files in os.walk(out_dir):
+            if "segmentation.csv" in files:
+                seg_parts.append(pd.read_csv(os.path.join(root, "segmentation.csv")))
+        if not seg_parts:
+            _set("error", f"segmentation.csv not found in {out_dir}")
+            return
+        seg = pd.concat(seg_parts, ignore_index=True)
+        seg = seg[seg["cell"].notna()].copy()
+        seg["cell"] = seg["cell"].astype(str)
+        x_col = "x" if "x" in seg.columns else "x_location"
+        y_col = "y" if "y" in seg.columns else "y_location"
+        cells_df = (
+            seg.groupby("cell")
+            .agg(x_centroid=(x_col, "mean"), y_centroid=(y_col, "mean"),
+                 transcript_counts=(x_col, "count"))
+            .rename_axis("cell_id")
+        )
+        cells_df.index = cells_df.index.astype(str)
+        # Build cell boundaries from polygon files
+        cell_bounds: dict = {}
+        for root, dirs, files in os.walk(out_dir):
+            for poly_name in ("segmentation_polygons_2d.json", "segmentation_polygons.json",
+                              "polygons.json", "cell_polygons.json"):
+                if poly_name in files:
+                    poly_path = os.path.join(root, poly_name)
+                    with open(poly_path) as f:
+                        geo = json.load(f)
+                    for feat in geo.get("features", []):
+                        props = feat.get("properties", {})
+                        cid = str(props.get("cell", props.get("cell_id", feat.get("id", ""))))
+                        coords = feat.get("geometry", {}).get("coordinates", [[]])[0]
+                        if coords:
+                            cell_bounds[cid] = ([c[0] for c in coords], [c[1] for c in coords])
+                    break  # only one polygon file per dir needed
+        expr_mat = _build_baysor_expr(seg, cells_df)
+        n_cells = len(cells_df)
+        _set("done", f"Loaded — {n_cells:,} cells", result={
+            "cells_df": cells_df, "cell_bounds": cell_bounds,
+            "out_dir": out_dir, "expr": expr_mat, "source": "baysor",
+        })
+        print(f"  Loaded cached Baysor: {n_cells:,} cells from {os.path.basename(out_dir)}", flush=True)
+    except Exception as exc:
+        import traceback; traceback.print_exc()
+        _set("error", str(exc)[:300])
+
+
+def _load_cached_proseg(out_dir: str) -> None:
+    """Load a cached Proseg result from disk into _proseg_state."""
+    def _set(status, message, result=None):
+        with _proseg_lock:
+            _proseg_state["status"]  = status
+            _proseg_state["message"] = message
+            if result is not None:
+                _proseg_state["result"] = result
+    try:
+        _set("running", "Loading cached Proseg result…")
+        # Find cell-metadata.csv.gz (may be in subdirs for patch runs)
+        meta_parts = []
+        tx_parts   = []
+        for root, dirs, files in os.walk(out_dir):
+            if "cell-metadata.csv.gz" in files:
+                meta_parts.append(pd.read_csv(os.path.join(root, "cell-metadata.csv.gz")))
+            if "transcript-metadata.csv.gz" in files:
+                tx_parts.append(pd.read_csv(os.path.join(root, "transcript-metadata.csv.gz")))
+        if not meta_parts:
+            _set("error", f"cell-metadata.csv.gz not found in {out_dir}")
+            return
+        cell_meta = pd.concat(meta_parts, ignore_index=True)
+        tx_meta   = pd.concat(tx_parts,   ignore_index=True) if tx_parts else pd.DataFrame()
+        cells_df = cell_meta.rename(columns={
+            "cell_id": "cell_id", "x": "x_centroid", "y": "y_centroid",
+            "count": "transcript_counts", "area": "cell_area",
+        })
+        if "cell_id" in cells_df.columns:
+            cells_df = cells_df.set_index("cell_id")
+        cells_df.index = cells_df.index.astype(str)
+        # Build cell boundaries from polygon files
+        cell_bounds: dict = {}
+        for root, dirs, files in os.walk(out_dir):
+            for poly_name in ("polygons.geojson", "polygons.json", "cell_polygons.json",
+                              "segmentation_polygons.json"):
+                if poly_name in files:
+                    poly_path = os.path.join(root, poly_name)
+                    with open(poly_path) as f:
+                        geo = json.load(f)
+                    for feat in geo.get("features", []):
+                        props = feat.get("properties", {})
+                        cid = str(props.get("cell_id", props.get("cell", feat.get("id", ""))))
+                        coords = feat.get("geometry", {}).get("coordinates", [[]])[0]
+                        if coords:
+                            cell_bounds[cid] = ([c[0] for c in coords], [c[1] for c in coords])
+                    break
+        expr_mat = _build_proseg_expr(tx_meta, cells_df) if not tx_meta.empty else None
+        n_cells = len(cells_df)
+        _set("done", f"Loaded — {n_cells:,} cells", result={
+            "cells_df": cells_df, "cell_bounds": cell_bounds,
+            "out_dir": out_dir, "expr": expr_mat, "source": "proseg",
+        })
+        print(f"  Loaded cached Proseg: {n_cells:,} cells from {os.path.basename(out_dir)}", flush=True)
+    except Exception as exc:
+        import traceback; traceback.print_exc()
+        _set("error", str(exc)[:300])
+
+
 def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
                 x_min=None, x_max=None, y_min=None, y_max=None) -> None:
-    """Background thread: run Baysor resegmentation and store results."""
+    """Background thread: run Baysor resegmentation, using sopa patches if available."""
 
     def _set(status, message, result=None):
         with _baysor_lock:
@@ -433,7 +760,6 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
             if result is not None:
                 _baysor_state["result"] = result
 
-    # Locate baysor binary (may not be in PATH if app was launched from IDE)
     BAYSOR_CANDIDATES = [
         "baysor",
         os.path.expanduser("~/.julia/bin/baysor"),
@@ -451,159 +777,144 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
         return None
 
     try:
-        # ── Check that baysor is available ───────────────────────────────
         baysor_bin = _find_baysor()
         if baysor_bin is None:
             _set("error", "baysor not found. Install from github.com/kharchenkolab/Baysor")
             return
         print(f"  Using baysor: {baysor_bin}", flush=True)
 
+        _param_str = (f"s{scale}_m{min_mol}_p{int(use_prior)}"
+                      f"{'_c'+str(prior_conf) if use_prior else ''}"
+                      f"_x{x_min or 'A'}-{x_max or 'A'}_y{y_min or 'A'}-{y_max or 'A'}")
+        _param_tag = hashlib.md5(_param_str.encode()).hexdigest()[:8]
         out_dir = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache",
-                               "baysor_" + os.path.basename(DATA["data_dir"]))
+                               f"baysor_{os.path.basename(DATA['data_dir'])}_{_param_tag}")
         os.makedirs(out_dir, exist_ok=True)
-        tx_csv = os.path.join(out_dir, "transcripts.csv")
+        print(f"  Baysor: cache dir = {os.path.basename(out_dir)} ({_param_str})", flush=True)
 
-        # ── Export transcripts to CSV ────────────────────────────────────
-        _set("running", "Exporting transcripts to CSV…")
-        tx = pd.read_parquet(
+        # ── Load & prepare all transcripts (once) ────────────────────────
+        _set("running", "Loading transcripts…")
+        tx_all = pd.read_parquet(
             os.path.join(DATA["data_dir"], "transcripts.parquet"),
             columns=["x_location", "y_location", "feature_name", "cell_id"],
         )
-        # Convert cell_id: Xenium uses "UNASSIGNED" string; Baysor needs integer 0
-        cid = tx["cell_id"]
-        if cid.dtype == object or str(cid.dtype) == "string":
-            # String column — replace "UNASSIGNED" explicitly then parse
-            cid = cid.astype(str).replace({"UNASSIGNED": "0", "nan": "0", "<NA>": "0", "None": "0"})
-            cid = pd.to_numeric(cid, errors="coerce").fillna(0)
+        # Map Xenium string cell IDs → integers (0 = unassigned)
+        cid = tx_all["cell_id"].astype(str)
+        _unassigned = {"UNASSIGNED", "nan", "None", "<NA>", ""}
+        unique_assigned = [c for c in cid.unique() if c not in _unassigned]
+        id_map = {c: i + 1 for i, c in enumerate(unique_assigned)}
+        tx_all["cell_id"] = cid.map(id_map).fillna(0).astype("int64")
+
+        # Apply user's region filter
+        if x_min is not None: tx_all = tx_all[tx_all["x_location"] >= x_min]
+        if x_max is not None: tx_all = tx_all[tx_all["x_location"] <= x_max]
+        if y_min is not None: tx_all = tx_all[tx_all["y_location"] >= y_min]
+        if y_max is not None: tx_all = tx_all[tx_all["y_location"] <= y_max]
+
+        # ── Check for sopa patches ────────────────────────────────────────
+        patch_bounds = _get_patch_bounds_um()
+        # Intersect patches with user region filter
+        if patch_bounds and any(v is not None for v in [x_min, x_max, y_min, y_max]):
+            filtered = []
+            for px0, py0, px1, py1 in patch_bounds:
+                if x_min is not None and px1 < x_min: continue
+                if x_max is not None and px0 > x_max: continue
+                if y_min is not None and py1 < y_min: continue
+                if y_max is not None and py0 > y_max: continue
+                filtered.append((
+                    max(px0, x_min or px0), max(py0, y_min or py0),
+                    min(px1, x_max or px1), min(py1, y_max or py1),
+                ))
+            patch_bounds = filtered or None
+
+        if patch_bounds:
+            n_patches = len(patch_bounds)
+            print(f"  Baysor: using {n_patches} sopa patch(es)", flush=True)
+
+            all_cells: list   = []
+            all_bounds: dict  = {}
+            all_seg: list     = []
+            buf = float(scale)  # overlap buffer = cell radius
+
+            for pi, (px0, py0, px1, py1) in enumerate(patch_bounds):
+                _set("running", f"Baysor patch {pi + 1}/{n_patches}…")
+                # Filter with overlap buffer so cells at edges are fully captured
+                tx_patch = tx_all[
+                    (tx_all["x_location"] >= px0 - buf) & (tx_all["x_location"] <= px1 + buf) &
+                    (tx_all["y_location"] >= py0 - buf) & (tx_all["y_location"] <= py1 + buf)
+                ]
+                if len(tx_patch) < min_mol * 2:
+                    print(f"  Baysor: patch {pi + 1} has too few transcripts — skipping", flush=True)
+                    continue
+                print(f"  Baysor: patch {pi + 1}/{n_patches}: {len(tx_patch):,} transcripts", flush=True)
+
+                patch_dir = os.path.join(out_dir, f"patch_{pi:04d}")
+                try:
+                    cells_i, bounds_i, seg_i = _baysor_run_single(
+                        tx_patch, patch_dir, baysor_bin, scale, min_mol, use_prior, prior_conf
+                    )
+                except Exception as pe:
+                    print(f"  Baysor: patch {pi + 1} failed: {pe}", flush=True)
+                    continue
+
+                # Boundary resolution: keep cells whose centroid is inside this patch (non-buffered)
+                in_patch = (
+                    (cells_i["x_centroid"] >= px0) & (cells_i["x_centroid"] < px1) &
+                    (cells_i["y_centroid"] >= py0) & (cells_i["y_centroid"] < py1)
+                )
+                cells_i = cells_i[in_patch]
+                valid_ids = set(cells_i.index)
+
+                # Remap IDs to be globally unique: "p{pi}_{original_id}"
+                remap = {old: f"p{pi}_{old}" for old in valid_ids}
+                cells_i.index = pd.Index([remap[c] for c in cells_i.index], name="cell_id")
+                all_cells.append(cells_i)
+                for old_id, bnd in bounds_i.items():
+                    if old_id in valid_ids:
+                        all_bounds[remap[old_id]] = bnd
+                seg_i_valid = seg_i[seg_i["cell"].isin(valid_ids)].copy()
+                seg_i_valid["cell"] = seg_i_valid["cell"].map(remap)
+                all_seg.append(seg_i_valid)
+
+            if not all_cells:
+                _set("error", "No cells found across all patches. Check Baysor output.")
+                return
+
+            cells_df  = pd.concat(all_cells)
+            cell_bounds = all_bounds
+            seg_merged  = pd.concat(all_seg)
+            print(f"  Baysor: merged {len(cells_df):,} cells from {n_patches} patch(es)", flush=True)
+
         else:
-            cid = pd.to_numeric(cid, errors="coerce").fillna(0)
-        tx["cell_id"] = cid.astype("int64")
+            # ── Single run (no patches or no sopa data) ───────────────────
+            n_assigned = int((tx_all["cell_id"] != 0).sum())
+            print(f"  Baysor: {n_assigned:,} / {len(tx_all):,} transcripts have prior cell assignment", flush=True)
+            _up = use_prior and n_assigned > 0
+            if use_prior and not _up:
+                print("  Baysor: no assigned transcripts in region — disabling prior segmentation", flush=True)
+            _set("running", "Running Baysor (this may take 10–30 min)…")
+            try:
+                cells_df, cell_bounds, seg_merged = _baysor_run_single(
+                    tx_all, out_dir, baysor_bin, scale, min_mol, _up, prior_conf
+                )
+            except Exception as e:
+                _set("error", str(e)[:300])
+                return
 
-        # Apply spatial region filter if specified
-        if x_min is not None: tx = tx[tx["x_location"] >= x_min]
-        if x_max is not None: tx = tx[tx["x_location"] <= x_max]
-        if y_min is not None: tx = tx[tx["y_location"] >= y_min]
-        if y_max is not None: tx = tx[tx["y_location"] <= y_max]
-
-        n_assigned = int((tx["cell_id"] != 0).sum())
-        print(f"  Baysor: {n_assigned:,} / {len(tx):,} transcripts have prior cell assignment", flush=True)
-        # Disable prior if no assigned transcripts (would crash Baysor with Vector{Missing})
-        if use_prior and n_assigned == 0:
-            print("  Baysor: no assigned transcripts in region — disabling prior segmentation", flush=True)
-            use_prior = False
-
-        tx.to_csv(tx_csv, index=False)
-        print(f"  Baysor: exported {len(tx):,} transcripts to {tx_csv}", flush=True)
-
-        # ── Build baysor command ─────────────────────────────────────────
-        _set("running", "Running Baysor (this may take 10–30 min)…")
-        cmd = [
-            baysor_bin, "run",
-            "-s", str(scale),
-            "--min-molecules-per-cell", str(min_mol),
-            "--polygon-format", "FeatureCollection",
-            "-x", "x_location",
-            "-y", "y_location",
-            "-g", "feature_name",
-            "-o", out_dir,
-            tx_csv,
-        ]
-        if use_prior:
-            cmd += ["--prior-segmentation-confidence", str(prior_conf), ":cell_id"]
-
-        print(f"  Baysor cmd: {' '.join(cmd)}", flush=True)
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, cwd=out_dir,
-        )
-        # Stream output to console and update status with last line
-        last_line = ""
-        for line in proc.stdout:
-            line = _strip_ansi(line).rstrip()
-            if line:
-                print(f"  [baysor] {line}", flush=True)
-                last_line = line
-            _set("running", f"Running Baysor… {last_line[:60]}")
-        proc.wait()
-        if proc.returncode != 0:
-            _set("error", f"Baysor exited with code {proc.returncode}. Check console for details.")
-            return
-
-        # ── Parse segmentation CSV ───────────────────────────────────────
-        _set("running", "Loading Baysor results…")
-        seg_csv = os.path.join(out_dir, "segmentation.csv")
-        if not os.path.exists(seg_csv):
-            _set("error", f"segmentation.csv not found in {out_dir}")
-            return
-
-        seg = pd.read_csv(seg_csv)
-        # Baysor cell IDs are strings (e.g. 'CRbd5368ffe-6'); NaN = unassigned
-        seg = seg[seg["cell"].notna()].copy()
-
-        # Compute cell centroids and transcript counts
-        # Baysor segmentation.csv uses 'x'/'y' columns
-        x_col = "x" if "x" in seg.columns else "x_location"
-        y_col = "y" if "y" in seg.columns else "y_location"
-        cells_df = (
-            seg.groupby("cell")
-            .agg(
-                x_centroid=(x_col, "mean"),
-                y_centroid=(y_col, "mean"),
-                transcript_counts=(x_col, "count"),
-            )
-            .rename_axis("cell_id")
-        )
-
-        # ── Parse polygon GeoJSON ────────────────────────────────────────
-        cell_bounds: dict = {}
-        # Baysor 0.7.x output names vary by version; ID is feat["id"], no "properties"
-        for poly_name in ("segmentation_polygons_2d.json", "segmentation_polygons.json",
-                          "polygons.json", "cell_polygons.json"):
-            poly_path = os.path.join(out_dir, poly_name)
-            if os.path.exists(poly_path):
-                break
-            poly_path = None
-        if poly_path and os.path.exists(poly_path):
-            with open(poly_path) as f:
-                gj = json.load(f)
-            for feat in gj.get("features", []):
-                # Cell ID is feat["id"] in newer Baysor; fall back to properties
-                props = feat.get("properties") or {}
-                cid   = feat.get("id") or props.get("cell") or props.get("id")
-                geom  = feat.get("geometry", {})
-                gtype = geom.get("type")
-                if cid is None:
-                    continue
-                if gtype == "Polygon":
-                    ring = geom["coordinates"][0]
-                elif gtype == "MultiPolygon":
-                    ring = max((poly[0] for poly in geom["coordinates"]), key=len)
-                else:
-                    continue
-                vx = np.array([p[0] for p in ring], dtype=np.float32)
-                vy = np.array([p[1] for p in ring], dtype=np.float32)
-                cell_bounds[cid] = (vx, vy)
-            print(f"  Baysor: loaded {len(cell_bounds):,} polygons", flush=True)
-
-        # Build cell × gene expression matrix from transcript assignments
+        # ── Build expression matrix ───────────────────────────────────────
         _set("running", "Building expression matrix…")
-        expr_mat = None
-        gene_names_list = list(DATA["gene_names"])
-        gene_to_idx = {g: i for i, g in enumerate(gene_names_list)}
-        if "gene" in seg.columns:
-            cell_to_row = {c: i for i, c in enumerate(cells_df.index)}
-            seg_panel = seg[seg["gene"].isin(gene_to_idx)].copy()
-            valid_mask = seg_panel["cell"].isin(cell_to_row)
-            seg_panel = seg_panel[valid_mask]
-            rows = seg_panel["cell"].map(cell_to_row).astype(int).values
-            cols = seg_panel["gene"].map(gene_to_idx).astype(int).values
-            expr_mat = sp.csr_matrix(
-                (np.ones(len(rows), dtype=np.float32), (rows, cols)),
-                shape=(len(cells_df), len(gene_names_list))
-            )
-            print(f"  Baysor: built expression matrix {expr_mat.shape}", flush=True)
+        expr_mat = _build_baysor_expr(seg_merged, cells_df)
 
         n_cells = len(cells_df)
+        import json as _json
+        _params_out = {
+            "tool": "baysor", "scale": scale, "min_mol": min_mol,
+            "use_prior": use_prior, "prior_conf": prior_conf,
+            "x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max,
+            "n_cells": n_cells, "param_tag": _param_tag,
+        }
+        with open(os.path.join(out_dir, "params.json"), "w") as _f:
+            _json.dump(_params_out, _f)
         _set("done", f"Done — {n_cells:,} cells", result={
             "cells_df":    cells_df,
             "cell_bounds": cell_bounds,
@@ -623,7 +934,7 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
 
 def _run_proseg(voxel_size=None, n_threads=None,
                 x_min=None, x_max=None, y_min=None, y_max=None) -> None:
-    """Background thread: run Proseg resegmentation and store results."""
+    """Background thread: run Proseg resegmentation, using sopa patches if available."""
 
     def _set(status, message, result=None):
         with _proseg_lock:
@@ -639,7 +950,6 @@ def _run_proseg(voxel_size=None, n_threads=None,
     ]
 
     def _find_proseg():
-        # also search conda envs
         import shutil
         found = shutil.which("proseg")
         if found:
@@ -660,122 +970,134 @@ def _run_proseg(voxel_size=None, n_threads=None,
             return
         print(f"  Using proseg: {proseg_bin}", flush=True)
 
+        _param_str = (f"v{voxel_size or 'A'}_t{n_threads or 'A'}"
+                      f"_x{x_min or 'A'}-{x_max or 'A'}_y{y_min or 'A'}-{y_max or 'A'}")
+        _param_tag = hashlib.md5(_param_str.encode()).hexdigest()[:8]
         out_dir = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache",
-                               "proseg_" + os.path.basename(DATA["data_dir"]))
+                               f"proseg_{os.path.basename(DATA['data_dir'])}_{_param_tag}")
         os.makedirs(out_dir, exist_ok=True)
+        print(f"  Proseg: cache dir = {os.path.basename(out_dir)} ({_param_str})", flush=True)
 
         tx_src = os.path.join(DATA["data_dir"], "transcripts.parquet")
 
-        # Apply spatial region filter if specified — subset to a temp parquet
-        if any(v is not None for v in [x_min, x_max, y_min, y_max]):
-            _set("running", "Filtering transcripts to region…")
-            tx = pd.read_parquet(tx_src)
-            if x_min is not None: tx = tx[tx["x_location"] >= x_min]
-            if x_max is not None: tx = tx[tx["x_location"] <= x_max]
-            if y_min is not None: tx = tx[tx["y_location"] >= y_min]
-            if y_max is not None: tx = tx[tx["y_location"] <= y_max]
-            tx_path = os.path.join(out_dir, "transcripts_region.parquet")
-            tx.to_parquet(tx_path, index=False)
-            print(f"  Proseg: filtered to {len(tx):,} transcripts", flush=True)
-        else:
-            tx_path = tx_src
+        # ── Check for sopa patches ────────────────────────────────────────
+        patch_bounds = _get_patch_bounds_um()
+        if patch_bounds and any(v is not None for v in [x_min, x_max, y_min, y_max]):
+            filtered = []
+            for px0, py0, px1, py1 in patch_bounds:
+                if x_min is not None and px1 < x_min: continue
+                if x_max is not None and px0 > x_max: continue
+                if y_min is not None and py1 < y_min: continue
+                if y_max is not None and py0 > y_max: continue
+                filtered.append((
+                    max(px0, x_min or px0), max(py0, y_min or py0),
+                    min(px1, x_max or px1), min(py1, y_max or py1),
+                ))
+            patch_bounds = filtered or None
 
-        poly_out   = os.path.join(out_dir, "cell-polygons.geojson.gz")
-        meta_out   = os.path.join(out_dir, "cell-metadata.csv.gz")
-        tx_meta_out = os.path.join(out_dir, "transcript-metadata.csv.gz")
+        if patch_bounds:
+            n_patches = len(patch_bounds)
+            print(f"  Proseg: using {n_patches} sopa patch(es)", flush=True)
+            _set("running", "Loading transcripts for patch-based Proseg…")
+            tx_all = pd.read_parquet(tx_src)
+            if x_min is not None: tx_all = tx_all[tx_all["x_location"] >= x_min]
+            if x_max is not None: tx_all = tx_all[tx_all["x_location"] <= x_max]
+            if y_min is not None: tx_all = tx_all[tx_all["y_location"] >= y_min]
+            if y_max is not None: tx_all = tx_all[tx_all["y_location"] <= y_max]
 
-        cmd = [proseg_bin, "--xenium", tx_path,
-               "--output-cell-polygons",        poly_out,
-               "--output-cell-metadata",        meta_out,
-               "--output-transcript-metadata",  tx_meta_out]
-        if voxel_size:
-            cmd += ["--voxel-size", str(voxel_size)]
-        if n_threads:
-            cmd += ["--nthreads", str(n_threads)]
+            all_cells: list   = []
+            all_bounds: dict  = {}
+            all_tx_meta: list = []
+            CELL_ID_STRIDE    = 10_000_000  # max cells per patch
+            cell_offset       = 1
 
-        print(f"  Proseg cmd: {' '.join(cmd)}", flush=True)
-        _set("running", "Running Proseg…")
-        proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, cwd=out_dir,
-        )
-        last_line = ""
-        for line in proc.stdout:
-            line = _strip_ansi(line).rstrip()
-            if line:
-                print(f"  [proseg] {line}", flush=True)
-                last_line = line
-            _set("running", f"Running Proseg… {last_line[:60]}")
-        proc.wait()
-        if proc.returncode != 0:
-            _set("error", f"Proseg exited with code {proc.returncode}. Check console.")
-            return
-
-        # ── Parse cell metadata → centroids & counts ─────────────────────
-        _set("running", "Loading Proseg results…")
-        import gzip
-        cell_meta = pd.read_csv(meta_out)
-        # cell-metadata.csv.gz columns: cell, centroid_x, centroid_y, population, …
-        cells_df = cell_meta.rename(columns={
-            "cell":        "cell_id",
-            "centroid_x":  "x_centroid",
-            "centroid_y":  "y_centroid",
-            "population":  "transcript_counts",
-        }).set_index("cell_id")[["x_centroid", "y_centroid", "transcript_counts"]]
-
-        # ── Parse cell polygons GeoJSON ───────────────────────────────────
-        # Geometry type is MultiPolygon; take the largest ring per cell.
-        cell_bounds: dict = {}
-        if os.path.exists(poly_out):
-            with gzip.open(poly_out, "rt") as f:
-                gj = json.load(f)
-            for feat in gj.get("features", []):
-                props = feat.get("properties", {})
-                cid   = props.get("cell") if props.get("cell") is not None else props.get("id")
-                geom  = feat.get("geometry", {})
-                gtype = geom.get("type")
-                if cid is None:
+            for pi, (px0, py0, px1, py1) in enumerate(patch_bounds):
+                _set("running", f"Proseg patch {pi + 1}/{n_patches}…")
+                tx_patch = tx_all[
+                    (tx_all["x_location"] >= px0) & (tx_all["x_location"] <= px1) &
+                    (tx_all["y_location"] >= py0) & (tx_all["y_location"] <= py1)
+                ]
+                if len(tx_patch) < 10:
+                    print(f"  Proseg: patch {pi + 1} has too few transcripts — skipping", flush=True)
                     continue
-                if gtype == "Polygon":
-                    rings = [geom["coordinates"][0]]
-                elif gtype == "MultiPolygon":
-                    # Flatten all rings; pick the largest by point count
-                    rings = [poly[0] for poly in geom["coordinates"]]
-                else:
-                    continue
-                ring = max(rings, key=len)
-                vx = np.array([p[0] for p in ring], dtype=np.float32)
-                vy = np.array([p[1] for p in ring], dtype=np.float32)
-                cell_bounds[cid] = (vx, vy)
-            print(f"  Proseg: loaded {len(cell_bounds):,} polygons", flush=True)
+                print(f"  Proseg: patch {pi + 1}/{n_patches}: {len(tx_patch):,} transcripts", flush=True)
 
-        # Build cell × gene expression matrix from transcript metadata
-        _set("running", "Building expression matrix…")
-        expr_mat = None
-        gene_names_list = list(DATA["gene_names"])
-        tx_meta_path = os.path.join(out_dir, "transcript-metadata.csv.gz")
-        if os.path.exists(tx_meta_path):
-            try:
-                tx_meta = pd.read_csv(tx_meta_path)
-                gene_col = "gene" if "gene" in tx_meta.columns else None
-                cell_col = "cell" if "cell" in tx_meta.columns else None
-                if gene_col and cell_col:
-                    gene_to_idx = {g: i for i, g in enumerate(gene_names_list)}
-                    cell_to_row = {c: i for i, c in enumerate(cells_df.index)}
-                    tx_assigned = tx_meta[tx_meta[cell_col].notna()]
-                    valid_mask = tx_assigned[gene_col].isin(gene_to_idx) & tx_assigned[cell_col].isin(cell_to_row)
-                    tx_valid = tx_assigned[valid_mask]
-                    rows = tx_valid[cell_col].map(cell_to_row).astype(int).values
-                    cols = tx_valid[gene_col].map(gene_to_idx).astype(int).values
-                    expr_mat = sp.csr_matrix(
-                        (np.ones(len(rows), dtype=np.float32), (rows, cols)),
-                        shape=(len(cells_df), len(gene_names_list))
+                patch_dir = os.path.join(out_dir, f"patch_{pi:04d}")
+                try:
+                    cells_i, bounds_i, tx_meta_i = _proseg_run_single(
+                        tx_patch, patch_dir, proseg_bin, voxel_size, n_threads
                     )
-                    print(f"  Proseg: built expression matrix {expr_mat.shape}", flush=True)
-            except Exception as exc:
-                print(f"  Proseg: could not build expression matrix: {exc}", flush=True)
+                except Exception as pe:
+                    print(f"  Proseg: patch {pi + 1} failed: {pe}", flush=True)
+                    continue
+
+                # Boundary resolution: keep cells with centroid in this patch
+                in_patch = (
+                    (cells_i["x_centroid"] >= px0) & (cells_i["x_centroid"] < px1) &
+                    (cells_i["y_centroid"] >= py0) & (cells_i["y_centroid"] < py1)
+                )
+                cells_i  = cells_i[in_patch]
+                valid_ids = set(cells_i.index)
+
+                # Remap integer cell IDs with per-patch stride
+                remap = {old: old + cell_offset for old in valid_ids}
+                cells_i.index = pd.Index([remap[c] for c in cells_i.index], name="cell_id")
+                all_cells.append(cells_i)
+                for old_id, bnd in bounds_i.items():
+                    if old_id in valid_ids:
+                        all_bounds[remap[old_id]] = bnd
+                if tx_meta_i is not None:
+                    cell_col = "cell" if "cell" in tx_meta_i.columns else None
+                    if cell_col:
+                        tx_meta_i = tx_meta_i[tx_meta_i[cell_col].isin(valid_ids)].copy()
+                        tx_meta_i[cell_col] = tx_meta_i[cell_col].map(remap)
+                    all_tx_meta.append(tx_meta_i)
+                cell_offset += CELL_ID_STRIDE
+
+            if not all_cells:
+                _set("error", "No cells found across all patches. Check Proseg output.")
+                return
+
+            cells_df       = pd.concat(all_cells)
+            cell_bounds    = all_bounds
+            tx_meta_merged = pd.concat(all_tx_meta) if all_tx_meta else None
+            print(f"  Proseg: merged {len(cells_df):,} cells from {n_patches} patch(es)", flush=True)
+
+        else:
+            # ── Single run (no patches or no sopa data) ───────────────────
+            if any(v is not None for v in [x_min, x_max, y_min, y_max]):
+                _set("running", "Filtering transcripts to region…")
+                tx = pd.read_parquet(tx_src)
+                if x_min is not None: tx = tx[tx["x_location"] >= x_min]
+                if x_max is not None: tx = tx[tx["x_location"] <= x_max]
+                if y_min is not None: tx = tx[tx["y_location"] >= y_min]
+                if y_max is not None: tx = tx[tx["y_location"] <= y_max]
+                print(f"  Proseg: filtered to {len(tx):,} transcripts", flush=True)
+            else:
+                tx = pd.read_parquet(tx_src)
+
+            _set("running", "Running Proseg…")
+            try:
+                cells_df, cell_bounds, tx_meta_merged = _proseg_run_single(
+                    tx, out_dir, proseg_bin, voxel_size, n_threads
+                )
+            except Exception as e:
+                _set("error", str(e)[:300])
+                return
+
+        # ── Build expression matrix ───────────────────────────────────────
+        _set("running", "Building expression matrix…")
+        expr_mat = _build_proseg_expr(tx_meta_merged, cells_df)
 
         n_cells = len(cells_df)
+        import json as _json
+        _params_out = {
+            "tool": "proseg", "voxel_size": voxel_size, "n_threads": n_threads,
+            "x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max,
+            "n_cells": n_cells, "param_tag": _param_tag,
+        }
+        with open(os.path.join(out_dir, "params.json"), "w") as _f:
+            _json.dump(_params_out, _f)
         _set("done", f"Done — {n_cells:,} cells", result={
             "cells_df":    cells_df,
             "cell_bounds": cell_bounds,
@@ -836,9 +1158,14 @@ def _run_reseg_umap() -> None:
         # UMAP — prefer umap-learn, fall back to t-SNE
         _set("running", "Running UMAP…")
         try:
-            import umap as umap_lib
-            reducer = umap_lib.UMAP(n_neighbors=min(15, n_cells - 1),
-                                    min_dist=0.1, random_state=0)
+            import sys, types
+            # Stub tensorflow so umap/__init__.py can load parametric_umap without
+            # crashing on the NumPy 1.x vs 2.x ABI mismatch in the installed TF.
+            if "tensorflow" not in sys.modules:
+                sys.modules["tensorflow"] = types.ModuleType("tensorflow")
+            from umap.umap_ import UMAP
+            reducer = UMAP(n_neighbors=min(15, n_cells - 1),
+                           min_dist=0.1, random_state=0)
             embedding = reducer.fit_transform(pca_coords)
         except ImportError:
             from sklearn.manifold import TSNE
@@ -1013,7 +1340,19 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str) -> None:
         import tempfile
         import scipy.io as sio
         import rpy2.robjects as ro
+        import rpy2.robjects.conversion as _rconv
         from rpy2.robjects.packages import importr
+
+        # Ensure rpy2 conversion rules are active in this thread's context.
+        # Dash callbacks run in threads where the rpy2 ContextVar may be unset.
+        try:
+            if _rconv._get_cv().get(None) is None:
+                _rconv.activate(ro.default_converter)
+        except Exception:
+            try:
+                _rconv.activate(ro.default_converter)
+            except Exception:
+                pass
 
         # ── Load reference gene list ─────────────────────────────────────
         _set("running", "Opening Seurat reference (this may take a few minutes)…")
@@ -1993,6 +2332,10 @@ else:
 
 DATA = load_xenium_data(DATA_DIR)
 
+# ─── Extra datasets for multi-sample display ──────────────────────────────────
+# Each entry is like DATA but with an added "x_offset" key (µm shift on x-axis).
+EXTRA_DATASETS: list = []
+
 
 # ─── Data helpers ─────────────────────────────────────────────────────────────
 def get_gene_expression(gene: str) -> np.ndarray:
@@ -2182,6 +2525,7 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
         bres = _baysor_state["result"] if baysor_active and not pres and _baysor_state["result"] else None
 
     alt_res = pres or bres
+    _separator_shapes = []   # populated later for multi-sample mode
     if alt_res is not None:
         source_label = " [Proseg]" if pres else " [Baysor]"
         labels_key   = _annot_state.get("_active_labels_key") or ("labels_proseg" if pres else "labels_baysor")
@@ -2250,36 +2594,206 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
         y   = -df["y_centroid"].values   # y_centroid is in µm, negate for plot
         source_label    = ""
 
-        # ── Cell scatter traces ──────────────────────────────────────────
-        if color_by == "cluster":
-            traces, show_legend = _categorical_traces(x, y, df, method, size, opacity), True
-        elif color_by == "cell_type":
-            traces, show_legend = _cell_type_traces(x, y, df, size, opacity, "spatial"), True
-        elif color_by == "gene":
-            vals = get_gene_expression(gene)
-            traces = [go.Scattergl(
-                x=x, y=y, mode="markers",
-                marker=dict(size=size, color=vals, colorscale="Plasma", opacity=opacity,
-                            showscale=True,
-                            colorbar=dict(title=f"{gene}<br>(log1p)", thickness=12, len=0.5, x=1.02)),
-                text=df.index.tolist(), customdata=df.index.tolist(),
-                hovertemplate="<b>%{text}</b><br>" + gene + ": %{marker.color:.2f}<extra></extra>",
-                name=gene,
-            )]
-            show_legend = False
+        # ── Multi-sample: merge extra datasets ──────────────────────────
+        if EXTRA_DATASETS:
+            # Concatenate extra datasets into combined arrays
+            all_x       = [x]
+            all_y       = [y]
+            all_ids     = [df.index.tolist()]
+            all_dfs     = [df]
+            all_offsets = [0.0]
+            for eds in EXTRA_DATASETS:
+                edf    = eds["df"]
+                offset = eds["x_offset"]
+                all_x.append(edf["x_centroid"].values + offset)
+                all_y.append(-edf["y_centroid"].values)
+                all_ids.append(edf.index.tolist())
+                all_dfs.append(edf)
+                all_offsets.append(offset)
+
+            x_combined   = np.concatenate(all_x)
+            y_combined   = np.concatenate(all_y)
+            ids_combined = [cid for chunk in all_ids for cid in chunk]
+
+            # Build per-sample separator annotations (vertical dashed lines)
+            _separator_shapes = []
+            for eds in EXTRA_DATASETS:
+                sep_x = eds["x_offset"] - 250  # midpoint of gap
+                _separator_shapes.append(dict(
+                    type="line", x0=sep_x, x1=sep_x,
+                    y0=0, y1=1, yref="paper",
+                    line=dict(color=MUTED, width=1, dash="dot"),
+                ))
+
+            # Build color values across all datasets
+            if color_by == "cluster":
+                # Combine cluster IDs per dataset — use dataset index as prefix to avoid collisions
+                all_clust_vals  = []
+                all_clust_names = []
+                cmap_combined   = {}
+                color_idx       = 0
+                for di, (edf, offset) in enumerate(zip(all_dfs, all_offsets)):
+                    _method = method or (edf.get("cluster_methods", [None])[0]
+                                         if hasattr(edf, "get") else None)
+                    # edf is a plain DataFrame; cluster_methods come from DATA or EXTRA_DATASETS[di-1]
+                    ds = DATA if di == 0 else EXTRA_DATASETS[di - 1]
+                    _method = method if method in ds.get("cluster_methods", []) else (ds.get("cluster_methods") or [method])[0]
+                    col_name = f"clust__{_method}"
+                    if col_name in edf.columns:
+                        raw_vals = edf[col_name].values
+                        # Prefix dataset index so cluster IDs don't collide across samples
+                        prefixed = [f"S{di}:C{v}" for v in raw_vals]
+                        all_clust_vals.extend(prefixed)
+                        for pv in prefixed:
+                            if pv not in cmap_combined:
+                                cmap_combined[pv] = CLUSTER_COLORS[color_idx % len(CLUSTER_COLORS)]
+                                color_idx += 1
+                        all_clust_names.extend(prefixed)
+                    else:
+                        placeholders = [f"S{di}:C0"] * len(edf)
+                        all_clust_vals.extend(placeholders)
+                        all_clust_names.extend(placeholders)
+
+                # Build one trace per unique cluster-label across all samples
+                unique_labels = list(dict.fromkeys(all_clust_vals))
+                arr_x   = x_combined
+                arr_y   = y_combined
+                arr_ids = np.array(ids_combined)
+                arr_lbl = np.array(all_clust_vals)
+                traces  = []
+                for lbl in unique_labels:
+                    mask = arr_lbl == lbl
+                    traces.append(go.Scattergl(
+                        x=arr_x[mask], y=arr_y[mask], mode="markers",
+                        marker=dict(size=size, color=cmap_combined[lbl], opacity=opacity),
+                        name=lbl, legendgroup=lbl, showlegend=True,
+                        text=arr_ids[mask].tolist(),
+                        customdata=arr_ids[mask].tolist(),
+                        hovertemplate="<b>%{text}</b><extra>" + lbl + "</extra>",
+                    ))
+                show_legend = True
+
+            elif color_by == "cell_type":
+                # Combine cell type labels from each dataset's annotation state
+                all_labels_list = []
+                with _annot_lock:
+                    primary_labels = _annot_state.get("labels")
+                for di, edf in enumerate(all_dfs):
+                    if di == 0:
+                        lbl_series = primary_labels
+                    else:
+                        lbl_series = EXTRA_DATASETS[di - 1].get("_cell_type_labels")
+                    if lbl_series is not None:
+                        aligned = lbl_series.reindex(edf.index).fillna("Unknown")
+                        all_labels_list.extend(aligned.tolist())
+                    else:
+                        all_labels_list.extend(["Unknown"] * len(edf))
+
+                arr_lbl  = np.array(all_labels_list)
+                arr_x    = x_combined
+                arr_y    = y_combined
+                arr_ids  = np.array(ids_combined)
+                cell_types = sorted(set(all_labels_list))
+                cmap = {ct: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, ct in enumerate(cell_types)}
+                traces = []
+                for ct in cell_types:
+                    mask = arr_lbl == ct
+                    traces.append(go.Scattergl(
+                        x=arr_x[mask], y=arr_y[mask], mode="markers",
+                        marker=dict(size=size, color=cmap[ct], opacity=opacity),
+                        name=ct, legendgroup=ct, showlegend=True,
+                        text=arr_ids[mask].tolist(),
+                        customdata=arr_ids[mask].tolist(),
+                        hovertemplate="<b>%{text}</b><extra>" + ct + "</extra>",
+                    ))
+                show_legend = True
+
+            elif color_by == "gene":
+                # Collect expression per dataset
+                all_vals = []
+                for di, edf in enumerate(all_dfs):
+                    if di == 0:
+                        all_vals.append(get_gene_expression(gene))
+                    else:
+                        eds = EXTRA_DATASETS[di - 1]
+                        g_idx = eds.get("gene_name_to_idx", {}).get(gene)
+                        if g_idx is not None:
+                            raw  = eds["expr"][:, g_idx].toarray().flatten()
+                            idx_ = eds["df_to_expr"]
+                            vals_i = np.where(idx_ >= 0, raw[np.clip(idx_, 0, len(raw) - 1)], 0.0)
+                            all_vals.append(np.log1p(vals_i))
+                        else:
+                            all_vals.append(np.zeros(len(edf)))
+                vals_combined = np.concatenate(all_vals)
+                traces = [go.Scattergl(
+                    x=x_combined, y=y_combined, mode="markers",
+                    marker=dict(size=size, color=vals_combined, colorscale="Plasma", opacity=opacity,
+                                showscale=True,
+                                colorbar=dict(title=f"{gene}<br>(log1p)", thickness=12, len=0.5, x=1.02)),
+                    text=ids_combined, customdata=ids_combined,
+                    hovertemplate="<b>%{text}</b><br>" + gene + ": %{marker.color:.2f}<extra></extra>",
+                    name=gene,
+                )]
+                show_legend = False
+
+            else:
+                # QC / numeric column
+                label = QC_METRICS.get(color_by, color_by)
+                cs    = COLORSCALES.get(color_by, "Viridis")
+                all_vals = []
+                for edf in all_dfs:
+                    if color_by in edf.columns:
+                        all_vals.append(edf[color_by].values)
+                    else:
+                        all_vals.append(np.zeros(len(edf)))
+                vals_combined = np.concatenate(all_vals)
+                traces = [go.Scattergl(
+                    x=x_combined, y=y_combined, mode="markers",
+                    marker=dict(size=size, color=vals_combined, colorscale=cs, opacity=opacity,
+                                showscale=True,
+                                colorbar=dict(title=label, thickness=12, len=0.5, x=1.02)),
+                    text=ids_combined, customdata=ids_combined,
+                    hovertemplate="<b>%{text}</b><br>" + label + ": %{marker.color:.2f}<extra></extra>",
+                    name=label,
+                )]
+                show_legend = False
+
+            source_label = f" [{len(EXTRA_DATASETS) + 1} samples]"
+
         else:
-            label = QC_METRICS.get(color_by, color_by)
-            traces = [go.Scattergl(
-                x=x, y=y, mode="markers",
-                marker=dict(size=size, color=df[color_by].values,
-                            colorscale=COLORSCALES.get(color_by, "Viridis"),
-                            opacity=opacity, showscale=True,
-                            colorbar=dict(title=label, thickness=12, len=0.5, x=1.02)),
-                text=df.index.tolist(), customdata=df.index.tolist(),
-                hovertemplate="<b>%{text}</b><br>" + label + ": %{marker.color:.2f}<extra></extra>",
-                name=label,
-            )]
-            show_legend = False
+            # ── Single sample (no extra datasets) ───────────────────────
+            # _separator_shapes already = [] from function-level init
+
+            # ── Cell scatter traces ──────────────────────────────────────────
+            if color_by == "cluster":
+                traces, show_legend = _categorical_traces(x, y, df, method, size, opacity), True
+            elif color_by == "cell_type":
+                traces, show_legend = _cell_type_traces(x, y, df, size, opacity, "spatial"), True
+            elif color_by == "gene":
+                vals = get_gene_expression(gene)
+                traces = [go.Scattergl(
+                    x=x, y=y, mode="markers",
+                    marker=dict(size=size, color=vals, colorscale="Plasma", opacity=opacity,
+                                showscale=True,
+                                colorbar=dict(title=f"{gene}<br>(log1p)", thickness=12, len=0.5, x=1.02)),
+                    text=df.index.tolist(), customdata=df.index.tolist(),
+                    hovertemplate="<b>%{text}</b><br>" + gene + ": %{marker.color:.2f}<extra></extra>",
+                    name=gene,
+                )]
+                show_legend = False
+            else:
+                label = QC_METRICS.get(color_by, color_by)
+                traces = [go.Scattergl(
+                    x=x, y=y, mode="markers",
+                    marker=dict(size=size, color=df[color_by].values,
+                                colorscale=COLORSCALES.get(color_by, "Viridis"),
+                                opacity=opacity, showscale=True,
+                                colorbar=dict(title=label, thickness=12, len=0.5, x=1.02)),
+                    text=df.index.tolist(), customdata=df.index.tolist(),
+                    hovertemplate="<b>%{text}</b><br>" + label + ": %{marker.color:.2f}<extra></extra>",
+                    name=label,
+                )]
+                show_legend = False
 
     # ── Boundary overlay traces ──────────────────────────────────────────
     boundary_toggles = boundary_toggles or []
@@ -2341,7 +2855,7 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
     fig = go.Figure(data=traces)
     if morph_image:
         fig.update_layout(images=[morph_image])
-    fig.update_layout(
+    layout_kwargs = dict(
         **_base_layout(title_text, "X (µm)", "Y (µm)", equal_aspect=True),
         showlegend=show_legend,
         legend=dict(
@@ -2351,6 +2865,9 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
         ),
         uirevision="spatial",
     )
+    if _separator_shapes:
+        layout_kwargs["shapes"] = _separator_shapes
+    fig.update_layout(**layout_kwargs)
     # Explicitly preserve viewport ranges to prevent zoom resets on figure rebuild
     if relayout:
         rx0 = relayout.get("xaxis.range[0]")
@@ -2541,6 +3058,49 @@ def _sdata_summary(sdata) -> str:
     return f"{n_tx:,} transcripts | images: {', '.join(images) or 'none'}"
 
 
+def _save_sdata_to_disk(save_path: str) -> None:
+    """Background thread: write current SpatialData + analysis results to disk."""
+    def _set(status, msg):
+        with _save_sdata_lock:
+            _save_sdata_state["status"]  = status
+            _save_sdata_state["message"] = msg
+
+    try:
+        with _sdata_lock:
+            sdata = _sdata_state.get("sdata")
+        if sdata is None:
+            _set("error", "No SpatialData loaded. Open 'Resegment Cells' first to build it.")
+            return
+
+        import spatialdata as sd
+        _set("running", f"Writing to {save_path}…")
+        print(f"  save_spatialdata: writing to {save_path}…", flush=True)
+
+        # Attach analysis results to sdata table if present
+        if "table" in sdata.tables:
+            tbl = sdata.tables["table"]
+            df  = DATA.get("df")
+            if df is not None and "cell_id" in tbl.obs.columns:
+                # Cluster labels
+                for method in DATA.get("cluster_methods", []):
+                    if method in df.columns:
+                        mapping = df.set_index("cell_id")[method].to_dict()
+                        tbl.obs[method] = tbl.obs["cell_id"].map(mapping)
+                # Cell-type annotation
+                with _annot_lock:
+                    labels = _annot_state.get("labels")
+                if labels is not None and "cell_id" in labels.columns and "cell_type" in labels.columns:
+                    ct_map = dict(zip(labels["cell_id"], labels["cell_type"]))
+                    tbl.obs["cell_type"] = tbl.obs["cell_id"].map(ct_map)
+
+        sdata.write(save_path, overwrite=True)
+        print(f"  save_spatialdata: done → {save_path}", flush=True)
+        _set("done", f"Saved to {save_path}")
+    except Exception as exc:
+        import traceback; traceback.print_exc()
+        _set("error", str(exc)[:300])
+
+
 def _sdata_autoload() -> None:
     """If a Zarr cache exists for this dataset, load it into _sdata_state at startup."""
     cache = _sdata_cache_path()
@@ -2562,6 +3122,150 @@ def _sdata_autoload() -> None:
         print(f"  SpatialData: auto-loaded from cache — {summary}", flush=True)
     except Exception as exc:
         print(f"  SpatialData: auto-load failed: {exc}", flush=True)
+
+
+# ─── Cache utilities ───────────────────────────────────────────────────────────
+
+def _cache_dir() -> str:
+    return os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache")
+
+
+def _cache_size_str() -> str:
+    """Return human-readable total size of the cache directory."""
+    cache = _cache_dir()
+    if not os.path.isdir(cache):
+        return "0 B"
+    total = 0
+    for root, dirs, files in os.walk(cache):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if total < 1024 or unit == "TB":
+            return f"{total:.1f} {unit}" if unit != "B" else f"{total} B"
+        total /= 1024
+    return f"{total:.1f} TB"
+
+
+def _format_seg_label(tool: str, params: dict) -> str:
+    """Format a human-readable label for a cached segmentation run."""
+    if tool == "baysor":
+        parts = [f"r={params.get('scale', '?')}µm", f"min={params.get('min_mol', '?')}tx"]
+        if params.get("use_prior"):
+            parts.append(f"prior={params.get('prior_conf', '?')}")
+        x_min, x_max = params.get("x_min"), params.get("x_max")
+        y_min, y_max = params.get("y_min"), params.get("y_max")
+        if any(v is not None for v in [x_min, x_max, y_min, y_max]):
+            parts.append(f"x={x_min}-{x_max} y={y_min}-{y_max}µm")
+        else:
+            parts.append("full slide")
+        n = params.get("n_cells")
+        if n:
+            parts.append(f"{n:,} cells")
+        return "Baysor: " + ", ".join(parts)
+    else:
+        parts = []
+        vs = params.get("voxel_size")
+        parts.append(f"voxel={'auto' if not vs else str(vs)+'µm'}")
+        x_min, x_max = params.get("x_min"), params.get("x_max")
+        y_min, y_max = params.get("y_min"), params.get("y_max")
+        if any(v is not None for v in [x_min, x_max, y_min, y_max]):
+            parts.append(f"x={x_min}-{x_max} y={y_min}-{y_max}µm")
+        else:
+            parts.append("full slide")
+        n = params.get("n_cells")
+        if n:
+            parts.append(f"{n:,} cells")
+        return "Proseg: " + ", ".join(parts)
+
+
+def _list_cached_seg_runs() -> list:
+    """Return list of {label, value} dicts for all complete cached Baysor/Proseg runs for the current dataset."""
+    cache_base = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache")
+    dataset = os.path.basename(DATA.get("data_dir", ""))
+    opts = []
+    if not os.path.isdir(cache_base):
+        return opts
+    for entry in sorted(os.listdir(cache_base)):
+        out_dir = os.path.join(cache_base, entry)
+        if not os.path.isdir(out_dir):
+            continue
+        # Determine tool
+        if entry.startswith(f"baysor_{dataset}_"):
+            tool = "baysor"
+            param_tag = entry[len(f"baysor_{dataset}_"):]
+            # Check completeness: any segmentation.csv anywhere in the tree
+            complete = any(
+                "segmentation.csv" in files
+                for _, _, files in os.walk(out_dir)
+            )
+        elif entry.startswith(f"proseg_{dataset}_"):
+            tool = "proseg"
+            param_tag = entry[len(f"proseg_{dataset}_"):]
+            complete = any(
+                "cell-metadata.csv.gz" in files
+                for _, _, files in os.walk(out_dir)
+            )
+        else:
+            continue
+        if not complete:
+            continue
+        params_path = os.path.join(out_dir, "params.json")
+        if os.path.exists(params_path):
+            with open(params_path) as f:
+                params = json.load(f)
+            label = _format_seg_label(tool, params)
+        else:
+            label = f"{tool.capitalize()}: [{param_tag}]"
+        opts.append({"label": label, "value": f"{tool}:{param_tag}", "out_dir": out_dir, "param_tag": param_tag})
+    return opts
+
+
+def _clean_cache_for_dataset() -> str:
+    """Delete all cache entries that belong to the current dataset. Returns summary string."""
+    cache = _cache_dir()
+    if not os.path.isdir(cache):
+        return "Cache directory not found."
+    tag = hashlib.md5(DATA["data_dir"].encode()).hexdigest()[:8]
+    dataset_name = os.path.basename(DATA["data_dir"])
+    removed = 0
+    import shutil
+    for entry in os.listdir(cache):
+        full = os.path.join(cache, entry)
+        # Match files/dirs that contain the dataset tag or dataset name
+        if tag in entry or dataset_name in entry:
+            try:
+                if os.path.isdir(full):
+                    shutil.rmtree(full)
+                else:
+                    os.remove(full)
+                removed += 1
+            except Exception as e:
+                print(f"  clean_cache: could not remove {entry}: {e}", flush=True)
+    print(f"  clean_cache: removed {removed} cache entries for dataset {dataset_name}", flush=True)
+    return f"Removed {removed} cache entries for {dataset_name}."
+
+
+def _available_samples() -> list:
+    """Scan CWD and parent for output-XETG* directories containing experiment.xenium."""
+    candidates = []
+    search_dirs = [os.getcwd(), os.path.dirname(os.path.abspath(__file__))]
+    seen = set()
+    for base in search_dirs:
+        try:
+            entries = sorted(os.listdir(base))
+        except Exception:
+            continue
+        for entry in entries:
+            full = os.path.join(base, entry)
+            if (entry.startswith("output-") and os.path.isdir(full)
+                    and os.path.exists(os.path.join(full, "experiment.xenium"))
+                    and full not in seen):
+                seen.add(full)
+                candidates.append({"label": entry, "value": full})
+    return candidates
 
 
 def to_spatialdata(qv_threshold: int = 20, force: bool = False) -> None:
@@ -2779,8 +3483,40 @@ def create_patches(width_um: float = 1000.0, min_transcripts: int = 10) -> None:
     threading.Thread(target=_run, daemon=True).start()
 
 
+def _sdata_transform_to_um(gdf):
+    """Transform a SpatialData GeoDataFrame from its intrinsic coordinate system
+    to µm by applying the registered transform to the global coordinate system
+    (morphology image pixels) and then scaling by PIXEL_SIZE_UM.
+
+    Returns a new GeoDataFrame with coordinates in µm.
+    """
+    try:
+        import shapely.affinity
+        import geopandas as gpd
+        from spatialdata.transformations import get_transformation
+        t = get_transformation(gdf, to_coordinate_system="global")
+        # Get the 3×3 affine matrix [x, y, 1] (row=output, col=input)
+        M = t.to_affine_matrix(input_axes=("x", "y"), output_axes=("x", "y"))
+        # M transforms intrinsic coords → global pixel coords
+        # Compose with PIXEL_SIZE_UM to go directly to µm
+        sx = M[0, 0] * PIXEL_SIZE_UM
+        sy = M[1, 1] * PIXEL_SIZE_UM
+        tx = M[0, 2] * PIXEL_SIZE_UM
+        ty = M[1, 2] * PIXEL_SIZE_UM
+        geoms_um = [
+            shapely.affinity.affine_transform(g, [sx, M[0, 1] * PIXEL_SIZE_UM,
+                                                   M[1, 0] * PIXEL_SIZE_UM, sy,
+                                                   tx, ty])
+            for g in gdf.geometry
+        ]
+        return gpd.GeoDataFrame(geometry=geoms_um)
+    except Exception as exc:
+        print(f"  _sdata_transform_to_um failed: {exc}, using raw coordinates", flush=True)
+        return gdf
+
+
 def _sdata_overlays_to_shapes(show_roi: bool, show_patches: bool) -> list:
-    """Extract ROI polygon and/or patch grid as Plotly layout shapes."""
+    """Extract ROI polygon and/or patch grid as Plotly layout shapes (in µm)."""
     shapes = []
     with _sdata_lock:
         roi     = _sdata_state.get("roi")
@@ -2788,7 +3524,8 @@ def _sdata_overlays_to_shapes(show_roi: bool, show_patches: bool) -> list:
 
     if show_roi and roi is not None:
         try:
-            for geom in roi.geometry:
+            roi_um = _sdata_transform_to_um(roi)
+            for geom in roi_um.geometry:
                 coords = list(geom.exterior.coords)
                 xs = [c[0] for c in coords]
                 ys = [-c[1] for c in coords]  # negate Y for plot space
@@ -2807,8 +3544,9 @@ def _sdata_overlays_to_shapes(show_roi: bool, show_patches: bool) -> list:
 
     if show_patches and patches is not None:
         try:
-            for geom in patches.geometry:
-                b = geom.bounds  # (minx, miny, maxx, maxy)
+            patches_um = _sdata_transform_to_um(patches)
+            for geom in patches_um.geometry:
+                b = geom.bounds  # (minx, miny, maxx, maxy) in µm
                 shapes.append(dict(
                     type="rect",
                     x0=b[0], y0=-b[3], x1=b[2], y1=-b[1],  # negate Y
@@ -2834,30 +3572,8 @@ else:
     gene_options = _base_gene_options
 
 sidebar = html.Div([
-    # Header + collapsible tissue info
-    html.Div([
-        html.Div([
-            html.Div("XENIUM EXPLORER", style={
-                "fontSize": "11px", "fontWeight": "700",
-                "letterSpacing": "2px", "color": ACCENT, "marginBottom": "4px",
-            }),
-            html.Div(meta.get("run_name", "—"), style={"fontSize": "13px", "color": TEXT, "fontWeight": "600"}),
-            html.Div(meta.get("region_name", ""), style={"fontSize": "11px", "color": MUTED}),
-        ], style={"marginBottom": "10px"}),
-
-        # Collapsible stats — expand on hover over the tissue section
-        html.Div([
-            html.Hr(style={"borderColor": BORDER, "margin": "0 0 10px 0"}),
-            html.Div([
-                stat_row("Cells",       f"{meta.get('num_cells', 0):,}"),
-                stat_row("Transcripts", f"{meta.get('num_transcripts', 0):,}"),
-                stat_row("Panel",       meta.get("panel_name", "—")),
-                stat_row("Genes",       str(len(gene_names))),
-                stat_row("Tissue",      meta.get("panel_tissue_type", "—")),
-                stat_row("Pixel",       f"{meta.get('pixel_size', PIXEL_SIZE_UM)} µm"),
-            ], style={"marginBottom": "6px"}),
-        ], className="tissue-details"),
-    ], id="tissue-info-section", style={"marginBottom": "14px"}),
+    # Header + collapsible tissue info (rebuilt dynamically on dataset change)
+    html.Div(id="tissue-info-content"),
 
     html.Hr(style={"borderColor": BORDER, "margin": "0 0 14px 0"}),
 
@@ -3044,59 +3760,9 @@ sidebar = html.Div([
 
     # ── Cell type annotation ────────────────────────────────────────────
     ctrl_label("Cell Type Annotation"),
-    dcc.RadioItems(
-        id="annot-source",
-        options=[
-            {"label": html.Span(" CellTypist model", style={"fontSize": "12px", "color": TEXT}),
-             "value": "celltypist"},
-            {"label": html.Span(" Seurat RDS reference", style={"fontSize": "12px", "color": TEXT}),
-             "value": "seurat"},
-        ],
-        value="celltypist",
-        inputStyle={"marginRight": "5px"},
-        labelStyle={"display": "flex", "alignItems": "center", "marginBottom": "5px", "cursor": "pointer"},
-        style={"marginBottom": "8px"},
-    ),
-    # CellTypist controls
-    html.Div(id="annot-celltypist-div", children=[
-        dcc.Dropdown(
-            id="annot-model",
-            options=[{"label": v, "value": k} for k, v in CELLTYPIST_MODELS.items()],
-            value="Healthy_Adult_Heart.pkl",
-            clearable=False,
-            style={"fontSize": "12px", "marginBottom": "8px"},
-        ),
-    ]),
-    # Seurat RDS controls
-    html.Div(id="annot-seurat-div", style={"display": "none"}, children=[
-        ctrl_label("RDS File Path"),
-        dcc.Input(
-            id="annot-rds-path",
-            type="text",
-            value="/Users/ikuz/Documents/XeniumWorkflow/Post_R3_FINAL_with_counts.rds",
-            style={
-                "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
-                "border": f"1px solid {BORDER}", "borderRadius": "4px",
-                "padding": "4px 8px", "fontSize": "11px", "marginBottom": "8px",
-                "boxSizing": "border-box",
-            },
-        ),
-        ctrl_label("Label Column"),
-        dcc.Input(
-            id="annot-label-col",
-            type="text",
-            value="Names",
-            style={
-                "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
-                "border": f"1px solid {BORDER}", "borderRadius": "4px",
-                "padding": "4px 8px", "fontSize": "11px", "marginBottom": "8px",
-                "boxSizing": "border-box",
-            },
-        ),
-    ]),
     html.Button(
-        "Run Annotation",
-        id="annot-btn",
+        "Annotate Cells",
+        id="annot-modal-open-btn",
         n_clicks=0,
         style={
             "width": "100%", "padding": "7px 0",
@@ -3137,48 +3803,9 @@ sidebar = html.Div([
 
     # ── SpaGE gene imputation ───────────────────────────────────────────
     ctrl_label("SpaGE Gene Imputation"),
-    html.Div(
-        "Impute additional genes from snRNA-seq reference using SpaGE.",
-        style={"fontSize": "10px", "color": MUTED, "marginBottom": "8px", "lineHeight": "1.4"},
-    ),
-    ctrl_label("Reference .rds File"),
-    dcc.Input(
-        id="spage-rds-path",
-        type="text",
-        value="/Users/ikuz/Documents/XeniumWorkflow/Post_R3_FINAL_with_counts.rds",
-        debounce=True,
-        style={
-            "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
-            "border": f"1px solid {BORDER}", "borderRadius": "4px",
-            "padding": "4px 8px", "fontSize": "11px", "marginBottom": "8px",
-            "boxSizing": "border-box",
-        },
-    ),
-    ctrl_label("Principal Vectors (n_pv)"),
-    dcc.Slider(
-        id="spage-npv", min=10, max=100, step=5, value=50,
-        marks={10: "10", 50: "50", 100: "100"},
-        tooltip={"placement": "bottom", "always_visible": False},
-    ),
-    html.Div(style={"marginBottom": "8px"}),
-    ctrl_label("Genes to Impute"),
-    html.Div(
-        "Leave empty for top-200 HVG. Paste gene names separated by commas or newlines.",
-        style={"fontSize": "10px", "color": MUTED, "marginBottom": "4px", "lineHeight": "1.4"},
-    ),
-    dcc.Textarea(
-        id="spage-genes",
-        placeholder="e.g. NPPA, MYH7, TNNT2",
-        style={
-            "width": "100%", "height": "70px", "backgroundColor": CARD_BG,
-            "color": TEXT, "border": f"1px solid {BORDER}", "borderRadius": "4px",
-            "padding": "4px 8px", "fontSize": "11px", "marginBottom": "8px",
-            "boxSizing": "border-box", "resize": "vertical",
-        },
-    ),
     html.Button(
-        "Run SpaGE",
-        id="spage-run-btn",
+        "Impute Genes",
+        id="spage-modal-open-btn",
         n_clicks=0,
         style={
             "width": "100%", "padding": "7px 0",
@@ -3190,114 +3817,6 @@ sidebar = html.Div([
     ),
     html.Div(id="spage-status", style={"fontSize": "11px", "color": MUTED, "minHeight": "16px", "marginBottom": "6px"}),
     dcc.Interval(id="spage-poll", interval=3000, disabled=True),
-
-    html.Hr(style={"borderColor": BORDER, "margin": "14px 0"}),
-
-    # ── Sopa / SpatialData ─────────────────────────────────────────────────
-    html.Div([
-        ctrl_label("Sopa / SpatialData"),
-        html.Div(
-            "Convert to SpatialData for tissue ROI and patch-based resegmentation.",
-            style={"fontSize": "10px", "color": MUTED, "marginBottom": "6px", "lineHeight": "1.4"},
-        ),
-        html.Div([  # collapsible details
-            ctrl_label("QV Threshold"),
-            dcc.Slider(
-                id="sdata-qv", min=0, max=40, step=5, value=20,
-                marks={0: "0", 20: "20", 40: "40"},
-                tooltip={"placement": "bottom", "always_visible": False},
-            ),
-            html.Div(style={"marginBottom": "10px"}),
-            html.Div([
-                html.Button(
-                    "Convert to SpatialData",
-                    id="sdata-convert-btn", n_clicks=0,
-                    style={
-                        "flex": "1", "padding": "7px 0",
-                        "backgroundColor": "#1f6feb", "color": "#fff",
-                        "border": "none", "borderRadius": "5px",
-                        "cursor": "pointer", "fontSize": "13px", "fontWeight": "600",
-                    },
-                ),
-                html.Button(
-                    "↺",
-                    id="sdata-clear-cache-btn", n_clicks=0,
-                    title="Clear disk cache and re-read from raw files",
-                    style={
-                        "padding": "7px 10px", "marginLeft": "4px",
-                        "backgroundColor": CARD_BG, "color": MUTED,
-                        "border": f"1px solid {BORDER}", "borderRadius": "5px",
-                        "cursor": "pointer", "fontSize": "13px",
-                    },
-                ),
-            ], style={"display": "flex", "marginBottom": "8px"}),
-            html.Button(
-                "Segment Tissue ROI",
-                id="sdata-roi-btn", n_clicks=0,
-                style={
-                    "width": "100%", "padding": "7px 0",
-                    "backgroundColor": CARD_BG, "color": TEXT,
-                    "border": f"1px solid {BORDER}", "borderRadius": "5px",
-                    "cursor": "pointer", "fontSize": "13px", "fontWeight": "600",
-                    "marginBottom": "8px",
-                },
-            ),
-            ctrl_label("Patch Width (µm)"),
-            dcc.Input(
-                id="sdata-patch-width", type="number", value=1000, min=100, max=10000,
-                debounce=True,
-                style={
-                    "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
-                    "border": f"1px solid {BORDER}", "borderRadius": "4px",
-                    "padding": "4px 8px", "fontSize": "11px", "marginBottom": "8px",
-                    "boxSizing": "border-box",
-                },
-            ),
-            ctrl_label("Min Transcripts / Patch"),
-            dcc.Input(
-                id="sdata-patch-min-tx", type="number", value=10, min=1, max=1000,
-                debounce=True,
-                style={
-                    "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
-                    "border": f"1px solid {BORDER}", "borderRadius": "4px",
-                    "padding": "4px 8px", "fontSize": "11px", "marginBottom": "8px",
-                    "boxSizing": "border-box",
-                },
-            ),
-            html.Button(
-                "Create Patches",
-                id="sdata-patches-btn", n_clicks=0,
-                style={
-                    "width": "100%", "padding": "7px 0",
-                    "backgroundColor": CARD_BG, "color": TEXT,
-                    "border": f"1px solid {BORDER}", "borderRadius": "5px",
-                    "cursor": "pointer", "fontSize": "13px", "fontWeight": "600",
-                    "marginBottom": "8px",
-                },
-            ),
-            dcc.Checklist(
-                id="sdata-show-roi",
-                options=[{"label": html.Span(
-                    " Show tissue ROI", style={"fontSize": "12px", "color": "#52b788"},
-                ), "value": "yes"}],
-                value=[],
-                inputStyle={"marginRight": "6px"},
-                labelStyle={"display": "flex", "alignItems": "center", "marginBottom": "4px"},
-            ),
-            dcc.Checklist(
-                id="sdata-show-patches",
-                options=[{"label": html.Span(
-                    " Show patch grid", style={"fontSize": "12px", "color": "#ffa500"},
-                ), "value": "yes"}],
-                value=[],
-                inputStyle={"marginRight": "6px"},
-                labelStyle={"display": "flex", "alignItems": "center", "marginBottom": "4px"},
-            ),
-            dcc.Interval(id="sdata-poll", interval=2000, disabled=True),
-        ], className="collapsible-details"),
-        html.Div(id="sdata-status",
-                 style={"fontSize": "11px", "color": MUTED, "minHeight": "16px", "marginBottom": "6px"}),
-    ], id="sdata-section"),
 
     html.Hr(style={"borderColor": BORDER, "margin": "14px 0"}),
 
@@ -3349,7 +3868,11 @@ app.layout = html.Div([
     dcc.Store(id="annot-done",       data=0),
     dcc.Store(id="baysor-done",      data=0),
     dcc.Store(id="proseg-done",      data=0),
+    dcc.Store(id="reseg-patches-confirmed", data=0),
     dcc.Store(id="spage-done",       data=0),
+    dcc.Store(id="dataset-version",        data=0),
+    dcc.Store(id="extra-datasets-version", data=0),
+    dcc.Store(id="cache-clean-done", data=0),
     dcc.Interval(id="spage-repl-poll", interval=4000, n_intervals=0),  # always-on for REPL-triggered runs
     dcc.Store(id="subset-version",   data=0),
     dcc.Store(id="sdata-done",       data=0),
@@ -3362,15 +3885,135 @@ app.layout = html.Div([
     dbc.Modal([
         dbc.ModalHeader(dbc.ModalTitle("Resegment Cells"), close_button=True),
         dbc.ModalBody([
-            # Algorithm selector tabs
-            dcc.Tabs(id="reseg-algo-tabs", value="baysor", children=[
-                dcc.Tab(label="Baysor", value="baysor", style={"color": TEXT, "backgroundColor": CARD_BG},
-                        selected_style={"color": "#fff", "backgroundColor": "#1f6feb", "fontWeight": "600"}),
-                dcc.Tab(label="Proseg", value="proseg", style={"color": TEXT, "backgroundColor": CARD_BG},
-                        selected_style={"color": "#fff", "backgroundColor": "#2d6a4f", "fontWeight": "600"}),
-            ], style={"marginBottom": "16px"}),
+            # ── Patch Setup ──────────────────────────────────────────────────
+            html.Div([
+                html.Div("Step 1 — Prepare Patches", style={"fontSize": "13px", "fontWeight": "600", "color": TEXT, "marginBottom": "8px"}),
+                html.Div(
+                    "Set parameters then click Prepare Patches. The app will build a SpatialData object, "
+                    "detect the tissue ROI, and partition it into patches. Review the overlays on the "
+                    "spatial plot, then confirm before running segmentation.",
+                    style={"fontSize": "10px", "color": MUTED, "marginBottom": "10px", "lineHeight": "1.4"},
+                ),
+                html.Div([
+                    html.Div([
+                        ctrl_label("QV Threshold"),
+                        dcc.Slider(
+                            id="sdata-qv", min=0, max=40, step=5, value=20,
+                            marks={0: "0", 20: "20", 40: "40"},
+                            tooltip={"placement": "bottom", "always_visible": False},
+                        ),
+                        html.Div(style={"marginBottom": "10px"}),
+                    ], style={"flex": "1"}),
+                    html.Div([
+                        ctrl_label("Patch Width (µm)"),
+                        dcc.Input(
+                            id="sdata-patch-width", type="number", value=1000, min=100, max=10000,
+                            debounce=True,
+                            style={
+                                "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                                "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                "padding": "4px 8px", "fontSize": "11px", "marginBottom": "8px",
+                                "boxSizing": "border-box",
+                            },
+                        ),
+                    ], style={"flex": "1"}),
+                    html.Div([
+                        ctrl_label("Min TX / Patch"),
+                        dcc.Input(
+                            id="sdata-patch-min-tx", type="number", value=10, min=1, max=1000,
+                            debounce=True,
+                            style={
+                                "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                                "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                "padding": "4px 8px", "fontSize": "11px", "marginBottom": "8px",
+                                "boxSizing": "border-box",
+                            },
+                        ),
+                    ], style={"flex": "1"}),
+                ], style={"display": "flex", "gap": "12px", "marginBottom": "6px"}),
+                # Prepare button + status row
+                html.Div([
+                    html.Button(
+                        "▶ Prepare Patches",
+                        id="sdata-prepare-btn", n_clicks=0,
+                        style={
+                            "padding": "6px 14px", "backgroundColor": "#1f6feb", "color": "#fff",
+                            "border": "none", "borderRadius": "4px",
+                            "cursor": "pointer", "fontSize": "12px", "fontWeight": "600",
+                        },
+                    ),
+                    html.Button(
+                        "↺ Re-build",
+                        id="sdata-clear-cache-btn", n_clicks=0,
+                        title="Clear disk cache and re-read from raw files",
+                        style={
+                            "padding": "6px 10px", "backgroundColor": CARD_BG, "color": MUTED,
+                            "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                            "cursor": "pointer", "fontSize": "11px",
+                        },
+                    ),
+                    html.Div(id="sdata-status",
+                             style={"fontSize": "11px", "color": MUTED, "flex": "1", "minHeight": "16px", "alignSelf": "center"}),
+                ], style={"display": "flex", "gap": "6px", "marginBottom": "8px", "alignItems": "center"}),
+                # Overlay checkboxes
+                html.Div([
+                    dcc.Checklist(
+                        id="sdata-show-roi",
+                        options=[{"label": html.Span(" Show tissue ROI", style={"fontSize": "11px", "color": "#52b788"}), "value": "yes"}],
+                        value=[],
+                        inputStyle={"marginRight": "5px"},
+                        labelStyle={"display": "flex", "alignItems": "center"},
+                    ),
+                    dcc.Checklist(
+                        id="sdata-show-patches",
+                        options=[{"label": html.Span(" Show patch grid", style={"fontSize": "11px", "color": "#ffa500"}), "value": "yes"}],
+                        value=[],
+                        inputStyle={"marginRight": "5px"},
+                        labelStyle={"display": "flex", "alignItems": "center"},
+                    ),
+                ], style={"display": "flex", "gap": "20px", "marginBottom": "10px"}),
+                # Confirmation banner (hidden until patches are ready)
+                html.Div(id="reseg-patch-confirm-div", children=[
+                    html.Div(id="reseg-patch-confirm-msg",
+                             style={"fontSize": "11px", "color": "#52b788", "marginBottom": "6px"}),
+                    html.Button(
+                        "✓ Patches look good — proceed to segmentation",
+                        id="reseg-confirm-patches-btn",
+                        n_clicks=0,
+                        style={
+                            "width": "100%", "padding": "7px 0",
+                            "backgroundColor": "#2d6a4f", "color": "#fff",
+                            "border": "none", "borderRadius": "5px",
+                            "cursor": "pointer", "fontSize": "12px", "fontWeight": "600",
+                            "marginBottom": "4px",
+                        },
+                    ),
+                ], style={"display": "none"}),
+                dcc.Interval(id="sdata-poll", interval=2000, disabled=True),
+                # Hidden elements needed by existing callbacks
+                html.Div(id="sdata-convert-btn", style={"display": "none"}),
+                html.Div(id="sdata-roi-btn", style={"display": "none"}),
+                html.Div(id="sdata-patches-btn", style={"display": "none"}),
+            ], style={"backgroundColor": "#161b22", "borderRadius": "6px", "padding": "12px", "marginBottom": "14px"}),
 
-            # ── Baysor settings panel ────────────────────────────────────
+            html.Hr(style={"borderColor": BORDER, "margin": "0 0 14px 0"}),
+
+            html.Div([
+                html.Div("Step 2 — Segmentation Settings", style={"fontSize": "13px", "fontWeight": "600", "color": TEXT, "marginBottom": "10px"}),
+                html.Div(id="reseg-step2-overlay", style={"display": "block"}, children=[
+                    html.Div("Confirm patches above to enable segmentation settings.",
+                             style={"fontSize": "11px", "color": MUTED, "textAlign": "center", "padding": "8px 0"}),
+                ]),
+                html.Div(id="reseg-step2-content", style={"opacity": "0.4", "pointerEvents": "none"}, children=[
+                    # Algorithm selector tabs
+                    dcc.Tabs(id="reseg-algo-tabs", value="baysor", children=[
+                        dcc.Tab(label="Baysor", value="baysor", style={"color": TEXT, "backgroundColor": CARD_BG},
+                                selected_style={"color": "#fff", "backgroundColor": "#1f6feb", "fontWeight": "600"}),
+                        dcc.Tab(label="Proseg", value="proseg", style={"color": TEXT, "backgroundColor": CARD_BG},
+                                selected_style={"color": "#fff", "backgroundColor": "#2d6a4f", "fontWeight": "600"}),
+                    ], style={"marginBottom": "16px"}),
+
+                    # ── Baysor settings panel ────────────────────────────────────
             html.Div(id="modal-baysor-panel", children=[
                 html.Div(
                     "Resegment cells using Baysor (must be installed). "
@@ -3516,6 +4159,8 @@ app.layout = html.Div([
                            "boxSizing": "border-box"},
                 ),
             ], style={"display": "none"}),  # hidden by default; shown when proseg tab is active
+                ]),  # end reseg-step2-content
+            ]),  # end Step 2 div
         ]),
         dbc.ModalFooter([
             html.Div(id="reseg-modal-run-status", style={"fontSize": "11px", "color": MUTED, "flex": "1"}),
@@ -3523,6 +4168,7 @@ app.layout = html.Div([
                 "Run",
                 id="reseg-modal-run-btn",
                 n_clicks=0,
+                disabled=True,
                 style={
                     "padding": "7px 20px",
                     "backgroundColor": "#1f6feb", "color": "#fff",
@@ -3533,6 +4179,271 @@ app.layout = html.Div([
             dbc.Button("Close", id="reseg-modal-close-btn", color="secondary", size="sm"),
         ], style={"display": "flex", "alignItems": "center", "gap": "8px"}),
     ], id="reseg-modal", is_open=False, size="lg",
+       style={"color": TEXT},
+       content_style={"backgroundColor": DARK_BG, "color": TEXT},
+       backdrop=True),
+
+# ── Cell Type Annotation modal ────────────────────────────────────────────────
+    dbc.Modal([
+        dbc.ModalHeader(dbc.ModalTitle("Cell Type Annotation"), close_button=True),
+        dbc.ModalBody([
+            html.Div(
+                "Annotate cells using CellTypist or transfer labels from a Seurat RDS reference.",
+                style={"fontSize": "11px", "color": MUTED, "marginBottom": "12px", "lineHeight": "1.4"},
+            ),
+            ctrl_label("Method"),
+            dcc.RadioItems(
+                id="annot-source",
+                options=[
+                    {"label": html.Span(" CellTypist model", style={"fontSize": "12px", "color": TEXT}),
+                     "value": "celltypist"},
+                    {"label": html.Span(" Seurat RDS reference", style={"fontSize": "12px", "color": TEXT}),
+                     "value": "seurat"},
+                ],
+                value="celltypist",
+                inputStyle={"marginRight": "5px"},
+                labelStyle={"display": "flex", "alignItems": "center", "marginBottom": "5px", "cursor": "pointer"},
+                style={"marginBottom": "10px"},
+            ),
+            # CellTypist controls
+            html.Div(id="annot-celltypist-div", children=[
+                ctrl_label("Model"),
+                dcc.Dropdown(
+                    id="annot-model",
+                    options=[{"label": v, "value": k} for k, v in CELLTYPIST_MODELS.items()],
+                    value="Healthy_Adult_Heart.pkl",
+                    clearable=False,
+                    style={"fontSize": "12px", "marginBottom": "10px",
+                           "backgroundColor": CARD_BG, "color": TEXT},
+                ),
+            ]),
+            # Seurat RDS controls
+            html.Div(id="annot-seurat-div", style={"display": "none"}, children=[
+                ctrl_label("RDS File Path"),
+                dcc.Input(
+                    id="annot-rds-path",
+                    type="text",
+                    value="/Users/ikuz/Documents/XeniumWorkflow/Post_R3_FINAL_with_counts.rds",
+                    style={
+                        "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                        "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                        "padding": "4px 8px", "fontSize": "11px", "marginBottom": "8px",
+                        "boxSizing": "border-box",
+                    },
+                ),
+                ctrl_label("Label Column"),
+                dcc.Input(
+                    id="annot-label-col",
+                    type="text",
+                    value="Names",
+                    style={
+                        "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                        "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                        "padding": "4px 8px", "fontSize": "11px", "marginBottom": "8px",
+                        "boxSizing": "border-box",
+                    },
+                ),
+            ]),
+        ]),
+        dbc.ModalFooter([
+            html.Div(id="annot-modal-status", style={"fontSize": "11px", "color": MUTED, "flex": "1"}),
+            html.Button(
+                "Run Annotation",
+                id="annot-btn",
+                n_clicks=0,
+                style={
+                    "padding": "7px 20px", "backgroundColor": "#238636", "color": "#fff",
+                    "border": "none", "borderRadius": "5px",
+                    "cursor": "pointer", "fontSize": "13px", "fontWeight": "600",
+                },
+            ),
+            dbc.Button("Close", id="annot-modal-close-btn", color="secondary", size="sm"),
+        ], style={"display": "flex", "alignItems": "center", "gap": "8px"}),
+    ], id="annot-modal", is_open=False, size="md",
+       style={"color": TEXT},
+       content_style={"backgroundColor": DARK_BG, "color": TEXT},
+       backdrop=True),
+
+# ── SpaGE Gene Imputation modal ───────────────────────────────────────────────
+    dbc.Modal([
+        dbc.ModalHeader(dbc.ModalTitle("SpaGE Gene Imputation"), close_button=True),
+        dbc.ModalBody([
+            html.Div(
+                "Impute expression of genes not in the Xenium panel using a scRNA-seq reference (Seurat RDS). "
+                "Results are cached and auto-loaded on next startup.",
+                style={"fontSize": "11px", "color": MUTED, "marginBottom": "14px", "lineHeight": "1.5"},
+            ),
+            ctrl_label("Reference .rds File"),
+            dcc.Input(
+                id="spage-rds-path",
+                type="text",
+                value="/Users/ikuz/Documents/XeniumWorkflow/Post_R3_FINAL_with_counts.rds",
+                debounce=True,
+                style={
+                    "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                    "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                    "padding": "4px 8px", "fontSize": "11px", "marginBottom": "12px",
+                    "boxSizing": "border-box",
+                },
+            ),
+            ctrl_label("Principal Vectors (n_pv)"),
+            dcc.Slider(
+                id="spage-npv", min=10, max=100, step=5, value=50,
+                marks={10: "10", 50: "50", 100: "100"},
+                tooltip={"placement": "bottom", "always_visible": False},
+            ),
+            html.Div(style={"marginBottom": "12px"}),
+            ctrl_label("Genes to Impute"),
+            html.Div(
+                "Leave empty for top-200 highly variable genes. Separate gene names with commas or newlines.",
+                style={"fontSize": "10px", "color": MUTED, "marginBottom": "6px", "lineHeight": "1.4"},
+            ),
+            dcc.Textarea(
+                id="spage-genes",
+                placeholder="e.g. NPPA, MYH7, TNNT2",
+                style={
+                    "width": "100%", "height": "100px", "backgroundColor": CARD_BG,
+                    "color": TEXT, "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                    "padding": "6px 8px", "fontSize": "11px", "marginBottom": "4px",
+                    "boxSizing": "border-box", "resize": "vertical",
+                },
+            ),
+        ]),
+        dbc.ModalFooter([
+            html.Div(id="spage-modal-status",
+                     style={"fontSize": "11px", "color": MUTED, "flex": "1"}),
+            html.Button(
+                "Run SpaGE",
+                id="spage-run-btn",
+                n_clicks=0,
+                style={
+                    "padding": "7px 20px",
+                    "backgroundColor": "#6f42c1", "color": "#fff",
+                    "border": "none", "borderRadius": "5px",
+                    "cursor": "pointer", "fontSize": "13px", "fontWeight": "600",
+                },
+            ),
+            dbc.Button("Close", id="spage-modal-close-btn", color="secondary", size="sm"),
+        ], style={"display": "flex", "alignItems": "center", "gap": "8px"}),
+    ], id="spage-modal", is_open=False, size="lg",
+       style={"color": TEXT},
+       content_style={"backgroundColor": DARK_BG, "color": TEXT},
+       backdrop=True),
+
+# ── Load Sample modal ─────────────────────────────────────────────────────────
+    dbc.Modal([
+        dbc.ModalHeader(dbc.ModalTitle("Load Xenium Sample"), close_button=True),
+        dbc.ModalBody([
+            html.Div("Select an available sample or enter a custom path:",
+                     style={"fontSize": "12px", "color": MUTED, "marginBottom": "10px"}),
+            dcc.Dropdown(
+                id="sample-picker",
+                options=_available_samples(),
+                placeholder="Available samples\u2026",
+                style={"marginBottom": "10px", "backgroundColor": CARD_BG, "color": TEXT},
+            ),
+            html.Div("Or enter a custom path:", style={"fontSize": "11px", "color": MUTED, "marginBottom": "4px"}),
+            dcc.Input(
+                id="sample-custom-path",
+                type="text",
+                placeholder="/path/to/output-XETG\u2026",
+                style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                       "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                       "padding": "6px 10px", "fontSize": "12px", "boxSizing": "border-box"},
+            ),
+            html.Div(id="sample-load-status",
+                     style={"fontSize": "11px", "color": MUTED, "marginTop": "8px", "minHeight": "16px"}),
+        ]),
+        dbc.ModalFooter([
+            html.Button("Load (Replace)", id="sample-load-btn", n_clicks=0,
+                        style={"padding": "7px 20px", "backgroundColor": "#1f6feb", "color": "#fff",
+                               "border": "none", "borderRadius": "5px", "cursor": "pointer",
+                               "fontSize": "13px", "fontWeight": "600"}),
+            html.Button("Add as Additional Sample", id="sample-add-btn", n_clicks=0,
+                        style={"padding": "7px 20px", "backgroundColor": "#238636", "color": "#fff",
+                               "border": "none", "borderRadius": "5px", "cursor": "pointer",
+                               "fontSize": "13px", "fontWeight": "600", "marginLeft": "8px"}),
+            dbc.Button("Cancel", id="sample-modal-close-btn", color="secondary", size="sm"),
+        ]),
+    ], id="sample-modal", is_open=False, size="lg",
+       content_style={"backgroundColor": DARK_BG, "color": TEXT}),
+
+# ── Clean Cache confirmation modal ────────────────────────────────────────────
+    dbc.Modal([
+        dbc.ModalHeader(dbc.ModalTitle("Clean Cache"), close_button=True),
+        dbc.ModalBody([
+            html.Div(id="cache-clean-confirm-text",
+                     style={"fontSize": "13px", "color": TEXT}),
+        ]),
+        dbc.ModalFooter([
+            html.Button("Delete", id="cache-clean-confirm-btn", n_clicks=0,
+                        style={"padding": "7px 20px", "backgroundColor": "#da3633", "color": "#fff",
+                               "border": "none", "borderRadius": "5px", "cursor": "pointer",
+                               "fontSize": "13px", "fontWeight": "600"}),
+            dbc.Button("Cancel", id="cache-clean-cancel-btn", color="secondary", size="sm"),
+        ]),
+    ], id="cache-clean-modal", is_open=False,
+       content_style={"backgroundColor": DARK_BG, "color": TEXT}),
+
+# ── Save as SpatialData modal ──────────────────────────────────────────────────
+    dbc.Modal([
+        dbc.ModalHeader(dbc.ModalTitle("Save as SpatialData"), close_button=True),
+        dbc.ModalBody([
+            html.Div(
+                "Export the current dataset (transcripts, images, shapes) plus any analysis results "
+                "(cluster labels, cell-type annotations) to a SpatialData Zarr store.",
+                style={"fontSize": "11px", "color": MUTED, "marginBottom": "14px", "lineHeight": "1.5"},
+            ),
+            ctrl_label("Output Directory"),
+            dcc.Input(
+                id="save-sdata-dir",
+                type="text",
+                placeholder="/path/to/output/directory",
+                debounce=True,
+                style={
+                    "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                    "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                    "padding": "5px 8px", "fontSize": "11px", "marginBottom": "10px",
+                    "boxSizing": "border-box",
+                },
+            ),
+            ctrl_label("Filename (folder name for the .zarr store)"),
+            dcc.Input(
+                id="save-sdata-name",
+                type="text",
+                placeholder="my_analysis.zarr",
+                debounce=True,
+                style={
+                    "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                    "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                    "padding": "5px 8px", "fontSize": "11px", "marginBottom": "10px",
+                    "boxSizing": "border-box",
+                },
+            ),
+            html.Div(
+                "Note: SpatialData must be built first (open 'Resegment Cells' → patches auto-build). "
+                "Existing stores at the same path will be overwritten.",
+                style={"fontSize": "10px", "color": MUTED, "lineHeight": "1.4"},
+            ),
+            dcc.Interval(id="save-sdata-poll", interval=1500, disabled=True),
+        ]),
+        dbc.ModalFooter([
+            html.Div(id="save-sdata-status",
+                     style={"fontSize": "11px", "color": MUTED, "flex": "1"}),
+            html.Button(
+                "Save",
+                id="save-sdata-run-btn",
+                n_clicks=0,
+                style={
+                    "padding": "7px 20px",
+                    "backgroundColor": "#1f6feb", "color": "#fff",
+                    "border": "none", "borderRadius": "5px",
+                    "cursor": "pointer", "fontSize": "13px", "fontWeight": "600",
+                },
+            ),
+            dbc.Button("Close", id="save-sdata-close-btn", color="secondary", size="sm"),
+        ], style={"display": "flex", "alignItems": "center", "gap": "8px"}),
+    ], id="save-sdata-modal", is_open=False, size="lg",
        style={"color": TEXT},
        content_style={"backgroundColor": DARK_BG, "color": TEXT},
        backdrop=True),
@@ -3703,6 +4614,11 @@ app.layout = html.Div([
 
 # ─── Callbacks ────────────────────────────────────────────────────────────────
 
+def _seg_tool(seg_source: str) -> str:
+    """Extract tool name from seg-source value: 'xenium', 'baysor', or 'proseg'."""
+    return (seg_source or "xenium").split(":")[0]
+
+
 @app.callback(
     Output("cluster-ctrl", "style"),
     Output("gene-ctrl",    "style"),
@@ -3762,13 +4678,15 @@ def store_relayout(relayout_data, current):
     Input("seg-source",         "value"),
     Input("spage-done",         "data"),
     Input("subset-version",     "data"),
-    Input("startup-trigger",    "n_intervals"),
+    Input("startup-trigger",        "n_intervals"),
+    Input("dataset-version",        "data"),
+    Input("extra-datasets-version", "data"),
 )
 def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
                  _annot_done, morph_enable, morph_zlevel, morph_channels,
                  morph_brightness, morph_opacity, relayout,
                  _baysor_done, _proseg_done, seg_source,
-                 _spage_done, _subset_ver, _startup):
+                 _spage_done, _subset_ver, _startup, _ds_version, _extra_ds_version):
     # If only the viewport changed, avoid full figure rebuild
     triggered = callback_context.triggered_id
     boundaries_active = bool(boundary_toggles)
@@ -3815,8 +4733,8 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
     opacity          = opacity  or 0.85
     boundary_toggles = boundary_toggles or []
     seg_source  = seg_source or "xenium"
-    baysor_on   = (seg_source == "baysor")
-    proseg_on   = (seg_source == "proseg")
+    baysor_on   = (_seg_tool(seg_source) == "baysor")
+    proseg_on   = (_seg_tool(seg_source) == "proseg")
 
     # Morphology image overlay
     morph_image  = None
@@ -3983,6 +4901,38 @@ def show_cell_info(cell_id, method):
 
 
 @app.callback(
+    Output("spage-modal", "is_open"),
+    Input("spage-modal-open-btn", "n_clicks"),
+    Input("spage-modal-close-btn", "n_clicks"),
+    State("spage-modal", "is_open"),
+    prevent_initial_call=True,
+)
+def toggle_spage_modal(open_clicks, close_clicks, is_open):
+    triggered = callback_context.triggered_id
+    if triggered == "spage-modal-open-btn":
+        return True
+    if triggered == "spage-modal-close-btn":
+        return False
+    return is_open
+
+
+@app.callback(
+    Output("annot-modal", "is_open"),
+    Input("annot-modal-open-btn", "n_clicks"),
+    Input("annot-modal-close-btn", "n_clicks"),
+    State("annot-modal", "is_open"),
+    prevent_initial_call=True,
+)
+def toggle_annot_modal(open_clicks, close_clicks, is_open):
+    triggered = callback_context.triggered_id
+    if triggered == "annot-modal-open-btn":
+        return True
+    if triggered == "annot-modal-close-btn":
+        return False
+    return is_open
+
+
+@app.callback(
     Output("annot-celltypist-div", "style"),
     Output("annot-seurat-div",     "style"),
     Input("annot-source",          "value"),
@@ -3995,15 +4945,16 @@ def toggle_annot_source(source):
 
 
 @app.callback(
-    Output("annot-poll",    "disabled"),
-    Output("annot-status",  "children"),
-    Output("annot-btn",     "disabled"),
-    Input("annot-btn",      "n_clicks"),
-    State("annot-source",   "value"),
-    State("annot-model",    "value"),
-    State("annot-rds-path", "value"),
-    State("annot-label-col","value"),
-    State("seg-source",     "value"),
+    Output("annot-poll",         "disabled"),
+    Output("annot-status",       "children"),
+    Output("annot-btn",          "disabled"),
+    Output("annot-modal-status", "children"),
+    Input("annot-btn",           "n_clicks"),
+    State("annot-source",        "value"),
+    State("annot-model",         "value"),
+    State("annot-rds-path",      "value"),
+    State("annot-label-col",     "value"),
+    State("seg-source",          "value"),
     prevent_initial_call=True,
 )
 def start_annotation(n_clicks, source, model_name, rds_path, label_col, seg_source):
@@ -4011,15 +4962,16 @@ def start_annotation(n_clicks, source, model_name, rds_path, label_col, seg_sour
     # Use the currently selected segmentation source
     seg_source = seg_source or "xenium"
     with _proseg_lock:
-        pres = _proseg_state["result"] if seg_source == "proseg" and _proseg_state["status"] == "done" else None
+        pres = _proseg_state["result"] if _seg_tool(seg_source) == "proseg" and _proseg_state["status"] == "done" else None
     with _baysor_lock:
-        bres = _baysor_state["result"] if seg_source == "baysor" and _baysor_state["status"] == "done" else None
+        bres = _baysor_state["result"] if _seg_tool(seg_source) == "baysor" and _baysor_state["status"] == "done" else None
     alt_res = pres or bres
 
     if alt_res is not None:
         # Reseg mode: require an expression matrix
         if alt_res.get("expr") is None:
-            return False, "✗ No expression matrix for reseg cells — re-run Proseg/Baysor", False
+            msg = "✗ No expression matrix for reseg cells — re-run Proseg/Baysor"
+            return False, msg, False, msg
         expr_override     = alt_res["expr"]
         cell_ids_override = [str(c) for c in alt_res["cells_df"].index]
         # Include out_dir hash so cache is invalidated when Proseg/Baysor is re-run
@@ -4035,7 +4987,7 @@ def start_annotation(n_clicks, source, model_name, rds_path, label_col, seg_sour
 
     with _annot_lock:
         if _annot_state["status"] == "running":
-            return False, "Already running…", True
+            return False, "Already running…", True, "Already running…"
         _annot_state.update({"status": "running", "message": "Starting…", labels_key: None})
 
     if source == "seurat":
@@ -4056,21 +5008,24 @@ def start_annotation(n_clicks, source, model_name, rds_path, label_col, seg_sour
                     "cell_ids_override": cell_ids_override},
             daemon=True,
         ).start()
-    return False, "Starting…", True
+    return False, "Starting…", True, "Starting…"
 
 
 @app.callback(
-    Output("annot-status",  "children",   allow_duplicate=True),
-    Output("annot-poll",    "disabled",   allow_duplicate=True),
-    Output("annot-btn",     "disabled",   allow_duplicate=True),
-    Output("color-by",      "options"),
-    Output("annot-done",    "data"),
-    Input("annot-poll",     "n_intervals"),
-    State("color-by",       "options"),
-    State("annot-done",     "data"),
+    Output("annot-status",       "children",   allow_duplicate=True),
+    Output("annot-poll",         "disabled",   allow_duplicate=True),
+    Output("annot-btn",          "disabled",   allow_duplicate=True),
+    Output("color-by",           "options"),
+    Output("annot-done",         "data"),
+    Output("annot-modal-status", "children",   allow_duplicate=True),
+    Output("annot-modal",        "is_open",    allow_duplicate=True),
+    Input("annot-poll",          "n_intervals"),
+    State("color-by",            "options"),
+    State("annot-done",          "data"),
+    State("annot-modal",         "is_open"),
     prevent_initial_call=True,
 )
-def poll_annotation(_, current_options, done_version):
+def poll_annotation(_, current_options, done_version, modal_open):
     """Poll annotation state and update UI when done."""
     with _annot_lock:
         status  = _annot_state["status"]
@@ -4093,10 +5048,12 @@ def poll_annotation(_, current_options, done_version):
             options.append(opt)
 
     if done:
-        return f"✓ {message}", True, False, options, (done_version or 0) + 1
+        # Close the modal and show status in the sidebar
+        return f"✓ {message}", True, False, options, (done_version or 0) + 1, f"✓ {message}", False
     if error:
-        return f"✗ {message}", True, False, options, done_version
-    return message, False, True, options, done_version   # keep polling
+        # Keep the modal open so user can see the error
+        return f"✗ {message}", True, False, options, done_version, f"✗ {message}", modal_open
+    return message, False, True, options, done_version, message, modal_open   # keep polling
 
 
 @app.callback(
@@ -4159,7 +5116,10 @@ def poll_baysor(_, done_version):
         message = _baysor_state["message"]
 
     if status == "done":
-        return f"✓ {message}", True, (done_version or 0) + 1, "baysor"
+        out_dir = (_baysor_state.get("result") or {}).get("out_dir", "")
+        param_tag = os.path.basename(out_dir).split("_")[-1] if out_dir else ""
+        seg_val = f"baysor:{param_tag}" if param_tag else "baysor"
+        return f"✓ {message}", True, (done_version or 0) + 1, seg_val
     if status == "error":
         return f"✗ {message}", True, done_version, no_update
     return message, False, done_version, no_update
@@ -4204,7 +5164,10 @@ def poll_proseg(_, done_version):
         message = _proseg_state["message"]
 
     if status == "done":
-        return f"✓ {message}", True, (done_version or 0) + 1, "proseg"
+        out_dir = (_proseg_state.get("result") or {}).get("out_dir", "")
+        param_tag = os.path.basename(out_dir).split("_")[-1] if out_dir else ""
+        seg_val = f"proseg:{param_tag}" if param_tag else "proseg"
+        return f"✓ {message}", True, (done_version or 0) + 1, seg_val
     if status == "error":
         return f"✗ {message}", True, done_version, no_update
     return message, False, done_version, no_update
@@ -4213,17 +5176,34 @@ def poll_proseg(_, done_version):
 # ─── Resegmentation modal callbacks ───────────────────────────────────────────
 
 @app.callback(
-    Output("reseg-modal", "is_open"),
-    Input("reseg-modal-open-btn", "n_clicks"),
+    Output("reseg-modal",              "is_open"),
+    Output("reseg-patches-confirmed",  "data",     allow_duplicate=True),
+    Output("reseg-modal-run-btn",      "disabled",  allow_duplicate=True),
+    Output("reseg-patch-confirm-div",  "style",     allow_duplicate=True),
+    Output("reseg-patch-confirm-msg",  "children",  allow_duplicate=True),
+    Output("reseg-step2-content",      "style",     allow_duplicate=True),
+    Output("reseg-step2-overlay",      "style",     allow_duplicate=True),
+    Input("reseg-modal-open-btn",  "n_clicks"),
     Input("reseg-modal-close-btn", "n_clicks"),
     State("reseg-modal", "is_open"),
     prevent_initial_call=True,
 )
 def toggle_reseg_modal(open_clicks, close_clicks, is_open):
     triggered = callback_context.triggered_id
-    if triggered == "reseg-modal-open-btn":
-        return True
-    return False
+    if triggered == "reseg-modal-open-btn" and open_clicks:
+        # Check if patches already exist from a previous run / cache
+        with _sdata_lock:
+            has_patches = _sdata_state.get("patches") is not None
+        if has_patches:
+            with _sdata_lock:
+                n_patches = len(_sdata_state["patches"])
+            confirm_msg = (f"✓ {n_patches} patches ready — review ROI and patches on the "
+                           f"spatial plot, then confirm to proceed.")
+            # Patches exist: show confirm div, keep Step 2 locked until user confirms
+            return True, 0, True, {}, confirm_msg, {"opacity": "0.4", "pointerEvents": "none"}, {"display": "block"}
+        # No patches yet: hide confirm div, lock Step 2
+        return True, 0, True, {"display": "none"}, "", {"opacity": "0.4", "pointerEvents": "none"}, {"display": "block"}
+    return False, no_update, no_update, no_update, no_update, no_update, no_update
 
 
 @app.callback(
@@ -4252,6 +5232,7 @@ def switch_reseg_tab(algo):
     Output("proseg-poll", "disabled", allow_duplicate=True),
     Input("reseg-modal-run-btn", "n_clicks"),
     State("reseg-algo-tabs", "value"),
+    State("reseg-patches-confirmed", "data"),
     # Baysor states
     State("baysor-xmin", "value"),
     State("baysor-xmax", "value"),
@@ -4270,9 +5251,11 @@ def switch_reseg_tab(algo):
     State("proseg-nthreads", "value"),
     prevent_initial_call=True,
 )
-def run_reseg_modal(n_clicks, algo,
+def run_reseg_modal(n_clicks, algo, patches_confirmed,
                     bxmin, bxmax, bymin, bymax, bscale, bmin_mol, buse_prior, bprior_conf,
                     pxmin, pxmax, pymin, pymax, pvoxel, pthreads):
+    if not patches_confirmed:
+        return "✗ Please confirm patches in Step 1 before running segmentation.", no_update, no_update, no_update
     if algo == "baysor":
         with _baysor_lock:
             if _baysor_state["status"] == "running":
@@ -4372,12 +5355,12 @@ def poll_reseg_umap(_):
     Input("baysor-done",       "data"),
     Input("proseg-done",       "data"),
     State("boundary-toggles",  "options"),
-    State("seg-source",        "options"),
 )
-def update_boundary_options(baysor_done, proseg_done, boundary_opts, seg_opts):
+def update_boundary_options(baysor_done, proseg_done, boundary_opts):
     baysor_ready = _baysor_state["status"] == "done" and _baysor_state["result"] is not None
     proseg_ready = _proseg_state["status"] == "done" and _proseg_state["result"] is not None
 
+    # Rebuild boundary options (unchanged logic)
     updated_boundary = []
     for opt in boundary_opts:
         v = opt["value"]
@@ -4388,35 +5371,81 @@ def update_boundary_options(baysor_done, proseg_done, boundary_opts, seg_opts):
         else:
             updated_boundary.append(opt)
 
-    updated_seg = []
-    for opt in seg_opts:
-        v = opt["value"]
-        if v == "proseg":
-            updated_seg.append({**opt, "disabled": not proseg_ready})
-        elif v == "baysor":
-            updated_seg.append({**opt, "disabled": not baysor_ready})
-        else:
-            updated_seg.append(opt)
+    # Rebuild seg-source options dynamically from cache
+    seg_opts = [{"label": "Xenium (original)", "value": "xenium"}]
+    cached = _list_cached_seg_runs()
+    baysor_cached = [c for c in cached if c["value"].startswith("baysor:")]
+    proseg_cached  = [c for c in cached if c["value"].startswith("proseg:")]
+    current_baysor_dir = (_baysor_state.get("result") or {}).get("out_dir", "")
+    current_proseg_dir = (_proseg_state.get("result") or {}).get("out_dir", "")
+    for c in baysor_cached:
+        is_current = (c["out_dir"] == current_baysor_dir)
+        label = ("\u2605 " if is_current else "") + c["label"]
+        seg_opts.append({"label": label, "value": c["value"]})
+    for c in proseg_cached:
+        is_current = (c["out_dir"] == current_proseg_dir)
+        label = ("\u2605 " if is_current else "") + c["label"]
+        seg_opts.append({"label": label, "value": c["value"]})
 
-    return updated_boundary, updated_seg
+    return updated_boundary, seg_opts
+
+
+
+@app.callback(
+    Output("baysor-done",  "data",     allow_duplicate=True),
+    Output("proseg-done",  "data",     allow_duplicate=True),
+    Output("seg-source",   "value",    allow_duplicate=True),
+    Output("baysor-poll",  "disabled", allow_duplicate=True),
+    Output("proseg-poll",  "disabled", allow_duplicate=True),
+    Input("seg-source",    "value"),
+    State("baysor-done",   "data"),
+    State("proseg-done",   "data"),
+    prevent_initial_call=True,
+)
+def load_seg_run_from_cache(seg_value, baysor_ver, proseg_ver):
+    """When user selects a cached run from the dropdown, load it from disk if needed."""
+    if not seg_value or ":" not in seg_value:
+        return no_update, no_update, no_update, no_update, no_update
+
+    tool, param_tag = seg_value.split(":", 1)
+    cache_base = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache")
+    dataset = os.path.basename(DATA.get("data_dir", ""))
+    out_dir = os.path.join(cache_base, f"{tool}_{dataset}_{param_tag}")
+
+    if tool == "baysor":
+        current_dir = (_baysor_state.get("result") or {}).get("out_dir", "")
+        if current_dir == out_dir and _baysor_state["status"] == "done":
+            return no_update, no_update, no_update, no_update, no_update
+        threading.Thread(target=_load_cached_baysor, args=(out_dir,), daemon=True).start()
+        # Enable baysor-poll so it detects the load completion and bumps baysor-done
+        return no_update, no_update, no_update, False, no_update
+    elif tool == "proseg":
+        current_dir = (_proseg_state.get("result") or {}).get("out_dir", "")
+        if current_dir == out_dir and _proseg_state["status"] == "done":
+            return no_update, no_update, no_update, no_update, no_update
+        threading.Thread(target=_load_cached_proseg, args=(out_dir,), daemon=True).start()
+        # Enable proseg-poll so it detects the load completion and bumps proseg-done
+        return no_update, no_update, no_update, no_update, False
+    return no_update, no_update, no_update, no_update, no_update
 
 
 # ─── SpaGE callbacks ──────────────────────────────────────────────────────────
 
 @app.callback(
     Output("spage-poll",    "disabled"),
-    Output("spage-status",  "children"),
-    Output("spage-run-btn", "disabled"),
-    Input("spage-run-btn",  "n_clicks"),
-    State("spage-rds-path", "value"),
-    State("spage-npv",      "value"),
-    State("spage-genes",    "value"),
+    Output("spage-status",       "children"),
+    Output("spage-modal-status", "children"),
+    Output("spage-run-btn",      "disabled"),
+    Input("spage-run-btn",       "n_clicks"),
+    State("spage-rds-path",      "value"),
+    State("spage-npv",           "value"),
+    State("spage-genes",         "value"),
     prevent_initial_call=True,
 )
 def start_spage(n_clicks, rds_path, n_pv, genes_input):
     with _spage_lock:
         if _spage_state["status"] == "running":
-            return False, "Already running…", True
+            return "Already running…", "Already running…", True
         _spage_state.update({"status": "running", "message": "Starting…", "result": None})
     rds_path = rds_path or "/Users/ikuz/Documents/XeniumWorkflow/Post_R3_FINAL_with_counts.rds"
     n_pv = int(n_pv or 50)
@@ -4427,28 +5456,31 @@ def start_spage(n_clicks, rds_path, n_pv, genes_input):
         target=lambda: ctx.run(_run_spage_imputation, rds_path, n_pv, genes_str),
         daemon=True,
     ).start()
-    return False, "Starting SpaGE…", True
+    return "Starting SpaGE…", "Starting SpaGE…", True
 
 
 @app.callback(
-    Output("spage-status",    "children",  allow_duplicate=True),
-    Output("spage-poll",      "disabled",  allow_duplicate=True),
-    Output("spage-run-btn",   "disabled",  allow_duplicate=True),
-    Output("spage-done",      "data"),
-    Input("spage-poll",       "n_intervals"),
-    State("spage-done",       "data"),
+    Output("spage-status",       "children",  allow_duplicate=True),
+    Output("spage-modal-status", "children",  allow_duplicate=True),
+    Output("spage-modal",        "is_open",   allow_duplicate=True),
+    Output("spage-poll",         "disabled",  allow_duplicate=True),
+    Output("spage-run-btn",      "disabled",  allow_duplicate=True),
+    Output("spage-done",         "data"),
+    Input("spage-poll",          "n_intervals"),
+    State("spage-done",          "data"),
+    State("spage-modal",         "is_open"),
     prevent_initial_call=True,
 )
-def poll_spage(_, done_version):
+def poll_spage(_, done_version, modal_open):
     with _spage_lock:
         status  = _spage_state["status"]
         message = _spage_state["message"]
 
     if status == "done":
-        return f"✓ {message}", True, False, (done_version or 0) + 1
+        return f"✓ {message}", f"✓ {message}", False, True, False, (done_version or 0) + 1
     if status == "error":
-        return f"✗ {message}", True, False, done_version
-    return message, False, True, done_version
+        return f"✗ {message}", f"✗ {message}", modal_open, True, False, done_version
+    return message, message, modal_open, False, True, done_version
 
 
 @app.callback(
@@ -4483,10 +5515,10 @@ def poll_spage_repl(_, done_version):
 
 @app.callback(
     Output("gene-selector", "options"),
-    Input("spage-done", "data"),
-    prevent_initial_call=True,
+    Input("spage-done",       "data"),
+    Input("dataset-version",  "data"),
 )
-def update_gene_options(_spage_version):
+def update_gene_options(_spage_version, _ds_version):
     """Rebuild gene dropdown: native genes + imputed genes after SpaGE."""
     base = [{"label": g, "value": g} for g in sorted(DATA["gene_names"])]
     with _spage_lock:
@@ -4609,102 +5641,145 @@ def run_repl(_, __, code):
 # ─── SpatialData / Sopa callbacks ─────────────────────────────────────────────
 
 @app.callback(
-    Output("sdata-poll",        "disabled"),
-    Output("sdata-status",      "children"),
-    Output("sdata-convert-btn", "disabled"),
-    Input("sdata-convert-btn",  "n_clicks"),
-    State("sdata-qv",           "value"),
+    Output("sdata-poll",              "disabled",  allow_duplicate=True),
+    Output("sdata-status",            "children",  allow_duplicate=True),
+    Output("sdata-clear-cache-btn",   "disabled",  allow_duplicate=True),
+    Output("sdata-prepare-btn",       "disabled",  allow_duplicate=True),
+    Output("reseg-patches-confirmed", "data",      allow_duplicate=True),
+    Output("reseg-patch-confirm-div", "style",     allow_duplicate=True),
+    Input("sdata-clear-cache-btn",    "n_clicks"),
+    State("sdata-qv",                 "value"),
     prevent_initial_call=True,
 )
-def start_sdata_convert(n_clicks, qv):
-    with _sdata_lock:
-        if _sdata_state["status"] == "running":
-            return False, "Already running…", True
-        _sdata_state.update({"status": "running", "message": "Starting…"})
-    to_spatialdata(qv_threshold=int(qv or 20))
-    return False, "Converting…", True
-
-
-@app.callback(
-    Output("sdata-poll",             "disabled",  allow_duplicate=True),
-    Output("sdata-status",           "children",  allow_duplicate=True),
-    Output("sdata-convert-btn",      "disabled",  allow_duplicate=True),
-    Output("sdata-clear-cache-btn",  "disabled",  allow_duplicate=True),
-    Input("sdata-clear-cache-btn",   "n_clicks"),
-    State("sdata-qv",                "value"),
-    prevent_initial_call=True,
-)
-def clear_and_reconvert(n_clicks, qv):
+def start_sdata_clear(n_clicks, qv):
     """Delete cache then trigger a forced re-read from raw files."""
     with _sdata_lock:
         if _sdata_state["status"] == "running":
-            return False, "Already running…", True, True
-        _sdata_state.update({"status": "running", "message": "Clearing cache…"})
+            return False, "Already running…", True, True, no_update, no_update
+        _sdata_state.update({"status": "running", "message": "Clearing cache…",
+                              "roi": None, "patches": None})
     clear_sdata_cache()
     to_spatialdata(qv_threshold=int(qv or 20), force=True)
-    return False, "Re-reading from raw files…", True, True
+    return False, "Re-reading from raw files…", True, True, 0, {"display": "none"}
+
+
+@app.callback(
+    Output("sdata-status",            "children",  allow_duplicate=True),
+    Output("sdata-poll",              "disabled",  allow_duplicate=True),
+    Output("sdata-clear-cache-btn",   "disabled",  allow_duplicate=True),
+    Output("sdata-prepare-btn",       "disabled",  allow_duplicate=True),
+    Output("sdata-done",              "data"),
+    Output("sdata-show-roi",          "value",     allow_duplicate=True),
+    Output("sdata-show-patches",      "value",     allow_duplicate=True),
+    Output("reseg-patch-confirm-div", "style",     allow_duplicate=True),
+    Output("reseg-patch-confirm-msg", "children",  allow_duplicate=True),
+    Input("sdata-poll",               "n_intervals"),
+    State("sdata-done",               "data"),
+    State("sdata-patch-width",        "value"),
+    State("sdata-patch-min-tx",       "value"),
+    prevent_initial_call=True,
+)
+def poll_sdata(_, done_version, patch_width, patch_min_tx):
+    with _sdata_lock:
+        status      = _sdata_state["status"]
+        message     = _sdata_state["message"]
+        has_roi     = _sdata_state.get("roi") is not None
+        has_patches = _sdata_state.get("patches") is not None
+        has_sdata   = _sdata_state.get("sdata") is not None
+
+    HIDE = {"display": "none"}
+    SHOW = {}
+    no_chg = no_update
+
+    if status == "running":
+        # poll=enabled, clear-btn=disabled, prepare-btn=disabled
+        return message, False, True, True, no_chg, no_chg, no_chg, HIDE, no_chg
+
+    if status in ("done", "roi_done", "patches_done", "error"):
+        # Chain: sdata done → auto-run ROI if not done
+        if status == "done" and not has_roi and has_sdata:
+            with _sdata_lock:
+                _sdata_state.update({"status": "running", "message": "Detecting tissue ROI…"})
+            segment_tissue_roi()
+            return "Detecting tissue ROI…", False, True, True, no_chg, no_chg, no_chg, HIDE, no_chg
+
+        # Chain: ROI done → auto-run patches if not done
+        if has_roi and not has_patches:
+            width  = float(patch_width  or 1000)
+            min_tx = int(patch_min_tx   or 10)
+            with _sdata_lock:
+                _sdata_state.update({"status": "running", "message": "Creating patches…"})
+            create_patches(width_um=width, min_transcripts=min_tx)
+            return "Creating patches…", False, True, True, no_chg, no_chg, no_chg, HIDE, no_chg
+
+        # Patches exist — show overlays + confirmation, re-enable buttons
+        if has_patches:
+            with _sdata_lock:
+                n_patches = len(_sdata_state["patches"])
+            confirm_msg = (f"✓ {n_patches} patches ready — review ROI and patches on the "
+                           f"spatial plot, then confirm to proceed.")
+            return (message, True, False, False, (done_version or 0) + 1,
+                    ["yes"], ["yes"], SHOW, confirm_msg)
+
+        # Error — re-enable buttons so user can retry
+        if status == "error":
+            return f"✗ {message}", True, False, False, no_chg, no_chg, no_chg, HIDE, no_chg
+
+        return message, True, False, False, no_chg, no_chg, no_chg, no_chg, no_chg
+
+    return (no_update, no_update, no_update, no_update, no_update,
+            no_update, no_update, no_update, no_update)
+
+
+@app.callback(
+    Output("sdata-poll",             "disabled",    allow_duplicate=True),
+    Output("sdata-status",           "children",    allow_duplicate=True),
+    Output("sdata-show-roi",         "value",       allow_duplicate=True),
+    Output("sdata-show-patches",     "value",       allow_duplicate=True),
+    Output("reseg-patch-confirm-div","style",       allow_duplicate=True),
+    Output("reseg-patch-confirm-msg","children",    allow_duplicate=True),
+    Output("sdata-prepare-btn",      "disabled",    allow_duplicate=True),
+    Input("sdata-prepare-btn",       "n_clicks"),
+    State("sdata-qv",                "value"),
+    prevent_initial_call=True,
+)
+def start_prepare_patches(n_clicks, qv):
+    """User clicked Prepare Patches — start pipeline or show cached result."""
+    if not n_clicks:
+        return no_update, no_update, no_update, no_update, no_update, no_update, no_update
+    with _sdata_lock:
+        status      = _sdata_state["status"]
+        message     = _sdata_state["message"]
+        has_patches = _sdata_state.get("patches") is not None
+    # Patches already ready — just show overlays and confirmation
+    if has_patches:
+        with _sdata_lock:
+            n_patches = len(_sdata_state["patches"])
+        confirm_msg = (f"✓ {n_patches} patches ready — review ROI and patches on the "
+                       f"spatial plot, then confirm to proceed.")
+        return True, message, ["yes"], ["yes"], {}, confirm_msg, False
+    # Already running — just enable poll to show progress
+    if status == "running":
+        return False, message, no_update, no_update, {"display": "none"}, "", True
+    # Start the pipeline: sdata → ROI → patches (chained by poll_sdata)
+    with _sdata_lock:
+        _sdata_state.update({"status": "running", "message": "Building SpatialData…"})
     to_spatialdata(qv_threshold=int(qv or 20))
-    return False, "Converting…", True
+    return False, "Building SpatialData…", no_update, no_update, {"display": "none"}, "", True
 
 
 @app.callback(
-    Output("sdata-status",          "children",  allow_duplicate=True),
-    Output("sdata-poll",            "disabled",  allow_duplicate=True),
-    Output("sdata-convert-btn",     "disabled",  allow_duplicate=True),
-    Output("sdata-clear-cache-btn", "disabled",  allow_duplicate=True),
-    Output("sdata-done",            "data"),
-    Input("sdata-poll",             "n_intervals"),
-    State("sdata-done",             "data"),
+    Output("reseg-patches-confirmed", "data"),
+    Output("reseg-step2-content",     "style"),
+    Output("reseg-step2-overlay",     "style"),
+    Output("reseg-modal-run-btn",     "disabled"),
+    Input("reseg-confirm-patches-btn", "n_clicks"),
     prevent_initial_call=True,
 )
-def poll_sdata(_, done_version):
-    with _sdata_lock:
-        status  = _sdata_state["status"]
-        message = _sdata_state["message"]
-    if status in ("done", "roi_done", "patches_done"):
-        return f"✓ {message}", True, False, False, (done_version or 0) + 1
-    if status == "error":
-        return f"✗ {message}", True, False, False, done_version
-    # Still running
-    return message, False, True, True, done_version
-
-
-@app.callback(
-    Output("sdata-status",      "children",  allow_duplicate=True),
-    Output("sdata-poll",        "disabled",  allow_duplicate=True),
-    Output("sdata-roi-btn",     "disabled",  allow_duplicate=True),
-    Input("sdata-roi-btn",      "n_clicks"),
-    prevent_initial_call=True,
-)
-def start_roi_segmentation(_):
-    with _sdata_lock:
-        if _sdata_state.get("sdata") is None:
-            return "✗ Run 'Convert to SpatialData' first", True, False
-        if _sdata_state["status"] == "running":
-            return "Already running…", False, True
-        _sdata_state.update({"status": "running", "message": "Segmenting tissue ROI…"})
-    segment_tissue_roi()
-    return "Segmenting tissue ROI…", False, True
-
-
-@app.callback(
-    Output("sdata-status",       "children",  allow_duplicate=True),
-    Output("sdata-poll",         "disabled",  allow_duplicate=True),
-    Output("sdata-patches-btn",  "disabled",  allow_duplicate=True),
-    Input("sdata-patches-btn",   "n_clicks"),
-    State("sdata-patch-width",   "value"),
-    State("sdata-patch-min-tx",  "value"),
-    prevent_initial_call=True,
-)
-def start_create_patches(_, width_um, min_tx):
-    with _sdata_lock:
-        if _sdata_state.get("sdata") is None:
-            return "✗ Run 'Convert to SpatialData' first", True, False
-        if _sdata_state["status"] == "running":
-            return "Already running…", False, True
-        _sdata_state.update({"status": "running", "message": "Creating patches…"})
-    create_patches(width_um=float(width_um or 1000), min_transcripts=int(min_tx or 10))
-    return "Creating patches…", False, True
+def confirm_patches(n_clicks):
+    if not n_clicks:
+        return no_update, no_update, no_update, no_update
+    return 1, {}, {"display": "none"}, False
 
 
 @app.callback(
@@ -4721,6 +5796,308 @@ def update_sdata_overlays(show_roi, show_patches, _sdata_ver):
     patched = Patch()
     patched["layout"]["shapes"] = shapes
     return patched
+
+
+# ─── Dataset switcher callbacks ───────────────────────────────────────────────
+
+@app.callback(
+    Output("tissue-info-content", "children"),
+    Input("dataset-version", "data"),
+)
+def update_tissue_info(_):
+    meta = DATA.get("metadata", {})
+    cache_size = _cache_size_str()
+    return html.Div([
+        html.Div([
+            html.Div("XENIUM EXPLORER", style={
+                "fontSize": "11px", "fontWeight": "700",
+                "letterSpacing": "2px", "color": ACCENT, "marginBottom": "4px",
+            }),
+            html.Div(meta.get("run_name", "\u2014"),
+                     style={"fontSize": "13px", "color": TEXT, "fontWeight": "600"}),
+            html.Div(meta.get("region_name", ""),
+                     style={"fontSize": "11px", "color": MUTED}),
+        ], style={"marginBottom": "10px"}),
+
+        html.Div([
+            html.Hr(style={"borderColor": BORDER, "margin": "0 0 10px 0"}),
+            html.Div([
+                stat_row("Cells",       f"{meta.get('num_cells', 0):,}"),
+                stat_row("Transcripts", f"{meta.get('num_transcripts', 0):,}"),
+                stat_row("Panel",       meta.get("panel_name", "\u2014")),
+                stat_row("Genes",       str(len(DATA.get("gene_names", [])))),
+                stat_row("Tissue",      meta.get("panel_tissue_type", "\u2014")),
+                stat_row("Pixel",       f"{meta.get('pixel_size', PIXEL_SIZE_UM)} \u00b5m"),
+            ], style={"marginBottom": "10px"}),
+            html.Hr(style={"borderColor": BORDER, "margin": "0 0 10px 0"}),
+            # Sample switcher
+            html.Button("\U0001f4c2 Load Different Sample", id="sample-modal-open-btn", n_clicks=0,
+                        style={"width": "100%", "padding": "5px 0",
+                               "backgroundColor": CARD_BG, "color": TEXT,
+                               "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                               "cursor": "pointer", "fontSize": "11px", "marginBottom": "4px"}),
+            html.Button("\U0001f4be Save as SpatialData", id="save-sdata-open-btn", n_clicks=0,
+                        style={"width": "100%", "padding": "5px 0",
+                               "backgroundColor": CARD_BG, "color": TEXT,
+                               "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                               "cursor": "pointer", "fontSize": "11px", "marginBottom": "4px"}),
+            html.Button("\u2716 Remove Extra Samples", id="remove-extra-samples-btn", n_clicks=0,
+                        style={"width": "100%", "padding": "5px 0",
+                               "backgroundColor": CARD_BG, "color": MUTED,
+                               "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                               "cursor": "pointer", "fontSize": "11px", "marginBottom": "8px"}),
+            html.Div(id="extra-samples-status",
+                     style={"fontSize": "10px", "color": MUTED, "marginBottom": "4px", "minHeight": "14px"}),
+            # Cache info
+            html.Div([
+                html.Span(f"Cache: {cache_size}",
+                          id="cache-size-display",
+                          style={"fontSize": "11px", "color": MUTED}),
+                html.Button("Clean", id="cache-clean-open-btn", n_clicks=0,
+                            style={"marginLeft": "8px", "padding": "1px 8px",
+                                   "backgroundColor": CARD_BG, "color": MUTED,
+                                   "border": f"1px solid {BORDER}", "borderRadius": "3px",
+                                   "cursor": "pointer", "fontSize": "10px"}),
+            ], style={"display": "flex", "alignItems": "center"}),
+        ], className="tissue-details"),
+    ], id="tissue-info-section", style={"marginBottom": "14px"})
+
+
+@app.callback(
+    Output("sample-modal", "is_open"),
+    Output("sample-picker", "options"),
+    Input("sample-modal-open-btn", "n_clicks"),
+    Input("sample-modal-close-btn", "n_clicks"),
+    State("sample-modal", "is_open"),
+    prevent_initial_call=True,
+)
+def toggle_sample_modal(open_clicks, close_clicks, is_open):
+    if callback_context.triggered_id == "sample-modal-open-btn" and open_clicks:
+        return True, _available_samples()
+    return False, no_update
+
+
+@app.callback(
+    Output("sample-load-status",  "children"),
+    Output("sample-modal",        "is_open",       allow_duplicate=True),
+    Output("dataset-version",     "data",          allow_duplicate=True),
+    Input("sample-load-btn",      "n_clicks"),
+    State("sample-picker",        "value"),
+    State("sample-custom-path",   "value"),
+    State("dataset-version",      "data"),
+    prevent_initial_call=True,
+)
+def load_sample(n_clicks, picked_path, custom_path, ds_version):
+    new_dir = (custom_path or "").strip() or picked_path
+    if not new_dir:
+        return "Select a sample or enter a path.", no_update, no_update
+    new_dir = os.path.abspath(new_dir)
+    if not os.path.exists(os.path.join(new_dir, "experiment.xenium")):
+        return f"Not a valid Xenium directory: {new_dir}", no_update, no_update
+    if new_dir == DATA["data_dir"]:
+        return "Already loaded.", no_update, no_update
+    try:
+        new_data = load_xenium_data(new_dir)
+        DATA.update(new_data)
+        # Reset all per-dataset state
+        with _baysor_lock:
+            _baysor_state.update({"status": "idle", "message": "", "result": None})
+        with _proseg_lock:
+            _proseg_state.update({"status": "idle", "message": "", "result": None})
+        with _annot_lock:
+            _annot_state.update({"status": "idle", "message": "", "labels": None,
+                                  "labels_proseg": None, "labels_baysor": None})
+        with _spage_lock:
+            _spage_state.update({"status": "idle", "message": "", "result": None})
+        with _sdata_lock:
+            _sdata_state.update({"status": "idle", "message": "", "sdata": None,
+                                  "roi": None, "patches": None})
+        with _umap_reseg_lock:
+            _umap_reseg_state.update({"status": "idle", "message": "", "result": None})
+        # Re-run autoloads for the new dataset
+        _annot_autoload()
+        _sdata_autoload()
+        _spage_autoload()
+        print(f"  Loaded new dataset: {new_dir}", flush=True)
+        return "Loaded.", False, (ds_version or 0) + 1
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        return f"Error: {exc}", no_update, no_update
+
+
+@app.callback(
+    Output("sample-load-status",       "children",  allow_duplicate=True),
+    Output("sample-modal",             "is_open",   allow_duplicate=True),
+    Output("extra-datasets-version",   "data",      allow_duplicate=True),
+    Output("extra-samples-status",     "children",  allow_duplicate=True),
+    Input("sample-add-btn",            "n_clicks"),
+    State("sample-picker",             "value"),
+    State("sample-custom-path",        "value"),
+    State("extra-datasets-version",    "data"),
+    prevent_initial_call=True,
+)
+def add_sample(n_clicks, picked_path, custom_path, extra_ver):
+    """Load a new Xenium dataset and append it to EXTRA_DATASETS side-by-side."""
+    global EXTRA_DATASETS
+    new_dir = (custom_path or "").strip() or picked_path
+    if not new_dir:
+        return "Select a sample or enter a path.", no_update, no_update, no_update
+    new_dir = os.path.abspath(new_dir)
+    if not os.path.exists(os.path.join(new_dir, "experiment.xenium")):
+        return f"Not a valid Xenium directory: {new_dir}", no_update, no_update, no_update
+    # Check for duplicates
+    all_dirs = [DATA["data_dir"]] + [eds["data_dir"] for eds in EXTRA_DATASETS]
+    if new_dir in all_dirs:
+        return "Sample already loaded.", no_update, no_update, no_update
+    try:
+        new_data = load_xenium_data(new_dir)
+        # Compute x_offset: place new sample to the right of all current ones
+        # x_offset = max(x_centroid) of the last dataset + 500 µm gap - min(x_centroid) of new dataset
+        if EXTRA_DATASETS:
+            last_ds = EXTRA_DATASETS[-1]
+            last_max_x = last_ds["df"]["x_centroid"].max() + last_ds["x_offset"]
+        else:
+            last_max_x = DATA["df"]["x_centroid"].max()
+        new_min_x  = new_data["df"]["x_centroid"].min()
+        x_offset   = last_max_x - new_min_x + 500.0
+        new_data["x_offset"] = x_offset
+        EXTRA_DATASETS.append(new_data)
+        n_total = 1 + len(EXTRA_DATASETS)
+        status_msg = f"{n_total} samples loaded"
+        print(f"  Added extra dataset: {new_dir} (x_offset={x_offset:.0f} µm)", flush=True)
+        return f"Added (x_offset={x_offset:.0f} µm).", False, (extra_ver or 0) + 1, status_msg
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        return f"Error: {exc}", no_update, no_update, no_update
+
+
+@app.callback(
+    Output("extra-datasets-version", "data",     allow_duplicate=True),
+    Output("extra-samples-status",   "children", allow_duplicate=True),
+    Input("remove-extra-samples-btn", "n_clicks"),
+    State("extra-datasets-version",   "data"),
+    prevent_initial_call=True,
+)
+def remove_extra_samples(n_clicks, extra_ver):
+    """Clear all extra datasets, reverting to single-sample view."""
+    global EXTRA_DATASETS
+    if not EXTRA_DATASETS:
+        return no_update, "No extra samples loaded."
+    n_removed = len(EXTRA_DATASETS)
+    EXTRA_DATASETS.clear()
+    print(f"  Removed {n_removed} extra dataset(s).", flush=True)
+    return (extra_ver or 0) + 1, "Extra samples removed."
+
+
+@app.callback(
+    Output("cluster-method", "options"),
+    Output("cluster-method", "value"),
+    Input("dataset-version", "data"),
+    prevent_initial_call=True,
+)
+def update_cluster_options(_):
+    methods = DATA["cluster_methods"]
+    opts = [{"label": method_label(m), "value": m} for m in methods]
+    return opts, (methods[0] if methods else None)
+
+
+@app.callback(
+    Output("cache-clean-modal",        "is_open"),
+    Output("cache-clean-confirm-text", "children"),
+    Input("cache-clean-open-btn",      "n_clicks"),
+    Input("cache-clean-cancel-btn",    "n_clicks"),
+    Input("cache-clean-confirm-btn",   "n_clicks"),
+    prevent_initial_call=True,
+)
+def toggle_cache_clean_modal(open_clicks, cancel_clicks, confirm_clicks):
+    tid = callback_context.triggered_id
+    if tid == "cache-clean-open-btn" and open_clicks:
+        size = _cache_size_str()
+        dataset_name = os.path.basename(DATA["data_dir"])
+        return True, (f"Delete all cache entries for dataset '{dataset_name}'? "
+                      f"Total cache size: {size}. This cannot be undone.")
+    return False, no_update
+
+
+@app.callback(
+    Output("cache-clean-modal",  "is_open",  allow_duplicate=True),
+    Output("cache-clean-done",   "data"),
+    Output("cache-size-display", "children"),
+    Input("cache-clean-confirm-btn", "n_clicks"),
+    State("cache-clean-done",        "data"),
+    prevent_initial_call=True,
+)
+def do_clean_cache(n_clicks, version):
+    _clean_cache_for_dataset()
+    new_size = _cache_size_str()
+    return False, (version or 0) + 1, f"Cache: {new_size}"
+
+
+# ─── Save as SpatialData callbacks ────────────────────────────────────────────
+@app.callback(
+    Output("save-sdata-modal", "is_open"),
+    Input("save-sdata-open-btn",  "n_clicks"),
+    Input("save-sdata-close-btn", "n_clicks"),
+    State("save-sdata-modal", "is_open"),
+    prevent_initial_call=True,
+)
+def toggle_save_sdata_modal(open_clicks, close_clicks, is_open):
+    if callback_context.triggered_id == "save-sdata-open-btn" and open_clicks:
+        return True
+    if callback_context.triggered_id == "save-sdata-close-btn":
+        return False
+    return is_open
+
+
+@app.callback(
+    Output("save-sdata-status",  "children"),
+    Output("save-sdata-poll",    "disabled"),
+    Output("save-sdata-run-btn", "disabled"),
+    Input("save-sdata-run-btn",  "n_clicks"),
+    State("save-sdata-dir",      "value"),
+    State("save-sdata-name",     "value"),
+    prevent_initial_call=True,
+)
+def start_save_sdata(n_clicks, out_dir, fname):
+    out_dir = (out_dir or "").strip()
+    fname   = (fname or "").strip()
+    if not out_dir:
+        return "Enter an output directory.", True, False
+    if not fname:
+        fname = "analysis.zarr"
+    if not fname.endswith(".zarr"):
+        fname += ".zarr"
+    save_path = os.path.join(out_dir, fname)
+    with _save_sdata_lock:
+        if _save_sdata_state["status"] == "running":
+            return "Already saving…", False, True
+        _save_sdata_state.update({"status": "running", "message": f"Writing to {save_path}…"})
+    threading.Thread(target=_save_sdata_to_disk, args=(save_path,), daemon=True).start()
+    return f"Writing to {save_path}…", False, True
+
+
+@app.callback(
+    Output("save-sdata-status",  "children",  allow_duplicate=True),
+    Output("save-sdata-poll",    "disabled",  allow_duplicate=True),
+    Output("save-sdata-run-btn", "disabled",  allow_duplicate=True),
+    Output("save-sdata-modal",   "is_open",   allow_duplicate=True),
+    Input("save-sdata-poll",     "n_intervals"),
+    State("save-sdata-modal",    "is_open"),
+    prevent_initial_call=True,
+)
+def poll_save_sdata(_, modal_open):
+    with _save_sdata_lock:
+        status  = _save_sdata_state["status"]
+        message = _save_sdata_state["message"]
+    if status == "running":
+        return message, False, True, modal_open
+    if status == "done":
+        return f"✓ {message}", True, False, False
+    if status == "error":
+        return f"✗ {message}", True, False, modal_open
+    return no_update, True, False, modal_open
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
