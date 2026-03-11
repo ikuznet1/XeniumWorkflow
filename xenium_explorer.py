@@ -104,6 +104,10 @@ _save_sdata_state: dict = {"status": "idle", "message": ""}
 _save_sdata_lock  = threading.Lock()
 _sdata_version = 0  # incremented when ROI/patches change, to trigger overlay refresh
 
+# ─── SPLIT ambient RNA correction state ───────────────────────────────────────
+_split_state: dict = {"status": "idle", "message": "", "result": None}
+_split_lock   = threading.Lock()
+
 # ─── Server log capture ────────────────────────────────────────────────────────
 import collections
 _log_buffer: collections.deque = collections.deque(maxlen=200)
@@ -480,8 +484,18 @@ def _run_seurat_annotation(rds_path: str, label_col: str = "Names", labels_key: 
         # ── 1. Load Seurat object via rpy2 ───────────────────────────────
         _set("running", "Loading Seurat RDS (may take ~30s)…")
         import rpy2.robjects as ro
+        import rpy2.robjects.conversion as _rconv
         from rpy2.robjects import pandas2ri
         from rpy2.robjects.packages import importr
+        # Dash callbacks run in threads where rpy2's ContextVar for conversion rules is unset
+        try:
+            if _rconv._get_cv().get(None) is None:
+                _rconv.activate(ro.default_converter)
+        except Exception:
+            try:
+                _rconv.activate(ro.default_converter)
+            except Exception:
+                pass
         pandas2ri.activate()
 
         base = importr("base")
@@ -828,6 +842,99 @@ def _build_proseg_expr(tx_meta_df, cells_df):
     return mat
 
 
+def _update_reseg_zarr_obs(zarr_path: str, cells_df: pd.DataFrame) -> None:
+    """Update the obs (cell metadata) in a reseg SpatialData zarr with new columns from cells_df.
+    Only adds/overwrites columns — does not touch X or var."""
+    if not os.path.isdir(zarr_path):
+        return
+    try:
+        import spatialdata as _sd_obs, anndata as _ad_obs
+        _sdata_obs = _sd_obs.read_zarr(zarr_path)
+        _adata_obs = _sdata_obs.tables["table"]
+        # Merge new columns from cells_df into existing obs
+        new_cols = [c for c in cells_df.columns if c not in _adata_obs.obs.columns]
+        if not new_cols:
+            return  # nothing to add
+        _obs_new = _adata_obs.obs.copy()
+        for col in new_cols:
+            # Align by index
+            _obs_new[col] = cells_df[col].reindex(_obs_new.index).values
+        _adata_new = _ad_obs.AnnData(
+            X=_adata_obs.X, obs=_obs_new, var=_adata_obs.var, uns=dict(_adata_obs.uns)
+        )
+        _sdata_obs.tables["table"] = _adata_new
+        try:
+            _sdata_obs.write_element("table")
+        except Exception:
+            _sdata_obs.write(zarr_path, overwrite=True)
+        print(f"  Updated zarr obs: added {new_cols} to {os.path.basename(zarr_path)}", flush=True)
+    except Exception as _e:
+        print(f"  Warning: failed to update zarr obs ({_e})", flush=True)
+
+
+def _build_reseg_sdata(cells_df, cell_bounds, expr_mat, gene_names, source, out_dir) -> str:
+    """Build and write a SpatialData zarr for a resegmentation result. Returns zarr path."""
+    try:
+        import spatialdata
+        from spatialdata.models import TableModel, ShapesModel
+        import anndata as ad
+        import geopandas as gpd
+        from shapely.geometry import Polygon
+    except ImportError:
+        print("  Warning: spatialdata/geopandas/shapely not available — skipping reseg zarr", flush=True)
+        return ""
+
+    var_df = pd.DataFrame({"is_imputed": False}, index=list(gene_names))
+    obs_df = cells_df.copy()
+    obs_df.index = obs_df.index.astype(str)
+
+    n_genes = len(gene_names)
+    if expr_mat is not None:
+        X = sp.csr_matrix(expr_mat, dtype=np.float32)
+    else:
+        X = sp.csr_matrix((len(obs_df), n_genes), dtype=np.float32)
+
+    adata = ad.AnnData(X=X, obs=obs_df, var=var_df)
+    adata.uns["source"] = source
+    adata.uns["imputed_genes"] = []
+    try:
+        adata = TableModel.parse(adata)
+    except Exception:
+        pass
+
+    geometries = {}
+    for cid, (vx, vy) in cell_bounds.items():
+        try:
+            geometries[str(cid)] = Polygon(zip(vx, vy))
+        except Exception:
+            pass
+
+    if geometries:
+        gdf = gpd.GeoDataFrame(
+            geometry=list(geometries.values()),
+            index=pd.Index(list(geometries.keys()), name="cell_id"),
+        )
+        try:
+            shapes = ShapesModel.parse(gdf)
+            sdata = spatialdata.SpatialData(
+                tables={"table": adata},
+                shapes={"cell_boundaries": shapes},
+            )
+        except Exception:
+            sdata = spatialdata.SpatialData(tables={"table": adata})
+    else:
+        sdata = spatialdata.SpatialData(tables={"table": adata})
+
+    zarr_path = os.path.join(out_dir, f"spatialdata_{source}.zarr")
+    try:
+        sdata.write(zarr_path)
+        print(f"  Reseg zarr written: {zarr_path}", flush=True)
+    except Exception as e:
+        print(f"  Warning: failed to write reseg zarr: {e}", flush=True)
+        return ""
+    return zarr_path
+
+
 def _load_cached_baysor(out_dir: str) -> None:
     """Load a cached Baysor result from disk into _baysor_state."""
     def _set(status, message, result=None):
@@ -836,6 +943,7 @@ def _load_cached_baysor(out_dir: str) -> None:
             _baysor_state["message"] = message
             if result is not None:
                 _baysor_state["result"] = result
+    print(f"Loading cached Baysor: {os.path.basename(out_dir)}…", flush=True)
     try:
         _set("running", "Loading cached Baysor result…")
         # Collect all segmentation.csv files (may be one per patch subdir)
@@ -876,11 +984,42 @@ def _load_cached_baysor(out_dir: str) -> None:
                     break  # only one polygon file per dir needed
         expr_mat = _build_baysor_expr(seg, cells_df)
         n_cells = len(cells_df)
+
+        # Compute clusters + UMAP if not already in cells_df (migration for old cache)
+        if "umap_1" not in cells_df.columns and expr_mat is not None:
+            _set("running", f"Computing UMAP and clusters for {n_cells:,} cells (one-time migration)…")
+            _compute_reseg_clusters_umap(cells_df, expr_mat,
+                                         progress_fn=lambda msg: _set("running", msg))
+
+        zarr_path = os.path.join(out_dir, "spatialdata_baysor.zarr")
+        if not os.path.isdir(zarr_path):
+            zarr_path = _build_reseg_sdata(
+                cells_df, cell_bounds, expr_mat, DATA["gene_names"], "baysor", out_dir
+            )
+        else:
+            # Update zarr obs if we just computed clusters/UMAP (migration)
+            _update_reseg_zarr_obs(zarr_path, cells_df)
+
+        try:
+            import spatialdata as _sd_
+            _adata_b = _sd_.read_zarr(zarr_path).tables["table"]
+            _baysor_corr = (
+                sp.csr_matrix(_adata_b.layers["X_corrected"])
+                if "X_corrected" in _adata_b.layers else None
+            )
+            _baysor_corr_imp = list(_adata_b.uns.get("split_corrected_imputed_genes", []))
+        except Exception:
+            _baysor_corr = None
+            _baysor_corr_imp = []
+
         _set("done", f"Loaded — {n_cells:,} cells", result={
             "cells_df": cells_df, "cell_bounds": cell_bounds,
             "out_dir": out_dir, "expr": expr_mat, "source": "baysor",
+            "sdata_path": zarr_path,
+            "split_corrected_expr": _baysor_corr,
+            "split_corrected_imputed_genes": _baysor_corr_imp,
         })
-        print(f"  Loaded cached Baysor: {n_cells:,} cells from {os.path.basename(out_dir)}", flush=True)
+        print(f"Loaded cached Baysor: {n_cells:,} cells from {os.path.basename(out_dir)}", flush=True)
     except Exception as exc:
         import traceback; traceback.print_exc()
         _set("error", str(exc)[:300])
@@ -894,6 +1033,7 @@ def _load_cached_proseg(out_dir: str) -> None:
             _proseg_state["message"] = message
             if result is not None:
                 _proseg_state["result"] = result
+    print(f"Loading cached Proseg: {os.path.basename(out_dir)}…", flush=True)
     try:
         _set("running", "Loading cached Proseg result…")
         # Find cell-metadata.csv.gz (may be in subdirs for patch runs)
@@ -934,11 +1074,41 @@ def _load_cached_proseg(out_dir: str) -> None:
                     break
         expr_mat = _build_proseg_expr(tx_meta, cells_df) if not tx_meta.empty else None
         n_cells = len(cells_df)
+
+        # Compute clusters + UMAP if not already in cells_df (migration for old cache)
+        if "umap_1" not in cells_df.columns and expr_mat is not None:
+            _set("running", f"Computing UMAP and clusters for {n_cells:,} cells (one-time migration)…")
+            _compute_reseg_clusters_umap(cells_df, expr_mat,
+                                         progress_fn=lambda msg: _set("running", msg))
+
+        zarr_path = os.path.join(out_dir, "spatialdata_proseg.zarr")
+        if not os.path.isdir(zarr_path):
+            zarr_path = _build_reseg_sdata(
+                cells_df, cell_bounds, expr_mat, DATA["gene_names"], "proseg", out_dir
+            )
+        else:
+            _update_reseg_zarr_obs(zarr_path, cells_df)
+
+        try:
+            import spatialdata as _sd_
+            _adata_p = _sd_.read_zarr(zarr_path).tables["table"]
+            _proseg_corr = (
+                sp.csr_matrix(_adata_p.layers["X_corrected"])
+                if "X_corrected" in _adata_p.layers else None
+            )
+            _proseg_corr_imp = list(_adata_p.uns.get("split_corrected_imputed_genes", []))
+        except Exception:
+            _proseg_corr = None
+            _proseg_corr_imp = []
+
         _set("done", f"Loaded — {n_cells:,} cells", result={
             "cells_df": cells_df, "cell_bounds": cell_bounds,
             "out_dir": out_dir, "expr": expr_mat, "source": "proseg",
+            "sdata_path": zarr_path,
+            "split_corrected_expr": _proseg_corr,
+            "split_corrected_imputed_genes": _proseg_corr_imp,
         })
-        print(f"  Loaded cached Proseg: {n_cells:,} cells from {os.path.basename(out_dir)}", flush=True)
+        print(f"Loaded cached Proseg: {n_cells:,} cells from {os.path.basename(out_dir)}", flush=True)
     except Exception as exc:
         import traceback; traceback.print_exc()
         _set("error", str(exc)[:300])
@@ -1110,12 +1280,20 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
         }
         with open(os.path.join(out_dir, "params.json"), "w") as _f:
             _json.dump(_params_out, _f)
+        _set("running", "Computing UMAP and clusters…")
+        _compute_reseg_clusters_umap(cells_df, expr_mat,
+                                     progress_fn=lambda msg: _set("running", msg))
+        _set("running", "Writing SpatialData zarr…")
+        zarr_path = _build_reseg_sdata(
+            cells_df, cell_bounds, expr_mat, DATA["gene_names"], "baysor", out_dir
+        )
         _set("done", f"Done — {n_cells:,} cells", result={
             "cells_df":    cells_df,
             "cell_bounds": cell_bounds,
             "out_dir":     out_dir,
             "expr":        expr_mat,
             "source":      "baysor",
+            "sdata_path":  zarr_path,
         })
         print(f"  Baysor: {n_cells:,} cells segmented", flush=True)
 
@@ -1293,12 +1471,20 @@ def _run_proseg(voxel_size=None, n_threads=None,
         }
         with open(os.path.join(out_dir, "params.json"), "w") as _f:
             _json.dump(_params_out, _f)
+        _set("running", "Computing UMAP and clusters…")
+        _compute_reseg_clusters_umap(cells_df, expr_mat,
+                                     progress_fn=lambda msg: _set("running", msg))
+        _set("running", "Writing SpatialData zarr…")
+        zarr_path = _build_reseg_sdata(
+            cells_df, cell_bounds, expr_mat, DATA["gene_names"], "proseg", out_dir
+        )
         _set("done", f"Done — {n_cells:,} cells", result={
             "cells_df":    cells_df,
             "cell_bounds": cell_bounds,
             "out_dir":     out_dir,
             "expr":        expr_mat,
             "source":      "proseg",
+            "sdata_path":  zarr_path,
         })
         print(f"  Proseg: {n_cells:,} cells segmented", flush=True)
 
@@ -1308,7 +1494,410 @@ def _run_proseg(voxel_size=None, n_threads=None,
         _set("error", str(exc)[:300])
 
 
-# ─── Reseg UMAP computation ───────────────────────────────────────────────────
+# ─── Reseg clustering + UMAP ─────────────────────────────────────────────────
+
+def _compute_reseg_clusters_umap(cells_df: pd.DataFrame, expr_mat,
+                                  progress_fn=None) -> None:
+    """Compute KMeans clustering and UMAP for reseg cells in-place on cells_df.
+    Adds columns: cluster_kmeans_10, umap_1, umap_2.
+    Also updates _umap_reseg_state so the UMAP scatter plot works immediately."""
+    if expr_mat is None:
+        return
+
+    from sklearn.decomposition import TruncatedSVD
+
+    n_cells = len(cells_df)
+    if progress_fn:
+        progress_fn(f"Normalising {n_cells:,} cells for UMAP/clustering…")
+
+    mat = expr_mat[:, :len(DATA["gene_names"])].astype("float32").tocsr()
+    row_sums = np.asarray(mat.sum(axis=1)).flatten()
+    row_sums[row_sums == 0] = 1.0
+    mat = sp.diags(1e4 / row_sums).dot(mat).tocsr()
+    mat.data = np.log1p(mat.data)
+
+    n_comp = min(50, n_cells - 1, mat.shape[1] - 1)
+    if progress_fn:
+        progress_fn(f"PCA ({n_comp} components)…")
+    svd = TruncatedSVD(n_components=n_comp, random_state=42)
+    pca_coords = svd.fit_transform(mat)
+
+    # KMeans clustering
+    from sklearn.cluster import MiniBatchKMeans
+    n_clusters = min(10, n_cells)
+    if progress_fn:
+        progress_fn(f"KMeans ({n_clusters} clusters)…")
+    km = MiniBatchKMeans(n_clusters=n_clusters, random_state=42, n_init=3)
+    cells_df["cluster_kmeans_10"] = km.fit_predict(pca_coords) + 1  # 1-indexed
+
+    # UMAP or t-SNE fallback
+    if progress_fn:
+        progress_fn("Computing UMAP…")
+    try:
+        import sys, types
+        # Stub tensorflow so umap/__init__.py can load parametric_umap without
+        # crashing on the NumPy 1.x vs 2.x ABI mismatch in the installed TF.
+        if "tensorflow" not in sys.modules:
+            sys.modules["tensorflow"] = types.ModuleType("tensorflow")
+        import warnings
+        from umap.umap_ import UMAP
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="n_jobs value.*overridden")
+            reducer = UMAP(n_neighbors=min(15, n_cells - 1), min_dist=0.1, random_state=42)
+            umap_coords = reducer.fit_transform(pca_coords)
+    except Exception:
+        from sklearn.manifold import TSNE
+        perp = min(30, max(5, n_cells // 10))
+        umap_coords = TSNE(n_components=2, perplexity=perp, random_state=42).fit_transform(pca_coords)
+
+    cells_df["umap_1"] = umap_coords[:, 0]
+    cells_df["umap_2"] = umap_coords[:, 1]
+
+    # Store result in _umap_reseg_state so the existing UMAP scatter works
+    umap_df = pd.DataFrame(umap_coords, index=cells_df.index, columns=["umap_1", "umap_2"])
+    with _umap_reseg_lock:
+        _umap_reseg_state["status"]  = "done"
+        _umap_reseg_state["message"] = f"Done — {n_cells:,} cells"
+        _umap_reseg_state["result"]  = umap_df
+
+    if progress_fn:
+        progress_fn(f"UMAP + clustering done ({n_cells:,} cells)")
+    print(f"  Reseg: UMAP + {n_clusters} KMeans clusters computed for {n_cells:,} cells", flush=True)
+
+
+def _compute_split_clusters_umap(cells_df: pd.DataFrame, corrected_mat,
+                                  progress_fn=None) -> None:
+    """
+    Compute KMeans clusters and UMAP on SPLIT-corrected counts.
+    Writes cluster_split_10, split_umap_1, split_umap_2 columns into cells_df in-place.
+    """
+    try:
+        import scipy.sparse as sp_
+        from sklearn.preprocessing import normalize
+        from sklearn.decomposition import TruncatedSVD
+        from sklearn.cluster import KMeans
+        try:
+            import umap
+            _have_umap = True
+        except ImportError:
+            _have_umap = False
+
+        n_cells, n_genes = corrected_mat.shape
+        if progress_fn:
+            progress_fn(f"SPLIT: normalizing {n_cells:,} cells × {n_genes} genes…")
+
+        mat = corrected_mat if sp_.issparse(corrected_mat) else sp_.csr_matrix(corrected_mat)
+        # Log-normalize
+        log_mat = mat.copy().astype(np.float32)
+        log_mat.data = np.log1p(log_mat.data)
+        normed = normalize(log_mat, norm="l2", axis=1)
+
+        # PCA via SVD
+        n_comp = min(50, n_cells - 1, n_genes - 1)
+        if progress_fn:
+            progress_fn(f"SPLIT: SVD ({n_comp} components)…")
+        svd = TruncatedSVD(n_components=n_comp, random_state=42)
+        pca = svd.fit_transform(normed)
+
+        # KMeans
+        if progress_fn:
+            progress_fn("SPLIT: KMeans clustering (k=10)…")
+        km = KMeans(n_clusters=10, random_state=42, n_init=10)
+        labels = km.fit_predict(pca)
+        cells_df["cluster_split_10"] = (labels + 1).astype(str)
+
+        # UMAP
+        if _have_umap:
+            if progress_fn:
+                progress_fn("SPLIT: computing UMAP…")
+            n_neighbors = min(30, n_cells - 1)
+            reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors,
+                                min_dist=0.3, random_state=42)
+            embedding = reducer.fit_transform(pca)
+            cells_df["split_umap_1"] = embedding[:, 0].astype(np.float32)
+            cells_df["split_umap_2"] = embedding[:, 1].astype(np.float32)
+        else:
+            if progress_fn:
+                progress_fn("SPLIT: umap-learn not available, skipping UMAP.")
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+
+def _split_write_zarr(sdata_path: str, corrected_mat, cells_df: pd.DataFrame,
+                       gene_names: list) -> None:
+    """Write SPLIT corrected counts + cluster/UMAP obs columns to a SpatialData zarr."""
+    try:
+        import spatialdata as _sd_
+        with _sdata_lock:
+            sdata = _sd_.read_zarr(sdata_path)
+            adata = sdata.tables["table"]
+            # Store corrected counts as layer
+            import scipy.sparse as sp_
+            mat = corrected_mat if sp_.issparse(corrected_mat) else sp_.csr_matrix(corrected_mat)
+            # Align rows to adata.obs order
+            adata.layers["X_corrected"] = mat
+            # Copy cluster and UMAP columns
+            for col in ["cluster_split_10", "split_umap_1", "split_umap_2"]:
+                if col in cells_df.columns:
+                    adata.obs[col] = cells_df[col].values
+            sdata.tables["table"] = adata
+            sdata.write_element("table")
+        print(f"  SPLIT: wrote corrected layer to {os.path.basename(sdata_path)}", flush=True)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+
+
+def _r_dgcmatrix_to_scipy(r_mat):
+    """Convert an R dgCMatrix to a scipy CSR matrix."""
+    import scipy.sparse as sp_
+    import numpy as np
+    i = np.array(r_mat.slots["i"])
+    p = np.array(r_mat.slots["p"])
+    x = np.array(r_mat.slots["x"])
+    dims = list(r_mat.slots["Dim"])
+    return sp_.csr_matrix((x, i, p), shape=(dims[0], dims[1]))
+
+
+def _run_split_correction(rds_path: str, label_col: str = "Names",
+                           max_cores: int = 4, seg_source: str = "xenium") -> None:
+    """
+    Background thread: run RCTD (doublet mode) + SPLIT::purify() for ambient RNA correction.
+    Requires R packages: spacexr, SPLIT (bdsc-tds/SPLIT).
+    """
+    _redirect_rpy2_console()
+
+    def _set(status, message, result=None):
+        with _split_lock:
+            _split_state["status"]  = status
+            _split_state["message"] = message
+            if result is not None:
+                _split_state["result"] = result
+
+    try:
+        import rpy2.robjects as ro
+        import rpy2.robjects.conversion as _rconv
+        from rpy2.robjects import pandas2ri
+        from rpy2.robjects.packages import importr
+        import scipy.sparse as sp_
+        import scipy.io as sio
+        import tempfile
+
+        # rpy2 thread fix
+        try:
+            if _rconv._get_cv().get(None) is None:
+                _rconv.activate(ro.default_converter)
+        except Exception:
+            try:
+                _rconv.activate(ro.default_converter)
+            except Exception:
+                pass
+        pandas2ri.activate()
+
+        # ── 1. Get active data ──────────────────────────────────────────────
+        _tool = _seg_tool(seg_source)
+        bres = _baysor_state["result"] if _baysor_state["status"] == "done" else None
+        pres = _proseg_state["result"] if _proseg_state["status"] == "done" else None
+        if _tool == "baysor":
+            _alt_res = bres
+        elif _tool == "proseg":
+            _alt_res = pres
+        else:
+            _alt_res = None
+
+        if _alt_res is not None:
+            expr       = _alt_res["expr"]
+            cells_df   = _alt_res["cells_df"].copy()
+            sdata_path = _alt_res.get("sdata_path", "")
+            gni        = _alt_res.get("gene_name_to_idx") or DATA.get("gene_name_to_idx", {})
+        else:
+            expr       = DATA["expr"]
+            cells_df   = DATA["df"].copy()
+            sdata_path = DATA.get("sdata_path", "")
+            gni        = DATA.get("gene_name_to_idx", {})
+
+        panel_genes = DATA["gene_names"]  # always use panel gene list
+        n_panel     = len(panel_genes)
+        # Slice to panel-only columns (drop imputed)
+        if expr.shape[1] > n_panel:
+            expr_panel = expr[:, :n_panel]
+        else:
+            expr_panel = expr
+        n_cells, n_genes = expr_panel.shape
+        print(f"  SPLIT: {n_cells:,} cells × {n_genes} panel genes", flush=True)
+
+        # ── 2. Check R packages ──────────────────────────────────────────────
+        _set("running", "Loading R packages (spacexr, SPLIT)…")
+        try:
+            importr("spacexr")
+        except Exception:
+            _set("error", "spacexr not installed. In R: devtools::install_github('dmcable/spacexr')")
+            return
+        try:
+            importr("SPLIT")
+        except Exception:
+            _set("error", "SPLIT not installed. In R: remotes::install_github('bdsc-tds/SPLIT')")
+            return
+        importr("SeuratObject")
+        importr("Matrix")
+        base = importr("base")
+
+        # ── 3. Load Seurat reference ─────────────────────────────────────────
+        _set("running", "Loading Seurat reference…")
+        rds = base.readRDS(rds_path)
+        meta_r  = ro.r['slot'](rds, "meta.data")
+        meta_df = pandas2ri.rpy2py(meta_r)
+        if label_col not in meta_df.columns:
+            _set("error", f"Column '{label_col}' not found. Available: {list(meta_df.columns)[:10]}")
+            return
+
+        # ── 4. Shared genes ──────────────────────────────────────────────────
+        _set("running", "Finding shared genes…")
+        ro.r.assign("._split_rds", rds)
+        mat_r     = ro.r("slot(slot(._split_rds, 'assays')[['RNA']], 'counts')")
+        ref_genes = list(ro.r['rownames'](mat_r))
+        shared_genes = sorted(set(panel_genes) & set(ref_genes))
+        if len(shared_genes) < 10:
+            _set("error", f"Only {len(shared_genes)} shared genes between reference and panel.")
+            return
+        print(f"  SPLIT: {len(shared_genes)} shared genes", flush=True)
+
+        # ── 5. Build Reference ───────────────────────────────────────────────
+        _set("running", f"Building RCTD Reference ({len(meta_df):,} ref cells)…")
+        ro.r.assign("._split_genes", ro.StrVector(shared_genes))
+        ro.r("""
+._split_ref_mat <- slot(slot(._split_rds, 'assays')[['RNA']], 'counts')[._split_genes, , drop=FALSE]
+._split_ref_mat <- as(._split_ref_mat, 'dgCMatrix')
+""")
+        ref_labels_r       = ro.StrVector(meta_df[label_col].astype(str).tolist())
+        ref_labels_r.names = ro.StrVector(list(meta_df.index.astype(str)))
+        ro.r.assign("._split_ref_labels", ref_labels_r)
+        ro.r("""
+._split_ref_factor <- as.factor(._split_ref_labels)
+._split_numi_ref   <- colSums(._split_ref_mat)
+._split_reference  <- spacexr::Reference(
+    counts      = ._split_ref_mat,
+    cell_types  = ._split_ref_factor,
+    nUMI        = ._split_numi_ref
+)
+""")
+
+        # ── 6. Build SpatialRNA (panel genes only) ───────────────────────────
+        _set("running", f"Building SpatialRNA object ({n_cells:,} cells)…")
+        # Subset expr_panel to shared genes
+        shared_idx = [gni[g] for g in shared_genes if g in gni and gni[g] < n_panel]
+        shared_genes_present = [g for g in shared_genes if g in gni and gni[g] < n_panel]
+        expr_shared = expr_panel[:, shared_idx]  # cells × shared_genes
+        # gene × cells for R
+        expr_t = expr_shared.T.toarray() if hasattr(expr_shared, 'toarray') else expr_shared.T
+        counts_r_mat = ro.r.matrix(
+            ro.FloatVector(expr_t.flatten(order='F').tolist()),
+            nrow=len(shared_genes_present),
+            ncol=n_cells
+        )
+        ro.r['rownames'](counts_r_mat)[:] = shared_genes_present
+        cell_ids = [str(c) for c in cells_df.index]
+        ro.r['colnames'](counts_r_mat)[:] = cell_ids
+        ro.r.assign("._split_counts_mat", counts_r_mat)
+        ro.r("""._split_counts_mat <- as(._split_counts_mat, 'dgCMatrix')""")
+
+        coords_df = cells_df[["x_centroid", "y_centroid"]].copy()
+        coords_df.columns = ["x", "y"]
+        coords_r = pandas2ri.py2rpy(coords_df)
+        ro.r.assign("._split_coords", coords_r)
+        ro.r("""
+rownames(._split_coords) <- colnames(._split_counts_mat)
+._split_numi <- colSums(._split_counts_mat)
+._split_spatialrna <- spacexr::SpatialRNA(
+    coords  = ._split_coords,
+    counts  = ._split_counts_mat,
+    nUMI    = ._split_numi
+)
+""")
+
+        # ── 7. Run RCTD (doublet mode) ───────────────────────────────────────
+        _set("running", f"Running RCTD doublet mode (max_cores={max_cores})… [~20-40 min]")
+        print("  SPLIT: starting RCTD doublet mode…", flush=True)
+        ro.r.assign("._split_max_cores", ro.IntVector([max_cores]))
+        ro.r("""
+._split_rctd <- spacexr::create.RCTD(._split_spatialrna, ._split_reference,
+    max_cores=._split_max_cores[1], CELL_MIN_INSTANCE=5, doublet_mode=TRUE)
+._split_rctd <- spacexr::run.RCTD(._split_rctd, doublet_mode='doublet')
+._split_rctd <- SPLIT::run_post_process_RCTD(._split_rctd)
+""")
+        print("  SPLIT: RCTD done, running purify()…", flush=True)
+
+        # ── 8. Run SPLIT::purify ─────────────────────────────────────────────
+        _set("running", "Running SPLIT::purify()…")
+        # Full counts matrix (all panel genes) gene × cells
+        expr_full_t = expr_panel.T.toarray() if hasattr(expr_panel, 'toarray') else expr_panel.T
+        full_r_mat = ro.r.matrix(
+            ro.FloatVector(expr_full_t.flatten(order='F').tolist()),
+            nrow=n_panel,
+            ncol=n_cells
+        )
+        ro.r['rownames'](full_r_mat)[:] = list(panel_genes)
+        ro.r['colnames'](full_r_mat)[:] = cell_ids
+        ro.r.assign("._split_full_counts", full_r_mat)
+        ro.r("""._split_full_counts <- as(._split_full_counts, 'dgCMatrix')""")
+        ro.r("""
+._split_res <- SPLIT::purify(
+    counts          = ._split_full_counts,
+    rctd            = ._split_rctd,
+    DO_purify_singlets = TRUE
+)
+._split_purified <- ._split_res$purified_counts
+""")
+
+        # ── 9. Convert back to Python ────────────────────────────────────────
+        _set("running", "Converting corrected counts to Python…")
+        purified_r = ro.r["._split_purified"]
+        # Convert dgCMatrix → scipy CSR (cells × genes)
+        purified_csr_t = _r_dgcmatrix_to_scipy(purified_r)  # gene × cells
+        corrected_mat  = purified_csr_t.T.tocsr()             # cells × genes
+        corrected_mat.data = np.clip(corrected_mat.data, 0, None)
+        print(f"  SPLIT: corrected matrix shape {corrected_mat.shape}", flush=True)
+
+        # ── 10. Compute clusters + UMAP ──────────────────────────────────────
+        _set("running", "Computing clusters and UMAP on corrected counts…")
+        _compute_split_clusters_umap(cells_df, corrected_mat,
+                                      progress_fn=lambda msg: _set("running", msg))
+
+        # ── 11. Write to zarr ────────────────────────────────────────────────
+        if sdata_path and os.path.isdir(sdata_path):
+            _set("running", "Writing corrected counts to SpatialData zarr…")
+            _split_write_zarr(sdata_path, corrected_mat, cells_df, list(panel_genes))
+
+        # ── 12. Update in-memory ─────────────────────────────────────────────
+        if _alt_res is not None:
+            with _split_lock:
+                _alt_res["split_corrected_expr"] = corrected_mat
+                _alt_res["split_corrected_imputed_genes"] = []
+                # Merge cluster/UMAP cols back into alt_res cells_df
+                for col in ["cluster_split_10", "split_umap_1", "split_umap_2"]:
+                    if col in cells_df.columns:
+                        _alt_res["cells_df"][col] = cells_df[col].values
+        else:
+            DATA["split_corrected_expr"] = corrected_mat
+            DATA["split_corrected_imputed_genes"] = []
+            for col in ["cluster_split_10", "split_umap_1", "split_umap_2"]:
+                if col in cells_df.columns:
+                    DATA["df"][col] = cells_df[col].values
+
+        _set("done", f"SPLIT complete — {n_cells:,} cells corrected", result={"n_cells": n_cells})
+        print(f"  SPLIT: done — {n_cells:,} cells corrected", flush=True)
+
+    except Exception:
+        import traceback
+        msg = traceback.format_exc()
+        print(f"  SPLIT ERROR:\n{msg}", flush=True)
+        with _split_lock:
+            _split_state["status"]  = "error"
+            _split_state["message"] = msg.strip().splitlines()[-1]
+
+
+# ─── Reseg UMAP computation (manual re-run) ───────────────────────────────────
 
 def _run_reseg_umap() -> None:
     """Background thread: compute UMAP for the active resegmented cells."""
@@ -1327,9 +1916,25 @@ def _run_reseg_umap() -> None:
             bres = _baysor_state["result"] if not pres and _baysor_state["status"] == "done" else None
         alt_res = pres or bres
 
-        if alt_res is None or alt_res.get("expr") is None:
-            _set("error", "No expression matrix — re-run segmentation first")
+        if alt_res is None:
+            _set("error", "No segmentation loaded — load a Baysor/Proseg run first")
             return
+
+        if alt_res.get("expr") is None:
+            # Try loading expr from the reseg SpatialData zarr
+            zarr_path = alt_res.get("sdata_path", "")
+            if zarr_path and os.path.isdir(zarr_path):
+                try:
+                    import spatialdata as _sd_umap
+                    _sdata_umap = _sd_umap.read_zarr(zarr_path)
+                    alt_res["expr"] = sp.csr_matrix(_sdata_umap.tables["table"].X)
+                    print(f"  Reseg UMAP: loaded expr from {os.path.basename(zarr_path)}", flush=True)
+                except Exception as _ze:
+                    _set("error", f"No expression matrix — re-run segmentation ({_ze})")
+                    return
+            else:
+                _set("error", "No expression matrix — re-run segmentation first")
+                return
 
         expr      = alt_res["expr"]   # (n_cells × n_genes) CSR
         cell_ids  = [str(c) for c in alt_res["cells_df"].index]
@@ -1358,13 +1963,16 @@ def _run_reseg_umap() -> None:
             # crashing on the NumPy 1.x vs 2.x ABI mismatch in the installed TF.
             if "tensorflow" not in sys.modules:
                 sys.modules["tensorflow"] = types.ModuleType("tensorflow")
+            import warnings
             from umap.umap_ import UMAP
-            reducer = UMAP(n_neighbors=min(15, n_cells - 1),
-                           min_dist=0.1, random_state=0)
-            embedding = reducer.fit_transform(pca_coords)
-        except ImportError:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message="n_jobs value.*overridden")
+                reducer = UMAP(n_neighbors=min(15, n_cells - 1),
+                               min_dist=0.1, random_state=0)
+                embedding = reducer.fit_transform(pca_coords)
+        except Exception:
             from sklearn.manifold import TSNE
-            _set("running", "Running t-SNE (umap-learn not installed)…")
+            _set("running", "Running t-SNE (umap-learn not installed or TF error)…")
             perp = min(30, max(5, n_cells // 10))
             embedding = TSNE(n_components=2, perplexity=perp,
                              random_state=0).fit_transform(pca_coords)
@@ -1520,8 +2128,10 @@ def _vectorized_spage(spatial_df: pd.DataFrame, rna_df: pd.DataFrame,
     return pd.DataFrame(imp, index=spatial_df.index, columns=genes_to_predict)
 
 
-def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str) -> None:
-    """Background thread: run SpaGE gene imputation and store results."""
+def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str, seg_source: str = None) -> None:
+    """Background thread: run SpaGE gene imputation and store results.
+    When seg_source is a Baysor/Proseg run, imputes against reseg cells and writes
+    back to the reseg SpatialData zarr (alt_res['sdata_path'])."""
     _redirect_rpy2_console()
 
     def _set(status, message, result=None):
@@ -1549,6 +2159,18 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str) -> None:
             except Exception:
                 pass
 
+        # ── Determine active reseg (if any) ──────────────────────────────
+        _alt_res = None
+        if seg_source and _seg_tool(seg_source) != "xenium":
+            if _seg_tool(seg_source) == "baysor":
+                with _baysor_lock:
+                    if _baysor_state["status"] == "done":
+                        _alt_res = _baysor_state["result"]
+            elif _seg_tool(seg_source) == "proseg":
+                with _proseg_lock:
+                    if _proseg_state["status"] == "done":
+                        _alt_res = _proseg_state["result"]
+
         # ── Load reference gene list ─────────────────────────────────────
         _set("running", "Opening Seurat reference (this may take a few minutes)…")
         importr("SeuratObject")
@@ -1558,7 +2180,13 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str) -> None:
         ro.r('rna_genes  <- rownames(rna_ref@data)')
         rna_genes_all = list(ro.r("rna_genes"))
 
-        xenium_genes = set(DATA["gene_names"])
+        # Use only panel (non-imputed) genes for shared-gene computation
+        gene_var = DATA.get("gene_var")
+        if gene_var is not None and "is_imputed" in gene_var.columns:
+            panel_gene_names = [g for g in DATA["gene_names"] if not gene_var.loc[g, "is_imputed"]]
+        else:
+            panel_gene_names = list(DATA["gene_names"])
+        xenium_genes = set(panel_gene_names)
         shared_genes = sorted(xenium_genes & set(rna_genes_all))
         if not shared_genes:
             _set("error", "No shared genes between Xenium panel and reference!")
@@ -1582,7 +2210,9 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str) -> None:
             genes_needed = shared_genes + genes_to_predict
             genes_key = ",".join(sorted(genes_to_predict))
 
-        cache_file = _spage_cache_path(rds_path, genes_key)
+        # Reseg runs get a separate cache key so their imputed values don't clash with Xenium
+        _cache_seg_suffix = f"__{seg_source.replace(':', '_')}" if (seg_source and _alt_res is not None) else ""
+        cache_file = _spage_cache_path(rds_path, genes_key + _cache_seg_suffix)
         if os.path.exists(cache_file):
             _set("running", "Loading cached SpaGE results…")
             imp_df = pd.read_parquet(cache_file)
@@ -1638,31 +2268,121 @@ writeLines(colnames(mat_sub), "{cells_file}")
             _set("error", "No valid genes to predict after filtering against reference.")
             return
 
-        # ── Build Xenium normalized matrix ───────────────────────────────
+        # ── Build normalized expression matrix for SpaGE input ───────────
         shared_in_rna = [g for g in shared_genes if g in rna_genes_sub]
-        xen_idx = [DATA["gene_name_to_idx"][g] for g in shared_in_rna]
-        xen_raw = DATA["expr"][:, xen_idx].toarray().astype(np.float32)
-        rs = xen_raw.sum(axis=1, keepdims=True)
-        rs[rs == 0] = 1.0
-        xen_norm = np.log1p(xen_raw / rs * 10_000)
 
-        df  = DATA["df"]
-        idx = DATA["df_to_expr"]
-        good = idx >= 0
-        xen_aligned = np.zeros((len(df), len(shared_in_rna)), dtype=np.float32)
-        xen_aligned[good] = xen_norm[idx[good]]
-        spatial_df = pd.DataFrame(xen_aligned, index=df.index, columns=shared_in_rna)
+        if _alt_res is not None:
+            # ── Reseg path: use alt_res["expr"] (panel genes × reseg cells) ──
+            reseg_expr = _alt_res.get("expr")
+            if reseg_expr is None:
+                _set("error", "Reseg has no expression matrix — reload segmentation.")
+                return
+            # Panel gene index (columns 0..n_panel-1 of reseg expr)
+            panel_gni = {g: i for i, g in enumerate(panel_gene_names)}
+            shared_in_rna_use = [g for g in shared_in_rna if g in panel_gni]
+            xen_idx_use = [panel_gni[g] for g in shared_in_rna_use]
+            if not shared_in_rna_use:
+                _set("error", "No shared genes found in reseg expression matrix.")
+                return
+            xen_raw = reseg_expr[:, xen_idx_use].toarray().astype(np.float32)
+            rs = xen_raw.sum(axis=1, keepdims=True); rs[rs == 0] = 1.0
+            xen_norm = np.log1p(xen_raw / rs * 10_000)
+            spatial_df = pd.DataFrame(xen_norm, index=_alt_res["cells_df"].index,
+                                      columns=shared_in_rna_use)
+        else:
+            # ── Xenium path ───────────────────────────────────────────────
+            panel_gni = DATA["gene_name_to_idx"]
+            shared_in_rna_use = [g for g in shared_in_rna if g in panel_gni]
+            xen_idx = [panel_gni[g] for g in shared_in_rna_use]
+            xen_raw = DATA["expr"][:, xen_idx].toarray().astype(np.float32)
+            rs = xen_raw.sum(axis=1, keepdims=True); rs[rs == 0] = 1.0
+            xen_norm = np.log1p(xen_raw / rs * 10_000)
+            df  = DATA["df"]
+            idx = DATA["df_to_expr"]
+            good = idx >= 0
+            xen_aligned = np.zeros((len(df), len(shared_in_rna_use)), dtype=np.float32)
+            xen_aligned[good] = xen_norm[idx[good]]
+            spatial_df = pd.DataFrame(xen_aligned, index=df.index, columns=shared_in_rna_use)
 
         # ── Run SpaGE ────────────────────────────────────────────────────
         _set("running", f"Running SpaGE (n_pv={n_pv}, {len(genes_to_predict)} genes)…")
         imp_df = _vectorized_spage(spatial_df, rna_df, n_pv, genes_to_predict)
 
-        # ── Cache ─────────────────────────────────────────────────────────
+        # ── Cache to parquet ──────────────────────────────────────────────
         _set("running", "Saving imputed results…")
         imp_df.to_parquet(cache_file)
-        _spage_index_update(cache_file)
-        _set("done", f"Done — {len(imp_df.columns):,} genes imputed", result=imp_df)
+        if _alt_res is None:
+            _spage_index_update(cache_file)
         print(f"  SpaGE: {len(imp_df.columns)} genes cached to {cache_file}", flush=True)
+
+        def _spage_write_zarr(sdata_path, imp_df_sub, lock_ctx=None):
+            """Append imputed gene columns to a SpatialData zarr table. Returns list of new genes written."""
+            try:
+                import spatialdata as _sd_w, anndata as _ad_w
+                _sdata_w = _sd_w.read_zarr(sdata_path)
+                _adata_w = _sdata_w.tables["table"]
+                _existing = set(_adata_w.var_names)
+                _new_genes = [g for g in imp_df_sub.columns if g not in _existing]
+                if not _new_genes:
+                    return []
+                _new_X = sp.csr_matrix(imp_df_sub[_new_genes].values.astype(np.float32))
+                _new_var = pd.DataFrame(
+                    {"is_imputed": True},
+                    index=pd.Index(_new_genes, name=_adata_w.var.index.name or "gene"),
+                )
+                _adata_new = _ad_w.AnnData(
+                    X=sp.hstack([_adata_w.X, _new_X]).tocsr(),
+                    obs=_adata_w.obs.copy(),
+                    var=pd.concat([_adata_w.var, _new_var]),
+                    uns=dict(_adata_w.uns),
+                )
+                _adata_new.uns["imputed_genes"] = list(_adata_w.uns.get("imputed_genes", [])) + _new_genes
+                _sdata_w.tables["table"] = _adata_new
+                try:
+                    _sdata_w.write_element("table")
+                except Exception:
+                    _sdata_w.write(sdata_path, overwrite=True)
+                return _new_genes, _adata_new
+            except Exception as _ze:
+                print(f"  SpaGE: zarr write-back failed (non-fatal): {_ze}", flush=True)
+                return [], None
+
+        if _alt_res is not None:
+            # ── Reseg write-back: update alt_res["expr"] and per-reseg gene index ──
+            sdata_path = _alt_res.get("sdata_path", "")
+            if sdata_path and os.path.isdir(sdata_path):
+                _set("running", "Writing imputed genes to reseg SpatialData zarr…")
+                result_pair = _spage_write_zarr(sdata_path, imp_df)
+                new_genes = result_pair[0] if result_pair else []
+                if new_genes:
+                    print(f"  SpaGE reseg: wrote {len(new_genes)} genes to {os.path.basename(sdata_path)}", flush=True)
+                    with _spage_lock:
+                        # Extend alt_res["expr"] with new imputed columns
+                        new_cols = sp.csr_matrix(imp_df[new_genes].values.astype(np.float32))
+                        _alt_res["expr"] = sp.hstack([_alt_res["expr"], new_cols]).tocsr()
+                        # Rebuild per-reseg gene index (preserves order)
+                        prev_gni = _alt_res.get("gene_name_to_idx") or DATA["gene_name_to_idx"]
+                        prev_names = sorted(prev_gni, key=prev_gni.__getitem__)
+                        extended_names = prev_names + new_genes
+                        _alt_res["gene_name_to_idx"] = {g: i for i, g in enumerate(extended_names)}
+                        _alt_res["imputed_genes"] = list(_alt_res.get("imputed_genes", [])) + new_genes
+        else:
+            # ── Xenium write-back: update DATA["expr"] and gene_names ─────────────
+            sdata_path = DATA.get("sdata_path", "")
+            if sdata_path and os.path.isdir(sdata_path):
+                _set("running", "Writing imputed genes to SpatialData zarr…")
+                result_pair = _spage_write_zarr(sdata_path, imp_df)
+                new_genes = result_pair[0] if result_pair else []
+                adata_new  = result_pair[1] if len(result_pair) > 1 else None
+                if new_genes and adata_new is not None:
+                    print(f"  SpaGE: wrote {len(new_genes)} imputed genes to zarr", flush=True)
+                    with _spage_lock:
+                        DATA["gene_names"]       = list(adata_new.var_names)
+                        DATA["gene_name_to_idx"] = {g: i for i, g in enumerate(DATA["gene_names"])}
+                        DATA["expr"]             = sp.csr_matrix(adata_new.X)
+                        DATA["gene_var"]         = adata_new.var
+
+        _set("done", f"Done — {len(imp_df.columns):,} genes imputed", result=imp_df)
 
     except Exception as exc:
         import traceback
@@ -2426,75 +3146,11 @@ def info_chip(label, value):
 # ─── Data loading ─────────────────────────────────────────────────────────────
 def load_xenium_data(data_dir: str) -> dict:
     print(f"Loading from: {data_dir}", flush=True)
-
-    with open(os.path.join(data_dir, "experiment.xenium")) as f:
-        metadata = json.load(f)
-
-    print("  cells...", flush=True)
-    cells = pd.read_parquet(os.path.join(data_dir, "cells.parquet"))
-    cells = cells.set_index("cell_id")
-
-    print("  UMAP...", flush=True)
-    umap_df = pd.read_csv(
-        os.path.join(data_dir, "analysis/umap/gene_expression_2_components/projection.csv"),
-        index_col="Barcode",
-    )
-
-    print("  clusters...", flush=True)
-    cluster_dir = os.path.join(data_dir, "analysis/clustering")
-    cluster_methods = {}
-    for method in sorted(os.listdir(cluster_dir)):
-        path = os.path.join(cluster_dir, method, "clusters.csv")
-        if os.path.exists(path):
-            df_c = pd.read_csv(path, index_col="Barcode")
-            cluster_methods[method] = df_c["Cluster"]
-
-    print("  gene expression matrix...", flush=True)
-    with h5py.File(os.path.join(data_dir, "cell_feature_matrix.h5"), "r") as f:
-        barcodes   = [b.decode() for b in f["matrix/barcodes"][:]]
-        gene_names = [g.decode() for g in f["matrix/features/name"][:]]
-        shape = tuple(f["matrix/shape"][:])
-        expr = sp.csc_matrix(
-            (f["matrix/data"][:], f["matrix/indices"][:], f["matrix/indptr"][:]),
-            shape=shape,
-        ).T.tocsr()   # → (cells × genes)
-
-    print("  cell boundaries...", flush=True)
-    cb_df = pd.read_parquet(os.path.join(data_dir, "cell_boundaries.parquet"))
-    cell_bounds = _build_boundary_dict(cb_df)
-
-    print("  nucleus boundaries...", flush=True)
-    nb_df = pd.read_parquet(os.path.join(data_dir, "nucleus_boundaries.parquet"))
-    nucleus_bounds = _build_boundary_dict(nb_df)
-
-    # Build merged dataframe
-    df = cells.copy()
-    df["umap_1"] = umap_df["UMAP-1"].reindex(df.index)
-    df["umap_2"] = umap_df["UMAP-2"].reindex(df.index)
-    for method, series in cluster_methods.items():
-        df[f"clust__{method}"] = series.reindex(df.index).fillna(0).astype(int)
-
-    barcode_idx = {b: i for i, b in enumerate(barcodes)}
-    df_to_expr  = np.array([barcode_idx.get(cid, -1) for cid in df.index], dtype=np.int64)
-
-    print(f"  Done: {len(df):,} cells | {len(gene_names)} genes | "
-          f"{len(cluster_methods)} cluster sets", flush=True)
-
-    gene_name_to_idx = {g: i for i, g in enumerate(gene_names)}
-
-    return {
-        "metadata":         metadata,
-        "df":               df,
-        "gene_names":       gene_names,
-        "gene_name_to_idx": gene_name_to_idx,
-        "barcodes":         barcodes,
-        "expr":             expr,
-        "df_to_expr":       df_to_expr,
-        "cluster_methods":  list(cluster_methods.keys()),
-        "cell_bounds":      cell_bounds,
-        "nucleus_bounds":   nucleus_bounds,
-        "data_dir":         data_dir,
-    }
+    zarr_path = os.path.join(data_dir, "spatialdata_xenium.zarr")
+    if not os.path.isdir(zarr_path):
+        print("  Generating spatialdata_xenium.zarr (one-time, ~30–60 s)…", flush=True)
+        _build_xenium_sdata(data_dir)
+    return _load_from_xenium_sdata(zarr_path, data_dir)
 
 
 def _build_boundary_dict(df: pd.DataFrame) -> dict:
@@ -2513,6 +3169,185 @@ def _build_boundary_dict(df: pd.DataFrame) -> dict:
     vx_groups = np.split(vx_s, change)
     vy_groups = np.split(vy_s, change)
     return {cid: (vxg, vyg) for cid, vxg, vyg in zip(unique_ids, vx_groups, vy_groups)}
+
+
+def _gdf_to_bounds_dict(gdf) -> dict:
+    """Convert GeoDataFrame of cell polygons back to {cell_id: (x_verts, y_verts)}."""
+    result = {}
+    for idx, geom in gdf.geometry.items():
+        if geom is not None and not geom.is_empty:
+            xy = geom.exterior.coords.xy
+            result[idx] = (np.array(xy[0]), np.array(xy[1]))
+    return result
+
+
+def _build_xenium_sdata(data_dir: str) -> None:
+    """Read all raw Xenium files and write spatialdata_xenium.zarr next to them (one-time generation)."""
+    try:
+        import spatialdata
+        from spatialdata.models import TableModel, ShapesModel
+        import anndata as ad
+        import geopandas as gpd
+        from shapely.geometry import Polygon
+    except ImportError as e:
+        raise ImportError(
+            f"spatialdata, anndata, geopandas, and shapely are required to generate the zarr store: {e}\n"
+            "Install with: pip install spatialdata anndata geopandas shapely"
+        )
+
+    print("  Reading raw files for spatialdata_xenium.zarr generation…", flush=True)
+
+    with open(os.path.join(data_dir, "experiment.xenium")) as f:
+        metadata = json.load(f)
+
+    cells = pd.read_parquet(os.path.join(data_dir, "cells.parquet"))
+    cells = cells.set_index("cell_id")
+
+    umap_df = pd.read_csv(
+        os.path.join(data_dir, "analysis/umap/gene_expression_2_components/projection.csv"),
+        index_col="Barcode",
+    )
+
+    cluster_dir = os.path.join(data_dir, "analysis/clustering")
+    cluster_methods = {}
+    for method in sorted(os.listdir(cluster_dir)):
+        path = os.path.join(cluster_dir, method, "clusters.csv")
+        if os.path.exists(path):
+            df_c = pd.read_csv(path, index_col="Barcode")
+            cluster_methods[method] = df_c["Cluster"]
+
+    with h5py.File(os.path.join(data_dir, "cell_feature_matrix.h5"), "r") as f:
+        barcodes   = [b.decode() for b in f["matrix/barcodes"][:]]
+        gene_names = [g.decode() for g in f["matrix/features/name"][:]]
+        shape      = tuple(f["matrix/shape"][:])
+        expr = sp.csc_matrix(
+            (f["matrix/data"][:], f["matrix/indices"][:], f["matrix/indptr"][:]),
+            shape=shape,
+        ).T.tocsr()   # → (cells × genes)
+
+    print("  Building obs DataFrame…", flush=True)
+    df = cells.copy()
+    df["umap_1"] = umap_df["UMAP-1"].reindex(df.index)
+    df["umap_2"] = umap_df["UMAP-2"].reindex(df.index)
+    for method, series in cluster_methods.items():
+        df[f"clust__{method}"] = series.reindex(df.index).fillna(0).astype(int)
+
+    # Align expression matrix rows to match df.index order
+    barcode_idx = {b: i for i, b in enumerate(barcodes)}
+    row_order   = np.array([barcode_idx.get(cid, -1) for cid in df.index], dtype=np.int64)
+    valid_mask  = row_order >= 0
+    n_cells, n_genes = len(df), len(gene_names)
+
+    if valid_mask.all():
+        expr_aligned = expr[row_order].tocsr()
+    else:
+        rows_v = np.where(valid_mask)[0]
+        expr_aligned = sp.lil_matrix((n_cells, n_genes), dtype=np.float32)
+        expr_aligned[rows_v] = expr[row_order[valid_mask]]
+        expr_aligned = expr_aligned.tocsr()
+
+    # Build AnnData
+    var_df  = pd.DataFrame({"is_imputed": False}, index=pd.Index(gene_names, name="gene"))
+    obs_df  = df.copy()
+    obs_df.index = obs_df.index.astype(str)
+    adata   = ad.AnnData(X=sp.csr_matrix(expr_aligned, dtype=np.float32), obs=obs_df, var=var_df)
+    adata.uns["metadata"]        = metadata
+    adata.uns["cluster_methods"] = list(cluster_methods.keys())
+    adata.uns["imputed_genes"]   = []
+    try:
+        adata = TableModel.parse(adata)
+    except Exception:
+        pass
+
+    # Build boundary GeoDataFrames
+    print("  Building cell boundary shapes…", flush=True)
+    cb_df = pd.read_parquet(os.path.join(data_dir, "cell_boundaries.parquet"))
+    nb_df = pd.read_parquet(os.path.join(data_dir, "nucleus_boundaries.parquet"))
+
+    def _bounds_to_gdf(bounds_dict):
+        geoms = {}
+        for cid, (vx, vy) in bounds_dict.items():
+            try:
+                geoms[str(cid)] = Polygon(zip(vx, vy))
+            except Exception:
+                pass
+        gdf = gpd.GeoDataFrame(
+            geometry=list(geoms.values()),
+            index=pd.Index(list(geoms.keys()), name="cell_id"),
+        )
+        try:
+            return ShapesModel.parse(gdf)
+        except Exception:
+            return gdf
+
+    cell_shapes = _bounds_to_gdf(_build_boundary_dict(cb_df))
+    nuc_shapes  = _bounds_to_gdf(_build_boundary_dict(nb_df))
+
+    sdata = spatialdata.SpatialData(
+        tables={"table": adata},
+        shapes={"cell_boundaries": cell_shapes, "nucleus_boundaries": nuc_shapes},
+    )
+
+    zarr_path = os.path.join(data_dir, "spatialdata_xenium.zarr")
+    print(f"  Writing {os.path.basename(zarr_path)} ({n_cells:,} cells, {n_genes} genes)…", flush=True)
+    sdata.write(zarr_path)
+    print("  spatialdata_xenium.zarr generation complete.", flush=True)
+
+
+def _load_from_xenium_sdata(zarr_path: str, data_dir: str) -> dict:
+    """Load DATA dict from a spatialdata_xenium.zarr store."""
+    try:
+        import spatialdata
+    except ImportError:
+        raise ImportError("spatialdata is required: pip install spatialdata")
+
+    print(f"  Loading from spatialdata_xenium.zarr…", flush=True)
+    sdata = spatialdata.read_zarr(zarr_path)
+    adata = sdata.tables["table"]
+
+    gene_names       = list(adata.var_names)
+    gene_name_to_idx = {g: i for i, g in enumerate(gene_names)}
+    barcodes         = list(adata.obs_names)
+    n                = len(adata)
+
+    # obs order == expr row order (guaranteed by _build_xenium_sdata write order)
+    df_to_expr = np.arange(n, dtype=np.int64)
+
+    cell_bounds = {}
+    nuc_bounds  = {}
+    try:
+        cell_bounds = _gdf_to_bounds_dict(sdata.shapes["cell_boundaries"])
+    except Exception as e:
+        print(f"  Warning: could not load cell boundaries from zarr: {e}", flush=True)
+    try:
+        nuc_bounds = _gdf_to_bounds_dict(sdata.shapes["nucleus_boundaries"])
+    except Exception as e:
+        print(f"  Warning: could not load nucleus boundaries from zarr: {e}", flush=True)
+
+    obs_df = adata.obs.copy()
+    cluster_methods = list(adata.uns.get("cluster_methods", []))
+    print(f"  Done: {n:,} cells | {len(gene_names)} genes | {len(cluster_methods)} cluster sets", flush=True)
+
+    return {
+        "metadata":          dict(adata.uns.get("metadata", {})),
+        "df":                obs_df,
+        "gene_names":        gene_names,
+        "gene_name_to_idx":  gene_name_to_idx,
+        "barcodes":          barcodes,
+        "expr":              sp.csr_matrix(adata.X),
+        "df_to_expr":        df_to_expr,
+        "cluster_methods":   cluster_methods,
+        "cell_bounds":       cell_bounds,
+        "nucleus_bounds":    nuc_bounds,
+        "data_dir":          data_dir,
+        "sdata_path":        zarr_path,
+        "gene_var":          adata.var,
+        "split_corrected_expr": (
+            sp.csr_matrix(adata.layers["X_corrected"])
+            if "X_corrected" in adata.layers else None
+        ),
+        "split_corrected_imputed_genes": list(adata.uns.get("split_corrected_imputed_genes", [])),
+    }
 
 
 # ─── Locate & load data ───────────────────────────────────────────────────────
@@ -2535,9 +3370,18 @@ EXTRA_DATASETS: list = []
 # ─── Data helpers ─────────────────────────────────────────────────────────────
 def get_gene_expression(gene: str) -> np.ndarray:
     """log1p expression for *gene*, aligned to DATA['df'] row order.
-    Genes with ' [imp]' suffix are served from SpaGE imputed results."""
+    Genes with ' [imp]' suffix are served from DATA['expr'] if written back to zarr,
+    with fallback to _spage_state['result'] for pre-zarr cached results."""
     if gene.endswith(" [imp]"):
         base = gene[:-6]
+        # Check if imputed gene was written back into DATA["expr"]
+        if base in DATA.get("gene_name_to_idx", {}):
+            gene_idx = DATA["gene_name_to_idx"][base]
+            raw  = DATA["expr"][:, gene_idx].toarray().flatten()
+            idx  = DATA["df_to_expr"]
+            vals = np.where(idx >= 0, raw[np.clip(idx, 0, len(raw) - 1)], 0.0)
+            return np.log1p(vals)
+        # Fallback: old-style _spage_state result DataFrame
         with _spage_lock:
             res = _spage_state.get("result")
         if res is not None and base in res.columns:
@@ -2611,6 +3455,8 @@ def build_boundary_trace(cell_ids: list, bounds_dict: dict, color: str, name: st
     all_y = np.empty(total, dtype=np.float64)
     pos = 0
     for vx, vy in polys:
+        vx = np.asarray(vx, dtype=np.float64)
+        vy = np.asarray(vy, dtype=np.float64)
         n = len(vx)
         all_x[pos:pos + n] = vx
         all_y[pos:pos + n] = -vy
@@ -2696,15 +3542,38 @@ def _cell_type_traces(x, y, df, size, opacity, mode="spatial"):
     return traces
 
 
+def _get_expr_values(gene: str, alt_res=None, use_corrected: bool = False) -> "np.ndarray | None":
+    """Unified expression lookup supporting original and SPLIT-corrected counts."""
+    lookup = gene.replace(" [imp]", "").replace(" [corr+imp]", "")
+    if alt_res is not None:
+        expr = (alt_res.get("split_corrected_expr") if use_corrected else None) or alt_res.get("expr")
+        gni  = alt_res.get("gene_name_to_idx") or DATA.get("gene_name_to_idx", {})
+    else:
+        expr = DATA.get("split_corrected_expr") if use_corrected else DATA.get("expr")
+        gni  = DATA.get("gene_name_to_idx", {})
+    if expr is None or lookup not in gni:
+        return None
+    idx = gni[lookup]
+    if idx >= expr.shape[1]:
+        return None
+    return np.log1p(np.asarray(expr.getcol(idx).todense()).flatten().astype(np.float32))
+
+
 def _get_reseg_expr_values(gene: str, alt_res: dict) -> "np.ndarray | None":
-    """log1p expression for *gene* in resegmented cells, or None if not available."""
+    """log1p expression for *gene* in resegmented cells, or None if not available.
+    Uses alt_res['gene_name_to_idx'] if present (includes reseg-imputed genes),
+    falling back to DATA['gene_name_to_idx'] for panel genes."""
     expr = alt_res.get("expr")
     if expr is None:
         return None
-    gene_names_list = list(DATA["gene_names"])
-    if gene not in gene_names_list:
+    # Strip [imp] suffix if present
+    lookup = gene[:-6] if gene.endswith(" [imp]") else gene
+    gni = alt_res.get("gene_name_to_idx") or DATA["gene_name_to_idx"]
+    if lookup not in gni:
         return None
-    idx = gene_names_list.index(gene)
+    idx = gni[lookup]
+    if idx >= expr.shape[1]:
+        return None
     col = expr.getcol(idx)
     vals = np.asarray(col.todense()).flatten().astype(np.float32)
     return np.log1p(vals)
@@ -2732,7 +3601,28 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
         show_legend  = False
         traces       = None   # filled below
 
-        if color_by == "cell_type":
+        if color_by == "cluster":
+            # Look for any cluster column in cells_df (added after UMAP/clustering on reseg cells)
+            cluster_col = next((c for c in bdf.columns if c.startswith("cluster")), None)
+            if cluster_col is not None:
+                cluster_vals = bdf[cluster_col].astype(str)
+                unique_clusters = sorted(cluster_vals.unique(), key=lambda v: int(v) if v.isdigit() else v)
+                cmap = {cl: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, cl in enumerate(unique_clusters)}
+                traces = []
+                for cl in unique_clusters:
+                    mask = (cluster_vals == cl).values
+                    traces.append(go.Scattergl(
+                        x=x[mask], y=y[mask], mode="markers",
+                        marker=dict(size=size, color=cmap[cl], opacity=opacity),
+                        name=f"Cluster {cl}", legendgroup=cl, showlegend=True,
+                        text=np.array(cell_ids_str)[mask].tolist(),
+                        customdata=np.array(cell_ids_str)[mask].tolist(),
+                        hovertemplate="<b>%{text}</b><extra>Cluster " + cl + "</extra>",
+                    ))
+                show_legend = True
+            # If no cluster column: fall through to generic fallback (transcript_counts)
+
+        elif color_by == "cell_type":
             with _annot_lock:
                 labels = _annot_state.get(labels_key)
             if labels is not None:
@@ -4014,6 +4904,26 @@ sidebar = html.Div([
     dcc.Interval(id="spage-poll", interval=3000, disabled=True),
 
     html.Hr(style={"borderColor": BORDER, "margin": "14px 0"}),
+    ctrl_label("SPLIT Correction"),
+    dbc.Button("✦ Correct Ambient RNA", id="split-modal-open-btn",
+               style={"width":"100%","backgroundColor":"#e85d04","color":"white"}),
+    html.Div(id="split-status",
+             style={"fontSize":"0.75rem","marginTop":"4px","color":"#8b949e"}),
+    dcc.Interval(id="split-poll", interval=3000, disabled=True),
+    html.Hr(style={"borderColor": BORDER, "margin": "14px 0"}),
+    ctrl_label("Active Counts"),
+    dcc.RadioItems(
+        id="counts-mode",
+        options=[
+            {"label": " Original",        "value": "original"},
+            {"label": " SPLIT Corrected", "value": "corrected", "disabled": True},
+        ],
+        value="original",
+        labelStyle={"display":"block","cursor":"pointer","marginBottom":"2px"},
+        style={"fontSize":"0.82rem"},
+    ),
+
+    html.Hr(style={"borderColor": BORDER, "margin": "14px 0"}),
 
     # UMAP toggle
     html.Button(
@@ -4071,6 +4981,8 @@ app.layout = html.Div([
     dcc.Interval(id="spage-repl-poll", interval=4000, n_intervals=0),  # always-on for REPL-triggered runs
     dcc.Store(id="subset-version",   data=0),
     dcc.Store(id="sdata-done",       data=0),
+    dcc.Store(id="split-done",        data=0),
+    dcc.Store(id="counts-mode-store", data="original"),
     dcc.Interval(id="subset-poll",   interval=500,  n_intervals=0),
     dcc.Interval(id="morph-hires-poll", interval=400, n_intervals=0),
     # Fires once after 500 ms to guarantee initial plot render in Dash 4
@@ -4559,6 +5471,36 @@ app.layout = html.Div([
        content_style={"backgroundColor": DARK_BG, "color": TEXT},
        backdrop=True),
 
+# ─── SPLIT correction modal ───────────────────────────────────────────────────
+dbc.Modal([
+    dbc.ModalHeader("SPLIT Ambient RNA Correction"),
+    dbc.ModalBody([
+        html.P("Requires R packages: spacexr (dmcable/spacexr) and SPLIT (bdsc-tds/SPLIT).",
+               style={"fontSize":"0.82rem","color":"#8b949e"}),
+        html.P("⚠ Peak RAM usage ~21 GB for a full Xenium slide.",
+               style={"fontSize":"0.82rem","color":"#e85d04"}),
+        dbc.Label("Seurat Reference RDS path"),
+        dbc.Input(id="split-rds-path", placeholder="/path/to/reference.rds",
+                  type="text", style={"fontSize":"0.82rem"}),
+        html.Br(),
+        dbc.Label("Cell-type label column"),
+        dbc.Input(id="split-label-col", value="Names",
+                  type="text", style={"fontSize":"0.82rem"}),
+        html.Br(),
+        dbc.Label("Max R cores"),
+        dbc.Input(id="split-max-cores", value=4, type="number",
+                  min=1, max=32, style={"fontSize":"0.82rem"}),
+        html.Br(),
+        dbc.Button("▶ Run SPLIT", id="split-run-btn", color="danger",
+                   style={"width":"100%"}),
+        html.Div(id="split-modal-status",
+                 style={"marginTop":"8px","fontSize":"0.82rem","color":"#8b949e"}),
+    ]),
+    dbc.ModalFooter(
+        dbc.Button("Close", id="split-modal-close-btn", color="secondary", size="sm")
+    ),
+], id="split-modal", is_open=False, size="lg"),
+
 # ── Load Sample modal ─────────────────────────────────────────────────────────
     dbc.Modal([
         dbc.ModalHeader(dbc.ModalTitle("Load Xenium Sample"), close_button=True),
@@ -4910,12 +5852,15 @@ def store_relayout(relayout_data, current):
     Input("startup-trigger",        "n_intervals"),
     Input("dataset-version",        "data"),
     Input("extra-datasets-version", "data"),
+    Input("split-done",             "data"),
+    State("counts-mode-store",      "data"),
 )
 def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
                  _annot_done, morph_enable, morph_zlevel, morph_channels,
                  morph_brightness, morph_opacity, relayout,
                  _baysor_done, _proseg_done, seg_source,
-                 _spage_done, _subset_ver, _startup, _ds_version, _extra_ds_version):
+                 _spage_done, _subset_ver, _startup, _ds_version, _extra_ds_version,
+                 _split_done, counts_mode):
     # If only the viewport changed, avoid full figure rebuild
     triggered = callback_context.triggered_id
     boundaries_active = bool(boundary_toggles)
@@ -5686,23 +6631,25 @@ def load_seg_run_from_cache(seg_value, baysor_ver, proseg_ver):
     State("spage-rds-path",      "value"),
     State("spage-npv",           "value"),
     State("spage-genes",         "value"),
+    State("seg-source",          "value"),
     prevent_initial_call=True,
 )
-def start_spage(n_clicks, rds_path, n_pv, genes_input):
+def start_spage(n_clicks, rds_path, n_pv, genes_input, seg_source):
     with _spage_lock:
         if _spage_state["status"] == "running":
-            return "Already running…", "Already running…", True
+            return False, "Already running…", "Already running…", True
         _spage_state.update({"status": "running", "message": "Starting…", "result": None})
     rds_path = rds_path or "/Users/ikuz/Documents/XeniumWorkflow/Post_R3_FINAL_with_counts.rds"
     n_pv = int(n_pv or 50)
     genes_str = genes_input or ""
+    seg_src = seg_source or "xenium"
     # Copy the current contextvars context so rpy2 conversion rules are available in the thread
     ctx = contextvars.copy_context()
     threading.Thread(
-        target=lambda: ctx.run(_run_spage_imputation, rds_path, n_pv, genes_str),
+        target=lambda: ctx.run(_run_spage_imputation, rds_path, n_pv, genes_str, seg_src),
         daemon=True,
     ).start()
-    return "Starting SpaGE…", "Starting SpaGE…", True
+    return False, "Starting SpaGE…", "Starting SpaGE…", True
 
 
 @app.callback(
@@ -5763,16 +6710,56 @@ def poll_spage_repl(_, done_version):
     Output("gene-selector", "options"),
     Input("spage-done",       "data"),
     Input("dataset-version",  "data"),
+    Input("seg-source",       "value"),
 )
-def update_gene_options(_spage_version, _ds_version):
-    """Rebuild gene dropdown: native genes + imputed genes after SpaGE."""
-    base = [{"label": g, "value": g} for g in sorted(DATA["gene_names"])]
+def update_gene_options(_spage_version, _ds_version, seg_source):
+    """Rebuild gene dropdown: native genes + imputed genes after SpaGE.
+    Imputed genes are excluded when a reseg source (Baysor/Proseg) is active,
+    since SpaGE has only been run against Xenium cells."""
+    xenium_active = _seg_tool(seg_source) == "xenium"
+
+    # Separate measured vs imputed genes using gene_var metadata if available
+    gene_var = DATA.get("gene_var")
+    if gene_var is not None and "is_imputed" in gene_var.columns:
+        measured = [g for g in DATA["gene_names"] if not gene_var.loc[g, "is_imputed"]]
+    else:
+        measured = list(DATA["gene_names"])
+
+    base = [{"label": g, "value": g} for g in sorted(measured)]
+
+    if not xenium_active:
+        # Reseg active: show imputed genes specific to this reseg result
+        tool = _seg_tool(seg_source)
+        if tool == "baysor":
+            with _baysor_lock:
+                res = _baysor_state.get("result") if _baysor_state["status"] == "done" else None
+        elif tool == "proseg":
+            with _proseg_lock:
+                res = _proseg_state.get("result") if _proseg_state["status"] == "done" else None
+        else:
+            res = None
+        if res:
+            imp_genes = res.get("imputed_genes", [])
+            if imp_genes:
+                imp = [{"label": f"{g} [imp]", "value": f"{g} [imp]"} for g in sorted(imp_genes)]
+                return base + imp
+        return base
+
+    # Xenium active: add imputed genes from zarr (already in DATA["expr"]) or _spage_state fallback
+    if gene_var is not None and "is_imputed" in gene_var.columns:
+        imp_genes = [g for g in DATA["gene_names"] if gene_var.loc[g, "is_imputed"]]
+        if imp_genes:
+            imp = [{"label": f"{g} [imp]", "value": f"{g} [imp]"} for g in sorted(imp_genes)]
+            return base + imp
+
+    # Fallback: old-style _spage_state result DataFrame
     with _spage_lock:
         result = _spage_state.get("result")
     if result is not None:
         imp = [{"label": f"{g} [imp]", "value": f"{g} [imp]"}
                for g in sorted(result.columns)]
         return base + imp
+
     return base
 
 
@@ -6049,10 +7036,28 @@ def update_sdata_overlays(show_roi, show_patches, _sdata_ver):
 @app.callback(
     Output("tissue-info-content", "children"),
     Input("dataset-version", "data"),
+    Input("seg-source", "value"),
 )
-def update_tissue_info(_):
+def update_tissue_info(_, seg_source):
     meta = DATA.get("metadata", {})
     cache_size = _cache_size_str()
+
+    # Determine active cell count from reseg result if active
+    tool = _seg_tool(seg_source)
+    if tool == "baysor":
+        with _baysor_lock:
+            res = _baysor_state.get("result")
+        n_cells_display = f"{len(res['cells_df']):,}" if res else f"{meta.get('num_cells', 0):,}"
+        seg_label = "Baysor"
+    elif tool == "proseg":
+        with _proseg_lock:
+            res = _proseg_state.get("result")
+        n_cells_display = f"{len(res['cells_df']):,}" if res else f"{meta.get('num_cells', 0):,}"
+        seg_label = "Proseg"
+    else:
+        n_cells_display = f"{meta.get('num_cells', 0):,}"
+        seg_label = "Xenium"
+
     return html.Div([
         html.Div([
             html.Div("XENIUM EXPLORER", style={
@@ -6068,7 +7073,8 @@ def update_tissue_info(_):
         html.Div([
             html.Hr(style={"borderColor": BORDER, "margin": "0 0 10px 0"}),
             html.Div([
-                stat_row("Cells",       f"{meta.get('num_cells', 0):,}"),
+                stat_row("Cells",       n_cells_display),
+                stat_row("Seg",         seg_label),
                 stat_row("Transcripts", f"{meta.get('num_transcripts', 0):,}"),
                 stat_row("Panel",       meta.get("panel_name", "\u2014")),
                 stat_row("Genes",       str(len(DATA.get("gene_names", [])))),

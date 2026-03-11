@@ -27,20 +27,30 @@ Expects a standard **10x Genomics Xenium output directory** containing:
 | `analysis/clustering/*/clusters.csv` | Cluster assignments, one file per method *(optional)* |
 | `morphology_focus/morphology_focus_ZZZZ.ome.tif` | Fluorescence z-stack images *(optional)* |
 
+### SpatialData zarr store
+
+On first launch, the app consolidates all cell-level data into a **`spatialdata_xenium.zarr`** file written next to the raw data (one-time, ~30–60 s for a typical dataset). Subsequent launches load exclusively from this zarr — the raw files are no longer read at startup.
+
+The zarr stores:
+- `table` — AnnData with the full cell × gene expression matrix, all obs metadata (centroids, QC metrics, UMAP, cluster assignments), and a `is_imputed` flag per gene
+- `cell_boundaries` / `nucleus_boundaries` — GeoDataFrame shapes
+
+Images are still read directly from `morphology_focus/` on demand.
+
 ## Features
 
 ### Sidebar
 
 The left sidebar is hidden by default and slides in when the mouse moves to the left edge of the screen. Sections:
 
-- **Tissue info** — Run name, region, and dataset stats (cells, transcripts, panel). Stats collapse by default and expand on hover.
+- **Tissue info** — Run name, region, and dataset stats (cells, transcripts, panel). Stats collapse by default and expand on hover. Includes buttons to load a different sample, save as SpatialData, and clear cache.
 - **Color By** — Dropdown to select the coloring mode.
-- **Segmentation source** — Dropdown to switch between Xenium (original), Baysor, and Proseg segmentations. Baysor/Proseg options are enabled after running resegmentation.
+- **Segmentation source** — Dropdown to switch between Xenium (original), Baysor, and Proseg segmentations. Shows all cached runs per tool (labeled by parameters); select any cached run to load it instantly.
 - **Overlays** — Multi-select checklist: Cell Boundaries, Nuclear Boundaries, Baysor Boundaries, Proseg Boundaries, and Morphology Image. Multiple overlays can be active simultaneously.
 - **Point style** — Size and opacity sliders.
-- **Resegmentation** — Single "Resegment Cells" button opens a modal with Baysor and Proseg tabs.
-- **SpaGE** — Gene imputation settings (GUI or REPL).
-- **Cell Type Annotation** — Annotation method settings.
+- **Resegmentation** — Single "Resegment Cells" button opens a modal with SpatialData patch setup (Step 1) and Baysor/Proseg algorithm tabs (Step 2).
+- **Impute Genes** — Button opens the SpaGE imputation modal.
+- **Annotate Cells** — Button opens the cell type annotation modal.
 - **UMAP** — Show/hide toggle and "Run UMAP on Reseg Cells" button.
 
 A gold **⬡ SUBSET ACTIVE** banner appears below the tissue info when a cell subset is active, showing the count and a "✕ Clear Subset" button.
@@ -48,7 +58,7 @@ A gold **⬡ SUBSET ACTIVE** banner appears below the tissue info when a cell su
 ### Visualization
 
 **Color modes** (Color By dropdown in sidebar):
-- **Cluster** — Categorical coloring by clustering method; multiple methods supported via a secondary dropdown
+- **Cluster** — Categorical coloring by clustering method; multiple methods supported via a secondary dropdown. For Baysor/Proseg cells, KMeans clusters (`cluster_kmeans_10`) are computed automatically after resegmentation.
 - **Gene Expression** — Continuous coloring by log1p expression; supports panel genes and SpaGE-imputed genes (marked `[imp]`)
 - **Cell Type** — Categorical coloring by annotation result (enabled after running annotation)
 - **Transcript Counts** — QC metric, Viridis colorscale
@@ -58,7 +68,7 @@ All color modes work on Xenium, Baysor, and Proseg cells after switching the seg
 
 **Plots:**
 - **Spatial plot** — 2D scatter of all cells at their µm centroids
-- **UMAP plot** — Dimensionality reduction view; hidden by default, toggle with "Show/Hide UMAP" button. Re-run UMAP on resegmented cells with the "Run UMAP on Reseg Cells" button.
+- **UMAP plot** — Dimensionality reduction view; hidden by default, toggle with "Show/Hide UMAP" button. UMAP is computed automatically after resegmentation. Use the "Run UMAP on Reseg Cells" button to recompute with different parameters.
 
 **Point rendering:**
 - Point size: 1–8 px (default 2)
@@ -95,12 +105,31 @@ Click any cell in the spatial or UMAP plot to see:
 
 ### Resegmentation
 
-Click **"Resegment Cells"** in the sidebar to open the resegmentation modal. Select the algorithm tab (Baysor or Proseg), configure parameters, and click **Run**. The modal closes and segmentation runs in the background; progress appears in the server log. Once complete:
+Click **"Resegment Cells"** in the sidebar to open the resegmentation modal. The modal has two steps:
+
+**Step 1 — Patch setup (SpatialData)**
+
+Configure patch parameters, then click **▶ Prepare Patches** to build the SpatialData object and spatial ROI:
+
+| Parameter | Default |
+|-----------|---------|
+| Quality Value (QV) filter | 20 |
+| Patch width (µm) | 1200 |
+| Min transcripts/patch | 10 |
+
+The ROI and patch grid are displayed as overlays on the spatial plot. Click **✓ Patches look good — proceed** to unlock Step 2. Use **↺ Re-build** to clear the cache and re-run with different parameters.
+
+**Step 2 — Algorithm selection**
+
+Select the algorithm tab (Baysor or Proseg), configure parameters, and click **Run**. Progress appears in the server log.
+
+Once complete:
 - The segmentation source dropdown automatically switches to the new segmentation
 - Baysor/Proseg boundary overlays become available
-- All color modes (gene expression, cell type, QC metrics) work on reseg cells
-- Cell annotation can be re-run on reseg cells
-- UMAP can be re-computed for reseg cells
+- KMeans clustering (10 clusters) and UMAP are computed automatically; results are saved to `spatialdata_{source}.zarr` and available immediately
+- All color modes (gene expression, cluster, cell type, QC metrics) work on reseg cells
+- Cell annotation and gene imputation can be run on reseg cells; imputed genes are saved to the reseg zarr
+- UMAP can be re-computed manually with the "Run UMAP on Reseg Cells" button
 
 **Baysor** — Julia-based algorithm ([Baysor](https://github.com/kharchenkolab/Baysor)):
 
@@ -122,11 +151,11 @@ Click **"Resegment Cells"** in the sidebar to open the resegmentation modal. Sel
 | Voxel size (µm) | auto |
 | Threads | all cores |
 
-Resegmentation output is cached in `~/.xenium_explorer_cache/baysor_{dataset}/` or `proseg_{dataset}/` across sessions.
+Resegmentation output is cached per run (keyed by parameters) in `~/.xenium_explorer_cache/baysor_{dataset}_{tag}/` or `proseg_{dataset}_{tag}/`. Multiple cached runs per tool are accessible from the segmentation source dropdown.
 
 ### Cell Type Annotation
 
-Two methods available. Annotation runs on the currently active segmentation (Xenium, Baysor, or Proseg). Each segmentation's annotations are cached separately.
+Click **"Annotate Cells"** in the sidebar to open the annotation modal. Three methods available. Annotation runs on the currently active segmentation (Xenium, Baysor, or Proseg). Each segmentation's annotations are cached separately.
 
 **CellTypist** — Uses pretrained Azimuth-compatible models:
 - Healthy Adult Heart (default)
@@ -138,13 +167,19 @@ Two methods available. Annotation runs on the currently active segmentation (Xen
 - Performs PCA on shared genes → cosine kNN (k=50) → majority vote label transfer to each Xenium cell
 - Only the shared genes (~500) are extracted in-process via rpy2 — no subprocess re-read of the full RDS
 
+**RCTD (spacexr)** — Probabilistic cell type deconvolution using the spacexr R package:
+- Specify the RDS file path and label column
+- Mode: `full` (argmax of weight per cell), `doublet` (best single + doublet assignment), `multi` (multi-type)
+- Max cores: number of parallel R workers (default 4)
+- Requires `spacexr` R package: `devtools::install_github('dmcable/spacexr')`
+
 Results are cached to `~/.xenium_explorer_cache/` and load instantly on subsequent runs.
 
 ### SpaGE Gene Imputation
 
-Imputes expression of genes not in the Xenium panel using a scRNA-seq reference (Seurat RDS).
+Click **"Impute Genes"** in the sidebar to open the SpaGE imputation modal. Imputes expression of genes not in the Xenium panel using a scRNA-seq reference (Seurat RDS).
 
-**GUI (sidebar):**
+**GUI (modal):**
 - **Reference RDS** — Path to Seurat object
 - **n_pv** — Number of principal vectors for cross-dataset alignment (10–100, default 50)
 - **Genes to impute** — Comma- or newline-separated gene list; leave blank to auto-select top-200 highly variable genes from the reference
@@ -159,11 +194,22 @@ run_spage(
 ```
 Progress is printed to the server log. When complete, imputed genes appear in the Color By dropdown automatically.
 
-Imputed genes appear in the gene expression dropdown with an `[imp]` suffix. Results are cached and **auto-loaded on startup** — imputed genes are available immediately without re-running SpaGE.
+Imputed genes appear in the gene expression dropdown with an `[imp]` suffix. Results are **written back into the active SpatialData zarr** (`spatialdata_xenium.zarr` for Xenium, or `spatialdata_{source}.zarr` for Baysor/Proseg) so they persist across restarts — imputed genes are available immediately on the next launch without re-running SpaGE. When a Baysor/Proseg segmentation is active, only genes imputed for that segmentation are shown in the dropdown. The parquet cache (`~/.xenium_explorer_cache/spage_*.parquet`) is also written for backward compatibility.
 
 **Algorithm:** Z-score normalization → Principal Vector alignment (domain adaptation) → cosine kNN (k=50) → inverse-distance weighted average. Vectorized with NumPy einsum (~200× faster than the original SpaGE loop).
 
 Reference: [Abdelaal et al. 2020, *Nucleic Acids Research*](https://academic.oup.com/nar/article/48/18/e107/5909530)
+
+### Save as SpatialData
+
+Click **"💾 Save as SpatialData"** in the tissue info section to export the current analysis as a SpatialData Zarr store. Specify an output directory and filename. The saved Zarr includes:
+- Cell/nucleus boundaries
+- Cell metadata (coordinates, QC metrics)
+- Gene expression table
+- Cluster labels (all methods)
+- Cell type annotations (if run)
+
+The file can be loaded by any SpatialData-compatible tool (e.g., napari-spatialdata, squidpy).
 
 ### Cell Subsetting
 
@@ -220,17 +266,27 @@ _annot_state["status"]
 
 All caches are stored in `~/.xenium_explorer_cache/` and are keyed per dataset.
 
+**In the Xenium output directory:**
+
+| File | Contents |
+|------|----------|
+| `spatialdata_xenium.zarr` | Primary data store — generated on first launch, loaded on all subsequent launches. Contains expression matrix, obs metadata, cluster assignments, boundaries, and any SpaGE-imputed genes. |
+
+**In `~/.xenium_explorer_cache/`:**
+
 | Cache | Contents |
 |-------|----------|
-| `{model}_{hash}.parquet` | Cell type annotation labels (Xenium cells) |
+| `seurat_{basename}_{col}_{hash}.parquet` | Seurat kNN annotation labels |
+| `celltypist_{model}_{hash}.parquet` | CellTypist annotation labels |
+| `rctd_{basename}_{col}_{mode}_{hash}.parquet` | RCTD annotation labels |
 | `labels_baysor_{hash}.parquet` | Cell type annotation labels (Baysor cells) |
 | `labels_proseg_{hash}.parquet` | Cell type annotation labels (Proseg cells) |
-| `spage_{hash}.parquet` | SpaGE imputed gene expression |
-| `spage_index.json` | Maps dataset paths to most recent SpaGE cache (enables auto-load on startup) |
+| `spage_{hash}.parquet` | SpaGE imputed gene expression (backward-compat; primary store is the zarr) |
+| `spage_index.json` | Maps dataset paths to most recent SpaGE cache |
 | `morph_overview_{hash}_z{level}.npz` | Pre-downsampled morphology overview (generated on first load) |
-| `spatialdata_{hash}.zarr` | SpatialData Zarr store (for sopa integration) |
-| `baysor_{dataset}/` | Baysor transcripts CSV and segmentation output |
-| `proseg_{dataset}/` | Proseg output (polygons, cell metadata, transcript metadata) |
+| `spatialdata_{hash}.zarr` | SpatialData Zarr store for sopa-based patch resegmentation |
+| `baysor_{dataset}_{tag}/` | Baysor output per parameter set; includes `params.json` and `spatialdata_baysor.zarr` (contains expression, clusters, UMAP, and any imputed genes) |
+| `proseg_{dataset}_{tag}/` | Proseg output per parameter set; includes `params.json` and `spatialdata_proseg.zarr` (contains expression, clusters, UMAP, and any imputed genes) |
 
 ## Dependencies
 
@@ -251,11 +307,13 @@ scikit-learn
 
 **Optional (for specific features):**
 ```
-anndata          # CellTypist annotation
+anndata          # Required for spatialdata_xenium.zarr generation and SpaGE write-back
+geopandas        # Required for spatialdata_xenium.zarr generation (cell boundary shapes)
+shapely          # Required for spatialdata_xenium.zarr generation
 celltypist       # CellTypist annotation
-rpy2             # Seurat RDS integration (SpaGE + annotation)
-spatialdata      # SpatialData / sopa integration
-sopa             # SpatialData / sopa integration
+rpy2             # Seurat RDS integration (SpaGE + annotation + RCTD)
+spatialdata      # Required for zarr generation and sopa integration
+sopa             # Patch-based resegmentation workflow
 umap-learn       # UMAP re-computation for reseg cells
 ```
 
@@ -263,6 +321,7 @@ umap-learn       # UMAP re-computation for reseg cells
 ```r
 SeuratObject
 Matrix
+spacexr          # RCTD annotation (devtools::install_github('dmcable/spacexr'))
 ```
 
 **External tools:**
