@@ -1,6 +1,6 @@
 # Xenium Explorer
 
-An interactive web application for visualizing and analyzing 10x Genomics Xenium spatial transcriptomics data. Supports cell clustering, gene expression, morphology overlays, cell type annotation, gene imputation, and resegmentation — all in a browser-based interface.
+An interactive web application for visualizing and analyzing 10x Genomics Xenium spatial transcriptomics data. Supports cell clustering, gene expression, morphology overlays, cell type annotation, gene imputation, resegmentation, and ambient RNA correction (SPLIT) — all in a browser-based interface.
 
 ## Usage
 
@@ -51,6 +51,8 @@ The left sidebar is hidden by default and slides in when the mouse moves to the 
 - **Resegmentation** — Single "Resegment Cells" button opens a modal with SpatialData patch setup (Step 1) and Baysor/Proseg algorithm tabs (Step 2).
 - **Impute Genes** — Button opens the SpaGE imputation modal.
 - **Annotate Cells** — Button opens the cell type annotation modal.
+- **SPLIT Correction** — Button opens the SPLIT ambient RNA correction modal.
+- **Active Counts** — Radio toggle to switch between original and SPLIT-corrected expression counts. The "SPLIT Corrected" option is grayed out until SPLIT has been run for the active segmentation.
 - **UMAP** — Show/hide toggle and "Run UMAP on Reseg Cells" button.
 
 A gold **⬡ SUBSET ACTIVE** banner appears below the tissue info when a cell subset is active, showing the count and a "✕ Clear Subset" button.
@@ -58,8 +60,8 @@ A gold **⬡ SUBSET ACTIVE** banner appears below the tissue info when a cell su
 ### Visualization
 
 **Color modes** (Color By dropdown in sidebar):
-- **Cluster** — Categorical coloring by clustering method; multiple methods supported via a secondary dropdown. For Baysor/Proseg cells, KMeans clusters (`cluster_kmeans_10`) are computed automatically after resegmentation.
-- **Gene Expression** — Continuous coloring by log1p expression; supports panel genes and SpaGE-imputed genes (marked `[imp]`)
+- **Cluster** — Categorical coloring by clustering method; multiple methods supported via a secondary dropdown. For Baysor/Proseg cells, KMeans clusters (`cluster_kmeans_10`) are computed automatically after resegmentation. After running SPLIT, a `cluster_split_10` column (KMeans on corrected counts) also appears in the dropdown.
+- **Gene Expression** — Continuous coloring by log1p expression; supports panel genes, SpaGE-imputed genes (marked `[imp]`), and genes imputed on corrected counts (marked `[corr+imp]`). The "Active Counts" toggle transparently switches the expression source between original and SPLIT-corrected matrices.
 - **Cell Type** — Categorical coloring by annotation result (enabled after running annotation)
 - **Transcript Counts** — QC metric, Viridis colorscale
 - **Cell Area / Nucleus Area** — Cell size QC metrics, Plasma/Cividis colorscales
@@ -68,7 +70,7 @@ All color modes work on Xenium, Baysor, and Proseg cells after switching the seg
 
 **Plots:**
 - **Spatial plot** — 2D scatter of all cells at their µm centroids
-- **UMAP plot** — Dimensionality reduction view; hidden by default, toggle with "Show/Hide UMAP" button. UMAP is computed automatically after resegmentation. Use the "Run UMAP on Reseg Cells" button to recompute with different parameters.
+- **UMAP plot** — Dimensionality reduction view; hidden by default, toggle with "Show/Hide UMAP" button. UMAP is computed automatically after resegmentation. Use the "Run UMAP on Reseg Cells" button to recompute with different parameters. After running SPLIT, switching to "SPLIT Corrected" in the Active Counts toggle displays a separate UMAP computed on the corrected expression matrix (`split_umap_1`/`split_umap_2`).
 
 **Point rendering:**
 - Point size: 1–8 px (default 2)
@@ -200,6 +202,42 @@ Imputed genes appear in the gene expression dropdown with an `[imp]` suffix. Res
 
 Reference: [Abdelaal et al. 2020, *Nucleic Acids Research*](https://academic.oup.com/nar/article/48/18/e107/5909530)
 
+### SPLIT Ambient RNA Correction
+
+Click **"✦ Correct Ambient RNA"** in the sidebar to open the SPLIT correction modal. SPLIT removes ambient/contaminating RNA from spatial transcriptomics data via RCTD doublet-mode decomposition followed by `SPLIT::purify()`.
+
+**Requirements:**
+- R packages: `spacexr` and `SPLIT`
+  ```r
+  devtools::install_github('dmcable/spacexr')
+  remotes::install_github('bdsc-tds/SPLIT')
+  ```
+- Peak RAM: ~21 GB for a full Xenium slide
+- Runtime: ~20–40 min (RCTD is the bottleneck)
+
+**Modal fields:**
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| Seurat Reference RDS path | — | Path to `.rds` Seurat object used as cell-type reference |
+| Cell-type label column | `Names` | Metadata column in the Seurat object containing cell type labels |
+| Max R cores | 4 | Parallel workers for RCTD |
+
+Click **▶ Run SPLIT** to start. Progress is streamed to the server log. When complete:
+
+- The **"SPLIT Corrected"** radio option in the sidebar becomes enabled
+- The active counts mode switches automatically to "SPLIT Corrected"
+- A `cluster_split_10` column (KMeans on corrected counts) appears in the cluster dropdown
+- A corrected-counts UMAP (`split_umap_1`/`split_umap_2`) is shown when the corrected mode is active
+- Corrected counts are persisted in the `X_corrected` layer of the active SpatialData zarr and reload automatically on the next launch
+
+**Active Counts toggle behavior:**
+- **Original** — all expression lookups use the raw Xenium/Baysor/Proseg count matrix; `[imp]` genes from SpaGE are shown
+- **SPLIT Corrected** — expression lookups use the corrected matrix; `[corr+imp]` genes (imputed on corrected counts via SpaGE) are shown instead
+- Switching segmentation sources resets the toggle to "Original" if no corrected data exists for that source
+
+**SpaGE on corrected counts:** Run SpaGE while "SPLIT Corrected" is active to impute genes using the corrected expression matrix. Resulting genes are marked `[corr+imp]` and stored in `adata.uns["split_corrected_imputed_genes"]` in the zarr.
+
 ### Save as SpatialData
 
 Click **"💾 Save as SpatialData"** in the tissue info section to export the current analysis as a SpatialData Zarr store. Specify an output directory and filename. The saved Zarr includes:
@@ -270,7 +308,7 @@ All caches are stored in `~/.xenium_explorer_cache/` and are keyed per dataset.
 
 | File | Contents |
 |------|----------|
-| `spatialdata_xenium.zarr` | Primary data store — generated on first launch, loaded on all subsequent launches. Contains expression matrix, obs metadata, cluster assignments, boundaries, and any SpaGE-imputed genes. |
+| `spatialdata_xenium.zarr` | Primary data store — generated on first launch, loaded on all subsequent launches. Contains expression matrix, obs metadata, cluster assignments, boundaries, SpaGE-imputed genes, and (after SPLIT) the `X_corrected` layer with corrected counts, `cluster_split_10`, and `split_umap_1/2`. |
 
 **In `~/.xenium_explorer_cache/`:**
 
@@ -285,8 +323,8 @@ All caches are stored in `~/.xenium_explorer_cache/` and are keyed per dataset.
 | `spage_index.json` | Maps dataset paths to most recent SpaGE cache |
 | `morph_overview_{hash}_z{level}.npz` | Pre-downsampled morphology overview (generated on first load) |
 | `spatialdata_{hash}.zarr` | SpatialData Zarr store for sopa-based patch resegmentation |
-| `baysor_{dataset}_{tag}/` | Baysor output per parameter set; includes `params.json` and `spatialdata_baysor.zarr` (contains expression, clusters, UMAP, and any imputed genes) |
-| `proseg_{dataset}_{tag}/` | Proseg output per parameter set; includes `params.json` and `spatialdata_proseg.zarr` (contains expression, clusters, UMAP, and any imputed genes) |
+| `baysor_{dataset}_{tag}/` | Baysor output per parameter set; includes `params.json` and `spatialdata_baysor.zarr` (contains expression, clusters, UMAP, imputed genes, and `X_corrected` layer after SPLIT) |
+| `proseg_{dataset}_{tag}/` | Proseg output per parameter set; includes `params.json` and `spatialdata_proseg.zarr` (contains expression, clusters, UMAP, imputed genes, and `X_corrected` layer after SPLIT) |
 
 ## Dependencies
 
@@ -321,7 +359,8 @@ umap-learn       # UMAP re-computation for reseg cells
 ```r
 SeuratObject
 Matrix
-spacexr          # RCTD annotation (devtools::install_github('dmcable/spacexr'))
+spacexr          # RCTD annotation + SPLIT (devtools::install_github('dmcable/spacexr'))
+SPLIT            # Ambient RNA correction (remotes::install_github('bdsc-tds/SPLIT'))
 ```
 
 **External tools:**

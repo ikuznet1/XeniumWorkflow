@@ -11,6 +11,8 @@ Usage:
 import os
 import re
 import sys
+import warnings
+warnings.filterwarnings("ignore", message=".*not recognized as a component of a Zarr hierarchy.*")
 import json
 import io
 import base64
@@ -27,7 +29,7 @@ import h5py
 from PIL import Image
 
 import dash
-from dash import dcc, html, Input, Output, State, callback_context
+from dash import dcc, html, Input, Output, State, callback_context, ALL
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 from plotly.colors import qualitative
@@ -107,6 +109,14 @@ _sdata_version = 0  # incremented when ROI/patches change, to trigger overlay re
 # ─── SPLIT ambient RNA correction state ───────────────────────────────────────
 _split_state: dict = {"status": "idle", "message": "", "result": None}
 _split_lock   = threading.Lock()
+
+# ─── ROI Annotation state ─────────────────────────────────────────────────────
+_roi_state: dict = {
+    "rois": [],           # [{name, cls, polygon_xy:[[x,y],...], color}]
+    "show": True,         # overlay visibility
+    "pending_hull": None, # [[x,y],...] awaiting save
+}
+_roi_lock = threading.Lock()
 
 # ─── Server log capture ────────────────────────────────────────────────────────
 import collections
@@ -826,11 +836,16 @@ def _build_proseg_expr(tx_meta_df, cells_df):
     gene_names_list = list(DATA["gene_names"])
     gene_to_idx = {g: i for i, g in enumerate(gene_names_list)}
     gene_col = "gene" if "gene" in tx_meta_df.columns else None
-    cell_col = "cell" if "cell" in tx_meta_df.columns else None
+    cell_col = ("cell" if "cell" in tx_meta_df.columns
+                else "assignment" if "assignment" in tx_meta_df.columns else None)
     if not gene_col or not cell_col:
         return None
     cell_to_row = {c: i for i, c in enumerate(cells_df.index)}
-    assigned = tx_meta_df[tx_meta_df[cell_col].notna()]
+    assigned = tx_meta_df[tx_meta_df[cell_col].notna()].copy()
+    if cell_col == "assignment":
+        # Filter out proseg's "unassigned" sentinel value (0xFFFFFFFF)
+        assigned = assigned[assigned[cell_col] != 4294967295]
+    assigned[cell_col] = assigned[cell_col].astype(int).astype(str)
     valid = assigned[assigned[gene_col].isin(gene_to_idx) & assigned[cell_col].isin(cell_to_row)]
     rows = valid[cell_col].map(cell_to_row).astype(int).values
     cols = valid[gene_col].map(gene_to_idx).astype(int).values
@@ -842,31 +857,83 @@ def _build_proseg_expr(tx_meta_df, cells_df):
     return mat
 
 
+def _load_zarr_obs_into_df(zarr_path: str, cells_df: pd.DataFrame) -> None:
+    """Read obs columns from a SpatialData zarr and merge any missing ones into cells_df in-place."""
+    try:
+        import zarr as _zarr_mod
+        _zgrp = _zarr_mod.open_group(zarr_path, mode="r")
+        _obs = _zgrp["tables"]["table"]["obs"]
+        _idx_key = _obs.attrs.get("_index", "_index")
+        _zarr_idx = [str(v) for v in _obs[_idx_key][:]] if _idx_key in _obs else None
+        for _col in _obs.keys():
+            if _col in {"__categories", "_index"} or _col == _idx_key:
+                continue
+            if _col not in cells_df.columns:
+                try:
+                    _vals = _obs[_col][:]
+                    if _zarr_idx is not None:
+                        cells_df[_col] = pd.Series(_vals, index=_zarr_idx).reindex(cells_df.index).values
+                    else:
+                        cells_df[_col] = _vals
+                except Exception:
+                    pass
+    except Exception as _ze:
+        print(f"  Warning: could not load obs from zarr: {_ze}", flush=True)
+
+
+def _load_zarr_boundaries_into_dict(sdata, cell_bounds: dict, tool_label: str) -> None:
+    """Fill cell_bounds from zarr shapes element if it's currently empty."""
+    if cell_bounds or "cell_boundaries" not in sdata.shapes:
+        return
+    _gdf = sdata.shapes["cell_boundaries"]
+    for _cid, _geom in zip(_gdf.index, _gdf.geometry):
+        try:
+            _coords = list(_geom.exterior.coords)
+            cell_bounds[str(_cid)] = ([c[0] for c in _coords], [c[1] for c in _coords])
+        except Exception:
+            pass
+    if cell_bounds:
+        print(f"  Loaded {len(cell_bounds):,} {tool_label} boundaries from zarr shapes", flush=True)
+
+
 def _update_reseg_zarr_obs(zarr_path: str, cells_df: pd.DataFrame) -> None:
     """Update the obs (cell metadata) in a reseg SpatialData zarr with new columns from cells_df.
-    Only adds/overwrites columns — does not touch X or var."""
+    Writes directly via zarr low-level API to avoid spatialdata's 'target path in use' error."""
     if not os.path.isdir(zarr_path):
         return
     try:
-        import spatialdata as _sd_obs, anndata as _ad_obs
-        _sdata_obs = _sd_obs.read_zarr(zarr_path)
-        _adata_obs = _sdata_obs.tables["table"]
-        # Merge new columns from cells_df into existing obs
-        new_cols = [c for c in cells_df.columns if c not in _adata_obs.obs.columns]
+        import zarr as _zarr_mod
+        _zroot = _zarr_mod.open_group(zarr_path, mode="r+")
+        if "tables" not in _zroot or "table" not in _zroot["tables"] \
+                or "obs" not in _zroot["tables"]["table"]:
+            return
+        _obs_grp = _zroot["tables"]["table"]["obs"]
+        existing_cols = set(_obs_grp.keys()) - {"__categories", "_index"}
+        new_cols = [c for c in cells_df.columns if c not in existing_cols]
         if not new_cols:
-            return  # nothing to add
-        _obs_new = _adata_obs.obs.copy()
-        for col in new_cols:
-            # Align by index
-            _obs_new[col] = cells_df[col].reindex(_obs_new.index).values
-        _adata_new = _ad_obs.AnnData(
-            X=_adata_obs.X, obs=_obs_new, var=_adata_obs.var, uns=dict(_adata_obs.uns)
-        )
-        _sdata_obs.tables["table"] = _adata_new
+            return
+        # Read the existing index to align values correctly
+        _idx_key = _obs_grp.attrs.get("_index", "_index")
+        if _idx_key in _obs_grp:
+            _existing_idx = [str(v) for v in _obs_grp[_idx_key][:]]
+        else:
+            _existing_idx = None
         try:
-            _sdata_obs.write_element("table")
-        except Exception:
-            _sdata_obs.write(zarr_path, overwrite=True)
+            from anndata.io import write_elem as _write_elem
+        except ImportError:
+            from anndata.experimental import write_elem as _write_elem
+        for col in new_cols:
+            try:
+                _ser = cells_df[col]
+                if _existing_idx is not None:
+                    _ser = _ser.reindex(_existing_idx)
+                try:
+                    _write_elem(_obs_grp, col, _ser)
+                except Exception:
+                    _arr = _ser.values
+                    _obs_grp.create_dataset(col, data=_arr, shape=_arr.shape, dtype=_arr.dtype, overwrite=True)
+            except Exception as _col_err:
+                print(f"  Warning: could not write obs col '{col}': {_col_err}", flush=True)
         print(f"  Updated zarr obs: added {new_cols} to {os.path.basename(zarr_path)}", flush=True)
     except Exception as _e:
         print(f"  Warning: failed to update zarr obs ({_e})", flush=True)
@@ -985,33 +1052,48 @@ def _load_cached_baysor(out_dir: str) -> None:
         expr_mat = _build_baysor_expr(seg, cells_df)
         n_cells = len(cells_df)
 
-        # Compute clusters + UMAP if not already in cells_df (migration for old cache)
-        if "umap_1" not in cells_df.columns and expr_mat is not None:
-            _set("running", f"Computing UMAP and clusters for {n_cells:,} cells (one-time migration)…")
-            _compute_reseg_clusters_umap(cells_df, expr_mat,
-                                         progress_fn=lambda msg: _set("running", msg))
-
         zarr_path = os.path.join(out_dir, "spatialdata_baysor.zarr")
+
+        # ── Load or build zarr ────────────────────────────────────────────
+        _baysor_corr     = None
+        _baysor_corr_imp = []
         if not os.path.isdir(zarr_path):
+            # First time: compute clusters/UMAP then build zarr (includes them)
+            if expr_mat is not None:
+                _set("running", f"Computing UMAP and clusters for {n_cells:,} cells…")
+                _compute_reseg_clusters_umap(cells_df, expr_mat,
+                                             progress_fn=lambda msg: _set("running", msg))
             zarr_path = _build_reseg_sdata(
                 cells_df, cell_bounds, expr_mat, DATA["gene_names"], "baysor", out_dir
             )
         else:
-            # Update zarr obs if we just computed clusters/UMAP (migration)
-            _update_reseg_zarr_obs(zarr_path, cells_df)
+            # Zarr exists — load obs columns (cluster, UMAP) from it directly
+            # to avoid recomputing and the 'target path in use' write-back error.
+            _load_zarr_obs_into_df(zarr_path, cells_df)
 
-        try:
-            import spatialdata as _sd_
-            _adata_b = _sd_.read_zarr(zarr_path).tables["table"]
-            _baysor_corr = (
-                sp.csr_matrix(_adata_b.layers["X_corrected"])
-                if "X_corrected" in _adata_b.layers else None
-            )
-            _baysor_corr_imp = list(_adata_b.uns.get("split_corrected_imputed_genes", []))
-        except Exception:
-            _baysor_corr = None
-            _baysor_corr_imp = []
+            # If cluster/UMAP still missing (very old cache), compute and write back
+            if "umap_1" not in cells_df.columns and expr_mat is not None:
+                _set("running", f"Computing UMAP and clusters for {n_cells:,} cells (one-time migration)…")
+                _compute_reseg_clusters_umap(cells_df, expr_mat,
+                                             progress_fn=lambda msg: _set("running", msg))
+                _update_reseg_zarr_obs(zarr_path, cells_df)
 
+            # Load corrected expr + cell boundaries from zarr
+            try:
+                import spatialdata as _sd_b
+                _sdata_b = _sd_b.read_zarr(zarr_path)
+                _adata_b = _sdata_b.tables["table"]
+                _baysor_corr = (
+                    sp.csr_matrix(_adata_b.layers["X_corrected"])
+                    if "X_corrected" in _adata_b.layers else None
+                )
+                _baysor_corr_imp = list(_adata_b.uns.get("split_corrected_imputed_genes", []))
+                _load_zarr_boundaries_into_dict(_sdata_b, cell_bounds, "Baysor")
+            except Exception as _ze2:
+                print(f"  Warning: could not read Baysor zarr: {_ze2}", flush=True)
+
+        with _roi_lock:
+            _roi_apply_metadata_to_df(cells_df, _roi_state["rois"])
         _set("done", f"Loaded — {n_cells:,} cells", result={
             "cells_df": cells_df, "cell_bounds": cell_bounds,
             "out_dir": out_dir, "expr": expr_mat, "source": "baysor",
@@ -1019,7 +1101,8 @@ def _load_cached_baysor(out_dir: str) -> None:
             "split_corrected_expr": _baysor_corr,
             "split_corrected_imputed_genes": _baysor_corr_imp,
         })
-        print(f"Loaded cached Baysor: {n_cells:,} cells from {os.path.basename(out_dir)}", flush=True)
+        print(f"Loaded cached Baysor: {n_cells:,} cells, {len(cell_bounds):,} boundaries "
+              f"from {os.path.basename(out_dir)}", flush=True)
     except Exception as exc:
         import traceback; traceback.print_exc()
         _set("error", str(exc)[:300])
@@ -1036,71 +1119,141 @@ def _load_cached_proseg(out_dir: str) -> None:
     print(f"Loading cached Proseg: {os.path.basename(out_dir)}…", flush=True)
     try:
         _set("running", "Loading cached Proseg result…")
-        # Find cell-metadata.csv.gz (may be in subdirs for patch runs)
-        meta_parts = []
-        tx_parts   = []
-        for root, dirs, files in os.walk(out_dir):
-            if "cell-metadata.csv.gz" in files:
-                meta_parts.append(pd.read_csv(os.path.join(root, "cell-metadata.csv.gz")))
-            if "transcript-metadata.csv.gz" in files:
-                tx_parts.append(pd.read_csv(os.path.join(root, "transcript-metadata.csv.gz")))
+        # Detect patch-based vs single run.
+        # Patch runs use per-patch local cell IDs that must be remapped to global IDs
+        # matching the scheme used during the live run: global_id = local_id + 1 + i*STRIDE
+        _CELL_ID_STRIDE   = 10_000_000
+        _PROSEG_UNASSIGNED = 4294967295  # 0xFFFFFFFF sentinel for unassigned transcripts
+        _patch_names = sorted([
+            d for d in os.listdir(out_dir)
+            if os.path.isdir(os.path.join(out_dir, d)) and d.startswith("patch_")
+            and os.path.exists(os.path.join(out_dir, d, "cell-metadata.csv.gz"))
+        ])
+        meta_parts: list = []
+        tx_parts:   list = []
+        if _patch_names:
+            # Patch run: apply global-ID stride (replicates live-run numbering)
+            for _i, _pname in enumerate(_patch_names):
+                _offset = 1 + _i * _CELL_ID_STRIDE
+                _pdir   = os.path.join(out_dir, _pname)
+                _df     = pd.read_csv(os.path.join(_pdir, "cell-metadata.csv.gz"))
+                _remap  = {int(lid): int(lid) + _offset for lid in _df["cell"].values}
+                _df["cell"] = _df["cell"].map(_remap)
+                meta_parts.append(_df)
+                _tx_path = os.path.join(_pdir, "transcript-metadata.csv.gz")
+                if os.path.exists(_tx_path):
+                    _tx_df = pd.read_csv(_tx_path)
+                    if "assignment" in _tx_df.columns:
+                        _mask = _tx_df["assignment"] != _PROSEG_UNASSIGNED
+                        _tx_df = _tx_df.copy()
+                        _tx_df.loc[_mask, "assignment"] = (
+                            _tx_df.loc[_mask, "assignment"].map(_remap)
+                        )
+                    elif "cell" in _tx_df.columns:
+                        _tx_df = _tx_df.copy()
+                        _tx_df["cell"] = _tx_df["cell"].map(_remap)
+                    tx_parts.append(_tx_df)
+        else:
+            # Single run: flat walk (no ID remapping needed)
+            for _root, _dirs, _files in os.walk(out_dir):
+                if "cell-metadata.csv.gz" in _files:
+                    meta_parts.append(pd.read_csv(os.path.join(_root, "cell-metadata.csv.gz")))
+                if "transcript-metadata.csv.gz" in _files:
+                    tx_parts.append(pd.read_csv(os.path.join(_root, "transcript-metadata.csv.gz")))
         if not meta_parts:
             _set("error", f"cell-metadata.csv.gz not found in {out_dir}")
             return
         cell_meta = pd.concat(meta_parts, ignore_index=True)
         tx_meta   = pd.concat(tx_parts,   ignore_index=True) if tx_parts else pd.DataFrame()
         cells_df = cell_meta.rename(columns={
-            "cell_id": "cell_id", "x": "x_centroid", "y": "y_centroid",
-            "count": "transcript_counts", "area": "cell_area",
+            "cell": "cell_id", "centroid_x": "x_centroid", "centroid_y": "y_centroid",
+            "population": "transcript_counts", "volume": "cell_area",
         })
         if "cell_id" in cells_df.columns:
             cells_df = cells_df.set_index("cell_id")
         cells_df.index = cells_df.index.astype(str)
-        # Build cell boundaries from polygon files
+        # Build cell boundaries from polygon files.
+        # For patch runs, leave cell_bounds empty so _load_zarr_boundaries_into_dict
+        # can populate it from the zarr shapes element (which has correct global IDs).
         cell_bounds: dict = {}
-        for root, dirs, files in os.walk(out_dir):
-            for poly_name in ("polygons.geojson", "polygons.json", "cell_polygons.json",
-                              "segmentation_polygons.json"):
-                if poly_name in files:
-                    poly_path = os.path.join(root, poly_name)
-                    with open(poly_path) as f:
-                        geo = json.load(f)
-                    for feat in geo.get("features", []):
-                        props = feat.get("properties", {})
-                        cid = str(props.get("cell_id", props.get("cell", feat.get("id", ""))))
-                        coords = feat.get("geometry", {}).get("coordinates", [[]])[0]
-                        if coords:
-                            cell_bounds[cid] = ([c[0] for c in coords], [c[1] for c in coords])
-                    break
+        if not _patch_names:
+            for root, dirs, files in os.walk(out_dir):
+                for poly_name in ("cell-polygons.geojson.gz", "polygons.geojson", "polygons.json",
+                                  "cell_polygons.json", "segmentation_polygons.json"):
+                    if poly_name in files:
+                        poly_path = os.path.join(root, poly_name)
+                        import gzip as _gzip
+                        _opener = _gzip.open if poly_name.endswith(".gz") else open
+                        with _opener(poly_path, "rt") as f:
+                            geo = json.load(f)
+                        for feat in geo.get("features", []):
+                            props = feat.get("properties", {})
+                            cid = str(props.get("cell_id", props.get("cell", feat.get("id", ""))))
+                            geom = feat.get("geometry", {})
+                            gtype = geom.get("type")
+                            if gtype == "Polygon":
+                                rings = [geom["coordinates"][0]]
+                            elif gtype == "MultiPolygon":
+                                rings = [poly[0] for poly in geom["coordinates"]]
+                            else:
+                                rings = [geom.get("coordinates", [[]])[0]]
+                            coords = max(rings, key=len) if rings else []
+                            if coords:
+                                cell_bounds[cid] = ([c[0] for c in coords], [c[1] for c in coords])
+                        break
         expr_mat = _build_proseg_expr(tx_meta, cells_df) if not tx_meta.empty else None
         n_cells = len(cells_df)
 
-        # Compute clusters + UMAP if not already in cells_df (migration for old cache)
-        if "umap_1" not in cells_df.columns and expr_mat is not None:
-            _set("running", f"Computing UMAP and clusters for {n_cells:,} cells (one-time migration)…")
-            _compute_reseg_clusters_umap(cells_df, expr_mat,
-                                         progress_fn=lambda msg: _set("running", msg))
-
         zarr_path = os.path.join(out_dir, "spatialdata_proseg.zarr")
+
+        # ── Load or build zarr ────────────────────────────────────────────
+        _proseg_corr     = None
+        _proseg_corr_imp = []
         if not os.path.isdir(zarr_path):
+            # First time: compute clusters/UMAP then build zarr (includes them)
+            if expr_mat is not None:
+                _set("running", f"Computing UMAP and clusters for {n_cells:,} cells…")
+                _compute_reseg_clusters_umap(cells_df, expr_mat,
+                                             progress_fn=lambda msg: _set("running", msg))
             zarr_path = _build_reseg_sdata(
                 cells_df, cell_bounds, expr_mat, DATA["gene_names"], "proseg", out_dir
             )
         else:
-            _update_reseg_zarr_obs(zarr_path, cells_df)
+            # Zarr exists — load obs columns (cluster, UMAP) from it directly
+            _load_zarr_obs_into_df(zarr_path, cells_df)
 
-        try:
-            import spatialdata as _sd_
-            _adata_p = _sd_.read_zarr(zarr_path).tables["table"]
-            _proseg_corr = (
-                sp.csr_matrix(_adata_p.layers["X_corrected"])
-                if "X_corrected" in _adata_p.layers else None
-            )
-            _proseg_corr_imp = list(_adata_p.uns.get("split_corrected_imputed_genes", []))
-        except Exception:
-            _proseg_corr = None
-            _proseg_corr_imp = []
+            # If cluster/UMAP still missing (very old cache), compute and write back
+            if "umap_1" not in cells_df.columns and expr_mat is not None:
+                _set("running", f"Computing UMAP and clusters for {n_cells:,} cells (one-time migration)…")
+                _compute_reseg_clusters_umap(cells_df, expr_mat,
+                                             progress_fn=lambda msg: _set("running", msg))
+                _update_reseg_zarr_obs(zarr_path, cells_df)
 
+            # Load expr (if missing), corrected expr + cell boundaries from zarr
+            try:
+                import spatialdata as _sd_p
+                _sdata_p = _sd_p.read_zarr(zarr_path)
+                _adata_p = _sdata_p.tables["table"]
+                if expr_mat is None:
+                    expr_mat = sp.csr_matrix(_adata_p.X)
+                    print(f"  Proseg: loaded expr from zarr {expr_mat.shape}", flush=True)
+                    # Align cells_df to zarr obs order (zarr may have fewer cells than CSV)
+                    zarr_ids = [str(i) for i in _adata_p.obs_names]
+                    if cells_df.index.duplicated().any():
+                        cells_df = cells_df[~cells_df.index.duplicated(keep="first")]
+                    cells_df = cells_df.reindex(zarr_ids).dropna(how="all")
+                    cells_df.index = cells_df.index.astype(str)
+                _proseg_corr = (
+                    sp.csr_matrix(_adata_p.layers["X_corrected"])
+                    if "X_corrected" in _adata_p.layers else None
+                )
+                _proseg_corr_imp = list(_adata_p.uns.get("split_corrected_imputed_genes", []))
+                _load_zarr_boundaries_into_dict(_sdata_p, cell_bounds, "Proseg")
+            except Exception as _ze2:
+                print(f"  Warning: could not read Proseg zarr: {_ze2}", flush=True)
+
+        with _roi_lock:
+            _roi_apply_metadata_to_df(cells_df, _roi_state["rois"])
         _set("done", f"Loaded — {n_cells:,} cells", result={
             "cells_df": cells_df, "cell_bounds": cell_bounds,
             "out_dir": out_dir, "expr": expr_mat, "source": "proseg",
@@ -1108,7 +1261,8 @@ def _load_cached_proseg(out_dir: str) -> None:
             "split_corrected_expr": _proseg_corr,
             "split_corrected_imputed_genes": _proseg_corr_imp,
         })
-        print(f"Loaded cached Proseg: {n_cells:,} cells from {os.path.basename(out_dir)}", flush=True)
+        print(f"Loaded cached Proseg: {n_cells:,} cells, {len(cell_bounds):,} boundaries "
+              f"from {os.path.basename(out_dir)}", flush=True)
     except Exception as exc:
         import traceback; traceback.print_exc()
         _set("error", str(exc)[:300])
@@ -1949,11 +2103,15 @@ def _run_reseg_umap() -> None:
         mat.data = np.log1p(mat.data)
 
         # PCA (TruncatedSVD) — reduce to 50 dims before UMAP
+        import warnings as _warnings
         from sklearn.decomposition import TruncatedSVD
         n_comp = min(50, n_cells - 1, mat.shape[1] - 1)
         _set("running", f"PCA ({n_comp} components)…")
         svd = TruncatedSVD(n_components=n_comp, random_state=0)
-        pca_coords = svd.fit_transform(mat)   # (n_cells × n_comp)
+        with _warnings.catch_warnings():
+            _warnings.filterwarnings("ignore", category=RuntimeWarning,
+                                     message="invalid value encountered in divide")
+            pca_coords = svd.fit_transform(mat)   # (n_cells × n_comp)
 
         # UMAP — prefer umap-learn, fall back to t-SNE
         _set("running", "Running UMAP…")
@@ -3439,6 +3597,23 @@ def viewport_cell_ids(relayout: dict) -> list | None:
     return idx[mask].tolist()
 
 
+def viewport_reseg_cell_ids(relayout: dict, cells_df) -> list | None:
+    """Like viewport_cell_ids but uses a reseg cells_df (Baysor/Proseg) instead of DATA['df']."""
+    x0 = relayout.get("xaxis.range[0]")
+    x1 = relayout.get("xaxis.range[1]")
+    y0 = relayout.get("yaxis.range[0]")
+    y1 = relayout.get("yaxis.range[1]")
+    if None in (x0, x1, y0, y1):
+        return None
+    xc = cells_df["x_centroid"].values
+    yc = cells_df["y_centroid"].values
+    idx = cells_df.index.values
+    xc_min, xc_max = float(x0), float(x1)
+    yc_min, yc_max = float(-y1), float(-y0)
+    mask = (xc >= xc_min) & (xc <= xc_max) & (yc >= yc_min) & (yc <= yc_max)
+    return [str(i) for i in idx[mask]]
+
+
 def build_boundary_trace(cell_ids: list, bounds_dict: dict, color: str, name: str) -> go.Scatter | None:
     """Build a single NaN-separated Scatter trace for a set of polygon boundaries."""
     # Collect polygon arrays, compute total size for pre-allocation
@@ -3581,7 +3756,8 @@ def _get_reseg_expr_values(gene: str, alt_res: dict) -> "np.ndarray | None":
 
 def make_spatial_fig(color_by, method, gene, size, opacity,
                      boundary_toggles, relayout,
-                     morph_image=None, extra_title="", baysor_active=False, proseg_active=False):
+                     morph_image=None, extra_title="", baysor_active=False, proseg_active=False,
+                     use_corrected: bool = False):
     # Choose data source: Proseg > Baysor > original Xenium (priority order)
     with _proseg_lock:
         pres = _proseg_state["result"] if proseg_active and _proseg_state["result"] else None
@@ -3643,7 +3819,7 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                 show_legend = True
 
         elif color_by == "gene":
-            vals = _get_reseg_expr_values(gene, alt_res)
+            vals = _get_expr_values(gene, alt_res, use_corrected=use_corrected)
             if vals is not None:
                 traces = [go.Scattergl(
                     x=x, y=y, mode="markers",
@@ -3654,6 +3830,21 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                     hovertemplate="<b>%{text}</b><br>" + gene + ": %{marker.color:.2f}<extra></extra>",
                     name=gene,
                 )]
+
+        elif color_by and color_by.startswith("roi_") and color_by in bdf.columns:
+            labels = bdf[color_by].fillna("(none)").astype(str)
+            u_vals = [v for v in sorted(labels.unique()) if v != "(none)"]
+            cmap   = {v: _roi_color(i) for i, v in enumerate(u_vals)}
+            cmap["(none)"] = "#666666"
+            colors = labels.map(cmap).values
+            traces = [go.Scattergl(
+                x=x, y=y, mode="markers",
+                marker=dict(size=size, color=colors, opacity=opacity),
+                text=cell_ids_str, customdata=cell_ids_str,
+                hovertemplate="<b>%{text}</b><br>" + color_by + ": %{text}<extra></extra>",
+                name=color_by,
+            )]
+            show_legend = False
 
         if traces is None:
             # Fallback: QC column if available, otherwise transcript counts
@@ -3855,7 +4046,8 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
             elif color_by == "cell_type":
                 traces, show_legend = _cell_type_traces(x, y, df, size, opacity, "spatial"), True
             elif color_by == "gene":
-                vals = get_gene_expression(gene)
+                vals = (_get_expr_values(gene, use_corrected=True) if use_corrected else None) \
+                    or get_gene_expression(gene)
                 traces = [go.Scattergl(
                     x=x, y=y, mode="markers",
                     marker=dict(size=size, color=vals, colorscale="Plasma", opacity=opacity,
@@ -3864,6 +4056,21 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                     text=df.index.tolist(), customdata=df.index.tolist(),
                     hovertemplate="<b>%{text}</b><br>" + gene + ": %{marker.color:.2f}<extra></extra>",
                     name=gene,
+                )]
+                show_legend = False
+            elif color_by and color_by.startswith("roi_") and color_by in df.columns:
+                labels = df[color_by].fillna("(none)").astype(str)
+                u_vals = [v for v in sorted(labels.unique()) if v != "(none)"]
+                cmap   = {v: _roi_color(i) for i, v in enumerate(u_vals)}
+                cmap["(none)"] = "#666666"
+                colors = labels.map(cmap).values
+                ids    = df.index.tolist()
+                traces = [go.Scattergl(
+                    x=x, y=y, mode="markers",
+                    marker=dict(size=size, color=colors, opacity=opacity),
+                    text=ids, customdata=ids,
+                    hovertemplate="<b>%{text}</b><extra></extra>",
+                    name=color_by,
                 )]
                 show_legend = False
             else:
@@ -3887,22 +4094,21 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
     # Each boundary source is rendered independently
     _needs_zoom_msg = False
 
-    def _add_boundary(bounds_dict, color, name, small_set=False):
-        """Render a boundary set; small_set=True skips viewport requirement."""
+    def _add_boundary(bounds_dict, color, name, reseg_cells_df=None):
+        """Render a boundary set using viewport filtering. reseg_cells_df uses Baysor/Proseg cells."""
         nonlocal _needs_zoom_msg, show_legend
         if not bounds_dict:
             return
-        if small_set:
-            ids = list(bounds_dict.keys())[:BOUNDARY_CELL_LIMIT]
+        if reseg_cells_df is not None:
+            visible = viewport_reseg_cell_ids(relayout or {}, reseg_cells_df)
         else:
             visible = viewport_cell_ids(relayout or {})
-            if visible is None:
-                _needs_zoom_msg = True
-                return
-            ids = visible
-            if len(ids) > BOUNDARY_CELL_LIMIT:
-                return  # too many, status set below
-        t = build_boundary_trace(ids, bounds_dict, color, name)
+        if visible is None:
+            _needs_zoom_msg = True
+            return
+        if len(visible) > BOUNDARY_CELL_LIMIT:
+            return
+        t = build_boundary_trace(visible, bounds_dict, color, name)
         if t:
             traces.append(t)
             show_legend = True
@@ -3912,25 +4118,28 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
     # otherwise show Xenium boundaries (zoom required).
     if "cell" in boundary_toggles:
         if alt_res is not None:
-            _add_boundary(alt_res["cell_bounds"], "#00d4ff", "Cell Boundaries", small_set=True)
+            _add_boundary(alt_res["cell_bounds"], "#00d4ff", "Cell Boundaries",
+                          reseg_cells_df=alt_res["cells_df"])
         else:
             _add_boundary(DATA["cell_bounds"], "#00d4ff", "Cell Boundaries")
     if "nucleus" in boundary_toggles:
         _add_boundary(DATA.get("nucleus_bounds", {}), "#ff9f43", "Nucleus Boundaries")
 
-    # Proseg boundaries (small set, no zoom required)
+    # Proseg boundaries (zoom required, uses Proseg cell centroids for viewport)
     if "proseg" in boundary_toggles:
         with _proseg_lock:
             _pres_local = _proseg_state.get("result")
         if _pres_local:
-            _add_boundary(_pres_local["cell_bounds"], "#2ed573", "Proseg Boundaries", small_set=True)
+            _add_boundary(_pres_local["cell_bounds"], "#2ed573", "Proseg Boundaries",
+                          reseg_cells_df=_pres_local["cells_df"])
 
-    # Baysor boundaries (small set, no zoom required)
+    # Baysor boundaries (zoom required, uses Baysor cell centroids for viewport)
     if "baysor" in boundary_toggles:
         with _baysor_lock:
             _bres_local = _baysor_state.get("result")
         if _bres_local:
-            _add_boundary(_bres_local["cell_bounds"], "#a29bfe", "Baysor Boundaries", small_set=True)
+            _add_boundary(_bres_local["cell_bounds"], "#a29bfe", "Baysor Boundaries",
+                          reseg_cells_df=_bres_local["cells_df"])
 
     if _needs_zoom_msg:
         boundary_status = " · zoom in to see Xenium boundaries"
@@ -3950,8 +4159,17 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
         ),
         uirevision="spatial",
     )
-    if _separator_shapes:
-        layout_kwargs["shapes"] = _separator_shapes
+    all_shapes = list(_separator_shapes)
+    with _roi_lock:
+        roi_visible = _roi_state["show"]
+        rois_snap   = list(_roi_state["rois"])
+        pending     = _roi_state.get("pending_hull")
+    if roi_visible and rois_snap:
+        all_shapes += _roi_shapes_for_fig(rois_snap)
+    if pending:
+        all_shapes += _roi_shapes_for_fig([], pending_hull=pending)
+    if all_shapes:
+        layout_kwargs["shapes"] = all_shapes
     fig.update_layout(**layout_kwargs)
     # Explicitly preserve viewport ranges to prevent zoom resets on figure rebuild
     if relayout:
@@ -4014,7 +4232,7 @@ def make_umap_fig(color_by, method, gene, size, opacity,
                 color_by = "transcript_counts"  # fall through
 
         if color_by == "gene":
-            vals = _get_reseg_expr_values(gene, alt_res)
+            vals = _get_expr_values(gene, alt_res, use_corrected=use_corrected)
             if vals is not None:
                 traces = [go.Scattergl(
                     x=xu, y=yu, mode="markers",
@@ -4306,6 +4524,186 @@ def _list_cached_seg_runs() -> list:
             label = f"{tool.capitalize()}: [{param_tag}]"
         opts.append({"label": label, "value": f"{tool}:{param_tag}", "out_dir": out_dir, "param_tag": param_tag})
     return opts
+
+
+# ─── ROI helper functions ──────────────────────────────────────────────────────
+
+_ROI_PALETTE = [
+    "#e74c3c","#3498db","#2ecc71","#f39c12","#9b59b6",
+    "#1abc9c","#e67e22","#34495e","#e91e63","#00bcd4","#cddc39","#ff5722",
+]
+
+def _roi_color(index: int) -> str:
+    return _ROI_PALETTE[index % len(_ROI_PALETTE)]
+
+
+def _roi_cache_path() -> str:
+    cache_dir = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    tag = hashlib.md5(DATA["data_dir"].encode()).hexdigest()[:8]
+    return os.path.join(cache_dir, f"rois_{tag}.json")
+
+
+def _roi_save_cache() -> None:
+    """Serialise _roi_state["rois"] to JSON. Call inside _roi_lock."""
+    try:
+        with open(_roi_cache_path(), "w") as f:
+            json.dump(_roi_state["rois"], f)
+    except Exception as e:
+        print(f"  ROI cache write error: {e}", flush=True)
+
+
+def _roi_load_cache() -> list:
+    try:
+        path = _roi_cache_path()
+        if not os.path.exists(path):
+            return []
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def _xy_to_svg_path(xy: list) -> str:
+    if not xy:
+        return ""
+    parts = [f"M {xy[0][0]},{xy[0][1]}"]
+    for x, y in xy[1:]:
+        parts.append(f"L {x},{y}")
+    parts.append("Z")
+    return " ".join(parts)
+
+
+def _hex_to_rgba(hex_color: str, alpha: float) -> str:
+    h = hex_color.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def _roi_compute_hull(cell_ids, src_df=None):
+    """Return convex hull exterior coords [[x,y],...] for the given cell_ids, or None."""
+    try:
+        from shapely.geometry import MultiPoint
+        df = src_df if src_df is not None else DATA["df"]
+        sub = df.loc[[c for c in cell_ids if c in df.index]]
+        if len(sub) < 3:
+            return None
+        pts = list(zip(sub["x_centroid"].values, -sub["y_centroid"].values))
+        hull = MultiPoint(pts).convex_hull
+        if hull.geom_type == "Polygon":
+            return [list(c) for c in hull.exterior.coords]
+        elif hull.geom_type == "LineString":
+            return [list(c) for c in hull.coords]
+        return None
+    except Exception as e:
+        print(f"  ROI hull error: {e}", flush=True)
+        return None
+
+
+def _roi_cells_in_polygon(polygon_xy: list, src_df=None) -> list:
+    """Return cell IDs (index values) whose centroids lie inside polygon_xy."""
+    try:
+        from shapely.geometry import Polygon as _SPoly, Point as _SPoint
+        poly = _SPoly(polygon_xy)
+        df = src_df if src_df is not None else DATA["df"]
+        xs = df["x_centroid"].values
+        ys = -df["y_centroid"].values
+        ids = df.index.tolist()
+        return [cid for cid, px, py in zip(ids, xs, ys) if poly.contains(_SPoint(px, py))]
+    except Exception as e:
+        print(f"  ROI containment error: {e}", flush=True)
+        return []
+
+
+def _roi_apply_metadata_to_df(df: "pd.DataFrame", rois: list) -> None:
+    """Add/update roi_{cls} columns in df based on rois list."""
+    classes = list({r["cls"] for r in rois})
+    for cls in classes:
+        col = f"roi_{cls}"
+        if col not in df.columns:
+            df[col] = pd.NA
+        else:
+            df[col] = pd.NA  # reset before re-applying
+
+    overlap_warned: set = set()
+    for roi in rois:
+        col = f"roi_{roi['cls']}"
+        cell_ids = _roi_cells_in_polygon(roi["polygon_xy"], src_df=df)
+        # Warn on overlaps with existing same-class assignments
+        existing = df.loc[[c for c in cell_ids if c in df.index], col]
+        overlapping = existing.dropna()
+        for existing_name in overlapping.unique():
+            key = (existing_name, roi["name"])
+            if key not in overlap_warned:
+                print(f"  ROI WARNING: '{roi['name']}' overlaps with '{existing_name}' (class '{roi['cls']}')", flush=True)
+                overlap_warned.add(key)
+        df.loc[[c for c in cell_ids if c in df.index], col] = roi["name"]
+
+
+def _roi_write_all_zarrs_bg() -> None:
+    """Daemon thread: write ROI metadata columns to all zarr stores."""
+    with _roi_lock:
+        rois = list(_roi_state["rois"])
+    # Write to Xenium zarr
+    try:
+        sdata_path = DATA.get("sdata_path", "")
+        if sdata_path and os.path.isdir(sdata_path):
+            _roi_apply_metadata_to_df(DATA["df"], rois)
+            _update_reseg_zarr_obs(sdata_path, DATA["df"])
+            print(f"  ROI: wrote {len(rois)} ROIs to xenium zarr", flush=True)
+    except Exception as e:
+        print(f"  ROI zarr write error (xenium): {e}", flush=True)
+    # Write to Baysor/Proseg zarrs
+    for run in _list_cached_seg_runs():
+        try:
+            tool = run["value"].split(":")[0]
+            if tool == "baysor":
+                with _baysor_lock:
+                    result = _baysor_state.get("result")
+            else:
+                with _proseg_lock:
+                    result = _proseg_state.get("result")
+            if result and result.get("sdata_path") and os.path.isdir(result["sdata_path"]):
+                _roi_apply_metadata_to_df(result["cells_df"], rois)
+                _update_reseg_zarr_obs(result["sdata_path"], result["cells_df"])
+                print(f"  ROI: wrote {len(rois)} ROIs to {tool} zarr", flush=True)
+        except Exception as e:
+            print(f"  ROI zarr write error ({run['value']}): {e}", flush=True)
+
+
+def _roi_shapes_for_fig(rois: list, pending_hull=None) -> list:
+    """Return list of Plotly shape dicts for ROI overlays."""
+    shapes = []
+    for r in rois:
+        shapes.append({
+            "type": "path",
+            "path": _xy_to_svg_path(r["polygon_xy"]),
+            "fillcolor": _hex_to_rgba(r["color"], 0.18),
+            "line": {"color": r["color"], "width": 1.5},
+            "layer": "above", "xref": "x", "yref": "y",
+        })
+    if pending_hull:
+        shapes.append({
+            "type": "path",
+            "path": _xy_to_svg_path(pending_hull),
+            "fillcolor": "rgba(200,200,200,0.2)",
+            "line": {"color": "#aaaaaa", "width": 1.5, "dash": "dot"},
+            "layer": "above", "xref": "x", "yref": "y",
+        })
+    return shapes
+
+
+def _auto_load_rois() -> None:
+    """Load ROIs from cache at startup and apply metadata to DATA['df']."""
+    rois = _roi_load_cache()
+    with _roi_lock:
+        _roi_state["rois"] = rois
+    if rois and "df" in DATA:
+        _roi_apply_metadata_to_df(DATA["df"], rois)
+        print(f"  ROI: auto-loaded {len(rois)} ROIs from cache", flush=True)
+
+
+_auto_load_rois()
 
 
 def _clean_cache_for_dataset() -> str:
@@ -4761,7 +5159,7 @@ sidebar = html.Div([
             },
         ),
         html.Div(
-            f"Xenium boundaries require zoom (limit {BOUNDARY_CELL_LIMIT:,} cells). Proseg/Baysor show all cells.",
+            f"Zoom in to see boundaries (limit {BOUNDARY_CELL_LIMIT:,} cells in viewport).",
             style={"fontSize": "10px", "color": MUTED, "marginTop": "4px", "lineHeight": "1.4"},
         ),
     ], style={"marginBottom": "10px"}),
@@ -4924,6 +5322,29 @@ sidebar = html.Div([
     ),
 
     html.Hr(style={"borderColor": BORDER, "margin": "14px 0"}),
+    ctrl_label("ROI Annotations"),
+    dcc.Checklist(
+        id="roi-show-toggle",
+        options=[{"label": " Show ROIs", "value": "show"}],
+        value=["show"],
+        style={"fontSize": "0.82rem", "marginBottom": "6px"},
+    ),
+    html.Button(
+        "Manage / Draw ROIs",
+        id="roi-manage-btn",
+        n_clicks=0,
+        style={
+            "width": "100%", "padding": "7px 0",
+            "backgroundColor": "#5b2d8e", "color": "#fff",
+            "border": "none", "borderRadius": "5px",
+            "cursor": "pointer", "fontSize": "13px", "fontWeight": "600",
+            "marginBottom": "6px",
+        },
+    ),
+    html.Div(id="roi-sidebar-summary",
+             style={"fontSize": "11px", "color": MUTED, "minHeight": "16px"}),
+
+    html.Hr(style={"borderColor": BORDER, "margin": "14px 0"}),
 
     # UMAP toggle
     html.Button(
@@ -4983,6 +5404,8 @@ app.layout = html.Div([
     dcc.Store(id="sdata-done",       data=0),
     dcc.Store(id="split-done",        data=0),
     dcc.Store(id="counts-mode-store", data="original"),
+    dcc.Store(id="roi-done",          data=0),
+    dcc.Store(id="roi-pending",       data=None),
     dcc.Interval(id="subset-poll",   interval=500,  n_intervals=0),
     dcc.Interval(id="morph-hires-poll", interval=400, n_intervals=0),
     # Fires once after 500 ms to guarantee initial plot render in Dash 4
@@ -5471,6 +5894,69 @@ app.layout = html.Div([
        content_style={"backgroundColor": DARK_BG, "color": TEXT},
        backdrop=True),
 
+# ─── ROI Save modal ───────────────────────────────────────────────────────────
+dbc.Modal([
+    dbc.ModalHeader("Save ROI"),
+    dbc.ModalBody([
+        html.Div(id="roi-save-preview",
+                 style={"fontSize": "0.85rem", "color": MUTED, "marginBottom": "10px"}),
+        dbc.Label("ROI Name", style={"fontSize": "0.82rem"}),
+        dbc.Input(id="roi-name-input", placeholder="e.g. Tumor_1",
+                  style={"backgroundColor": CARD_BG, "color": TEXT, "border": f"1px solid {BORDER}", "marginBottom": "8px"}),
+        dbc.Label("ROI Class", style={"fontSize": "0.82rem"}),
+        dbc.Input(id="roi-class-input", placeholder="e.g. region", value="region",
+                  style={"backgroundColor": CARD_BG, "color": TEXT, "border": f"1px solid {BORDER}"}),
+        html.Div(id="roi-save-error",
+                 style={"color": "#e74c3c", "fontSize": "0.82rem", "marginTop": "8px"}),
+    ]),
+    dbc.ModalFooter([
+        dbc.Button("Save", id="roi-save-btn", color="primary", size="sm"),
+        dbc.Button("Cancel", id="roi-save-cancel-btn", color="secondary", size="sm", className="ms-2"),
+    ]),
+], id="roi-save-modal", is_open=False,
+   style={"color": TEXT},
+   content_style={"backgroundColor": DARK_BG, "color": TEXT},
+   backdrop=True),
+
+# ─── ROI Manager modal ────────────────────────────────────────────────────────
+dbc.Modal([
+    dbc.ModalHeader("Manage ROIs"),
+    dbc.ModalBody([
+        html.Div(id="roi-list-div", style={"marginBottom": "18px"}),
+        html.Hr(style={"borderColor": BORDER}),
+        html.Div([
+            html.P("ROI Set Operations", style={"fontWeight": "600", "fontSize": "0.9rem", "marginBottom": "8px"}),
+            html.Div([
+                dcc.Dropdown(id="roi-op-a", placeholder="ROI A",
+                             style={"backgroundColor": CARD_BG, "color": TEXT, "fontSize": "0.82rem", "flex": "1"}),
+                dcc.Dropdown(id="roi-op", options=[
+                    {"label": "Union", "value": "union"},
+                    {"label": "Intersection", "value": "intersection"},
+                    {"label": "Subtract A−B", "value": "subtract"},
+                ], placeholder="Operation",
+                    style={"backgroundColor": CARD_BG, "color": TEXT, "fontSize": "0.82rem", "width": "130px"}),
+                dcc.Dropdown(id="roi-op-b", placeholder="ROI B",
+                             style={"backgroundColor": CARD_BG, "color": TEXT, "fontSize": "0.82rem", "flex": "1"}),
+            ], style={"display": "flex", "gap": "8px", "marginBottom": "8px", "alignItems": "center"}),
+            html.Div([
+                dbc.Input(id="roi-op-name", placeholder="Result name",
+                          style={"backgroundColor": CARD_BG, "color": TEXT, "border": f"1px solid {BORDER}", "flex": "1"}),
+                dbc.Input(id="roi-op-class", placeholder="Result class", value="region",
+                          style={"backgroundColor": CARD_BG, "color": TEXT, "border": f"1px solid {BORDER}", "flex": "1"}),
+                dbc.Button("Apply", id="roi-op-btn", color="primary", size="sm"),
+            ], style={"display": "flex", "gap": "8px", "alignItems": "center"}),
+            html.Div(id="roi-op-error",
+                     style={"color": "#e74c3c", "fontSize": "0.82rem", "marginTop": "6px"}),
+        ]),
+    ]),
+    dbc.ModalFooter([
+        dbc.Button("Close", id="roi-manage-close-btn", color="secondary", size="sm"),
+    ]),
+], id="roi-manage-modal", is_open=False, size="lg",
+   style={"color": TEXT},
+   content_style={"backgroundColor": DARK_BG, "color": TEXT},
+   backdrop=True),
+
 # ─── SPLIT correction modal ───────────────────────────────────────────────────
 dbc.Modal([
     dbc.ModalHeader("SPLIT Ambient RNA Correction"),
@@ -5660,7 +6146,7 @@ dbc.Modal([
                         },
                         config={
                             "displayModeBar": True,
-                            "modeBarButtonsToRemove": ["select2d", "lasso2d"],
+                            "modeBarButtonsToRemove": ["select2d"],
                             "toImageButtonOptions": {"format": "png", "scale": 2},
                         },
                         style={"height": "100%"},
@@ -5853,6 +6339,7 @@ def store_relayout(relayout_data, current):
     Input("dataset-version",        "data"),
     Input("extra-datasets-version", "data"),
     Input("split-done",             "data"),
+    Input("roi-done",               "data"),
     State("counts-mode-store",      "data"),
 )
 def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
@@ -5860,7 +6347,7 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
                  morph_brightness, morph_opacity, relayout,
                  _baysor_done, _proseg_done, seg_source,
                  _spage_done, _subset_ver, _startup, _ds_version, _extra_ds_version,
-                 _split_done, counts_mode):
+                 _split_done, _roi_done, counts_mode):
     # If only the viewport changed, avoid full figure rebuild
     triggered = callback_context.triggered_id
     boundaries_active = bool(boundary_toggles)
@@ -5927,7 +6414,8 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
         make_spatial_fig(color_by, method, gene, size, opacity,
                          boundary_toggles, relayout,
                          morph_image=morph_image, extra_title=morph_title,
-                         baysor_active=baysor_on, proseg_active=proseg_on),
+                         baysor_active=baysor_on, proseg_active=proseg_on,
+                         use_corrected=(counts_mode == "corrected")),
         make_umap_fig(color_by, method, gene, size, opacity,
                       baysor_active=baysor_on, proseg_active=proseg_on),
     )
@@ -6027,10 +6515,18 @@ def show_cell_info(cell_id, method):
         top_genes = []
         if alt_expr is not None:
             gene_names_list = list(DATA["gene_names"])
-            # Find row index in reseg cells_df
+            # Find row index in reseg cells_df — always use integer position to avoid
+            # boolean-array issues when cell IDs are non-unique (multi-patch Proseg runs)
             bdf = res["cells_df"]
             key_for_idx = key
-            row_idx = bdf.index.get_loc(key_for_idx)
+            matches = np.where(bdf.index == key_for_idx)[0]
+            if len(matches) == 0:
+                alt_expr = None
+            else:
+                row_idx = int(matches[0])
+                if row_idx >= alt_expr.shape[0]:
+                    alt_expr = None
+        if alt_expr is not None:
             raw     = alt_expr[row_idx, :].toarray().flatten()
             top_idx = np.argsort(raw)[::-1][:12]
             top_genes = [(gene_names_list[i], int(raw[i])) for i in top_idx if raw[i] > 0]
@@ -6563,7 +7059,7 @@ def update_boundary_options(baysor_done, proseg_done, boundary_opts):
             updated_boundary.append(opt)
 
     # Rebuild seg-source options dynamically from cache
-    seg_opts = [{"label": "Xenium (original)", "value": "xenium"}]
+    seg_opts = [{"label": "\u2605 Xenium (original)", "value": "xenium"}]
     cached = _list_cached_seg_runs()
     baysor_cached = [c for c in cached if c["value"].startswith("baysor:")]
     proseg_cached  = [c for c in cached if c["value"].startswith("proseg:")]
@@ -7350,6 +7846,451 @@ def poll_save_sdata(_, modal_open):
     if status == "error":
         return f"✗ {message}", True, False, modal_open
     return no_update, True, False, modal_open
+
+
+# ─── SPLIT correction callbacks ───────────────────────────────────────────────
+
+@app.callback(
+    Output("split-modal", "is_open"),
+    [Input("split-modal-open-btn", "n_clicks"),
+     Input("split-modal-close-btn", "n_clicks")],
+    [State("split-modal", "is_open")],
+    prevent_initial_call=True,
+)
+def open_split_modal(open_clicks, close_clicks, is_open):
+    if not open_clicks and not close_clicks:
+        return is_open
+    triggered = ctx.triggered_id
+    if triggered == "split-modal-open-btn" and open_clicks:
+        return True
+    return False
+
+
+@app.callback(
+    [Output("split-modal-status", "children"),
+     Output("split-poll", "disabled"),
+     Output("split-run-btn", "disabled")],
+    Input("split-run-btn", "n_clicks"),
+    [State("split-rds-path", "value"),
+     State("split-label-col", "value"),
+     State("split-max-cores", "value"),
+     State("seg-source", "value")],
+    prevent_initial_call=True,
+)
+def run_split(n_clicks, rds_path, label_col, max_cores, seg_source):
+    if not n_clicks:
+        return no_update, True, False
+    if not rds_path or not os.path.isfile(rds_path):
+        return "⚠ RDS file not found.", True, False
+    with _split_lock:
+        if _split_state["status"] == "running":
+            return "Already running…", False, True
+        _split_state["status"]  = "running"
+        _split_state["message"] = "Starting…"
+        _split_state["result"]  = None
+    label_col  = (label_col or "Names").strip()
+    max_cores  = int(max_cores or 4)
+    import contextvars
+    _ctx = contextvars.copy_context()
+    threading.Thread(
+        target=_ctx.run,
+        args=(_run_split_correction, rds_path, label_col, max_cores, seg_source),
+        daemon=True,
+    ).start()
+    return "Starting SPLIT correction…", False, True
+
+
+@app.callback(
+    [Output("split-status", "children"),
+     Output("split-modal-status", "children", allow_duplicate=True),
+     Output("split-modal", "is_open", allow_duplicate=True),
+     Output("split-poll", "disabled", allow_duplicate=True),
+     Output("split-run-btn", "disabled", allow_duplicate=True),
+     Output("split-done", "data"),
+     Output("counts-mode", "value"),
+     Output("dataset-version", "data", allow_duplicate=True)],
+    Input("split-poll", "n_intervals"),
+    [State("split-done", "data"),
+     State("dataset-version", "data")],
+    prevent_initial_call=True,
+)
+def poll_split(_, done_version, ds_version):
+    with _split_lock:
+        status  = _split_state["status"]
+        message = _split_state["message"]
+    if status == "idle":
+        return "", "", no_update, True, False, done_version, no_update, no_update
+    if status == "running":
+        return message, message, no_update, False, True, done_version, no_update, no_update
+    if status == "done":
+        return f"✓ {message}", f"✓ {message}", False, True, False, done_version + 1, "corrected", ds_version + 1
+    if status == "error":
+        return f"✗ {message}", f"✗ {message}", no_update, True, False, done_version, no_update, no_update
+    return "", "", no_update, True, False, done_version, no_update, no_update
+
+
+@app.callback(
+    Output("counts-mode-store", "data"),
+    Input("counts-mode", "value"),
+    prevent_initial_call=True,
+)
+def sync_counts_mode(value):
+    return value or "original"
+
+
+@app.callback(
+    Output("counts-mode", "options"),
+    [Input("split-done", "data"),
+     Input("seg-source", "value")],
+)
+def update_counts_options(_, seg_source):
+    _tool = _seg_tool(seg_source)
+    with _baysor_lock:
+        bres = _baysor_state["result"] if _baysor_state["status"] == "done" else None
+    with _proseg_lock:
+        pres = _proseg_state["result"] if _proseg_state["status"] == "done" else None
+    if _tool == "baysor":
+        alt_res = bres
+    elif _tool == "proseg":
+        alt_res = pres
+    else:
+        alt_res = None
+    if alt_res is not None:
+        has_corrected = alt_res.get("split_corrected_expr") is not None
+    else:
+        has_corrected = DATA.get("split_corrected_expr") is not None
+    return [
+        {"label": " Original",        "value": "original"},
+        {"label": " SPLIT Corrected", "value": "corrected", "disabled": not has_corrected},
+    ]
+
+
+# ─── ROI Annotation callbacks ─────────────────────────────────────────────────
+
+@app.callback(
+    Output("roi-pending",      "data",     allow_duplicate=True),
+    Output("roi-save-modal",   "is_open",  allow_duplicate=True),
+    Output("roi-save-preview", "children"),
+    Output("roi-save-error",   "children", allow_duplicate=True),
+    Output("roi-done",         "data",     allow_duplicate=True),
+    Input("spatial-plot",      "selectedData"),
+    State("seg-source",        "value"),
+    State("roi-done",          "data"),
+    prevent_initial_call=True,
+)
+def capture_lasso_selection(selected_data, seg_source, roi_done):
+    """CB-1: Lasso selection → compute hull → open save modal."""
+    if not selected_data or not selected_data.get("points"):
+        raise dash.exceptions.PreventUpdate
+    pts = selected_data["points"]
+    cell_ids = [p.get("customdata") for p in pts if p.get("customdata") is not None]
+    if not cell_ids:
+        raise dash.exceptions.PreventUpdate
+
+    tool = _seg_tool(seg_source)
+    if tool == "baysor":
+        with _baysor_lock:
+            result = _baysor_state.get("result")
+        src_df = result["cells_df"] if result else None
+    elif tool == "proseg":
+        with _proseg_lock:
+            result = _proseg_state.get("result")
+        src_df = result["cells_df"] if result else None
+    else:
+        src_df = None
+
+    if len(cell_ids) < 3:
+        return dash.no_update, False, "", "Need at least 3 cells to define an ROI.", roi_done
+
+    hull = _roi_compute_hull(cell_ids, src_df=src_df)
+    if hull is None:
+        return dash.no_update, False, "", "Could not compute hull (need ≥3 non-collinear cells).", roi_done
+
+    with _roi_lock:
+        _roi_state["pending_hull"] = hull
+    new_done = (roi_done or 0) + 1
+    preview = f"{len(cell_ids):,} cells selected — enter name and class below."
+    return hull, True, preview, "", new_done
+
+
+@app.callback(
+    Output("roi-save-modal",  "is_open",  allow_duplicate=True),
+    Output("roi-save-error",  "children", allow_duplicate=True),
+    Output("roi-done",        "data",     allow_duplicate=True),
+    Input("roi-save-btn",     "n_clicks"),
+    State("roi-name-input",   "value"),
+    State("roi-class-input",  "value"),
+    State("roi-pending",      "data"),
+    State("roi-done",         "data"),
+    State("seg-source",       "value"),
+    prevent_initial_call=True,
+)
+def save_roi(n_clicks, name, cls, polygon_xy, roi_done, seg_source):
+    """CB-2: Save ROI."""
+    if not n_clicks:
+        raise dash.exceptions.PreventUpdate
+    name = (name or "").strip()
+    cls  = (cls  or "region").strip()
+    if not name:
+        return True, "ROI Name is required.", roi_done
+    if not polygon_xy:
+        return True, "No polygon data — please draw a lasso selection first.", roi_done
+
+    with _roi_lock:
+        existing = _roi_state["rois"]
+        duplicate = any(r["name"] == name and r["cls"] == cls for r in existing)
+        if duplicate:
+            print(f"ERROR: ROI '{name}' class '{cls}' already exists", flush=True)
+            return True, f"ROI '{name}' (class '{cls}') already exists.", roi_done
+
+        color = _roi_color(len(existing))
+        new_roi = {"name": name, "cls": cls, "polygon_xy": polygon_xy, "color": color}
+        _roi_state["rois"].append(new_roi)
+        _roi_save_cache()
+        _roi_state["pending_hull"] = None
+
+    # Apply metadata to all loaded dfs
+    with _roi_lock:
+        rois = list(_roi_state["rois"])
+    _roi_apply_metadata_to_df(DATA["df"], rois)
+    tool = _seg_tool(seg_source)
+    if tool == "baysor":
+        with _baysor_lock:
+            result = _baysor_state.get("result")
+        if result:
+            _roi_apply_metadata_to_df(result["cells_df"], rois)
+    elif tool == "proseg":
+        with _proseg_lock:
+            result = _proseg_state.get("result")
+        if result:
+            _roi_apply_metadata_to_df(result["cells_df"], rois)
+
+    threading.Thread(target=_roi_write_all_zarrs_bg, daemon=True).start()
+    return False, "", (roi_done or 0) + 1
+
+
+@app.callback(
+    Output("roi-save-modal", "is_open", allow_duplicate=True),
+    Input("roi-save-cancel-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def cancel_roi_save(n_clicks):
+    """CB-3: Cancel save modal."""
+    if not n_clicks:
+        raise dash.exceptions.PreventUpdate
+    with _roi_lock:
+        _roi_state["pending_hull"] = None
+    return False
+
+
+@app.callback(
+    Output("roi-done", "data", allow_duplicate=True),
+    Input("roi-show-toggle", "value"),
+    State("roi-done", "data"),
+    prevent_initial_call=True,
+)
+def toggle_roi_show(value, roi_done):
+    """CB-4: Toggle ROI visibility."""
+    with _roi_lock:
+        _roi_state["show"] = "show" in (value or [])
+    return (roi_done or 0) + 1
+
+
+@app.callback(
+    Output("roi-manage-modal", "is_open"),
+    Output("roi-list-div",     "children"),
+    Output("roi-op-a",         "options"),
+    Output("roi-op-b",         "options"),
+    Input("roi-manage-btn",       "n_clicks"),
+    Input("roi-manage-close-btn", "n_clicks"),
+    State("roi-manage-modal",     "is_open"),
+    prevent_initial_call=True,
+)
+def open_roi_manager(open_clicks, close_clicks, is_open):
+    """CB-5: Open/populate ROI manager."""
+    triggered = callback_context.triggered_id
+    if triggered == "roi-manage-close-btn":
+        return False, dash.no_update, dash.no_update, dash.no_update
+    if not open_clicks:
+        raise dash.exceptions.PreventUpdate
+
+    with _roi_lock:
+        rois = list(_roi_state["rois"])
+
+    def _make_table(rois):
+        if not rois:
+            return html.P("No ROIs defined yet. Use lasso on the spatial plot to draw one.",
+                          style={"color": MUTED, "fontSize": "0.82rem"})
+        rows = []
+        for i, r in enumerate(rois):
+            rows.append(html.Tr([
+                html.Td(html.Div(style={"width": "18px", "height": "18px",
+                                         "backgroundColor": r["color"], "borderRadius": "3px"})),
+                html.Td(r["cls"], style={"padding": "4px 8px"}),
+                html.Td(r["name"], style={"padding": "4px 8px"}),
+                html.Td(dbc.Button("✕", id={"type": "roi-delete-btn", "index": i},
+                                   size="sm", color="danger", style={"padding": "1px 7px"})),
+            ]))
+        return dbc.Table([html.Tbody(rows)], bordered=False, hover=True,
+                         style={"fontSize": "0.82rem", "color": TEXT})
+
+    table = _make_table(rois)
+    op_opts = [{"label": f"{r['cls']}: {r['name']}", "value": i} for i, r in enumerate(rois)]
+    return True, table, op_opts, op_opts
+
+
+@app.callback(
+    Output("roi-done",     "data",     allow_duplicate=True),
+    Output("roi-list-div", "children", allow_duplicate=True),
+    Input({"type": "roi-delete-btn", "index": ALL}, "n_clicks"),
+    State("roi-done", "data"),
+    prevent_initial_call=True,
+)
+def delete_roi(n_clicks_list, roi_done):
+    """CB-6: Delete ROI by index."""
+    triggered = callback_context.triggered_id
+    if triggered is None or not any(n_clicks_list):
+        raise dash.exceptions.PreventUpdate
+    idx = triggered["index"]
+    with _roi_lock:
+        rois = _roi_state["rois"]
+        if idx < 0 or idx >= len(rois):
+            raise dash.exceptions.PreventUpdate
+        # Reassign colors to keep palette stable
+        rois.pop(idx)
+        for j, r in enumerate(rois):
+            r["color"] = _roi_color(j)
+        _roi_save_cache()
+
+    with _roi_lock:
+        rois = list(_roi_state["rois"])
+    _roi_apply_metadata_to_df(DATA["df"], rois)
+    with _baysor_lock:
+        bres = _baysor_state.get("result")
+    if bres:
+        _roi_apply_metadata_to_df(bres["cells_df"], rois)
+    with _proseg_lock:
+        pres = _proseg_state.get("result")
+    if pres:
+        _roi_apply_metadata_to_df(pres["cells_df"], rois)
+    threading.Thread(target=_roi_write_all_zarrs_bg, daemon=True).start()
+
+    # Rebuild table
+    if not rois:
+        table = html.P("No ROIs defined yet.", style={"color": MUTED, "fontSize": "0.82rem"})
+    else:
+        rows = []
+        for i, r in enumerate(rois):
+            rows.append(html.Tr([
+                html.Td(html.Div(style={"width": "18px", "height": "18px",
+                                         "backgroundColor": r["color"], "borderRadius": "3px"})),
+                html.Td(r["cls"], style={"padding": "4px 8px"}),
+                html.Td(r["name"], style={"padding": "4px 8px"}),
+                html.Td(dbc.Button("✕", id={"type": "roi-delete-btn", "index": i},
+                                   size="sm", color="danger", style={"padding": "1px 7px"})),
+            ]))
+        table = dbc.Table([html.Tbody(rows)], bordered=False, hover=True,
+                          style={"fontSize": "0.82rem", "color": TEXT})
+
+    return (roi_done or 0) + 1, table
+
+
+@app.callback(
+    Output("roi-op-error", "children"),
+    Output("roi-done",     "data",    allow_duplicate=True),
+    Input("roi-op-btn",    "n_clicks"),
+    State("roi-op-a",      "value"),
+    State("roi-op",        "value"),
+    State("roi-op-b",      "value"),
+    State("roi-op-name",   "value"),
+    State("roi-op-class",  "value"),
+    State("roi-done",      "data"),
+    prevent_initial_call=True,
+)
+def apply_roi_operation(n_clicks, idx_a, op, idx_b, result_name, result_cls, roi_done):
+    """CB-7: ROI set operation."""
+    if not n_clicks:
+        raise dash.exceptions.PreventUpdate
+    result_name = (result_name or "").strip()
+    result_cls  = (result_cls  or "region").strip()
+    if idx_a is None or idx_b is None or not op:
+        return "Select ROI A, operation, and ROI B.", roi_done
+    if not result_name:
+        return "Enter a result name.", roi_done
+
+    try:
+        from shapely.geometry import Polygon as _SPoly
+        with _roi_lock:
+            rois = _roi_state["rois"]
+            if idx_a >= len(rois) or idx_b >= len(rois):
+                return "Invalid ROI index.", roi_done
+            poly_a = _SPoly(rois[idx_a]["polygon_xy"])
+            poly_b = _SPoly(rois[idx_b]["polygon_xy"])
+            if op == "union":
+                result_geom = poly_a.union(poly_b)
+            elif op == "intersection":
+                result_geom = poly_a.intersection(poly_b)
+            else:
+                result_geom = poly_a.difference(poly_b)
+            hull = result_geom.convex_hull
+            if hull.is_empty or hull.geom_type not in ("Polygon", "LineString"):
+                return "Operation produced empty result.", roi_done
+            if hull.geom_type == "Polygon":
+                polygon_xy = [list(c) for c in hull.exterior.coords]
+            else:
+                polygon_xy = [list(c) for c in hull.coords]
+
+            duplicate = any(r["name"] == result_name and r["cls"] == result_cls for r in rois)
+            if duplicate:
+                return f"ROI '{result_name}' (class '{result_cls}') already exists.", roi_done
+
+            color = _roi_color(len(rois))
+            rois.append({"name": result_name, "cls": result_cls,
+                          "polygon_xy": polygon_xy, "color": color})
+            _roi_save_cache()
+
+        with _roi_lock:
+            rois_snap = list(_roi_state["rois"])
+        _roi_apply_metadata_to_df(DATA["df"], rois_snap)
+        threading.Thread(target=_roi_write_all_zarrs_bg, daemon=True).start()
+        return "", (roi_done or 0) + 1
+    except Exception as e:
+        return f"Error: {e}", roi_done
+
+
+@app.callback(
+    Output("color-by", "options", allow_duplicate=True),
+    Input("roi-done",  "data"),
+    State("color-by",  "options"),
+    prevent_initial_call=True,
+)
+def update_color_by_for_rois(roi_done, current_options):
+    """CB-8: Add/update roi_* options in color-by dropdown."""
+    with _roi_lock:
+        rois = list(_roi_state["rois"])
+    classes = list(dict.fromkeys(r["cls"] for r in rois))  # preserve order, deduplicate
+    options = [o for o in (current_options or []) if not o["value"].startswith("roi_")]
+    for cls in classes:
+        options.append({"label": f"ROI: {cls}", "value": f"roi_{cls}"})
+    return options
+
+
+@app.callback(
+    Output("roi-sidebar-summary", "children"),
+    Input("roi-done", "data"),
+    prevent_initial_call=True,
+)
+def update_roi_sidebar_summary(roi_done):
+    """CB-9: Update sidebar ROI summary."""
+    with _roi_lock:
+        rois = list(_roi_state["rois"])
+    if not rois:
+        return "No ROIs defined."
+    class_counts: dict = {}
+    for r in rois:
+        class_counts[r["cls"]] = class_counts.get(r["cls"], 0) + 1
+    parts = [f"{v} {k}" for k, v in class_counts.items()]
+    return f"{len(rois)} ROI{'s' if len(rois)!=1 else ''} ({', '.join(parts)})"
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
