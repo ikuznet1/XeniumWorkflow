@@ -46,14 +46,14 @@ The left sidebar is hidden by default and slides in when the mouse moves to the 
 - **Tissue info** — Run name, region, and dataset stats (cells, transcripts, panel). Stats collapse by default and expand on hover. Includes buttons to load a different sample, save as SpatialData, and clear cache.
 - **Color By** — Dropdown to select the coloring mode.
 - **Segmentation source** — Dropdown to switch between Xenium (original), Baysor, and Proseg segmentations. Shows all cached runs per tool (labeled by parameters); select any cached run to load it instantly.
-- **Overlays** — Multi-select checklist: Cell Boundaries, Nuclear Boundaries, Baysor Boundaries, Proseg Boundaries, and Morphology Image. Multiple overlays can be active simultaneously.
+- **Overlays** — Multi-select checklist: Xenium Cell Boundaries, Xenium Nuclei Boundaries, Baysor Boundaries, Proseg Boundaries, and Morphology Image. Multiple overlays can be active simultaneously.
 - **Point style** — Size and opacity sliders.
 - **Resegmentation** — Single "Resegment Cells" button opens a modal with SpatialData patch setup (Step 1) and Baysor/Proseg algorithm tabs (Step 2).
 - **Impute Genes** — Button opens the SpaGE imputation modal.
 - **Annotate Cells** — Button opens the cell type annotation modal.
 - **SPLIT Correction** — Button opens the SPLIT ambient RNA correction modal.
 - **Active Counts** — Radio toggle to switch between original and SPLIT-corrected expression counts. The "SPLIT Corrected" option is grayed out until SPLIT has been run for the active segmentation.
-- **UMAP** — Show/hide toggle and "Run UMAP on Reseg Cells" button.
+- **UMAP** — Show/hide toggle and "Rerun UMAP" button. Works on Xenium data (recomputes and updates `DATA["df"]`) as well as Baysor/Proseg reseg cells.
 
 A gold **⬡ SUBSET ACTIVE** banner appears below the tissue info when a cell subset is active, showing the count and a "✕ Clear Subset" button.
 
@@ -80,10 +80,10 @@ All color modes work on Xenium, Baysor, and Proseg cells after switching the seg
 
 Select any combination of overlays from the checklist in the sidebar:
 
-**Cell/Nucleus Boundaries** — Polygon outlines rendered for cells in the current viewport (limit: 3,000 cells). Zoom in to activate.
-- Cell boundaries: cyan
-- Nucleus boundaries: orange
-- Baysor/Proseg boundaries: shown for all reseg cells (no viewport limit)
+**Xenium Cell/Nuclei Boundaries** — Original Xenium polygon outlines rendered for cells in the current viewport (limit: 3,000 cells). Zoom in to activate. These always show Xenium boundaries regardless of the active segmentation source.
+- Xenium cell boundaries: cyan
+- Xenium nuclei boundaries: orange
+- Baysor/Proseg boundaries: their own separate checkboxes; shown for all reseg cells (no viewport limit)
 
 **Morphology Image** — Fluorescence overlay loaded from OME-TIFF tiles for viewports ≤ 5,000 µm wide.
 - Z-levels 0–3
@@ -131,7 +131,7 @@ Once complete:
 - KMeans clustering (10 clusters) and UMAP are computed automatically; results are saved to `spatialdata_{source}.zarr` and available immediately
 - All color modes (gene expression, cluster, cell type, QC metrics) work on reseg cells
 - Cell annotation and gene imputation can be run on reseg cells; imputed genes are saved to the reseg zarr
-- UMAP can be re-computed manually with the "Run UMAP on Reseg Cells" button
+- UMAP can be re-computed manually with the "Rerun UMAP" button (works for Xenium, Baysor, and Proseg)
 
 **Baysor** — Julia-based algorithm ([Baysor](https://github.com/kharchenkolab/Baysor)):
 
@@ -222,6 +222,8 @@ Click **"✦ Correct Ambient RNA"** in the sidebar to open the SPLIT correction 
 | Seurat Reference RDS path | — | Path to `.rds` Seurat object used as cell-type reference |
 | Cell-type label column | `Names` | Metadata column in the Seurat object containing cell type labels |
 | Max R cores | 4 | Parallel workers for RCTD |
+| Min UMI | 10 | Cells with fewer UMIs are excluded from RCTD (`UMI_min`) |
+| Min UMI sigma | 100 | Minimum UMI count for sigma parameter estimation in RCTD (`UMI_min_sigma`) |
 
 Click **▶ Run SPLIT** to start. Progress is streamed to the server log. When complete:
 

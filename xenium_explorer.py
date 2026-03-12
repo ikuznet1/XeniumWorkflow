@@ -13,6 +13,7 @@ import re
 import sys
 import warnings
 warnings.filterwarnings("ignore", message=".*not recognized as a component of a Zarr hierarchy.*")
+warnings.filterwarnings("ignore", message=".*R is not initialized by the main thread.*")
 import json
 import io
 import base64
@@ -46,6 +47,10 @@ PIXEL_SIZE_UM = 0.2125
 # Max cells for which to render boundaries (performance guard)
 BOUNDARY_CELL_LIMIT = 3000
 
+# RCTD pie chart settings
+PIE_THRESHOLD      = 1500   # max cells in view to render RCTD weight pie charts
+RCTD_PIE_RADIUS_UM = 8.0    # pie chart radius in µm
+
 CLUSTER_COLORS = (
     qualitative.Plotly + qualitative.D3 + qualitative.G10
     + qualitative.T10 + qualitative.Pastel
@@ -76,8 +81,18 @@ COLORSCALES = {
 
 
 # ─── Annotation state (shared across callbacks via background thread) ─────────
-_annot_state: dict = {"status": "idle", "message": "", "labels": None, "labels_proseg": None, "labels_baysor": None}
+_annot_state: dict = {"status": "idle", "message": ""}
 _annot_lock   = threading.Lock()
+
+_ANNOT_METHODS = {"celltypist": "CellTypist", "seurat": "Seurat", "rctd": "RCTD"}
+
+def _labels_key_for_method(method: str, alt_res=None) -> str:
+    """Return the _annot_state key for a given annotation method + seg source."""
+    if alt_res is None:
+        return f"labels_{method}"
+    out_tag = hashlib.md5((alt_res.get("out_dir", "")).encode()).hexdigest()[:8]
+    tool    = alt_res.get("source", "baysor")
+    return f"labels_{method}_{tool}_{out_tag}"
 
 # ─── Baysor segmentation state ────────────────────────────────────────────────
 _baysor_state: dict = {"status": "idle", "message": "", "result": None}
@@ -268,7 +283,8 @@ def _run_celltypist(model_name: str, labels_key: str = "labels",
 
 def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "full",
                           n_cores: int = 4, labels_key: str = "labels",
-                          expr_override=None, cell_ids_override=None) -> None:
+                          expr_override=None, cell_ids_override=None,
+                          umi_min: int = 20, umi_min_sigma: int = 100) -> None:
     """
     Background thread: run RCTD (spacexr) for cell-type assignment.
     Requires the spacexr R package:
@@ -277,6 +293,9 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
     In 'doublet'/'multi' mode the first_type column is used.
     """
     _redirect_rpy2_console()
+    import rpy2.robjects.conversion as _rconv
+    import rpy2.robjects as _ro_mod
+    _rconv.set_conversion(_ro_mod.default_converter)
 
     def _set(status, message, labels=None):
         with _annot_lock:
@@ -286,9 +305,7 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
                 _annot_state[labels_key] = labels
 
     try:
-        cache_key  = f"rctd_{os.path.basename(rds_path)}_{label_col}_{mode}"
-        if labels_key != "labels":
-            cache_key += f"_{labels_key}"
+        cache_key  = f"rctd_{os.path.basename(rds_path)}_{label_col}_{mode}_umi{umi_min}_sig{umi_min_sigma}_{labels_key}"
         cache_file = _cache_path(cache_key)
         if os.path.exists(cache_file):
             _set("running", "Loading cached RCTD annotation…")
@@ -297,6 +314,19 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
             labels.index = labels.index.astype(str)
             unique_types = labels.unique().tolist()
             print(f"  RCTD: loaded from cache — {len(unique_types)} cell types", flush=True)
+            # Restore weights so pie charts render on zoom
+            weights_cache = cache_file.replace(".parquet", "_weights.parquet")
+            weights_df = None
+            if os.path.exists(weights_cache):
+                try:
+                    weights_df = pd.read_parquet(weights_cache)
+                    weights_df.index = weights_df.index.astype(str)
+                    print(f"  RCTD: loaded weights from cache ({weights_df.shape[1]} types)", flush=True)
+                except Exception as _we:
+                    print(f"  RCTD: weight cache load failed: {_we}", flush=True)
+            weights_key = f"rctd_weights_{labels_key}"
+            with _annot_lock:
+                _annot_state[weights_key] = weights_df
             _set("done", f"Done (cached) — {len(unique_types)} cell types", labels=labels)
             return
 
@@ -309,22 +339,16 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
         from rpy2.robjects.packages import importr
 
         # Ensure rpy2 conversion rules are active in this thread
-        try:
-            if _rconv._get_cv().get(None) is None:
-                _rconv.activate(ro.default_converter)
-        except Exception:
-            try:
-                _rconv.activate(ro.default_converter)
-            except Exception:
-                pass
+        _rconv.set_conversion(ro.default_converter)
         pandas2ri.activate()
 
         # ── 1. Check spacexr ─────────────────────────────────────────────
         _set("running", "Loading spacexr…")
         try:
             importr("spacexr")
-        except Exception:
-            _set("error", "spacexr not installed. In R run: devtools::install_github('dmcable/spacexr')")
+        except Exception as _spacexr_err:
+            print(f"  RCTD: importr('spacexr') failed: {_spacexr_err}", flush=True)
+            _set("error", f"spacexr not found by rpy2: {str(_spacexr_err)[:200]}")
             return
 
         importr("SeuratObject")
@@ -378,11 +402,11 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
         if expr_override is not None:
             xen_mat_full = expr_override.T        # genes × cells
             cell_ids     = [str(c) for c in (cell_ids_override or range(expr_override.shape[0]))]
-            id_to_xy     = df.set_index("cell_id")[["x_centroid", "y_centroid"]]
-            coords_df    = id_to_xy.reindex(cell_ids).fillna(0.0)
+            coords_df    = df[["x_centroid", "y_centroid"]].reindex(
+                               pd.Index(cell_ids)).fillna(0.0)
         else:
-            xen_mat_full = DATA["expr_matrix"].T  # genes × cells
-            cell_ids     = [str(c) for c in df["cell_id"].tolist()]
+            xen_mat_full = DATA["expr"].T  # genes × cells
+            cell_ids     = [str(c) for c in df.index.tolist()]
             coords_df    = df[["x_centroid", "y_centroid"]].copy()
             coords_df.index = cell_ids
 
@@ -392,8 +416,8 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
 
         tmpdir = tempfile.mkdtemp(prefix="xenium_rctd_")
         sio.mmwrite(os.path.join(tmpdir, "xenium.mtx"), xen_sub)
-        with open(os.path.join(tmpdir, "genes.txt"),    "w") as f: f.write("\n".join(shared_genes))
-        with open(os.path.join(tmpdir, "barcodes.txt"), "w") as f: f.write("\n".join(cell_ids))
+        with open(os.path.join(tmpdir, "genes.txt"),    "w") as f: f.write("\n".join(shared_genes) + "\n")
+        with open(os.path.join(tmpdir, "barcodes.txt"), "w") as f: f.write("\n".join(cell_ids) + "\n")
         coords_df.to_csv(os.path.join(tmpdir, "coords.csv"))
 
         ro.r.assign("._rctd_tmpdir", tmpdir)
@@ -416,10 +440,13 @@ colnames(._rctd_coords) <- c('x', 'y')
 
         # ── 6. Create and run RCTD ───────────────────────────────────────
         _set("running", f"Running RCTD ({mode} mode, {n_cores} cores)…")
-        ro.r.assign("._rctd_mode",  mode)
-        ro.r.assign("._rctd_cores", n_cores)
+        ro.r.assign("._rctd_mode",    mode)
+        ro.r.assign("._rctd_cores",   n_cores)
+        ro.r.assign("._rctd_umi_min",       ro.IntVector([umi_min]))
+        ro.r.assign("._rctd_umi_min_sigma", ro.IntVector([umi_min_sigma]))
         ro.r("""
-._rctd_obj <- spacexr::create.RCTD(._rctd_puck, ._rctd_reference, max_cores=._rctd_cores)
+._rctd_obj <- spacexr::create.RCTD(._rctd_puck, ._rctd_reference, max_cores=._rctd_cores,
+    UMI_min=._rctd_umi_min[1], UMI_min_sigma=._rctd_umi_min_sigma[1])
 ._rctd_obj <- spacexr::run.RCTD(._rctd_obj, doublet_mode=._rctd_mode)
 """)
         print("  RCTD: run complete — extracting results…", flush=True)
@@ -439,9 +466,11 @@ names(._rctd_types) <- rownames(._rctd_weights)
 names(._rctd_types) <- rownames(._rctd_res)
 """)
 
-        types_r       = ro.r("._rctd_types")
-        cell_type_map = dict(zip(list(types_r.names), list(types_r)))
-        labels        = pd.Series(cell_type_map, name="label").astype(str)
+        types_r   = ro.r("._rctd_types")
+        names_r   = ro.r("names(._rctd_types)")
+        cell_ids  = list(names_r)
+        cell_vals = [str(v) for v in types_r]
+        labels    = pd.Series(dict(zip(cell_ids, cell_vals)), name="label").astype(str)
         labels.index  = labels.index.astype(str)
 
         unique_types = labels.unique().tolist()
@@ -449,12 +478,35 @@ names(._rctd_types) <- rownames(._rctd_res)
 
         pd.DataFrame({"label": labels}).to_parquet(cache_file)
 
-        # Cleanup R temporaries
-        ro.r("rm(list=ls(pattern='^\\._rctd_'))")
-        import shutil; shutil.rmtree(tmpdir, ignore_errors=True)
+        # ── 8. Extract and cache weight matrix (full mode only) ───────────
+        weights_df = None
+        if mode == "full":
+            _set("running", "Extracting RCTD weight matrix…")
+            try:
+                ro.r("._rctd_weights_dense <- as.matrix(._rctd_weights)")
+                ct_names   = list(ro.r("colnames(._rctd_weights)"))
+                cell_ids_w = list(ro.r("rownames(._rctd_weights)"))
+                w_arr      = np.array(ro.r("._rctd_weights_dense"))
+                weights_df = pd.DataFrame(w_arr, index=cell_ids_w, columns=ct_names)
+                weights_df.index = weights_df.index.astype(str)
+                weights_cache = cache_file.replace(".parquet", "_weights.parquet")
+                weights_df.to_parquet(weights_cache)
+                print(f"  RCTD: weights saved ({weights_df.shape[1]} types)", flush=True)
+            except Exception as _we:
+                print(f"  RCTD: weight extraction failed: {_we}", flush=True)
+        weights_key = f"rctd_weights_{labels_key}"
+        with _annot_lock:
+            _annot_state[weights_key] = weights_df
 
         _set("done", f"Done — {len(unique_types)} cell types in {len(labels):,} cells",
              labels=labels)
+
+        # Cleanup R temporaries (best-effort)
+        try:
+            ro.r("rm(list=ls(pattern='^\\._rctd_'))")
+        except Exception:
+            pass
+        import shutil; shutil.rmtree(tmpdir, ignore_errors=True)
 
     except Exception as exc:
         import traceback; traceback.print_exc()
@@ -469,6 +521,10 @@ def _run_seurat_annotation(rds_path: str, label_col: str = "Names", labels_key: 
     Uses the same rpy2 + SpaGE PV alignment already set up for SpaGE.
     """
     _redirect_rpy2_console()
+    import rpy2.robjects.conversion as _rconv
+    import rpy2.robjects as _ro_mod
+    _rconv.set_conversion(_ro_mod.default_converter)
+
     def _set(status, message, labels=None):
         with _annot_lock:
             _annot_state["status"]  = status
@@ -477,9 +533,7 @@ def _run_seurat_annotation(rds_path: str, label_col: str = "Names", labels_key: 
                 _annot_state[labels_key] = labels
 
     try:
-        cache_key = f"seurat_{os.path.basename(rds_path)}_{label_col}"
-        if labels_key != "labels":
-            cache_key += f"_{labels_key}"
+        cache_key = f"seurat_{os.path.basename(rds_path)}_{label_col}_{labels_key}"
         cache_file = _cache_path(cache_key)
         if os.path.exists(cache_file):
             _set("running", "Loading cached annotation…")
@@ -494,18 +548,8 @@ def _run_seurat_annotation(rds_path: str, label_col: str = "Names", labels_key: 
         # ── 1. Load Seurat object via rpy2 ───────────────────────────────
         _set("running", "Loading Seurat RDS (may take ~30s)…")
         import rpy2.robjects as ro
-        import rpy2.robjects.conversion as _rconv
         from rpy2.robjects import pandas2ri
         from rpy2.robjects.packages import importr
-        # Dash callbacks run in threads where rpy2's ContextVar for conversion rules is unset
-        try:
-            if _rconv._get_cv().get(None) is None:
-                _rconv.activate(ro.default_converter)
-        except Exception:
-            try:
-                _rconv.activate(ro.default_converter)
-            except Exception:
-                pass
         pandas2ri.activate()
 
         base = importr("base")
@@ -657,7 +701,8 @@ def _get_patch_bounds_um():
         return None
 
 
-def _baysor_run_single(tx_df, patch_dir, baysor_bin, scale, min_mol, use_prior, prior_conf):
+def _baysor_run_single(tx_df, patch_dir, baysor_bin, scale, min_mol, use_prior, prior_conf,
+                       scale_std=None, iters=500):
     """Run Baysor on tx_df, write outputs to patch_dir.
     Returns (cells_df, cell_bounds_dict, seg_df) or raises on failure.
     cells_df is indexed by string cell_id.
@@ -671,10 +716,14 @@ def _baysor_run_single(tx_df, patch_dir, baysor_bin, scale, min_mol, use_prior, 
     if use_prior and not _use_prior:
         print(f"  Baysor [{patch_dir}]: no assigned transcripts — disabling prior", flush=True)
 
-    cmd = [
-        baysor_bin, "run",
-        "-s", str(scale),
+    cmd = [baysor_bin, "run"]
+    if scale != -1:
+        cmd += ["-s", str(scale)]
+    if scale_std is not None:
+        cmd += ["--scale-std", str(scale_std)]
+    cmd += [
         "--min-molecules-per-cell", str(min_mol),
+        "--iters", str(iters),
         "--polygon-format", "FeatureCollection",
         "-x", "x_location",
         "-y", "y_location",
@@ -682,8 +731,9 @@ def _baysor_run_single(tx_df, patch_dir, baysor_bin, scale, min_mol, use_prior, 
         "-o", patch_dir,
         tx_csv,
     ]
+    _prior_col = "nucleus_prior_id" if "nucleus_prior_id" in tx_df.columns else "cell_id"
     if _use_prior:
-        cmd += ["--prior-segmentation-confidence", str(prior_conf), ":cell_id"]
+        cmd += ["--prior-segmentation-confidence", str(prior_conf), f":{_prior_col}"]
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                             text=True, cwd=patch_dir)
@@ -903,13 +953,15 @@ def _update_reseg_zarr_obs(zarr_path: str, cells_df: pd.DataFrame) -> None:
         return
     try:
         import zarr as _zarr_mod
-        _zroot = _zarr_mod.open_group(zarr_path, mode="r+")
+        _zroot = _zarr_mod.open_group(zarr_path, mode="r+", use_consolidated=False)
         if "tables" not in _zroot or "table" not in _zroot["tables"] \
                 or "obs" not in _zroot["tables"]["table"]:
             return
         _obs_grp = _zroot["tables"]["table"]["obs"]
         existing_cols = set(_obs_grp.keys()) - {"__categories", "_index"}
-        new_cols = [c for c in cells_df.columns if c not in existing_cols]
+        # Always re-write roi_* columns (may have changed due to add/delete)
+        new_cols = [c for c in cells_df.columns
+                    if c not in existing_cols or c.startswith("roi_")]
         if not new_cols:
             return
         # Read the existing index to align values correctly
@@ -927,11 +979,17 @@ def _update_reseg_zarr_obs(zarr_path: str, cells_df: pd.DataFrame) -> None:
                 _ser = cells_df[col]
                 if _existing_idx is not None:
                     _ser = _ser.reindex(_existing_idx)
-                try:
-                    _write_elem(_obs_grp, col, _ser)
-                except Exception:
-                    _arr = _ser.values
+                # For string/object columns bypass _write_elem (zarr warns on object dtype)
+                # and write directly as fixed-width unicode numpy array.
+                if _ser.dtype == object or pd.api.types.is_string_dtype(_ser):
+                    _arr = np.array(_ser.fillna("").values, dtype=str)
                     _obs_grp.create_dataset(col, data=_arr, shape=_arr.shape, dtype=_arr.dtype, overwrite=True)
+                else:
+                    try:
+                        _write_elem(_obs_grp, col, _ser)
+                    except Exception:
+                        _arr = _ser.values
+                        _obs_grp.create_dataset(col, data=_arr, shape=_arr.shape, dtype=_arr.dtype, overwrite=True)
             except Exception as _col_err:
                 print(f"  Warning: could not write obs col '{col}': {_col_err}", flush=True)
         print(f"  Updated zarr obs: added {new_cols} to {os.path.basename(zarr_path)}", flush=True)
@@ -1269,7 +1327,8 @@ def _load_cached_proseg(out_dir: str) -> None:
 
 
 def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
-                x_min=None, x_max=None, y_min=None, y_max=None) -> None:
+                x_min=None, x_max=None, y_min=None, y_max=None,
+                scale_std=None, iters=500) -> None:
     """Background thread: run Baysor resegmentation, using sopa patches if available."""
 
     def _set(status, message, result=None):
@@ -1302,7 +1361,7 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
             return
         print(f"  Using baysor: {baysor_bin}", flush=True)
 
-        _param_str = (f"s{scale}_m{min_mol}_p{int(use_prior)}"
+        _param_str = (f"s{scale}_ss{scale_std}_m{min_mol}_i{iters}_p{int(use_prior)}"
                       f"{'_c'+str(prior_conf) if use_prior else ''}"
                       f"_x{x_min or 'A'}-{x_max or 'A'}_y{y_min or 'A'}-{y_max or 'A'}")
         _param_tag = hashlib.md5(_param_str.encode()).hexdigest()[:8]
@@ -1313,9 +1372,15 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
 
         # ── Load & prepare all transcripts (once) ────────────────────────
         _set("running", "Loading transcripts…")
+        import pyarrow.parquet as _pq
+        _tx_path = os.path.join(DATA["data_dir"], "transcripts.parquet")
+        _tx_schema_cols = _pq.read_schema(_tx_path).names
+        _tx_cols = ["x_location", "y_location", "feature_name", "cell_id"]
+        if "overlaps_nucleus" in _tx_schema_cols:
+            _tx_cols.append("overlaps_nucleus")
         tx_all = pd.read_parquet(
             os.path.join(DATA["data_dir"], "transcripts.parquet"),
-            columns=["x_location", "y_location", "feature_name", "cell_id"],
+            columns=_tx_cols,
         )
         # Map Xenium string cell IDs → integers (0 = unassigned)
         cid = tx_all["cell_id"].astype(str)
@@ -1323,6 +1388,18 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
         unique_assigned = [c for c in cid.unique() if c not in _unassigned]
         id_map = {c: i + 1 for i, c in enumerate(unique_assigned)}
         tx_all["cell_id"] = cid.map(id_map).fillna(0).astype("int64")
+        # Build nucleus_prior_id: cell_id only for transcripts overlapping a nucleus.
+        # This gives Baysor a tighter nuclear prior instead of the full cell boundary prior.
+        if "overlaps_nucleus" in tx_all.columns:
+            tx_all["nucleus_prior_id"] = (
+                tx_all["cell_id"].where(tx_all["overlaps_nucleus"].astype(bool), 0)
+            )
+            print(f"  Baysor: nucleus prior — "
+                  f"{int((tx_all['nucleus_prior_id'] != 0).sum()):,} / {len(tx_all):,} "
+                  f"transcripts inside nuclei", flush=True)
+        else:
+            tx_all["nucleus_prior_id"] = tx_all["cell_id"]
+            print("  Baysor: overlaps_nucleus column not found — using cell_id as prior", flush=True)
 
         # Apply user's region filter
         if x_min is not None: tx_all = tx_all[tx_all["x_location"] >= x_min]
@@ -1370,7 +1447,8 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
                 patch_dir = os.path.join(out_dir, f"patch_{pi:04d}")
                 try:
                     cells_i, bounds_i, seg_i = _baysor_run_single(
-                        tx_patch, patch_dir, baysor_bin, scale, min_mol, use_prior, prior_conf
+                        tx_patch, patch_dir, baysor_bin, scale, min_mol, use_prior, prior_conf,
+                        scale_std=scale_std, iters=iters
                     )
                 except Exception as pe:
                     print(f"  Baysor: patch {pi + 1} failed: {pe}", flush=True)
@@ -1414,7 +1492,8 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
             _set("running", "Running Baysor (this may take 10–30 min)…")
             try:
                 cells_df, cell_bounds, seg_merged = _baysor_run_single(
-                    tx_all, out_dir, baysor_bin, scale, min_mol, _up, prior_conf
+                    tx_all, out_dir, baysor_bin, scale, min_mol, _up, prior_conf,
+                    scale_std=scale_std, iters=iters
                 )
             except Exception as e:
                 _set("error", str(e)[:300])
@@ -1427,7 +1506,8 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
         n_cells = len(cells_df)
         import json as _json
         _params_out = {
-            "tool": "baysor", "scale": scale, "min_mol": min_mol,
+            "tool": "baysor", "scale": scale, "scale_std": scale_std,
+            "min_mol": min_mol, "iters": iters,
             "use_prior": use_prior, "prior_conf": prior_conf,
             "x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max,
             "n_cells": n_cells, "param_tag": _param_tag,
@@ -1720,7 +1800,7 @@ def _compute_reseg_clusters_umap(cells_df: pd.DataFrame, expr_mat,
 
 
 def _compute_split_clusters_umap(cells_df: pd.DataFrame, corrected_mat,
-                                  progress_fn=None) -> None:
+                                  corrected_cell_ids=None, progress_fn=None) -> None:
     """
     Compute KMeans clusters and UMAP on SPLIT-corrected counts.
     Writes cluster_split_10, split_umap_1, split_umap_2 columns into cells_df in-place.
@@ -1731,9 +1811,9 @@ def _compute_split_clusters_umap(cells_df: pd.DataFrame, corrected_mat,
         from sklearn.decomposition import TruncatedSVD
         from sklearn.cluster import KMeans
         try:
-            import umap
+            from umap.umap_ import UMAP as _UMAP
             _have_umap = True
-        except ImportError:
+        except Exception:
             _have_umap = False
 
         n_cells, n_genes = corrected_mat.shape
@@ -1758,45 +1838,142 @@ def _compute_split_clusters_umap(cells_df: pd.DataFrame, corrected_mat,
             progress_fn("SPLIT: KMeans clustering (k=10)…")
         km = KMeans(n_clusters=10, random_state=42, n_init=10)
         labels = km.fit_predict(pca)
-        cells_df["cluster_split_10"] = (labels + 1).astype(str)
 
         # UMAP
+        embedding = None
         if _have_umap:
             if progress_fn:
                 progress_fn("SPLIT: computing UMAP…")
             n_neighbors = min(30, n_cells - 1)
-            reducer = umap.UMAP(n_components=2, n_neighbors=n_neighbors,
+            reducer = _UMAP(n_components=2, n_neighbors=n_neighbors,
                                 min_dist=0.3, random_state=42)
             embedding = reducer.fit_transform(pca)
-            cells_df["split_umap_1"] = embedding[:, 0].astype(np.float32)
-            cells_df["split_umap_2"] = embedding[:, 1].astype(np.float32)
+
+        # Write back to cells_df — handle subset case (RCTD may drop low-UMI cells)
+        if corrected_cell_ids is not None and len(corrected_cell_ids) < len(cells_df):
+            try:
+                sample_id = cells_df.index[0]
+                cast = type(sample_id)
+                int_idx = pd.Index([cast(c) for c in corrected_cell_ids])
+            except Exception:
+                int_idx = pd.Index(corrected_cell_ids)
+            cells_df["cluster_split_10"] = pd.array([pd.NA] * len(cells_df), dtype="string")
+            cells_df.loc[int_idx, "cluster_split_10"] = (labels + 1).astype(str)
+            if embedding is not None:
+                cells_df["split_umap_1"] = np.nan
+                cells_df["split_umap_2"] = np.nan
+                cells_df.loc[int_idx, "split_umap_1"] = embedding[:, 0].astype(np.float32)
+                cells_df.loc[int_idx, "split_umap_2"] = embedding[:, 1].astype(np.float32)
         else:
-            if progress_fn:
-                progress_fn("SPLIT: umap-learn not available, skipping UMAP.")
+            cells_df["cluster_split_10"] = (labels + 1).astype(str)
+            if embedding is not None:
+                cells_df["split_umap_1"] = embedding[:, 0].astype(np.float32)
+                cells_df["split_umap_2"] = embedding[:, 1].astype(np.float32)
+        if not _have_umap and progress_fn:
+            progress_fn("SPLIT: umap-learn not available, skipping UMAP.")
     except Exception:
         import traceback
         traceback.print_exc()
 
 
 def _split_write_zarr(sdata_path: str, corrected_mat, cells_df: pd.DataFrame,
-                       gene_names: list) -> None:
-    """Write SPLIT corrected counts + cluster/UMAP obs columns to a SpatialData zarr."""
+                       gene_names: list, corrected_cell_ids=None) -> None:
+    """Write SPLIT corrected counts + cluster/UMAP obs columns to a SpatialData zarr.
+    Uses zarr low-level API to avoid spatialdata 'target path in use' error."""
     try:
-        import spatialdata as _sd_
+        import zarr as _zarr_mod
+        import scipy.sparse as sp_
+        try:
+            from anndata.io import write_elem as _write_elem
+        except ImportError:
+            from anndata.experimental import write_elem as _write_elem
+
         with _sdata_lock:
-            sdata = _sd_.read_zarr(sdata_path)
-            adata = sdata.tables["table"]
-            # Store corrected counts as layer
-            import scipy.sparse as sp_
-            mat = corrected_mat if sp_.issparse(corrected_mat) else sp_.csr_matrix(corrected_mat)
-            # Align rows to adata.obs order
-            adata.layers["X_corrected"] = mat
-            # Copy cluster and UMAP columns
+            zroot = _zarr_mod.open_group(sdata_path, mode="r+", use_consolidated=False)
+            if "tables" not in zroot or "table" not in zroot["tables"]:
+                print("  SPLIT: no table in zarr — skipping zarr write", flush=True)
+                return
+            table_grp = zroot["tables"]["table"]
+            obs_grp   = table_grp["obs"]
+
+            # Read zarr obs index for alignment
+            idx_key  = obs_grp.attrs.get("_index", "_index")
+            zarr_ids = [str(v) for v in obs_grp[idx_key][:]]
+
+            # Align corrected_mat rows to zarr obs order
+            # Use corrected_cell_ids (from R colnames) when available — RCTD may drop cells
+            if corrected_cell_ids is not None:
+                id_to_row = {str(cid): i for i, cid in enumerate(corrected_cell_ids)}
+            else:
+                id_to_row = {str(cid): i for i, cid in enumerate(cells_df.index)}
+            row_indices = [id_to_row.get(cid, -1) for cid in zarr_ids]
+            mat         = corrected_mat if sp_.issparse(corrected_mat) \
+                          else sp_.csr_matrix(corrected_mat)
+            # Build aligned matrix; -1 means cell was dropped by RCTD → zero row
+            valid_out = [i for i, r in enumerate(row_indices) if r >= 0]
+            valid_in  = [r for r in row_indices if r >= 0]
+            n_zarr    = len(zarr_ids)
+            if valid_in:
+                mat_sub = mat[valid_in, :]
+                coo     = mat_sub.tocoo()
+                new_row = np.array(valid_out)[coo.row]
+                mat_aligned = sp_.csr_matrix(
+                    (coo.data, (new_row, coo.col)),
+                    shape=(n_zarr, mat.shape[1])
+                )
+            else:
+                mat_aligned = sp_.csr_matrix((n_zarr, mat.shape[1]), dtype=mat.dtype)
+            print(f"  SPLIT: aligned {len(valid_in)}/{n_zarr} cells for zarr write", flush=True)
+
+            # Pad X_corrected to match zarr var width (panel genes only; zarr var may include
+            # SpaGE-imputed genes appended later). Imputed columns get zeros.
+            var_grp = table_grp["var"]
+            try:
+                var_key = var_grp.attrs.get("_index", "_index")
+                n_var   = len(var_grp[var_key])
+            except (KeyError, Exception):
+                # Fallback: read n_var from X matrix shape attribute
+                try:
+                    _x_grp = table_grp["X"]
+                    if isinstance(_x_grp, _zarr_mod.Array):
+                        n_var = _x_grp.shape[1]
+                    else:
+                        n_var = _x_grp.attrs.get("shape", [0, mat_aligned.shape[1]])[1]
+                except Exception:
+                    n_var = mat_aligned.shape[1]
+            if mat_aligned.shape[1] < n_var:
+                n_pad       = n_var - mat_aligned.shape[1]
+                mat_aligned = sp_.hstack(
+                    [mat_aligned, sp_.csr_matrix((n_zarr, n_pad), dtype=mat_aligned.dtype)],
+                    format="csr",
+                )
+                print(f"  SPLIT: padded X_corrected to {mat_aligned.shape} "
+                      f"(+{n_pad} imputed gene cols = 0)", flush=True)
+
+            # Write X_corrected layer — use_consolidated=False bypasses consolidated metadata.
+            # Delete first so reruns with new parameters fully replace old results.
+            layers_grp = table_grp.require_group("layers")
+            if "X_corrected" in layers_grp:
+                del layers_grp["X_corrected"]
+            _write_elem(layers_grp, "X_corrected", mat_aligned)
+
+            # Write obs columns — delete then rewrite so reruns fully replace old values
             for col in ["cluster_split_10", "split_umap_1", "split_umap_2"]:
-                if col in cells_df.columns:
-                    adata.obs[col] = cells_df[col].values
-            sdata.tables["table"] = adata
-            sdata.write_element("table")
+                if col in obs_grp:
+                    del obs_grp[col]
+            for col in ["cluster_split_10", "split_umap_1", "split_umap_2"]:
+                if col not in cells_df.columns:
+                    continue
+                ser = cells_df[col].reindex(zarr_ids)
+                if cells_df[col].dtype == object or pd.api.types.is_string_dtype(cells_df[col]):
+                    arr = np.array(ser.fillna("").values, dtype=str)
+                    obs_grp.create_dataset(col, data=arr, shape=arr.shape,
+                                           dtype=arr.dtype, overwrite=True)
+                else:
+                    arr = ser.values
+                    obs_grp.create_dataset(col, data=arr, shape=arr.shape,
+                                           dtype=arr.dtype, overwrite=True)
+
         print(f"  SPLIT: wrote corrected layer to {os.path.basename(sdata_path)}", flush=True)
     except Exception:
         import traceback
@@ -1804,22 +1981,29 @@ def _split_write_zarr(sdata_path: str, corrected_mat, cells_df: pd.DataFrame,
 
 
 def _r_dgcmatrix_to_scipy(r_mat):
-    """Convert an R dgCMatrix to a scipy CSR matrix."""
+    """Convert an R dgCMatrix to a scipy CSC matrix (genes × cells).
+
+    dgCMatrix is column-sparse (CSC): p = column pointers, i = row indices.
+    Callers that need cells × genes should call .T.tocsr() on the result.
+    """
     import scipy.sparse as sp_
     import numpy as np
     i = np.array(r_mat.slots["i"])
     p = np.array(r_mat.slots["p"])
     x = np.array(r_mat.slots["x"])
     dims = list(r_mat.slots["Dim"])
-    return sp_.csr_matrix((x, i, p), shape=(dims[0], dims[1]))
+    return sp_.csc_matrix((x, i, p), shape=(dims[0], dims[1]))
 
 
 def _run_split_correction(rds_path: str, label_col: str = "Names",
-                           max_cores: int = 4, seg_source: str = "xenium") -> None:
+                           max_cores: int = 4, seg_source: str = "xenium",
+                           min_umi: int = 10, min_umi_sigma: int = 100) -> None:
     """
     Background thread: run RCTD (doublet mode) + SPLIT::purify() for ambient RNA correction.
     Requires R packages: spacexr, SPLIT (bdsc-tds/SPLIT).
     """
+    print(f"  SPLIT: starting — min_umi={min_umi}, min_umi_sigma={min_umi_sigma}, "
+          f"max_cores={max_cores}, seg_source={seg_source!r}", flush=True)
     _redirect_rpy2_console()
 
     def _set(status, message, result=None):
@@ -1839,20 +2023,15 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
         import tempfile
 
         # rpy2 thread fix
-        try:
-            if _rconv._get_cv().get(None) is None:
-                _rconv.activate(ro.default_converter)
-        except Exception:
-            try:
-                _rconv.activate(ro.default_converter)
-            except Exception:
-                pass
+        _rconv.set_conversion(ro.default_converter)
         pandas2ri.activate()
 
         # ── 1. Get active data ──────────────────────────────────────────────
         _tool = _seg_tool(seg_source)
-        bres = _baysor_state["result"] if _baysor_state["status"] == "done" else None
-        pres = _proseg_state["result"] if _proseg_state["status"] == "done" else None
+        with _baysor_lock:
+            bres = _baysor_state["result"] if _baysor_state["status"] == "done" else None
+        with _proseg_lock:
+            pres = _proseg_state["result"] if _proseg_state["status"] == "done" else None
         if _tool == "baysor":
             _alt_res = bres
         elif _tool == "proseg":
@@ -1950,11 +2129,15 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
             nrow=len(shared_genes_present),
             ncol=n_cells
         )
-        ro.r['rownames'](counts_r_mat)[:] = shared_genes_present
         cell_ids = [str(c) for c in cells_df.index]
-        ro.r['colnames'](counts_r_mat)[:] = cell_ids
         ro.r.assign("._split_counts_mat", counts_r_mat)
-        ro.r("""._split_counts_mat <- as(._split_counts_mat, 'dgCMatrix')""")
+        ro.r.assign("._split_rownames", ro.StrVector(shared_genes_present))
+        ro.r.assign("._split_colnames", ro.StrVector(cell_ids))
+        ro.r("""
+rownames(._split_counts_mat) <- ._split_rownames
+colnames(._split_counts_mat) <- ._split_colnames
+._split_counts_mat <- as(._split_counts_mat, 'dgCMatrix')
+""")
 
         coords_df = cells_df[["x_centroid", "y_centroid"]].copy()
         coords_df.columns = ["x", "y"]
@@ -1973,10 +2156,13 @@ rownames(._split_coords) <- colnames(._split_counts_mat)
         # ── 7. Run RCTD (doublet mode) ───────────────────────────────────────
         _set("running", f"Running RCTD doublet mode (max_cores={max_cores})… [~20-40 min]")
         print("  SPLIT: starting RCTD doublet mode…", flush=True)
-        ro.r.assign("._split_max_cores", ro.IntVector([max_cores]))
+        ro.r.assign("._split_max_cores",    ro.IntVector([max_cores]))
+        ro.r.assign("._split_min_umi",      ro.IntVector([min_umi]))
+        ro.r.assign("._split_min_umi_sigma", ro.IntVector([min_umi_sigma]))
         ro.r("""
 ._split_rctd <- spacexr::create.RCTD(._split_spatialrna, ._split_reference,
-    max_cores=._split_max_cores[1], CELL_MIN_INSTANCE=5, doublet_mode=TRUE)
+    max_cores=._split_max_cores[1], CELL_MIN_INSTANCE=5,
+    UMI_min=._split_min_umi[1], UMI_min_sigma=._split_min_umi_sigma[1])
 ._split_rctd <- spacexr::run.RCTD(._split_rctd, doublet_mode='doublet')
 ._split_rctd <- SPLIT::run_post_process_RCTD(._split_rctd)
 """)
@@ -1991,9 +2177,12 @@ rownames(._split_coords) <- colnames(._split_counts_mat)
             nrow=n_panel,
             ncol=n_cells
         )
-        ro.r['rownames'](full_r_mat)[:] = list(panel_genes)
-        ro.r['colnames'](full_r_mat)[:] = cell_ids
         ro.r.assign("._split_full_counts", full_r_mat)
+        ro.r.assign("._split_panel_genes", ro.StrVector(list(panel_genes)))
+        ro.r("""
+rownames(._split_full_counts) <- ._split_panel_genes
+colnames(._split_full_counts) <- ._split_colnames
+""")
         ro.r("""._split_full_counts <- as(._split_full_counts, 'dgCMatrix')""")
         ro.r("""
 ._split_res <- SPLIT::purify(
@@ -2007,26 +2196,41 @@ rownames(._split_coords) <- colnames(._split_counts_mat)
         # ── 9. Convert back to Python ────────────────────────────────────────
         _set("running", "Converting corrected counts to Python…")
         purified_r = ro.r["._split_purified"]
+        # Extract cell IDs from R colnames — RCTD may drop low-UMI cells
+        try:
+            corrected_cell_ids = list(ro.r['colnames'](purified_r))
+        except Exception:
+            corrected_cell_ids = None
         # Convert dgCMatrix → scipy CSR (cells × genes)
         purified_csr_t = _r_dgcmatrix_to_scipy(purified_r)  # gene × cells
         corrected_mat  = purified_csr_t.T.tocsr()             # cells × genes
         corrected_mat.data = np.clip(corrected_mat.data, 0, None)
-        print(f"  SPLIT: corrected matrix shape {corrected_mat.shape}", flush=True)
+        n_corr = corrected_mat.shape[0]
+        n_orig = len(cells_df)
+        print(f"  SPLIT: corrected matrix shape {corrected_mat.shape} "
+              f"({n_corr}/{n_orig} cells)", flush=True)
+        if corrected_cell_ids is None:
+            corrected_cell_ids = [str(c) for c in cells_df.index[:n_corr]]
 
         # ── 10. Compute clusters + UMAP ──────────────────────────────────────
         _set("running", "Computing clusters and UMAP on corrected counts…")
         _compute_split_clusters_umap(cells_df, corrected_mat,
+                                      corrected_cell_ids=corrected_cell_ids,
                                       progress_fn=lambda msg: _set("running", msg))
 
         # ── 11. Write to zarr ────────────────────────────────────────────────
         if sdata_path and os.path.isdir(sdata_path):
             _set("running", "Writing corrected counts to SpatialData zarr…")
-            _split_write_zarr(sdata_path, corrected_mat, cells_df, list(panel_genes))
+            _split_write_zarr(sdata_path, corrected_mat, cells_df, list(panel_genes),
+                              corrected_cell_ids=corrected_cell_ids)
 
         # ── 12. Update in-memory ─────────────────────────────────────────────
         if _alt_res is not None:
-            with _split_lock:
+            _lock = _baysor_lock if _tool == "baysor" else _proseg_lock
+            with _lock:
                 _alt_res["split_corrected_expr"] = corrected_mat
+                _alt_res["split_corrected_cell_ids"] = corrected_cell_ids
+                _alt_res["split_panel_genes"] = list(panel_genes)
                 _alt_res["split_corrected_imputed_genes"] = []
                 # Merge cluster/UMAP cols back into alt_res cells_df
                 for col in ["cluster_split_10", "split_umap_1", "split_umap_2"]:
@@ -2034,6 +2238,8 @@ rownames(._split_coords) <- colnames(._split_counts_mat)
                         _alt_res["cells_df"][col] = cells_df[col].values
         else:
             DATA["split_corrected_expr"] = corrected_mat
+            DATA["split_corrected_cell_ids"] = corrected_cell_ids
+            DATA["split_panel_genes"] = list(panel_genes)
             DATA["split_corrected_imputed_genes"] = []
             for col in ["cluster_split_10", "split_umap_1", "split_umap_2"]:
                 if col in cells_df.columns:
@@ -2071,7 +2277,140 @@ def _run_reseg_umap() -> None:
         alt_res = pres or bres
 
         if alt_res is None:
-            _set("error", "No segmentation loaded — load a Baysor/Proseg run first")
+            # Xenium mode: use SPLIT-corrected expr if counts_mode == "corrected",
+            # otherwise use raw expression matrix.
+            with _umap_reseg_lock:
+                _counts_mode = _umap_reseg_state.get("counts_mode", "original")
+            _corr_expr = DATA.get("split_corrected_expr") if _counts_mode == "corrected" else None
+            _corr_ids  = DATA.get("split_corrected_cell_ids")  # IDs of cells SPLIT kept
+            _xen_df    = DATA["df"]
+
+            # If corrected expr was loaded from zarr at startup it is full-size
+            # (all cells, zeros for non-SPLIT cells) but corr_ids is not populated.
+            # Derive corr_ids from cluster_split_10 and subset the matrix.
+            # If corrected expr is full-size (loaded from zarr at startup), corr_ids
+            # won't be set. Identify SPLIT-kept cells by non-zero rows (zeroed for
+            # non-corrected cells during zarr write) and subset the matrix.
+            if _corr_expr is not None and _corr_ids is None and \
+                    _corr_expr.shape[0] == len(_xen_df):
+                _row_sums = np.asarray(_corr_expr.sum(axis=1)).flatten()
+                _kept_idx = np.where(_row_sums > 0)[0]
+                if len(_kept_idx) > 0:
+                    _corr_ids = [str(i) for i in _xen_df.index[_kept_idx]]
+                    _corr_expr = _corr_expr[_kept_idx, :]
+                    DATA["split_corrected_cell_ids"] = _corr_ids
+                    print(f"  UMAP: derived {len(_corr_ids):,} SPLIT cell IDs from non-zero rows",
+                          flush=True)
+
+            # Zarr fallback: if corrected expr not in memory (e.g. after app restart),
+            # try loading X_corrected from the SpatialData zarr using low-level zarr API
+            # (obs columns written via create_dataset are not exposed by spatialdata .obs).
+            if (_counts_mode == "corrected") and (_corr_expr is None) and DATA.get("sdata_path") and \
+                    os.path.isdir(DATA["sdata_path"]):
+                try:
+                    import zarr as _zarr_fb
+                    _zfb    = _zarr_fb.open_group(DATA["sdata_path"], mode="r",
+                                                  use_consolidated=False)
+                    _tbl_fb = _zfb["tables"]["table"]
+                    _obs_fb = _tbl_fb["obs"]
+                    _lay_fb = _tbl_fb.get("layers", {})
+                    if "X_corrected" in _lay_fb:
+                        # Read sparse X_corrected
+                        _xg = _lay_fb["X_corrected"]
+                        _xcorr_full = sp.csr_matrix(
+                            (_xg["data"][:], _xg["indices"][:], _xg["indptr"][:]),
+                            shape=tuple(_xg.attrs["shape"]),
+                        )
+                        # Read cell IDs
+                        _idx_key = _obs_fb.attrs.get("_index", "_index")
+                        _all_ids = [str(v) for v in _obs_fb[_idx_key][:]]
+                        # Identify SPLIT-kept cells via non-empty cluster_split_10
+                        if "cluster_split_10" in _obs_fb:
+                            _clust   = np.array([str(v) for v in _obs_fb["cluster_split_10"][:]])
+                            _kept_mask = np.array([bool(v.strip()) for v in _clust], dtype=bool)
+                        else:
+                            _kept_mask = np.ones(len(_all_ids), dtype=bool)
+                        _kept_rows = np.where(_kept_mask)[0]
+                        _corr_expr = _xcorr_full[_kept_rows, :]
+                        _corr_ids  = [_all_ids[i] for i in _kept_rows]
+                        # Cache in DATA so subsequent calls don't re-read zarr
+                        DATA["split_corrected_expr"]     = _corr_expr
+                        DATA["split_corrected_cell_ids"] = _corr_ids
+                        print(f"  Xenium UMAP: loaded X_corrected from zarr "
+                              f"({len(_corr_ids):,} SPLIT-corrected cells)", flush=True)
+                except Exception as _fb_err:
+                    print(f"  Xenium UMAP: zarr X_corrected fallback failed: {_fb_err}",
+                          flush=True)
+
+            if _corr_expr is not None and _corr_ids is not None:
+                # Build index mapping: corrected_cell_ids → rows in _corr_expr
+                _id_to_row = {str(cid): i for i, cid in enumerate(_corr_ids)}
+                _df_ids    = [str(i) for i in _xen_df.index]
+                _sub_rows  = [_id_to_row[i] for i in _df_ids if i in _id_to_row]
+                _sub_mask  = [i in _id_to_row for i in _df_ids]  # bool mask over DATA["df"]
+                expr = _corr_expr[_sub_rows, :]
+                _n   = len(_sub_rows)
+                _set("running", f"Normalising {_n:,} SPLIT-corrected cells…")
+                print(f"  Xenium UMAP: using SPLIT-corrected counts for {_n:,}/{len(_xen_df):,} cells",
+                      flush=True)
+            else:
+                expr = DATA.get("expr")
+                if expr is None:
+                    _set("error", "No expression matrix loaded")
+                    return
+                _sub_mask = None
+                _n        = len(_xen_df)
+                _set("running", f"Normalising {_n:,} Xenium cells…")
+                print(f"  Xenium UMAP: using original counts for {_n:,} cells", flush=True)
+
+            _mat = expr.astype("float32").tocsr()
+            _rs  = np.asarray(_mat.sum(axis=1)).flatten()
+            _rs[_rs == 0] = 1.0
+            _mat = sp.diags(1e4 / _rs).dot(_mat).tocsr()
+            _mat.data = np.log1p(_mat.data)
+            import warnings as _w2
+            from sklearn.decomposition import TruncatedSVD as _TSVD2
+            _nc = min(50, _n - 1, _mat.shape[1] - 1)
+            _set("running", f"PCA ({_nc} components)…")
+            _svd2 = _TSVD2(n_components=_nc, random_state=0)
+            with _w2.catch_warnings():
+                _w2.filterwarnings("ignore", category=RuntimeWarning,
+                                   message="invalid value encountered in divide")
+                _pca2 = _svd2.fit_transform(_mat)
+            _set("running", "Running UMAP…")
+            try:
+                import sys as _sys2, types as _types2
+                if "tensorflow" not in _sys2.modules:
+                    _sys2.modules["tensorflow"] = _types2.ModuleType("tensorflow")
+                from umap.umap_ import UMAP as _UMAP2
+                with _w2.catch_warnings():
+                    _w2.filterwarnings("ignore", message="n_jobs value.*overridden")
+                    _emb2 = _UMAP2(n_neighbors=min(15, _n - 1), min_dist=0.1,
+                                   random_state=0).fit_transform(_pca2)
+            except Exception:
+                from sklearn.manifold import TSNE as _TSNE2
+                _set("running", "Running t-SNE (umap-learn unavailable)…")
+                _emb2 = _TSNE2(n_components=2, perplexity=min(30, max(5, _n // 10)),
+                               random_state=0).fit_transform(_pca2)
+
+            if _sub_mask is not None:
+                # Write NaN for cells SPLIT dropped, UMAP coords for cells it kept
+                _u1 = np.full(len(_xen_df), np.nan)
+                _u2 = np.full(len(_xen_df), np.nan)
+                _sub_idx = np.where(_sub_mask)[0]
+                _u1[_sub_idx] = _emb2[:, 0]
+                _u2[_sub_idx] = _emb2[:, 1]
+                DATA["df"]["umap_1"] = _u1
+                DATA["df"]["umap_2"] = _u2
+            else:
+                DATA["df"]["umap_1"] = _emb2[:, 0]
+                DATA["df"]["umap_2"] = _emb2[:, 1]
+            _umap_df_cache.clear()
+            with _umap_reseg_lock:
+                _umap_reseg_state["_xenium_bumped"] = False
+            _label = "SPLIT-corrected" if _sub_mask is not None else "Xenium"
+            _set("done", f"{_label} UMAP — {_n:,} cells")
+            print(f"  {_label} UMAP recomputed for {_n:,} cells", flush=True)
             return
 
         if alt_res.get("expr") is None:
@@ -2090,10 +2429,15 @@ def _run_reseg_umap() -> None:
                 _set("error", "No expression matrix — re-run segmentation first")
                 return
 
-        expr      = alt_res["expr"]   # (n_cells × n_genes) CSR
+        with _umap_reseg_lock:
+            _counts_mode = _umap_reseg_state.get("counts_mode", "original")
+        _corr = alt_res.get("split_corrected_expr") if _counts_mode == "corrected" else None
+        expr      = _corr if _corr is not None else alt_res["expr"]   # (n_cells × n_genes) CSR
+        _src_label = "SPLIT-corrected" if _corr is not None else "reseg"
         cell_ids  = [str(c) for c in alt_res["cells_df"].index]
         n_cells   = len(cell_ids)
-        _set("running", f"Normalising {n_cells:,} cells…")
+        _set("running", f"Normalising {n_cells:,} {_src_label} cells…")
+        print(f"  Reseg UMAP: using {_src_label} counts for {n_cells:,} cells", flush=True)
 
         # CP10K + log1p normalise
         mat = expr.astype("float32").tocsr()
@@ -2182,30 +2526,50 @@ def _spage_index_update(cache_file: str) -> None:
 
 
 def _annot_autoload() -> None:
-    """On startup, load the most recently cached Xenium annotation for this dataset."""
+    """On startup, load all cached Xenium annotations for this dataset (all methods)."""
     import glob
     tag       = hashlib.md5(DATA["data_dir"].encode()).hexdigest()[:8]
     cache_dir = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache")
-    # Xenium annotation files: {model}_{tag}.parquet (no "labels_proseg" / "labels_baysor" prefix)
     pattern   = os.path.join(cache_dir, f"*_{tag}.parquet")
-    files     = [f for f in glob.glob(pattern)
-                 if not os.path.basename(f).startswith(("labels_proseg", "labels_baysor",
-                                                         "spage_", "spatialdata_"))]
-    if not files:
+    label_files  = [f for f in glob.glob(pattern)
+                    if not os.path.basename(f).startswith(("labels_", "spage_", "spatialdata_"))
+                    and not os.path.basename(f).endswith("_weights.parquet")]
+    weight_files = [f for f in glob.glob(pattern)
+                    if os.path.basename(f).endswith("_weights.parquet")]
+    if not label_files and not weight_files:
         return
-    latest = max(files, key=os.path.getmtime)
-    try:
-        cached       = pd.read_parquet(latest)
-        labels       = cached["label"].astype(str)
-        labels.index = labels.index.astype(str)
-        unique_types = labels.unique().tolist()
-        with _annot_lock:
-            _annot_state["labels"]  = labels
-            _annot_state["status"]  = "done"
-            _annot_state["message"] = f"Auto-loaded — {len(unique_types)} cell types"
-        print(f"  Annotation: auto-loaded {len(unique_types)} types from {os.path.basename(latest)}", flush=True)
-    except Exception as exc:
-        print(f"  Annotation: auto-load failed: {exc}", flush=True)
+    loaded = 0
+    for fpath in label_files:
+        name = os.path.basename(fpath)
+        if name.startswith("rctd_"):
+            method = "rctd"
+        elif name.startswith("seurat_"):
+            method = "seurat"
+        else:
+            method = "celltypist"
+        labels_key = f"labels_{method}"
+        try:
+            cached       = pd.read_parquet(fpath)
+            labels       = cached["label"].astype(str)
+            labels.index = labels.index.astype(str)
+            with _annot_lock:
+                _annot_state[labels_key] = labels
+                _annot_state["status"]   = "done"
+                _annot_state["message"]  = f"Auto-loaded ({_ANNOT_METHODS[method]})"
+            print(f"  Annotation: auto-loaded {method} ({len(labels.unique())} types) from {name}", flush=True)
+            loaded += 1
+        except Exception as exc:
+            print(f"  Annotation: auto-load failed for {name}: {exc}", flush=True)
+    for fpath in weight_files:
+        name = os.path.basename(fpath)
+        try:
+            weights_df = pd.read_parquet(fpath)
+            weights_df.index = weights_df.index.astype(str)
+            with _annot_lock:
+                _annot_state["rctd_weights_labels_rctd"] = weights_df
+            print(f"  Annotation: auto-loaded RCTD weights ({weights_df.shape[1]} types) from {name}", flush=True)
+        except Exception as exc:
+            print(f"  Annotation: weight auto-load failed for {name}: {exc}", flush=True)
 
 
 def _spage_autoload() -> None:
@@ -2308,14 +2672,7 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str, seg_source
 
         # Ensure rpy2 conversion rules are active in this thread's context.
         # Dash callbacks run in threads where the rpy2 ContextVar may be unset.
-        try:
-            if _rconv._get_cv().get(None) is None:
-                _rconv.activate(ro.default_converter)
-        except Exception:
-            try:
-                _rconv.activate(ro.default_converter)
-            except Exception:
-                pass
+        _rconv.set_conversion(ro.default_converter)
 
         # ── Determine active reseg (if any) ──────────────────────────────
         _alt_res = None
@@ -2609,12 +2966,15 @@ def subset(cluster=None, cell_type=None,
 
     # ── Cell type filter ──────────────────────────────────────────────────
     if cell_type is not None:
-        labels = _annot_state.get("labels")
+        with _annot_lock:
+            labels = next((v for m in _ANNOT_METHODS
+                           for k, v in _annot_state.items()
+                           if k == f"labels_{m}" and v is not None), None)
         if labels is None:
             print("  subset: no cell type annotation loaded — skipping cell_type filter", flush=True)
         else:
             vals = [cell_type] if isinstance(cell_type, str) else list(cell_type)
-            mask &= labels.reindex(df.index).isin(vals)
+            mask &= labels.reindex(df.index.astype(str)).isin(vals)
 
     # ── Gene expression filter ────────────────────────────────────────────
     if gene is not None and (min_expr is not None or max_expr is not None):
@@ -2665,6 +3025,58 @@ def unsubset():
     _umap_df_cache.clear()
     _subset_version += 1
     print(f"  unsubset: restored {len(DATA['df']):,} cells", flush=True)
+
+
+def retry_split_zarr_write(seg_source: str = None) -> None:
+    """Write in-memory SPLIT corrected counts to the SpatialData zarr.
+
+    Use this if SPLIT completed successfully in the current session but the zarr
+    write failed (e.g. due to consolidated metadata error). Call from the REPL:
+
+        retry_split_zarr_write()               # Xenium
+        retry_split_zarr_write("baysor:xxxx")  # Baysor run
+        retry_split_zarr_write("proseg:xxxx")  # Proseg run
+    """
+    tool = _seg_tool(seg_source) if seg_source else "xenium"
+
+    if tool == "baysor":
+        with _baysor_lock:
+            res = _baysor_state.get("result")
+    elif tool == "proseg":
+        with _proseg_lock:
+            res = _proseg_state.get("result")
+    else:
+        res = None  # Xenium uses DATA directly
+
+    if res is not None:
+        corrected_mat     = res.get("split_corrected_expr")
+        corrected_ids     = res.get("split_corrected_cell_ids")
+        panel_genes       = res.get("split_panel_genes")
+        sdata_path        = res.get("sdata_path", "")
+        cells_df          = res.get("cells_df")
+    else:
+        corrected_mat     = DATA.get("split_corrected_expr")
+        corrected_ids     = DATA.get("split_corrected_cell_ids")
+        panel_genes       = DATA.get("split_panel_genes")
+        sdata_path        = DATA.get("sdata_path", "")
+        cells_df          = DATA.get("df")
+
+    if corrected_mat is None:
+        print("  retry_split_zarr_write: no split_corrected_expr in memory — "
+              "has SPLIT been run this session?", flush=True)
+        return
+    if not sdata_path or not os.path.isdir(sdata_path):
+        print(f"  retry_split_zarr_write: sdata_path not found: {sdata_path!r}", flush=True)
+        return
+    if not panel_genes:
+        print("  retry_split_zarr_write: split_panel_genes not stored — "
+              "please rerun SPLIT (old session data)", flush=True)
+        return
+
+    print(f"  retry_split_zarr_write: writing {corrected_mat.shape} matrix to {sdata_path}",
+          flush=True)
+    _split_write_zarr(sdata_path, corrected_mat, cells_df, panel_genes,
+                      corrected_cell_ids=corrected_ids)
 
 
 def get_genes(file: str = None) -> list:
@@ -3688,17 +4100,33 @@ def _categorical_traces(x, y, df, method, size, opacity, mode="spatial"):
     return traces
 
 
-def _cell_type_traces(x, y, df, size, opacity, mode="spatial"):
-    """Categorical traces coloured by cell type annotation."""
+def _cell_type_color_map(labels_key: str, df) -> dict:
+    """Return {cell_type: color} map consistent with _cell_type_traces ordering."""
     with _annot_lock:
-        labels = _annot_state.get("labels")
+        labels = _annot_state.get(labels_key)
+    if labels is None:
+        return {}
+    aligned = labels.reindex(df.index.astype(str)).fillna("Unknown")
+    cell_types = sorted(aligned.unique())
+    return {ct: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, ct in enumerate(cell_types)}
+
+
+def _cell_type_traces(x, y, df, size, opacity, mode="spatial", labels_key="labels_celltypist",
+                      invisible=False):
+    """Categorical traces coloured by cell type annotation.
+
+    When invisible=True, scatter markers are transparent (for hover/click only when pies
+    are rendered as layout shapes). Legend entries are added as zero-length traces.
+    """
+    with _annot_lock:
+        labels = _annot_state.get(labels_key)
     if labels is None:
         return [go.Scattergl(x=x, y=y, mode="markers",
                              marker=dict(size=size, color=MUTED, opacity=opacity),
                              name="No annotation")]
 
-    # Align labels to df index
-    aligned = labels.reindex(df.index).fillna("Unknown")
+    # Align labels to df index — cast both to str to handle int vs str mismatch
+    aligned = labels.reindex(df.index.astype(str)).fillna("Unknown")
     cell_types = sorted(aligned.unique())
     cmap = {ct: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, ct in enumerate(cell_types)}
 
@@ -3706,14 +4134,30 @@ def _cell_type_traces(x, y, df, size, opacity, mode="spatial"):
     for ct in cell_types:
         mask = (aligned == ct).values
         mk   = size if mode == "spatial" else max(2, size * 1.3)
-        traces.append(go.Scattergl(
-            x=x[mask], y=y[mask], mode="markers",
-            marker=dict(size=mk, color=cmap[ct], opacity=opacity),
-            name=ct, legendgroup=ct,
-            showlegend=(mode == "spatial"),
-            text=df.index[mask].tolist(), customdata=df.index[mask].tolist(),
-            hovertemplate="<b>%{text}</b><extra>" + ct + "</extra>",
-        ))
+        if invisible:
+            # Ghost scatter for hover/click; add a visible legend-only trace separately
+            traces.append(go.Scattergl(
+                x=x[mask], y=y[mask], mode="markers",
+                marker=dict(size=mk, color=cmap[ct], opacity=0),
+                name=ct, legendgroup=ct, showlegend=False,
+                text=df.index[mask].tolist(), customdata=df.index[mask].tolist(),
+                hovertemplate="<b>%{text}</b><extra>" + ct + "</extra>",
+            ))
+            # Zero-length legend entry so the legend still shows cell type → color
+            traces.append(go.Scattergl(
+                x=[None], y=[None], mode="markers",
+                marker=dict(size=mk, color=cmap[ct]),
+                name=ct, legendgroup=ct, showlegend=True,
+            ))
+        else:
+            traces.append(go.Scattergl(
+                x=x[mask], y=y[mask], mode="markers",
+                marker=dict(size=mk, color=cmap[ct], opacity=opacity),
+                name=ct, legendgroup=ct,
+                showlegend=(mode == "spatial"),
+                text=df.index[mask].tolist(), customdata=df.index[mask].tolist(),
+                hovertemplate="<b>%{text}</b><extra>" + ct + "</extra>",
+            ))
     return traces
 
 
@@ -3724,7 +4168,7 @@ def _get_expr_values(gene: str, alt_res=None, use_corrected: bool = False) -> "n
         expr = (alt_res.get("split_corrected_expr") if use_corrected else None) or alt_res.get("expr")
         gni  = alt_res.get("gene_name_to_idx") or DATA.get("gene_name_to_idx", {})
     else:
-        expr = DATA.get("split_corrected_expr") if use_corrected else DATA.get("expr")
+        expr = (DATA.get("split_corrected_expr") if use_corrected else None) or DATA.get("expr")
         gni  = DATA.get("gene_name_to_idx", {})
     if expr is None or lookup not in gni:
         return None
@@ -3766,9 +4210,9 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
 
     alt_res = pres or bres
     _separator_shapes = []   # populated later for multi-sample mode
+    _pie_shapes = []         # RCTD pie chart wedge shapes (single-dataset, Xenium only)
     if alt_res is not None:
         source_label = " [Proseg]" if pres else " [Baysor]"
-        labels_key   = _annot_state.get("_active_labels_key") or ("labels_proseg" if pres else "labels_baysor")
         bdf      = alt_res["cells_df"]
         x        =  bdf["x_centroid"].values
         y        = -bdf["y_centroid"].values
@@ -3798,9 +4242,11 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                 show_legend = True
             # If no cluster column: fall through to generic fallback (transcript_counts)
 
-        elif color_by == "cell_type":
+        elif color_by.startswith("cell_type:"):
+            _method = color_by.split(":")[1]
+            _lkey   = _labels_key_for_method(_method, alt_res)
             with _annot_lock:
-                labels = _annot_state.get(labels_key)
+                labels = _annot_state.get(_lkey)
             if labels is not None:
                 aligned = labels.reindex(pd.Index(cell_ids_str)).fillna("Unknown")
                 cell_types = sorted(aligned.unique())
@@ -3869,6 +4315,22 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
         x   =  df["x_centroid"].values   # x_centroid is in µm
         y   = -df["y_centroid"].values   # y_centroid is in µm, negate for plot
         source_label    = ""
+
+        # ── Viewport-filtered copies for pie chart threshold + rendering ─
+        df_vp, x_vp, y_vp = df, x, y   # default: full dataset
+        if relayout:
+            try:
+                _x0 = float(relayout.get("xaxis.range[0]", -1e18))
+                _x1 = float(relayout.get("xaxis.range[1]",  1e18))
+                _y0 = float(relayout.get("yaxis.range[0]", -1e18))
+                _y1 = float(relayout.get("yaxis.range[1]",  1e18))
+                if _x1 - _x0 < 1e17:  # real range, not default placeholder
+                    _vp_mask = (x >= _x0) & (x <= _x1) & (y >= _y0) & (y <= _y1)
+                    df_vp = df[_vp_mask]
+                    x_vp  = x[_vp_mask]
+                    y_vp  = y[_vp_mask]
+            except Exception:
+                pass
 
         # ── Multi-sample: merge extra datasets ──────────────────────────
         if EXTRA_DATASETS:
@@ -3949,11 +4411,12 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                     ))
                 show_legend = True
 
-            elif color_by == "cell_type":
+            elif color_by.startswith("cell_type:"):
                 # Combine cell type labels from each dataset's annotation state
+                _method = color_by.split(":")[1]
                 all_labels_list = []
                 with _annot_lock:
-                    primary_labels = _annot_state.get("labels")
+                    primary_labels = _annot_state.get(f"labels_{_method}")
                 for di, edf in enumerate(all_dfs):
                     if di == 0:
                         lbl_series = primary_labels
@@ -4043,11 +4506,25 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
             # ── Cell scatter traces ──────────────────────────────────────────
             if color_by == "cluster":
                 traces, show_legend = _categorical_traces(x, y, df, method, size, opacity), True
-            elif color_by == "cell_type":
-                traces, show_legend = _cell_type_traces(x, y, df, size, opacity, "spatial"), True
+            elif color_by.startswith("cell_type:"):
+                _method = color_by.split(":")[1]
+                _lkey = f"labels_{_method}"
+                _wkey = f"rctd_weights_{_lkey}"
+                with _annot_lock:
+                    _weights_df = _annot_state.get(_wkey)
+                if _weights_df is not None and len(df_vp) <= PIE_THRESHOLD:
+                    # Pie chart mode: invisible ghost scatter for hover + SVG wedge shapes
+                    _ct_colors = _cell_type_color_map(_lkey, df_vp)
+                    traces = _cell_type_traces(x_vp, y_vp, df_vp, size, opacity, "spatial",
+                                               labels_key=_lkey, invisible=True)
+                    _pie_shapes = _build_rctd_pie_shapes(df_vp, _weights_df, _ct_colors)
+                else:
+                    traces = _cell_type_traces(x, y, df, size, opacity, "spatial",
+                                               labels_key=_lkey)
+                show_legend = True
             elif color_by == "gene":
-                vals = (_get_expr_values(gene, use_corrected=True) if use_corrected else None) \
-                    or get_gene_expression(gene)
+                _cv = _get_expr_values(gene, use_corrected=True) if use_corrected else None
+                vals = _cv if _cv is not None else get_gene_expression(gene)
                 traces = [go.Scattergl(
                     x=x, y=y, mode="markers",
                     marker=dict(size=size, color=vals, colorscale="Plasma", opacity=opacity,
@@ -4113,17 +4590,11 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
             traces.append(t)
             show_legend = True
 
-    # "Cell Boundaries" follows the active source:
-    # if Proseg/Baysor is active → show their boundaries (no zoom needed);
-    # otherwise show Xenium boundaries (zoom required).
+    # "Xenium Cell/Nuclei Boundaries" always show original Xenium boundaries (zoom required).
     if "cell" in boundary_toggles:
-        if alt_res is not None:
-            _add_boundary(alt_res["cell_bounds"], "#00d4ff", "Cell Boundaries",
-                          reseg_cells_df=alt_res["cells_df"])
-        else:
-            _add_boundary(DATA["cell_bounds"], "#00d4ff", "Cell Boundaries")
+        _add_boundary(DATA["cell_bounds"], "#00d4ff", "Xenium Cell Boundaries")
     if "nucleus" in boundary_toggles:
-        _add_boundary(DATA.get("nucleus_bounds", {}), "#ff9f43", "Nucleus Boundaries")
+        _add_boundary(DATA.get("nucleus_bounds", {}), "#ff9f43", "Xenium Nuclei Boundaries")
 
     # Proseg boundaries (zoom required, uses Proseg cell centroids for viewport)
     if "proseg" in boundary_toggles:
@@ -4159,7 +4630,7 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
         ),
         uirevision="spatial",
     )
-    all_shapes = list(_separator_shapes)
+    all_shapes = list(_separator_shapes) + list(_pie_shapes)
     with _roi_lock:
         roi_visible = _roi_state["show"]
         rois_snap   = list(_roi_state["rois"])
@@ -4188,7 +4659,8 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
 _umap_df_cache = {}
 
 def make_umap_fig(color_by, method, gene, size, opacity,
-                  baysor_active=False, proseg_active=False):
+                  baysor_active=False, proseg_active=False,
+                  use_corrected: bool = False):
     mk = max(2, size * 1.2)
 
     # Check if reseg UMAP is available and the matching source is active
@@ -4208,9 +4680,9 @@ def make_umap_fig(color_by, method, gene, size, opacity,
         xu        = udf["umap_1"].values
         yu        = udf["umap_2"].values
         cell_ids  = udf.index.tolist()
-        labels_key = _annot_state.get("_active_labels_key") or ("labels_proseg" if pres else "labels_baysor")
-
-        if color_by == "cell_type":
+        if color_by.startswith("cell_type:"):
+            _method    = color_by.split(":")[1]
+            labels_key = _labels_key_for_method(_method, alt_res)
             with _annot_lock:
                 labels = _annot_state.get(labels_key)
             if labels is not None:
@@ -4244,7 +4716,7 @@ def make_umap_fig(color_by, method, gene, size, opacity,
             else:
                 color_by = "transcript_counts"
 
-        if color_by not in ("cell_type", "gene"):
+        if not color_by.startswith("cell_type:") and color_by != "gene":
             bdf = alt_res["cells_df"]
             if color_by in bdf.columns:
                 vals  = bdf["transcript_counts"].values if color_by == "transcript_counts" \
@@ -4275,11 +4747,15 @@ def make_umap_fig(color_by, method, gene, size, opacity,
 
         if color_by == "cluster":
             traces = _categorical_traces(xu, yu, df, method, mk, opacity, mode="umap")
-        elif color_by == "cell_type":
-            traces = _cell_type_traces(xu, yu, df, mk, opacity, mode="umap")
+        elif color_by.startswith("cell_type:"):
+            _method = color_by.split(":")[1]
+            traces = _cell_type_traces(xu, yu, df, mk, opacity, mode="umap",
+                                       labels_key=f"labels_{_method}")
         elif color_by == "gene":
             has_umap = DATA["df"]["umap_1"].notna()
-            vals = get_gene_expression(gene)[has_umap.values]
+            _cv = _get_expr_values(gene, use_corrected=use_corrected) if use_corrected else None
+            vals = (_cv[has_umap.values] if _cv is not None
+                    else get_gene_expression(gene)[has_umap.values])
             traces = [go.Scattergl(
                 x=xu, y=yu, mode="markers",
                 marker=dict(size=mk, color=vals, colorscale="Plasma",
@@ -4384,20 +4860,55 @@ def _save_sdata_to_disk(save_path: str) -> None:
             tbl = sdata.tables["table"]
             df  = DATA.get("df")
             if df is not None and "cell_id" in tbl.obs.columns:
+                # Use cell_id column for mapping if available (zarr index is spatial string)
+                has_cell_id = "cell_id" in tbl.obs.columns
+                zarr_cell_ids = tbl.obs["cell_id"].astype(str) if has_cell_id else None
                 # Cluster labels
                 for method in DATA.get("cluster_methods", []):
                     if method in df.columns:
-                        mapping = df.set_index("cell_id")[method].to_dict()
-                        tbl.obs[method] = tbl.obs["cell_id"].map(mapping)
-                # Cell-type annotation
+                        if has_cell_id:
+                            tbl.obs[method] = zarr_cell_ids.map(
+                                df[method].astype(str).to_dict()).values
+                        else:
+                            tbl.obs[method] = df[method].reindex(
+                                tbl.obs.index.astype(str)).values
+                # Cell-type annotation — write each available method
                 with _annot_lock:
-                    labels = _annot_state.get("labels")
-                if labels is not None and "cell_id" in labels.columns and "cell_type" in labels.columns:
-                    ct_map = dict(zip(labels["cell_id"], labels["cell_type"]))
-                    tbl.obs["cell_type"] = tbl.obs["cell_id"].map(ct_map)
+                    for m in _ANNOT_METHODS:
+                        lbl = _annot_state.get(f"labels_{m}")
+                        if lbl is not None:
+                            lbl_str = lbl.astype(str)
+                            lbl_str.index = lbl_str.index.astype(str)
+                            if has_cell_id:
+                                tbl.obs[f"cell_type_{m}"] = zarr_cell_ids.map(
+                                    lbl_str.to_dict()).fillna("Unknown").values
+                            else:
+                                tbl.obs[f"cell_type_{m}"] = lbl_str.reindex(
+                                    tbl.obs.index.astype(str)).fillna("Unknown").values
+                    # RCTD weights matrix → obsm
+                    rctd_w = _annot_state.get("rctd_weights_labels_rctd")
+                    if rctd_w is not None:
+                        if has_cell_id:
+                            aligned = rctd_w.reindex(zarr_cell_ids.values).fillna(0.0)
+                        else:
+                            aligned = rctd_w.reindex(tbl.obs.index.astype(str)).fillna(0.0)
+                        tbl.obsm["rctd_weights"] = aligned.values
+                        tbl.uns["rctd_weight_columns"] = list(rctd_w.columns)
 
-        sdata.write(save_path, overwrite=True)
-        print(f"  save_spatialdata: done → {save_path}", flush=True)
+        # Build a lightweight SpatialData with only table + shapes (no images/transcripts).
+        # Images are already in the original Xenium output and are huge to re-encode.
+        import spatialdata as sd
+        elements = {}
+        for name, elem in sdata.shapes.items():
+            elements[name] = elem
+        if "table" in sdata.tables:
+            elements["table"] = sdata.tables["table"]
+        sdata_out = sd.SpatialData(
+            shapes={k: v for k, v in elements.items() if k != "table"},
+            tables={"table": elements["table"]} if "table" in elements else {},
+        )
+        sdata_out.write(save_path, overwrite=True)
+        print(f"  save_spatialdata: done (table + shapes only) → {save_path}", flush=True)
         _set("done", f"Saved to {save_path}")
     except Exception as exc:
         import traceback; traceback.print_exc()
@@ -4423,8 +4934,52 @@ def _sdata_autoload() -> None:
             _sdata_state["sdata"]   = sdata
         DATA["sdata"] = sdata
         print(f"  SpatialData: auto-loaded from cache — {summary}", flush=True)
+        # Load any cell-type annotations stored in zarr tbl.obs into _annot_state
+        _annot_load_from_sdata(sdata)
     except Exception as exc:
         print(f"  SpatialData: auto-load failed: {exc}", flush=True)
+
+
+def _annot_load_from_sdata(sdata) -> None:
+    """Load cell-type annotation columns from a SpatialData table into _annot_state."""
+    try:
+        if "table" not in sdata.tables:
+            return
+        tbl = sdata.tables["table"]
+        obs = tbl.obs
+        loaded = []
+        # If obs has cell_id column, re-index labels by cell_id (integer Xenium IDs)
+        # so they match DATA["df"].index when looked up in _cell_type_traces
+        id_index = obs["cell_id"].astype(str) if "cell_id" in obs.columns else None
+        for m in _ANNOT_METHODS:
+            col = f"cell_type_{m}"
+            if col in obs.columns:
+                labels = obs[col].astype(str).copy()
+                if id_index is not None:
+                    labels.index = id_index
+                else:
+                    labels.index = labels.index.astype(str)
+                # Only load if parquet cache didn't already populate this key
+                with _annot_lock:
+                    if _annot_state.get(f"labels_{m}") is None:
+                        _annot_state[f"labels_{m}"] = labels
+                        _annot_state["status"]  = "done"
+                        _annot_state["message"] = f"Auto-loaded ({_ANNOT_METHODS[m]}) from zarr"
+                        loaded.append(m)
+        if loaded:
+            print(f"  Annotation: loaded from zarr — {', '.join(loaded)}", flush=True)
+        # Also load RCTD weights if present
+        if "rctd_weights" in tbl.obsm and "rctd_weight_columns" in tbl.uns:
+            with _annot_lock:
+                if _annot_state.get("rctd_weights_labels_rctd") is None:
+                    cols     = list(tbl.uns["rctd_weight_columns"])
+                    w_index  = id_index if id_index is not None else obs.index.astype(str)
+                    w        = pd.DataFrame(tbl.obsm["rctd_weights"],
+                                            index=w_index, columns=cols)
+                    _annot_state["rctd_weights_labels_rctd"] = w
+                    print(f"  Annotation: loaded RCTD weights from zarr ({len(cols)} types)", flush=True)
+    except Exception as exc:
+        print(f"  Annotation: zarr load failed: {exc}", flush=True)
 
 
 # ─── Cache utilities ───────────────────────────────────────────────────────────
@@ -4574,6 +5129,65 @@ def _xy_to_svg_path(xy: list) -> str:
     return " ".join(parts)
 
 
+def _svg_sector(cx, cy, r, theta1, theta2):
+    """SVG path string for a filled wedge in data coordinates."""
+    import math
+    large = 1 if (theta2 - theta1) > math.pi else 0
+    x1 = cx + r * math.cos(theta1)
+    y1 = cy + r * math.sin(theta1)
+    x2 = cx + r * math.cos(theta2)
+    y2 = cy + r * math.sin(theta2)
+    if abs(theta2 - theta1 - 2 * math.pi) < 1e-6:   # full circle edge case
+        x2 = cx + r * math.cos(theta1 + 2 * math.pi - 1e-6)
+        y2 = cy + r * math.sin(theta1 + 2 * math.pi - 1e-6)
+    return f"M {cx},{cy} L {x1},{y1} A {r},{r},0,{large},1,{x2},{y2} Z"
+
+
+def _build_rctd_pie_shapes(df, weights_df, ct_colors, radius_um=RCTD_PIE_RADIUS_UM):
+    """Build Plotly layout shapes (SVG wedges) for RCTD weight pie charts.
+
+    Parameters
+    ----------
+    df : DataFrame  — cells with x_centroid, y_centroid (y already negated on caller side)
+    weights_df : DataFrame  — (n_cells, n_types), index = str cell IDs, cols = cell type names
+    ct_colors : dict  — {cell_type: hex_color}
+    radius_um : float  — wedge radius in µm (data coordinates)
+    """
+    import math
+    shapes = []
+    # Align weights to df; use str index
+    idx_str = df.index.astype(str)
+    w = weights_df.reindex(idx_str).fillna(0).values.astype(float)
+    xs = df["x_centroid"].values
+    ys = -df["y_centroid"].values      # negated, same as spatial plot y-axis
+    col_names = list(weights_df.columns)
+
+    for i in range(len(df)):
+        row = w[i]
+        total = row.sum()
+        if total <= 0:
+            continue
+        row = row / total  # normalize to sum=1
+        theta = -math.pi / 2   # start at top (12 o'clock)
+        cx, cy = float(xs[i]), float(ys[i])
+        for j, ct in enumerate(col_names):
+            frac = row[j]
+            if frac < 0.02:
+                theta += frac * 2 * math.pi
+                continue
+            dtheta = frac * 2 * math.pi
+            color = ct_colors.get(ct, "#888888")
+            path = _svg_sector(cx, cy, radius_um, theta, theta + dtheta)
+            shapes.append({
+                "type": "path", "path": path,
+                "fillcolor": color, "opacity": 0.85,
+                "line": {"width": 0},
+                "xref": "x", "yref": "y", "layer": "above",
+            })
+            theta += dtheta
+    return shapes
+
+
 def _hex_to_rgba(hex_color: str, alpha: float) -> str:
     h = hex_color.lstrip("#")
     r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
@@ -4617,13 +5231,14 @@ def _roi_cells_in_polygon(polygon_xy: list, src_df=None) -> list:
 
 def _roi_apply_metadata_to_df(df: "pd.DataFrame", rois: list) -> None:
     """Add/update roi_{cls} columns in df based on rois list."""
-    classes = list({r["cls"] for r in rois})
-    for cls in classes:
+    # Reset ALL existing roi_* columns first (handles deletions of last ROI in a class)
+    for col in [c for c in df.columns if c.startswith("roi_")]:
+        df[col] = pd.NA
+    # Ensure columns exist for all current classes
+    for cls in {r["cls"] for r in rois}:
         col = f"roi_{cls}"
         if col not in df.columns:
             df[col] = pd.NA
-        else:
-            df[col] = pd.NA  # reset before re-applying
 
     overlap_warned: set = set()
     for roi in rois:
@@ -5101,10 +5716,12 @@ sidebar = html.Div([
     dcc.Dropdown(
         id="color-by",
         options=[
-            {"label": "Cluster",           "value": "cluster"},
-            {"label": "Gene Expression",   "value": "gene"},
-            {"label": "Cell Type",         "value": "cell_type", "disabled": True},
-            {"label": "Transcript Counts", "value": "transcript_counts"},
+            {"label": "Cluster",                    "value": "cluster"},
+            {"label": "Gene Expression",            "value": "gene"},
+            {"label": "Cell Type (CellTypist)",     "value": "cell_type:celltypist", "disabled": True},
+            {"label": "Cell Type (Seurat)",         "value": "cell_type:seurat",     "disabled": True},
+            {"label": "Cell Type (RCTD)",           "value": "cell_type:rctd",       "disabled": True},
+            {"label": "Transcript Counts",          "value": "transcript_counts"},
             {"label": "Cell Area",         "value": "cell_area"},
             {"label": "Nucleus Area",      "value": "nucleus_area"},
         ],
@@ -5142,9 +5759,9 @@ sidebar = html.Div([
         dcc.Checklist(
             id="boundary-toggles",
             options=[
-                {"label": html.Span(" Cell Boundaries",    style={"color": "#00d4ff", "fontSize": "13px"}),
+                {"label": html.Span(" Xenium Cell Boundaries",    style={"color": "#00d4ff", "fontSize": "13px"}),
                  "value": "cell"},
-                {"label": html.Span(" Nucleus Boundaries", style={"color": "#ff9f43", "fontSize": "13px"}),
+                {"label": html.Span(" Xenium Nuclei Boundaries", style={"color": "#ff9f43", "fontSize": "13px"}),
                  "value": "nucleus"},
                 {"label": html.Span(" Proseg Boundaries",  style={"color": "#2ed573", "fontSize": "13px"}),
                  "value": "proseg", "disabled": True},
@@ -5589,26 +6206,51 @@ app.layout = html.Div([
                            "color": MUTED, "border": f"1px solid {BORDER}", "borderRadius": "4px",
                            "cursor": "pointer", "fontSize": "11px", "marginBottom": "10px"},
                 ),
-                ctrl_label("Cell Radius (µm)"),
-                dcc.Slider(
-                    id="baysor-scale", min=5, max=60, step=1, value=20,
-                    marks={5: "5", 20: "20", 40: "40", 60: "60"},
-                    tooltip={"placement": "bottom", "always_visible": False},
-                ),
-                html.Div(style={"marginBottom": "8px"}),
-                ctrl_label("Min Transcripts / Cell"),
-                dcc.Input(
-                    id="baysor-min-mol", type="number", value=10, min=1, max=500, step=1,
-                    style={
-                        "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
-                        "border": f"1px solid {BORDER}", "borderRadius": "4px",
-                        "padding": "4px 8px", "fontSize": "12px", "marginBottom": "8px",
-                    },
-                ),
+                html.Div([
+                    html.Div([
+                        ctrl_label("Cell Radius (µm, −1 = auto)"),
+                        dcc.Input(
+                            id="baysor-scale", type="number", value=20, min=-1, step=1,
+                            style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                                   "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                   "padding": "4px 8px", "fontSize": "12px", "marginBottom": "8px"},
+                        ),
+                    ], style={"flex": "1"}),
+                    html.Div([
+                        ctrl_label("Scale Std (optional)"),
+                        dcc.Input(
+                            id="baysor-scale-std", type="number", value=None, min=0, step=0.05,
+                            placeholder="e.g. 0.25",
+                            style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                                   "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                   "padding": "4px 8px", "fontSize": "12px", "marginBottom": "8px"},
+                        ),
+                    ], style={"flex": "1"}),
+                ], style={"display": "flex", "gap": "6px"}),
+                html.Div([
+                    html.Div([
+                        ctrl_label("Min Transcripts / Cell"),
+                        dcc.Input(
+                            id="baysor-min-mol", type="number", value=10, min=1, max=500, step=1,
+                            style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                                   "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                   "padding": "4px 8px", "fontSize": "12px", "marginBottom": "8px"},
+                        ),
+                    ], style={"flex": "1"}),
+                    html.Div([
+                        ctrl_label("Iterations"),
+                        dcc.Input(
+                            id="baysor-iters", type="number", value=500, min=1, step=1,
+                            style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                                   "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                   "padding": "4px 8px", "fontSize": "12px", "marginBottom": "8px"},
+                        ),
+                    ], style={"flex": "1"}),
+                ], style={"display": "flex", "gap": "6px"}),
                 dcc.Checklist(
                     id="baysor-use-prior",
                     options=[{"label": html.Span(
-                        " Use Xenium prior segmentation",
+                        " Use Xenium nuclei as prior segmentation",
                         style={"fontSize": "12px", "color": TEXT},
                     ), "value": "yes"}],
                     value=["yes"],
@@ -5807,6 +6449,28 @@ app.layout = html.Div([
                         "boxSizing": "border-box",
                     },
                 ),
+                ctrl_label("Min UMI (cells below excluded)"),
+                dcc.Input(
+                    id="annot-rctd-umi-min",
+                    type="number", value=20, min=1, max=500, step=1,
+                    style={
+                        "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                        "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                        "padding": "4px 8px", "fontSize": "11px", "marginBottom": "4px",
+                        "boxSizing": "border-box",
+                    },
+                ),
+                ctrl_label("Min UMI sigma (UMI_min_sigma)"),
+                dcc.Input(
+                    id="annot-rctd-umi-min-sigma",
+                    type="number", value=100, min=1, max=1000, step=1,
+                    style={
+                        "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                        "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                        "padding": "4px 8px", "fontSize": "11px", "marginBottom": "4px",
+                        "boxSizing": "border-box",
+                    },
+                ),
             ]),
         ]),
         dbc.ModalFooter([
@@ -5976,6 +6640,14 @@ dbc.Modal([
         dbc.Label("Max R cores"),
         dbc.Input(id="split-max-cores", value=4, type="number",
                   min=1, max=32, style={"fontSize":"0.82rem"}),
+        html.Br(),
+        dbc.Label("Min UMI (cells below this are excluded from RCTD)"),
+        dbc.Input(id="split-min-umi", value=10, type="number",
+                  min=1, max=500, style={"fontSize":"0.82rem"}),
+        html.Br(),
+        dbc.Label("Min UMI sigma (UMI_min_sigma)"),
+        dbc.Input(id="split-min-umi-sigma", value=100, type="number",
+                  min=1, max=1000, style={"fontSize":"0.82rem"}),
         html.Br(),
         dbc.Button("▶ Run SPLIT", id="split-run-btn", color="danger",
                    style={"width":"100%"}),
@@ -6147,7 +6819,7 @@ dbc.Modal([
                         config={
                             "displayModeBar": True,
                             "modeBarButtonsToRemove": ["select2d"],
-                            "toImageButtonOptions": {"format": "png", "scale": 2},
+                            "toImageButtonOptions": {"format": "svg", "filename": "xenium_spatial"},
                         },
                         style={"height": "100%"},
                     )
@@ -6160,6 +6832,7 @@ dbc.Modal([
                         config={
                             "displayModeBar": True,
                             "modeBarButtonsToRemove": ["select2d", "lasso2d"],
+                            "toImageButtonOptions": {"format": "svg", "filename": "xenium_umap"},
                         },
                         style={"height": "100%"},
                     )
@@ -6417,7 +7090,8 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
                          baysor_active=baysor_on, proseg_active=proseg_on,
                          use_corrected=(counts_mode == "corrected")),
         make_umap_fig(color_by, method, gene, size, opacity,
-                      baysor_active=baysor_on, proseg_active=proseg_on),
+                      baysor_active=baysor_on, proseg_active=proseg_on,
+                      use_corrected=(counts_mode == "corrected")),
     )
 
 
@@ -6632,11 +7306,13 @@ def toggle_annot_source(source):
     State("annot-label-col",     "value"),
     State("annot-rctd-mode",     "value"),
     State("annot-rctd-cores",    "value"),
-    State("seg-source",          "value"),
+    State("annot-rctd-umi-min",       "value"),
+    State("annot-rctd-umi-min-sigma", "value"),
+    State("seg-source",               "value"),
     prevent_initial_call=True,
 )
 def start_annotation(n_clicks, source, model_name, rds_path, label_col,
-                     rctd_mode, rctd_cores, seg_source):
+                     rctd_mode, rctd_cores, rctd_umi_min, rctd_umi_min_sigma, seg_source):
     """Kick off background annotation thread."""
     seg_source = seg_source or "xenium"
     with _proseg_lock:
@@ -6651,19 +7327,25 @@ def start_annotation(n_clicks, source, model_name, rds_path, label_col,
             return False, msg, False, msg
         expr_override     = alt_res["expr"]
         cell_ids_override = [str(c) for c in alt_res["cells_df"].index]
-        out_tag    = hashlib.md5((alt_res.get("out_dir", "")).encode()).hexdigest()[:8]
-        labels_key = f"labels_proseg_{out_tag}" if pres else f"labels_baysor_{out_tag}"
-        _annot_state["_active_labels_key"] = labels_key
+        pass
     else:
         expr_override     = None
         cell_ids_override = None
-        labels_key        = "labels"
-        _annot_state["_active_labels_key"] = "labels"
+
+    method     = source if source in _ANNOT_METHODS else "celltypist"
+    labels_key = _labels_key_for_method(method, alt_res)
 
     with _annot_lock:
         if _annot_state["status"] == "running":
             return False, "Already running…", True, "Already running…"
         _annot_state.update({"status": "running", "message": "Starting…", labels_key: None})
+
+    # Ensure rpy2 conversion rules are set in this callback thread BEFORE copy_context()
+    # so the spawned thread's context copy includes them
+    if source in ("seurat", "rctd"):
+        import rpy2.robjects.conversion as _rconv
+        import rpy2.robjects as _ro_mod
+        _rconv.set_conversion(_ro_mod.default_converter)
 
     if source == "seurat":
         ctx = contextvars.copy_context()
@@ -6684,6 +7366,8 @@ def start_annotation(n_clicks, source, model_name, rds_path, label_col,
                 rctd_mode or "full", int(rctd_cores or 4),
                 labels_key=labels_key, expr_override=expr_override,
                 cell_ids_override=cell_ids_override,
+                umi_min=int(rctd_umi_min or 20),
+                umi_min_sigma=int(rctd_umi_min_sigma or 100),
             ),
             daemon=True,
         ).start()
@@ -6720,17 +7404,19 @@ def poll_annotation(_, current_options, done_version, modal_open):
         done    = (status == "done")
         error   = (status == "error")
 
-    # Cell Type is available if any annotation labels exist (check all known keys)
+    # Enable each cell_type:method option if that method has any labels
     with _annot_lock:
-        any_labels = any(
-            v is not None
-            for k, v in _annot_state.items()
-            if k.startswith("labels")
-        )
+        methods_with_labels = {
+            m for m in _ANNOT_METHODS
+            if any(k.startswith(f"labels_{m}") and v is not None
+                   for k, v in _annot_state.items())
+        }
     options = []
     for opt in current_options:
-        if opt["value"] == "cell_type":
-            options.append({**opt, "disabled": not any_labels})
+        val = opt["value"]
+        if val.startswith("cell_type:"):
+            m = val.split(":")[1]
+            options.append({**opt, "disabled": m not in methods_with_labels})
         else:
             options.append(opt)
 
@@ -6926,7 +7612,9 @@ def switch_reseg_tab(algo):
     State("baysor-ymin", "value"),
     State("baysor-ymax", "value"),
     State("baysor-scale", "value"),
+    State("baysor-scale-std", "value"),
     State("baysor-min-mol", "value"),
+    State("baysor-iters", "value"),
     State("baysor-use-prior", "value"),
     State("baysor-prior-conf", "value"),
     # Proseg states
@@ -6939,7 +7627,7 @@ def switch_reseg_tab(algo):
     prevent_initial_call=True,
 )
 def run_reseg_modal(n_clicks, algo, patches_confirmed,
-                    bxmin, bxmax, bymin, bymax, bscale, bmin_mol, buse_prior, bprior_conf,
+                    bxmin, bxmax, bymin, bymax, bscale, bscale_std, bmin_mol, biters, buse_prior, bprior_conf,
                     pxmin, pxmax, pymin, pymax, pvoxel, pthreads):
     if not patches_confirmed:
         return "✗ Please confirm patches in Step 1 before running segmentation.", no_update, no_update, no_update
@@ -6948,8 +7636,10 @@ def run_reseg_modal(n_clicks, algo, patches_confirmed,
             if _baysor_state["status"] == "running":
                 return "Already running…", True, False, no_update
             _baysor_state.update({"status": "running", "message": "Starting…", "result": None})
-        scale      = float(bscale      or 20)
+        scale      = float(bscale) if bscale is not None else 20.0
+        scale_std  = float(bscale_std) if bscale_std is not None else None
         min_mol    = int(bmin_mol      or 10)
+        iters      = int(biters        or 500)
         prior_conf = float(bprior_conf or 0.5)
         use_prior_bool = "yes" in (buse_prior or [])
         region = {k: v for k, v in
@@ -6958,7 +7648,7 @@ def run_reseg_modal(n_clicks, algo, patches_confirmed,
         threading.Thread(
             target=_run_baysor,
             args=(scale, min_mol, use_prior_bool, prior_conf),
-            kwargs=region,
+            kwargs=dict(**region, scale_std=scale_std, iters=iters),
             daemon=True,
         ).start()
         return "Baysor starting…", False, False, True
@@ -7005,13 +7695,16 @@ def update_reseg_status(baysor_done, proseg_done):
     Output("umap-reseg-status",  "children"),
     Output("umap-reseg-btn",     "disabled"),
     Input("umap-reseg-btn",      "n_clicks"),
+    State("counts-mode-store",   "data"),
     prevent_initial_call=True,
 )
-def start_reseg_umap(_):
+def start_reseg_umap(_, counts_mode):
     with _umap_reseg_lock:
         if _umap_reseg_state["status"] == "running":
             return False, "Already running…", True
-        _umap_reseg_state.update({"status": "running", "message": "Starting…", "result": None})
+        _umap_reseg_state.update({"status": "running", "message": "Starting…", "result": None,
+                                  "_xenium_bumped": False,
+                                  "counts_mode": counts_mode or "original"})
     threading.Thread(target=_run_reseg_umap, daemon=True).start()
     return False, "Starting UMAP…", True
 
@@ -7020,18 +7713,25 @@ def start_reseg_umap(_):
     Output("umap-reseg-status",  "children",  allow_duplicate=True),
     Output("umap-reseg-poll",    "disabled",  allow_duplicate=True),
     Output("umap-reseg-btn",     "disabled",  allow_duplicate=True),
+    Output("dataset-version",    "data",      allow_duplicate=True),
     Input("umap-reseg-poll",     "n_intervals"),
+    State("dataset-version",     "data"),
     prevent_initial_call=True,
 )
-def poll_reseg_umap(_):
+def poll_reseg_umap(_, version):
     with _umap_reseg_lock:
-        status  = _umap_reseg_state["status"]
-        message = _umap_reseg_state["message"]
+        status   = _umap_reseg_state["status"]
+        message  = _umap_reseg_state["message"]
+        bumped   = _umap_reseg_state.get("_xenium_bumped", True)
     if status == "done":
-        return f"✓ {message}", True, False
+        if not bumped:
+            with _umap_reseg_lock:
+                _umap_reseg_state["_xenium_bumped"] = True
+            return f"✓ {message}", True, False, (version or 0) + 1
+        return f"✓ {message}", True, False, no_update
     if status == "error":
-        return f"✗ {message}", True, False
-    return message, False, True
+        return f"✗ {message}", True, False, no_update
+    return message, False, True, no_update
 
 
 # ─── Boundary overlay options: enable Proseg/Baysor when results are ready ────
@@ -7860,7 +8560,7 @@ def poll_save_sdata(_, modal_open):
 def open_split_modal(open_clicks, close_clicks, is_open):
     if not open_clicks and not close_clicks:
         return is_open
-    triggered = ctx.triggered_id
+    triggered = callback_context.triggered_id
     if triggered == "split-modal-open-btn" and open_clicks:
         return True
     return False
@@ -7874,10 +8574,12 @@ def open_split_modal(open_clicks, close_clicks, is_open):
     [State("split-rds-path", "value"),
      State("split-label-col", "value"),
      State("split-max-cores", "value"),
+     State("split-min-umi", "value"),
+     State("split-min-umi-sigma", "value"),
      State("seg-source", "value")],
     prevent_initial_call=True,
 )
-def run_split(n_clicks, rds_path, label_col, max_cores, seg_source):
+def run_split(n_clicks, rds_path, label_col, max_cores, min_umi, min_umi_sigma, seg_source):
     if not n_clicks:
         return no_update, True, False
     if not rds_path or not os.path.isfile(rds_path):
@@ -7890,11 +8592,13 @@ def run_split(n_clicks, rds_path, label_col, max_cores, seg_source):
         _split_state["result"]  = None
     label_col  = (label_col or "Names").strip()
     max_cores  = int(max_cores or 4)
+    min_umi       = int(min_umi or 10)
+    min_umi_sigma = int(min_umi_sigma or 100)
     import contextvars
     _ctx = contextvars.copy_context()
     threading.Thread(
         target=_ctx.run,
-        args=(_run_split_correction, rds_path, label_col, max_cores, seg_source),
+        args=(_run_split_correction, rds_path, label_col, max_cores, seg_source, min_umi, min_umi_sigma),
         daemon=True,
     ).start()
     return "Starting SPLIT correction…", False, True
@@ -7935,7 +8639,9 @@ def poll_split(_, done_version, ds_version):
     prevent_initial_call=True,
 )
 def sync_counts_mode(value):
-    return value or "original"
+    mode = value or "original"
+    print(f"  Now using {'SPLIT corrected' if mode == 'corrected' else 'original'} counts", flush=True)
+    return mode
 
 
 @app.callback(
@@ -8071,16 +8777,37 @@ def save_roi(n_clicks, name, cls, polygon_xy, roi_done, seg_source):
 
 @app.callback(
     Output("roi-save-modal", "is_open", allow_duplicate=True),
+    Output("roi-done", "data", allow_duplicate=True),
     Input("roi-save-cancel-btn", "n_clicks"),
+    State("roi-done", "data"),
     prevent_initial_call=True,
 )
-def cancel_roi_save(n_clicks):
-    """CB-3: Cancel save modal."""
+def cancel_roi_save(n_clicks, roi_done):
+    """CB-3: Cancel save modal — clears pending hull and bumps roi-done to re-render figure."""
     if not n_clicks:
         raise dash.exceptions.PreventUpdate
     with _roi_lock:
         _roi_state["pending_hull"] = None
-    return False
+    return False, (roi_done or 0) + 1
+
+
+@app.callback(
+    Output("roi-done", "data", allow_duplicate=True),
+    Input("spatial-plot", "relayoutData"),
+    State("roi-done", "data"),
+    prevent_initial_call=True,
+)
+def clear_lasso_on_tool_switch(relayout_data, roi_done):
+    """Clear pending lasso selection when user switches away from lasso/select tool."""
+    if not relayout_data or "dragmode" not in relayout_data:
+        raise dash.exceptions.PreventUpdate
+    if relayout_data["dragmode"] in ("lasso", "select"):
+        raise dash.exceptions.PreventUpdate
+    with _roi_lock:
+        if _roi_state.get("pending_hull") is None:
+            raise dash.exceptions.PreventUpdate
+        _roi_state["pending_hull"] = None
+    return (roi_done or 0) + 1
 
 
 @app.callback(
@@ -8256,6 +8983,31 @@ def apply_roi_operation(n_clicks, idx_a, op, idx_b, result_name, result_cls, roi
         return "", (roi_done or 0) + 1
     except Exception as e:
         return f"Error: {e}", roi_done
+
+
+@app.callback(
+    Output("color-by", "options", allow_duplicate=True),
+    Input("startup-trigger", "n_intervals"),
+    State("color-by",        "options"),
+    prevent_initial_call=True,
+)
+def init_colorby_annot_options(_, current_options):
+    """On startup, enable cell-type color-by options for any pre-loaded annotations."""
+    with _annot_lock:
+        methods_with_labels = {
+            m for m in _ANNOT_METHODS
+            if any(k.startswith(f"labels_{m}") and v is not None
+                   for k, v in _annot_state.items())
+        }
+    options = []
+    for opt in (current_options or []):
+        val = opt["value"]
+        if val.startswith("cell_type:"):
+            m = val.split(":")[1]
+            options.append({**opt, "disabled": m not in methods_with_labels})
+        else:
+            options.append(opt)
+    return options
 
 
 @app.callback(
