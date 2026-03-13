@@ -702,7 +702,7 @@ def _get_patch_bounds_um():
 
 
 def _baysor_run_single(tx_df, patch_dir, baysor_bin, scale, min_mol, use_prior, prior_conf,
-                       scale_std=None, iters=500):
+                       scale_std=None,  n_clusters=10):
     """Run Baysor on tx_df, write outputs to patch_dir.
     Returns (cells_df, cell_bounds_dict, seg_df) or raises on failure.
     cells_df is indexed by string cell_id.
@@ -723,7 +723,7 @@ def _baysor_run_single(tx_df, patch_dir, baysor_bin, scale, min_mol, use_prior, 
         cmd += ["--scale-std", str(scale_std)]
     cmd += [
         "--min-molecules-per-cell", str(min_mol),
-        "--iters", str(iters),
+        "--n-clusters", str(n_clusters),
         "--polygon-format", "FeatureCollection",
         "-x", "x_location",
         "-y", "y_location",
@@ -1328,7 +1328,7 @@ def _load_cached_proseg(out_dir: str) -> None:
 
 def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
                 x_min=None, x_max=None, y_min=None, y_max=None,
-                scale_std=None, iters=500) -> None:
+                scale_std=None, n_clusters=10) -> None:
     """Background thread: run Baysor resegmentation, using sopa patches if available."""
 
     def _set(status, message, result=None):
@@ -1361,7 +1361,7 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
             return
         print(f"  Using baysor: {baysor_bin}", flush=True)
 
-        _param_str = (f"s{scale}_ss{scale_std}_m{min_mol}_i{iters}_p{int(use_prior)}"
+        _param_str = (f"s{scale}_ss{scale_std}_m{min_mol}_i{n_clusters}_p{int(use_prior)}"
                       f"{'_c'+str(prior_conf) if use_prior else ''}"
                       f"_x{x_min or 'A'}-{x_max or 'A'}_y{y_min or 'A'}-{y_max or 'A'}")
         _param_tag = hashlib.md5(_param_str.encode()).hexdigest()[:8]
@@ -1448,7 +1448,7 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
                 try:
                     cells_i, bounds_i, seg_i = _baysor_run_single(
                         tx_patch, patch_dir, baysor_bin, scale, min_mol, use_prior, prior_conf,
-                        scale_std=scale_std, iters=iters
+                        scale_std=scale_std, n_clusters=n_clusters
                     )
                 except Exception as pe:
                     print(f"  Baysor: patch {pi + 1} failed: {pe}", flush=True)
@@ -1493,7 +1493,7 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
             try:
                 cells_df, cell_bounds, seg_merged = _baysor_run_single(
                     tx_all, out_dir, baysor_bin, scale, min_mol, _up, prior_conf,
-                    scale_std=scale_std, iters=iters
+                    scale_std=scale_std, n_clusters=n_clusters
                 )
             except Exception as e:
                 _set("error", str(e)[:300])
@@ -1507,7 +1507,7 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
         import json as _json
         _params_out = {
             "tool": "baysor", "scale": scale, "scale_std": scale_std,
-            "min_mol": min_mol, "iters": iters,
+            "min_mol": min_mol, "n_clusters": n_clusters,
             "use_prior": use_prior, "prior_conf": prior_conf,
             "x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max,
             "n_cells": n_cells, "param_tag": _param_tag,
@@ -6238,9 +6238,9 @@ app.layout = html.Div([
                         ),
                     ], style={"flex": "1"}),
                     html.Div([
-                        ctrl_label("Iterations"),
+                        ctrl_label("Number of cell types"),
                         dcc.Input(
-                            id="baysor-iters", type="number", value=500, min=1, step=1,
+                            id="baysor-n_clusters", type="number", value=10, min=1, step=1,
                             style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
                                    "border": f"1px solid {BORDER}", "borderRadius": "4px",
                                    "padding": "4px 8px", "fontSize": "12px", "marginBottom": "8px"},
@@ -7614,7 +7614,7 @@ def switch_reseg_tab(algo):
     State("baysor-scale", "value"),
     State("baysor-scale-std", "value"),
     State("baysor-min-mol", "value"),
-    State("baysor-iters", "value"),
+    State("baysor-n_clusters", "value"),
     State("baysor-use-prior", "value"),
     State("baysor-prior-conf", "value"),
     # Proseg states
@@ -7627,7 +7627,7 @@ def switch_reseg_tab(algo):
     prevent_initial_call=True,
 )
 def run_reseg_modal(n_clicks, algo, patches_confirmed,
-                    bxmin, bxmax, bymin, bymax, bscale, bscale_std, bmin_mol, biters, buse_prior, bprior_conf,
+                    bxmin, bxmax, bymin, bymax, bscale, bscale_std, bmin_mol, bn_clusters, buse_prior, bprior_conf,
                     pxmin, pxmax, pymin, pymax, pvoxel, pthreads):
     if not patches_confirmed:
         return "✗ Please confirm patches in Step 1 before running segmentation.", no_update, no_update, no_update
@@ -7639,7 +7639,7 @@ def run_reseg_modal(n_clicks, algo, patches_confirmed,
         scale      = float(bscale) if bscale is not None else 20.0
         scale_std  = float(bscale_std) if bscale_std is not None else None
         min_mol    = int(bmin_mol      or 10)
-        iters      = int(biters        or 500)
+        n_clusters      = int(bn_clusters        or 10)
         prior_conf = float(bprior_conf or 0.5)
         use_prior_bool = "yes" in (buse_prior or [])
         region = {k: v for k, v in
@@ -7648,7 +7648,7 @@ def run_reseg_modal(n_clicks, algo, patches_confirmed,
         threading.Thread(
             target=_run_baysor,
             args=(scale, min_mol, use_prior_bool, prior_conf),
-            kwargs=dict(**region, scale_std=scale_std, iters=iters),
+            kwargs=dict(**region, scale_std=scale_std, n_clusters=n_clusters),
             daemon=True,
         ).start()
         return "Baysor starting…", False, False, True
