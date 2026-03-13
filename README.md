@@ -1,4 +1,4 @@
-# Xenium Explorer
+# Xenium Visualizer
 
 An interactive web application for visualizing and analyzing 10x Genomics Xenium spatial transcriptomics data. Supports cell clustering, gene expression, morphology overlays, cell type annotation, gene imputation, resegmentation, and ambient RNA correction (SPLIT) — all in a browser-based interface.
 
