@@ -1,0 +1,35 @@
+# Xenium Explorer — pip requirements
+# Python 3.11 recommended.
+# Install: pip install -r requirements.txt
+#
+# For a fully self-contained environment (including R/rpy2) prefer the
+# conda environment instead:  conda env create -f environment.yml
+
+# ── Web framework ────────────────────────────────────────────────────────────
+dash>=4.0
+dash-bootstrap-components>=2.0
+plotly>=6.0
+
+# ── Core data / science ──────────────────────────────────────────────────────
+numpy>=2.0
+pandas>=2.2
+scipy>=1.13
+scikit-learn>=1.5
+h5py>=3.10
+
+# ── Image / file I/O ─────────────────────────────────────────────────────────
+Pillow>=10.0
+tifffile>=2024.1
+zarr>=3.0          # zarr v3 API required; v2 is NOT compatible
+
+# ── AnnData / SpatialData ────────────────────────────────────────────────────
+anndata>=0.10
+geopandas>=1.0
+shapely>=2.0
+spatialdata>=0.7
+sopa>=2.2
+
+# ── Optional features ────────────────────────────────────────────────────────
+celltypist>=1.6    # CellTypist cell-type annotation
+umap-learn>=0.5    # UMAP recomputation on reseg cells
+rpy2>=3.5          # Seurat / RCTD / SpaGE / SPLIT (requires R >= 4.3 on PATH)

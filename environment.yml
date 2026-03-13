@@ -1,0 +1,69 @@
+name: xenium-explorer
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+
+dependencies:
+  - python=3.11
+  - pip
+
+  # Core scientific stack (conda-forge builds link against optimized BLAS/LAPACK)
+  - numpy>=2.0
+  - pandas>=2.2
+  - scipy>=1.13
+  - scikit-learn>=1.5
+  - h5py>=3.10
+
+  # Image / file I/O
+  - pillow>=10.0
+  - tifffile>=2024.1
+  - zarr>=3.0          # zarr v3 API; v2 is NOT compatible
+
+  # Geospatial (required for zarr generation and boundary overlays)
+  - geopandas>=1.0
+  - shapely>=2.0
+
+  # R + rpy2 (conda-forge build handles R linkage automatically)
+  - r-base>=4.3
+  - rpy2>=3.5
+
+  # UMAP recomputation
+  - umap-learn>=0.5
+
+  # Resegmentation tools (bioconda)
+  - rust-proseg        # proseg CLI
+
+  - pip:
+      # Dash web framework (v4+ not yet on conda-forge)
+      - dash>=4.0
+      - dash-bootstrap-components>=2.0
+      - plotly>=6.0
+
+      # AnnData / SpatialData ecosystem (pip builds are more stable)
+      - anndata>=0.10
+      - spatialdata>=0.7
+      - sopa>=2.2
+
+      # Cell type annotation
+      - celltypist>=1.6
+
+# ─── R packages (install manually after activating the environment) ─────────
+#
+# Start R:  Rscript -e "..."
+#
+#   install.packages("BiocManager")
+#   BiocManager::install("SeuratObject")
+#   BiocManager::install("Matrix")
+#   install.packages("devtools")
+#   devtools::install_github("dmcable/spacexr")   # RCTD + SPLIT dependency
+#   remotes::install_github("bdsc-tds/SPLIT")      # ambient RNA correction
+#
+# ─── External CLI tools ─────────────────────────────────────────────────────
+#
+# Baysor (Julia):
+#   julia -e 'using Pkg; Pkg.add("Baysor")'
+#   # Binary will be at ~/.julia/bin/baysor
+#
+# Proseg is installed above via bioconda (rust-proseg).
+# If bioconda unavailable: cargo install proseg

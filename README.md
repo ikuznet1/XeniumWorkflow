@@ -2,6 +2,45 @@
 
 An interactive web application for visualizing and analyzing 10x Genomics Xenium spatial transcriptomics data. Supports cell clustering, gene expression, morphology overlays, cell type annotation, gene imputation, resegmentation, and ambient RNA correction (SPLIT) — all in a browser-based interface.
 
+## Installation
+
+### Option A — Conda (recommended)
+
+Handles Python, R, and rpy2 linkage in one step:
+
+```bash
+conda env create -f environment.yml
+conda activate xenium-explorer
+```
+
+Then install R packages (one-time, inside the activated environment):
+
+```bash
+Rscript -e "install.packages('BiocManager')"
+Rscript -e "BiocManager::install(c('SeuratObject', 'Matrix'))"
+Rscript -e "devtools::install_github('dmcable/spacexr')"   # RCTD + SPLIT
+Rscript -e "remotes::install_github('bdsc-tds/SPLIT')"     # ambient RNA correction
+```
+
+And Baysor (Julia, optional — only needed for Baysor resegmentation):
+
+```bash
+julia -e 'using Pkg; Pkg.add("Baysor")'
+# binary installed to ~/.julia/bin/baysor
+```
+
+### Option B — pip only
+
+Requires Python 3.11 and (for rpy2 features) R ≥ 4.3 already on PATH:
+
+```bash
+pip install -r requirements.txt
+```
+
+R packages are the same as Option A above.
+
+---
+
 ## Usage
 
 ```bash
@@ -10,6 +49,11 @@ python xenium_explorer.py          # auto-detects output-* directory
 ```
 
 Opens at **http://localhost:8050**.
+
+To stop the server:
+```bash
+lsof -ti:8050 | xargs kill -9
+```
 
 ## Input Data
 
@@ -236,6 +280,7 @@ Click **▶ Run SPLIT** to start. Progress is streamed to the server log. When c
 **Active Counts toggle behavior:**
 - **Original** — all expression lookups use the raw Xenium/Baysor/Proseg count matrix; `[imp]` genes from SpaGE are shown
 - **SPLIT Corrected** — expression lookups use the corrected matrix; `[corr+imp]` genes (imputed on corrected counts via SpaGE) are shown instead
+- The "SPLIT Corrected" option is greyed out (disabled) whenever no corrected matrix is available — either in memory or in the active zarr's `X_corrected` layer. It re-enables automatically once the corrected data is loaded (e.g., after selecting a Baysor/Proseg run that has a previously-run SPLIT result stored in zarr)
 - Switching segmentation sources resets the toggle to "Original" if no corrected data exists for that source
 
 **SpaGE on corrected counts:** Run SpaGE while "SPLIT Corrected" is active to impute genes using the corrected expression matrix. Resulting genes are marked `[corr+imp]` and stored in `adata.uns["split_corrected_imputed_genes"]` in the zarr.
@@ -330,41 +375,31 @@ All caches are stored in `~/.xenium_explorer_cache/` and are keyed per dataset.
 
 ## Dependencies
 
-**Python:**
-```
-dash
-dash-bootstrap-components
-plotly
-pandas
-numpy
-scipy
-h5py
-Pillow
-tifffile
-zarr
-scikit-learn
-```
+See `environment.yml` (conda) or `requirements.txt` (pip) for the full pinned dependency list.
 
-**Optional (for specific features):**
-```
-anndata          # Required for spatialdata_xenium.zarr generation and SpaGE write-back
-geopandas        # Required for spatialdata_xenium.zarr generation (cell boundary shapes)
-shapely          # Required for spatialdata_xenium.zarr generation
-celltypist       # CellTypist annotation
-rpy2             # Seurat RDS integration (SpaGE + annotation + RCTD)
-spatialdata      # Required for zarr generation and sopa integration
-sopa             # Patch-based resegmentation workflow
-umap-learn       # UMAP re-computation for reseg cells
-```
+**Summary:**
+
+| Package | Purpose |
+|---------|---------|
+| `dash`, `dash-bootstrap-components`, `plotly` | Web framework and plots |
+| `numpy`, `pandas`, `scipy`, `scikit-learn` | Core data processing |
+| `h5py` | Reading `cell_feature_matrix.h5` |
+| `Pillow`, `tifffile` | OME-TIFF morphology image loading |
+| `zarr>=3.0` | SpatialData zarr store (v3 API required) |
+| `anndata`, `geopandas`, `shapely` | SpatialData zarr generation |
+| `spatialdata`, `sopa` | Patch-based resegmentation workflow |
+| `celltypist` | CellTypist cell-type annotation |
+| `umap-learn` | UMAP recomputation on reseg cells |
+| `rpy2` + R ≥ 4.3 | Seurat label transfer, SpaGE, RCTD, SPLIT |
 
 **R packages** (via rpy2):
-```r
-SeuratObject
-Matrix
-spacexr          # RCTD annotation + SPLIT (devtools::install_github('dmcable/spacexr'))
-SPLIT            # Ambient RNA correction (remotes::install_github('bdsc-tds/SPLIT'))
-```
 
-**External tools:**
-- [Baysor](https://github.com/kharchenkolab/Baysor) — Julia-based resegmentation; expects `baysor` on PATH or at `~/.julia/bin/baysor`
-- [Proseg](https://github.com/dcjones/proseg) — Rust-based probabilistic resegmentation; install via `conda install bioconda::rust-proseg` or `cargo install proseg`
+| Package | Source |
+|---------|--------|
+| `SeuratObject`, `Matrix` | CRAN / Bioconductor |
+| `spacexr` | `devtools::install_github('dmcable/spacexr')` |
+| `SPLIT` | `remotes::install_github('bdsc-tds/SPLIT')` |
+
+**External CLI tools:**
+- [Baysor](https://github.com/kharchenkolab/Baysor) — Julia-based resegmentation; binary at `~/.julia/bin/baysor`
+- [Proseg](https://github.com/dcjones/proseg) — Rust-based probabilistic resegmentation; `conda install bioconda::rust-proseg` or `cargo install proseg`

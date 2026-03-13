@@ -915,6 +915,23 @@ def _load_zarr_obs_into_df(zarr_path: str, cells_df: pd.DataFrame) -> None:
         _obs = _zgrp["tables"]["table"]["obs"]
         _idx_key = _obs.attrs.get("_index", "_index")
         _zarr_idx = [str(v) for v in _obs[_idx_key][:]] if _idx_key in _obs else None
+        # Strip patch prefix (e.g. "p0_") from zarr IDs if cells_df lacks it.
+        # This happens when the zarr was built during a live patch run but the CSV
+        # stores raw Baysor IDs without the patch prefix.
+        if _zarr_idx is not None and len(_zarr_idx) > 0:
+            import re as _re
+            _stripped = [_re.sub(r'^p\d+_', '', _id) for _id in _zarr_idx]
+            _n = min(30, len(_zarr_idx))
+            if (len(set(_zarr_idx[:_n]) & set(cells_df.index[:_n].tolist())) == 0
+                    and len(set(_stripped[:_n]) & set(cells_df.index[:_n].tolist())) > 0):
+                print(f"  Stripping patch prefix from zarr obs index ({_zarr_idx[0]!r} → {_stripped[0]!r})", flush=True)
+                _zarr_idx = _stripped
+            elif len(set(_zarr_idx[:_n]) & set(cells_df.index[:_n].tolist())) == 0:
+                # Genuinely different run — skip, let caller recompute
+                print(f"  Warning: zarr obs index mismatch "
+                      f"({_zarr_idx[0]!r} vs {cells_df.index[0]!r}). "
+                      f"Will recompute cluster/UMAP.", flush=True)
+                return
         for _col in _obs.keys():
             if _col in {"__categories", "_index"} or _col == _idx_key:
                 continue
@@ -970,6 +987,25 @@ def _update_reseg_zarr_obs(zarr_path: str, cells_df: pd.DataFrame) -> None:
             _existing_idx = [str(v) for v in _obs_grp[_idx_key][:]]
         else:
             _existing_idx = None
+        # Detect stale zarr index (different run): update zarr index to match cells_df.
+        # First strip any patch prefix (p0_, p1_, ...) from existing index before comparing.
+        if _existing_idx is not None and len(_existing_idx) > 0:
+            import re as _re2
+            _stripped_existing = [_re2.sub(r'^p\d+_', '', _id) for _id in _existing_idx]
+            _n = min(30, len(_existing_idx))
+            _df_sample = set(cells_df.index[:_n].astype(str).tolist())
+            _raw_overlap      = len(set(_existing_idx[:_n]) & _df_sample)
+            _stripped_overlap = len(set(_stripped_existing[:_n]) & _df_sample)
+            _overlap = _raw_overlap or _stripped_overlap
+            if _overlap == 0:
+                print(f"  Updating stale zarr obs index to match current cells_df", flush=True)
+                _new_idx = np.array(list(cells_df.index.astype(str)), dtype=str)
+                _obs_grp.create_dataset(_idx_key, data=_new_idx, shape=_new_idx.shape,
+                                        dtype=_new_idx.dtype, overwrite=True)
+                _existing_idx = list(cells_df.index.astype(str))
+            elif _raw_overlap == 0 and _stripped_overlap > 0:
+                # Zarr uses p{N}_ patch prefix but cells_df uses bare IDs — strip for reindex
+                _existing_idx = _stripped_existing
         try:
             from anndata.io import write_elem as _write_elem
         except ImportError:
@@ -1128,9 +1164,13 @@ def _load_cached_baysor(out_dir: str) -> None:
             # Zarr exists — load obs columns (cluster, UMAP) from it directly
             # to avoid recomputing and the 'target path in use' write-back error.
             _load_zarr_obs_into_df(zarr_path, cells_df)
+            _zarr_obs_cols = [c for c in cells_df.columns
+                              if c not in ("x_centroid", "y_centroid", "transcript_counts")]
+            print(f"  Baysor cache: loaded obs cols from zarr: {_zarr_obs_cols}", flush=True)
 
-            # If cluster/UMAP still missing (very old cache), compute and write back
-            if "umap_1" not in cells_df.columns and expr_mat is not None:
+            # If cluster/UMAP still missing (very old cache or ID mismatch), compute and write back
+            _has_cluster = any(c.startswith("cluster") for c in cells_df.columns)
+            if ("umap_1" not in cells_df.columns or not _has_cluster) and expr_mat is not None:
                 _set("running", f"Computing UMAP and clusters for {n_cells:,} cells (one-time migration)…")
                 _compute_reseg_clusters_umap(cells_df, expr_mat,
                                              progress_fn=lambda msg: _set("running", msg))
@@ -1279,9 +1319,13 @@ def _load_cached_proseg(out_dir: str) -> None:
         else:
             # Zarr exists — load obs columns (cluster, UMAP) from it directly
             _load_zarr_obs_into_df(zarr_path, cells_df)
+            _zarr_obs_cols_p = [c for c in cells_df.columns
+                                if c not in ("x_centroid", "y_centroid", "transcript_counts")]
+            print(f"  Proseg cache: loaded obs cols from zarr: {_zarr_obs_cols_p}", flush=True)
 
-            # If cluster/UMAP still missing (very old cache), compute and write back
-            if "umap_1" not in cells_df.columns and expr_mat is not None:
+            # If cluster/UMAP still missing (very old cache or ID mismatch), compute and write back
+            _has_cluster_p = any(c.startswith("cluster") for c in cells_df.columns)
+            if ("umap_1" not in cells_df.columns or not _has_cluster_p) and expr_mat is not None:
                 _set("running", f"Computing UMAP and clusters for {n_cells:,} cells (one-time migration)…")
                 _compute_reseg_clusters_umap(cells_df, expr_mat,
                                              progress_fn=lambda msg: _set("running", msg))
@@ -1328,7 +1372,7 @@ def _load_cached_proseg(out_dir: str) -> None:
 
 def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
                 x_min=None, x_max=None, y_min=None, y_max=None,
-                scale_std=None, n_clusters=10) -> None:
+                scale_std=None, n_clusters=10, use_patches=True) -> None:
     """Background thread: run Baysor resegmentation, using sopa patches if available."""
 
     def _set(status, message, result=None):
@@ -1408,7 +1452,7 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
         if y_max is not None: tx_all = tx_all[tx_all["y_location"] <= y_max]
 
         # ── Check for sopa patches ────────────────────────────────────────
-        patch_bounds = _get_patch_bounds_um()
+        patch_bounds = _get_patch_bounds_um() if use_patches else None
         # Intersect patches with user region filter
         if patch_bounds and any(v is not None for v in [x_min, x_max, y_min, y_max]):
             filtered = []
@@ -1906,7 +1950,15 @@ def _split_write_zarr(sdata_path: str, corrected_mat, cells_df: pd.DataFrame,
                 id_to_row = {str(cid): i for i, cid in enumerate(corrected_cell_ids)}
             else:
                 id_to_row = {str(cid): i for i, cid in enumerate(cells_df.index)}
-            row_indices = [id_to_row.get(cid, -1) for cid in zarr_ids]
+            # Strip patch prefix (e.g. "p0_") from zarr IDs — live patch runs add this
+            # prefix but corrected_cell_ids come from R colnames which use bare Baysor IDs.
+            import re as _re
+            _stripped_zarr_ids = [_re.sub(r'^p\d+_', '', cid) for cid in zarr_ids]
+            _lookup_ids = _stripped_zarr_ids if (
+                len(set(_stripped_zarr_ids[:30]) & set(id_to_row)) >
+                len(set(zarr_ids[:30]) & set(id_to_row))
+            ) else zarr_ids
+            row_indices = [id_to_row.get(cid, -1) for cid in _lookup_ids]
             mat         = corrected_mat if sp_.issparse(corrected_mat) \
                           else sp_.csr_matrix(corrected_mat)
             # Build aligned matrix; -1 means cell was dropped by RCTD → zero row
@@ -2139,11 +2191,10 @@ colnames(._split_counts_mat) <- ._split_colnames
 ._split_counts_mat <- as(._split_counts_mat, 'dgCMatrix')
 """)
 
-        coords_df = cells_df[["x_centroid", "y_centroid"]].copy()
-        coords_df.columns = ["x", "y"]
-        coords_r = pandas2ri.py2rpy(coords_df)
-        ro.r.assign("._split_coords", coords_r)
+        ro.r.assign("._split_x", ro.FloatVector(cells_df["x_centroid"].astype(float).tolist()))
+        ro.r.assign("._split_y", ro.FloatVector(cells_df["y_centroid"].astype(float).tolist()))
         ro.r("""
+._split_coords <- data.frame(x=._split_x, y=._split_y)
 rownames(._split_coords) <- colnames(._split_counts_mat)
 ._split_numi <- colSums(._split_counts_mat)
 ._split_spatialrna <- spacexr::SpatialRNA(
@@ -2541,13 +2592,19 @@ def _annot_autoload() -> None:
     loaded = 0
     for fpath in label_files:
         name = os.path.basename(fpath)
-        if name.startswith("rctd_"):
-            method = "rctd"
+        # Extract labels_key embedded in filename: strip "_{tag}.parquet" then find "_labels_"
+        name_stem = name[:-(len(tag) + 1 + len(".parquet"))]
+        lk_pos = name_stem.rfind("_labels_")
+        if lk_pos >= 0:
+            labels_key = name_stem[lk_pos + 1:]  # e.g. "labels_seurat" or "labels_seurat_baysor_abc12345"
+        elif name.startswith("rctd_"):
+            labels_key = "labels_rctd"
         elif name.startswith("seurat_"):
-            method = "seurat"
+            labels_key = "labels_seurat"
         else:
-            method = "celltypist"
-        labels_key = f"labels_{method}"
+            labels_key = "labels_celltypist"
+        # Derive method name from labels_key for display purposes
+        method = labels_key.split("_")[1] if "_" in labels_key else labels_key
         try:
             cached       = pd.read_parquet(fpath)
             labels       = cached["label"].astype(str)
@@ -4674,6 +4731,12 @@ def make_umap_fig(color_by, method, gene, size, opacity,
         bres = _baysor_state["result"] if baysor_active and not pres and _baysor_state["result"] else None
     alt_res = pres or bres
 
+    # Fall back to UMAP columns embedded in cells_df (loaded from zarr) when no explicit reseg UMAP
+    if alt_res is not None and reseg_umap is None:
+        _bdf = alt_res["cells_df"]
+        if "umap_1" in _bdf.columns and _bdf["umap_1"].notna().any():
+            reseg_umap = _bdf.dropna(subset=["umap_1", "umap_2"])
+
     if alt_res is not None and reseg_umap is not None:
         # Reseg UMAP: color by whatever is available
         udf       = reseg_umap
@@ -4716,7 +4779,28 @@ def make_umap_fig(color_by, method, gene, size, opacity,
             else:
                 color_by = "transcript_counts"
 
-        if not color_by.startswith("cell_type:") and color_by != "gene":
+        if color_by == "cluster" and not color_by.startswith("cell_type:") and color_by != "gene":
+            bdf = alt_res["cells_df"]
+            _cluster_col = next((c for c in bdf.columns if c.startswith("cluster")), None)
+            if _cluster_col is not None:
+                _cvals = bdf[_cluster_col].reindex(udf.index).astype(str)
+                _unique = sorted(_cvals.unique(), key=lambda v: int(v) if v.isdigit() else v)
+                _cmap = {cl: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, cl in enumerate(_unique)}
+                traces = []
+                for cl in _unique:
+                    mask = (_cvals == cl).values
+                    traces.append(go.Scattergl(
+                        x=xu[mask], y=yu[mask], mode="markers",
+                        marker=dict(size=mk, color=_cmap[cl], opacity=opacity),
+                        name=cl, showlegend=False,
+                        text=np.array(cell_ids)[mask].tolist(),
+                        customdata=np.array(cell_ids)[mask].tolist(),
+                        hovertemplate="<b>%{text}</b><extra>Cluster " + cl + "</extra>",
+                    ))
+            else:
+                color_by = "transcript_counts"
+
+        if not color_by.startswith("cell_type:") and color_by != "gene" and color_by != "cluster":
             bdf = alt_res["cells_df"]
             if color_by in bdf.columns:
                 vals  = bdf["transcript_counts"].values if color_by == "transcript_counts" \
@@ -6248,6 +6332,16 @@ app.layout = html.Div([
                     ], style={"flex": "1"}),
                 ], style={"display": "flex", "gap": "6px"}),
                 dcc.Checklist(
+                    id="baysor-use-patches",
+                    options=[{"label": html.Span(
+                        " Use patch-based segmentation (from Step 1)",
+                        style={"fontSize": "12px", "color": TEXT},
+                    ), "value": "yes"}],
+                    value=["yes"],
+                    inputStyle={"marginRight": "6px"},
+                    labelStyle={"display": "flex", "alignItems": "center", "marginBottom": "4px"},
+                ),
+                dcc.Checklist(
                     id="baysor-use-prior",
                     options=[{"label": html.Span(
                         " Use Xenium nuclei as prior segmentation",
@@ -7013,7 +7107,7 @@ def store_relayout(relayout_data, current):
     Input("extra-datasets-version", "data"),
     Input("split-done",             "data"),
     Input("roi-done",               "data"),
-    State("counts-mode-store",      "data"),
+    Input("counts-mode-store",      "data"),
 )
 def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
                  _annot_done, morph_enable, morph_zlevel, morph_channels,
@@ -7615,6 +7709,7 @@ def switch_reseg_tab(algo):
     State("baysor-scale-std", "value"),
     State("baysor-min-mol", "value"),
     State("baysor-n_clusters", "value"),
+    State("baysor-use-patches", "value"),
     State("baysor-use-prior", "value"),
     State("baysor-prior-conf", "value"),
     # Proseg states
@@ -7627,7 +7722,7 @@ def switch_reseg_tab(algo):
     prevent_initial_call=True,
 )
 def run_reseg_modal(n_clicks, algo, patches_confirmed,
-                    bxmin, bxmax, bymin, bymax, bscale, bscale_std, bmin_mol, bn_clusters, buse_prior, bprior_conf,
+                    bxmin, bxmax, bymin, bymax, bscale, bscale_std, bmin_mol, bn_clusters, buse_patches, buse_prior, bprior_conf,
                     pxmin, pxmax, pymin, pymax, pvoxel, pthreads):
     if not patches_confirmed:
         return "✗ Please confirm patches in Step 1 before running segmentation.", no_update, no_update, no_update
@@ -7638,9 +7733,10 @@ def run_reseg_modal(n_clicks, algo, patches_confirmed,
             _baysor_state.update({"status": "running", "message": "Starting…", "result": None})
         scale      = float(bscale) if bscale is not None else 20.0
         scale_std  = float(bscale_std) if bscale_std is not None else None
-        min_mol    = int(bmin_mol      or 10)
-        n_clusters      = int(bn_clusters        or 10)
-        prior_conf = float(bprior_conf or 0.5)
+        min_mol     = int(bmin_mol    or 10)
+        n_clusters  = int(bn_clusters or 10)
+        use_patches = "yes" in (buse_patches or [])
+        prior_conf  = float(bprior_conf or 0.5)
         use_prior_bool = "yes" in (buse_prior or [])
         region = {k: v for k, v in
                   dict(x_min=bxmin, x_max=bxmax, y_min=bymin, y_max=bymax).items()
@@ -7648,7 +7744,8 @@ def run_reseg_modal(n_clicks, algo, patches_confirmed,
         threading.Thread(
             target=_run_baysor,
             args=(scale, min_mol, use_prior_bool, prior_conf),
-            kwargs=dict(**region, scale_std=scale_std, n_clusters=n_clusters),
+            kwargs=dict(**region, scale_std=scale_std, n_clusters=n_clusters,
+                        use_patches=use_patches),
             daemon=True,
         ).start()
         return "Baysor starting…", False, False, True
@@ -8611,7 +8708,7 @@ def run_split(n_clicks, rds_path, label_col, max_cores, min_umi, min_umi_sigma, 
      Output("split-poll", "disabled", allow_duplicate=True),
      Output("split-run-btn", "disabled", allow_duplicate=True),
      Output("split-done", "data"),
-     Output("counts-mode", "value"),
+     Output("counts-mode", "value", allow_duplicate=True),
      Output("dataset-version", "data", allow_duplicate=True)],
     Input("split-poll", "n_intervals"),
     [State("split-done", "data"),
@@ -8645,11 +8742,16 @@ def sync_counts_mode(value):
 
 
 @app.callback(
-    Output("counts-mode", "options"),
-    [Input("split-done", "data"),
-     Input("seg-source", "value")],
+    [Output("counts-mode", "options"),
+     Output("counts-mode", "value", allow_duplicate=True)],
+    [Input("split-done",   "data"),
+     Input("seg-source",   "value"),
+     Input("baysor-done",  "data"),
+     Input("proseg-done",  "data")],
+    State("counts-mode", "value"),
+    prevent_initial_call=True,
 )
-def update_counts_options(_, seg_source):
+def update_counts_options(_, seg_source, _bd, _pd, current_value):
     _tool = _seg_tool(seg_source)
     with _baysor_lock:
         bres = _baysor_state["result"] if _baysor_state["status"] == "done" else None
@@ -8665,10 +8767,13 @@ def update_counts_options(_, seg_source):
         has_corrected = alt_res.get("split_corrected_expr") is not None
     else:
         has_corrected = DATA.get("split_corrected_expr") is not None
-    return [
+    options = [
         {"label": " Original",        "value": "original"},
         {"label": " SPLIT Corrected", "value": "corrected", "disabled": not has_corrected},
     ]
+    # Reset to original if currently on corrected but it's no longer available
+    new_value = current_value if has_corrected else "original"
+    return options, new_value
 
 
 # ─── ROI Annotation callbacks ─────────────────────────────────────────────────
