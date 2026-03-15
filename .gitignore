@@ -1,3 +1,6 @@
+uncorrected_counts.csv
+corrected_counts.csv
+snRV_ref.rds
 snRV_genes.txt
 to_impute_final.txt
 to_impute.txt

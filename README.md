@@ -373,6 +373,105 @@ All caches are stored in `~/.xenium_explorer_cache/` and are keyed per dataset.
 | `baysor_{dataset}_{tag}/` | Baysor output per parameter set; includes `params.json` and `spatialdata_baysor.zarr` (contains expression, clusters, UMAP, imputed genes, and `X_corrected` layer after SPLIT) |
 | `proseg_{dataset}_{tag}/` | Proseg output per parameter set; includes `params.json` and `spatialdata_proseg.zarr` (contains expression, clusters, UMAP, imputed genes, and `X_corrected` layer after SPLIT) |
 
+## Standalone Functions (`functions/`)
+
+A set of standalone Python scripts for programmatic use outside the app. All can be imported as modules or run as CLI tools.
+
+### `functions/impute.py` — SpaGE gene imputation
+
+Imputes expression of genes not in the Xenium panel using a Seurat scRNA-seq reference, and writes results into a SpatialData zarr.
+
+```python
+from functions.impute import impute
+
+# Explicit gene list
+impute(
+    sdata_path="/data/xenium.zarr",
+    rds_path="/refs/heart_ref.rds",
+    genes=["TNNT2", "MYH7", "ACTN2"],
+    n_pv=30,
+    output="/data/xenium_imputed.zarr",
+)
+
+# From a text file (one gene per line)
+impute(
+    sdata_path="/data/xenium.zarr",
+    rds_path="/refs/heart_ref.rds",
+    genes_file="/data/genes_to_impute.txt",
+    output="/data/xenium_imputed.zarr",
+)
+
+# Auto top-200 HVGs from reference (omit genes and genes_file)
+impute(
+    sdata_path="/data/xenium.zarr",
+    rds_path="/refs/heart_ref.rds",
+    output="/data/xenium_imputed.zarr",
+)
+```
+
+CLI:
+```bash
+python functions/impute.py /data/xenium.zarr /refs/heart_ref.rds \
+    --genes TNNT2 MYH7 ACTN2 --n_pv 30 --output /data/xenium_imputed.zarr
+
+python functions/impute.py /data/xenium.zarr /refs/heart_ref.rds \
+    --genes_file /data/genes.txt --output /data/xenium_imputed.zarr
+```
+
+Output is a full SpatialData zarr with imputed gene columns appended to the AnnData table. `adata.var["is_imputed"]` marks imputed genes; `adata.uns["imputed_genes"]` lists them.
+
+---
+
+### `functions/spatialdata2seurat.py` — SpatialData → Seurat RDS
+
+Converts a SpatialData zarr to a Seurat RDS equivalent to `LoadXenium()` output.
+
+| Seurat slot | Content |
+|---|---|
+| `@assays$Xenium` | Panel gene raw counts (dgCMatrix, genes × cells) |
+| `@assays$Imputed` | SpaGE-imputed genes, if present |
+| `@meta.data` | All obs columns + `nCount_Xenium`, `nFeature_Xenium` |
+| `@images$fov` | Centroids + cell segmentation + nucleus segmentation |
+
+```python
+from functions.spatialdata2seurat import spatialdata2seurat
+
+# Standard conversion
+spatialdata2seurat(
+    sdata_path="/data/xenium.zarr",
+    output_rds="/data/xenium.rds",
+)
+
+# SPLIT-corrected counts, skip imputed assay
+spatialdata2seurat(
+    sdata_path="/data/xenium.zarr",
+    output_rds="/data/xenium_corrected.rds",
+    use_corrected=True,
+    include_imputed=False,
+)
+```
+
+CLI:
+```bash
+python functions/spatialdata2seurat.py /data/xenium.zarr /data/xenium.rds
+python functions/spatialdata2seurat.py /data/xenium.zarr /data/xenium.rds \
+    --use_corrected --no_imputed --no_nucleus
+```
+
+Requires: `rpy2`, R packages `Seurat`, `SeuratObject`, `Matrix`.
+
+---
+
+### Other functions
+
+| Script | Purpose |
+|--------|---------|
+| `functions/run_split.py` | Standalone RCTD + SPLIT ambient RNA correction; reads/writes directly to zarr |
+| `functions/export_to_cellnest.py` | Export SpatialData zarr to CellNEST-ready AnnData `.h5ad` |
+| `functions/migrate_baysor_cache.py` | Migrate old-format Baysor cache directories to current zarr format |
+
+---
+
 ## Dependencies
 
 See `environment.yml` (conda) or `requirements.txt` (pip) for the full pinned dependency list.
