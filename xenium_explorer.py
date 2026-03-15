@@ -401,51 +401,53 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
         _rconv.set_conversion(ro.default_converter)
         pandas2ri.activate()
 
-        # ── 1. Check spacexr ─────────────────────────────────────────────
-        _set("running", "Loading spacexr…")
-        try:
-            importr("spacexr")
-        except Exception as _spacexr_err:
-            print(f"  RCTD: importr('spacexr') failed: {_spacexr_err}", flush=True)
-            _set("error", f"spacexr not found by rpy2: {str(_spacexr_err)[:200]}")
-            return
+        from rpy2.rinterface_lib import openrlib
+        with openrlib.rlock:
+            # ── 1. Check spacexr ─────────────────────────────────────────────
+            _set("running", "Loading spacexr…")
+            try:
+                importr("spacexr")
+            except Exception as _spacexr_err:
+                print(f"  RCTD: importr('spacexr') failed: {_spacexr_err}", flush=True)
+                _set("error", f"spacexr not found by rpy2: {str(_spacexr_err)[:200]}")
+                return
 
-        importr("SeuratObject")
-        importr("Matrix")
-        base = importr("base")
+            importr("SeuratObject")
+            importr("Matrix")
+            base = importr("base")
 
-        # ── 2. Load Seurat reference ─────────────────────────────────────
-        _set("running", "Loading Seurat reference…")
-        rds = base.readRDS(rds_path)
-        meta_r  = ro.r['slot'](rds, "meta.data")
-        meta_df = pandas2ri.rpy2py(meta_r)
-        if label_col not in meta_df.columns:
-            _set("error", f"Column '{label_col}' not found. Available: {list(meta_df.columns)[:10]}")
-            return
+            # ── 2. Load Seurat reference ─────────────────────────────────────
+            _set("running", "Loading Seurat reference…")
+            rds = base.readRDS(rds_path)
+            meta_r  = ro.r['slot'](rds, "meta.data")
+            meta_df = pandas2ri.rpy2py(meta_r)
+            if label_col not in meta_df.columns:
+                _set("error", f"Column '{label_col}' not found. Available: {list(meta_df.columns)[:10]}")
+                return
 
-        # ── 3. Determine shared genes ────────────────────────────────────
-        _set("running", "Finding shared genes…")
-        ro.r.assign("._rctd_rds", rds)
-        mat_r     = ro.r("slot(slot(._rctd_rds, 'assays')[['RNA']], 'counts')")
-        ref_genes = list(ro.r['rownames'](mat_r))
-        xenium_genes = list(DATA["gene_names"])
-        shared_genes = sorted(set(xenium_genes) & set(ref_genes))
-        if len(shared_genes) < 10:
-            _set("error", f"Only {len(shared_genes)} shared genes between reference and panel.")
-            return
-        print(f"  RCTD: {len(shared_genes)} shared genes", flush=True)
+            # ── 3. Determine shared genes ────────────────────────────────────
+            _set("running", "Finding shared genes…")
+            ro.r.assign("._rctd_rds", rds)
+            mat_r     = ro.r("SeuratObject::LayerData(._rctd_rds[['RNA']], layer='counts')")
+            ref_genes = list(ro.r['rownames'](mat_r))
+            xenium_genes = list(DATA["gene_names"])
+            shared_genes = sorted(set(xenium_genes) & set(ref_genes))
+            if len(shared_genes) < 10:
+                _set("error", f"Only {len(shared_genes)} shared genes between reference and panel.")
+                return
+            print(f"  RCTD: {len(shared_genes)} shared genes", flush=True)
 
-        # ── 4. Build Reference object ────────────────────────────────────
-        _set("running", f"Building RCTD Reference ({len(meta_df):,} ref cells)…")
-        ro.r.assign("._rctd_genes", ro.StrVector(shared_genes))
-        ro.r("""
-._rctd_ref_mat <- slot(slot(._rctd_rds, 'assays')[['RNA']], 'counts')[._rctd_genes, , drop=FALSE]
+            # ── 4. Build Reference object ────────────────────────────────────
+            _set("running", f"Building RCTD Reference ({len(meta_df):,} ref cells)…")
+            ro.r.assign("._rctd_genes", ro.StrVector(shared_genes))
+            ro.r("""
+._rctd_ref_mat <- SeuratObject::LayerData(._rctd_rds[['RNA']], layer='counts')[._rctd_genes, , drop=FALSE]
 ._rctd_ref_mat <- as(._rctd_ref_mat, 'dgCMatrix')
 """)
-        ref_labels_r       = ro.StrVector(meta_df[label_col].astype(str).tolist())
-        ref_labels_r.names = ro.StrVector(list(meta_df.index.astype(str)))
-        ro.r.assign("._rctd_ref_labels", ref_labels_r)
-        ro.r("""
+            ref_labels_r       = ro.StrVector(meta_df[label_col].astype(str).tolist())
+            ref_labels_r.names = ro.StrVector(list(meta_df.index.astype(str)))
+            ro.r.assign("._rctd_ref_labels", ref_labels_r)
+            ro.r("""
 ._rctd_ref_factor <- as.factor(._rctd_ref_labels)
 ._rctd_numi_ref   <- colSums(._rctd_ref_mat)
 ._rctd_reference  <- spacexr::Reference(
@@ -455,32 +457,32 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
 )
 """)
 
-        # ── 5. Build SpatialRNA from Xenium ──────────────────────────────
-        _set("running", "Building SpatialRNA object…")
-        df = DATA["df"]
-        if expr_override is not None:
-            xen_mat_full = expr_override.T        # genes × cells
-            cell_ids     = [str(c) for c in (cell_ids_override or range(expr_override.shape[0]))]
-            coords_df    = df[["x_centroid", "y_centroid"]].reindex(
-                               pd.Index(cell_ids)).fillna(0.0)
-        else:
-            xen_mat_full = DATA["expr"].T  # genes × cells
-            cell_ids     = [str(c) for c in df.index.tolist()]
-            coords_df    = df[["x_centroid", "y_centroid"]].copy()
-            coords_df.index = cell_ids
+            # ── 5. Build SpatialRNA from Xenium ──────────────────────────────
+            _set("running", "Building SpatialRNA object…")
+            df = DATA["df"]
+            if expr_override is not None:
+                xen_mat_full = expr_override.T        # genes × cells
+                cell_ids     = [str(c) for c in (cell_ids_override or range(expr_override.shape[0]))]
+                coords_df    = df[["x_centroid", "y_centroid"]].reindex(
+                                   pd.Index(cell_ids)).fillna(0.0)
+            else:
+                xen_mat_full = DATA["expr"].T  # genes × cells
+                cell_ids     = [str(c) for c in df.index.tolist()]
+                coords_df    = df[["x_centroid", "y_centroid"]].copy()
+                coords_df.index = cell_ids
 
-        gene_idx   = {g: i for i, g in enumerate(xenium_genes)}
-        shared_idx = [gene_idx[g] for g in shared_genes]
-        xen_sub    = sp_.csc_matrix(xen_mat_full[shared_idx, :])   # shared_genes × cells
+            gene_idx   = {g: i for i, g in enumerate(xenium_genes)}
+            shared_idx = [gene_idx[g] for g in shared_genes]
+            xen_sub    = sp_.csc_matrix(xen_mat_full[shared_idx, :])   # shared_genes × cells
 
-        tmpdir = tempfile.mkdtemp(prefix="xenium_rctd_")
-        sio.mmwrite(os.path.join(tmpdir, "xenium.mtx"), xen_sub)
-        with open(os.path.join(tmpdir, "genes.txt"),    "w") as f: f.write("\n".join(shared_genes) + "\n")
-        with open(os.path.join(tmpdir, "barcodes.txt"), "w") as f: f.write("\n".join(cell_ids) + "\n")
-        coords_df.to_csv(os.path.join(tmpdir, "coords.csv"))
+            tmpdir = tempfile.mkdtemp(prefix="xenium_rctd_")
+            sio.mmwrite(os.path.join(tmpdir, "xenium.mtx"), xen_sub)
+            with open(os.path.join(tmpdir, "genes.txt"),    "w") as f: f.write("\n".join(shared_genes) + "\n")
+            with open(os.path.join(tmpdir, "barcodes.txt"), "w") as f: f.write("\n".join(cell_ids) + "\n")
+            coords_df.to_csv(os.path.join(tmpdir, "coords.csv"))
 
-        ro.r.assign("._rctd_tmpdir", tmpdir)
-        ro.r("""
+            ro.r.assign("._rctd_tmpdir", tmpdir)
+            ro.r("""
 ._rctd_xen_mat  <- Matrix::readMM(file.path(._rctd_tmpdir, "xenium.mtx"))
 ._rctd_xen_genes <- readLines(file.path(._rctd_tmpdir, "genes.txt"))
 ._rctd_xen_bcs   <- readLines(file.path(._rctd_tmpdir, "barcodes.txt"))
@@ -497,75 +499,75 @@ colnames(._rctd_coords) <- c('x', 'y')
 )
 """)
 
-        # ── 6. Create and run RCTD ───────────────────────────────────────
-        _set("running", f"Running RCTD ({mode} mode, {n_cores} cores)…")
-        ro.r.assign("._rctd_mode",    mode)
-        ro.r.assign("._rctd_cores",   n_cores)
-        ro.r.assign("._rctd_umi_min",       ro.IntVector([umi_min]))
-        ro.r.assign("._rctd_umi_min_sigma", ro.IntVector([umi_min_sigma]))
-        ro.r("""
+            # ── 6. Create and run RCTD ───────────────────────────────────────
+            _set("running", f"Running RCTD ({mode} mode, {n_cores} cores)…")
+            ro.r.assign("._rctd_mode",    mode)
+            ro.r.assign("._rctd_cores",   n_cores)
+            ro.r.assign("._rctd_umi_min",       ro.IntVector([umi_min]))
+            ro.r.assign("._rctd_umi_min_sigma", ro.IntVector([umi_min_sigma]))
+            ro.r("""
 ._rctd_obj <- spacexr::create.RCTD(._rctd_puck, ._rctd_reference, max_cores=._rctd_cores,
     UMI_min=._rctd_umi_min[1], UMI_min_sigma=._rctd_umi_min_sigma[1])
 ._rctd_obj <- spacexr::run.RCTD(._rctd_obj, doublet_mode=._rctd_mode)
 """)
-        print("  RCTD: run complete — extracting results…", flush=True)
+            print("  RCTD: run complete — extracting results…", flush=True)
 
-        # ── 7. Extract per-cell labels ────────────────────────────────────
-        _set("running", "Extracting RCTD results…")
-        if mode == "full":
-            ro.r("""
+            # ── 7. Extract per-cell labels ────────────────────────────────────
+            _set("running", "Extracting RCTD results…")
+            if mode == "full":
+                ro.r("""
 ._rctd_weights <- ._rctd_obj@results$weights
 ._rctd_types   <- colnames(._rctd_weights)[apply(._rctd_weights, 1, which.max)]
 names(._rctd_types) <- rownames(._rctd_weights)
 """)
-        else:  # doublet / multi
-            ro.r("""
+            else:  # doublet / multi
+                ro.r("""
 ._rctd_res   <- ._rctd_obj@results$results_df
 ._rctd_types <- as.character(._rctd_res$first_type)
 names(._rctd_types) <- rownames(._rctd_res)
 """)
 
-        types_r   = ro.r("._rctd_types")
-        names_r   = ro.r("names(._rctd_types)")
-        cell_ids  = list(names_r)
-        cell_vals = [str(v) for v in types_r]
-        labels    = pd.Series(dict(zip(cell_ids, cell_vals)), name="label").astype(str)
-        labels.index  = labels.index.astype(str)
+            types_r   = ro.r("._rctd_types")
+            names_r   = ro.r("names(._rctd_types)")
+            cell_ids  = list(names_r)
+            cell_vals = [str(v) for v in types_r]
+            labels    = pd.Series(dict(zip(cell_ids, cell_vals)), name="label").astype(str)
+            labels.index  = labels.index.astype(str)
 
-        unique_types = labels.unique().tolist()
-        print(f"  RCTD: {len(labels):,} cells → {len(unique_types)} types", flush=True)
+            unique_types = labels.unique().tolist()
+            print(f"  RCTD: {len(labels):,} cells → {len(unique_types)} types", flush=True)
 
-        pd.DataFrame({"label": labels}).to_parquet(cache_file)
+            pd.DataFrame({"label": labels}).to_parquet(cache_file)
 
-        # ── 8. Extract and cache weight matrix (full mode only) ───────────
-        weights_df = None
-        if mode == "full":
-            _set("running", "Extracting RCTD weight matrix…")
+            # ── 8. Extract and cache weight matrix (full mode only) ───────────
+            weights_df = None
+            if mode == "full":
+                _set("running", "Extracting RCTD weight matrix…")
+                try:
+                    ro.r("._rctd_weights_dense <- as.matrix(._rctd_weights)")
+                    ct_names   = list(ro.r("colnames(._rctd_weights)"))
+                    cell_ids_w = list(ro.r("rownames(._rctd_weights)"))
+                    w_arr      = np.array(ro.r("._rctd_weights_dense"))
+                    weights_df = pd.DataFrame(w_arr, index=cell_ids_w, columns=ct_names)
+                    weights_df.index = weights_df.index.astype(str)
+                    weights_cache = cache_file.replace(".parquet", "_weights.parquet")
+                    weights_df.to_parquet(weights_cache)
+                    print(f"  RCTD: weights saved ({weights_df.shape[1]} types)", flush=True)
+                except Exception as _we:
+                    print(f"  RCTD: weight extraction failed: {_we}", flush=True)
+            weights_key = f"rctd_weights_{labels_key}"
+            with _annot_lock:
+                _annot_state[weights_key] = weights_df
+
+            _set("done", f"Done — {len(unique_types)} cell types in {len(labels):,} cells",
+                 labels=labels)
+
+            # Cleanup R temporaries (best-effort)
             try:
-                ro.r("._rctd_weights_dense <- as.matrix(._rctd_weights)")
-                ct_names   = list(ro.r("colnames(._rctd_weights)"))
-                cell_ids_w = list(ro.r("rownames(._rctd_weights)"))
-                w_arr      = np.array(ro.r("._rctd_weights_dense"))
-                weights_df = pd.DataFrame(w_arr, index=cell_ids_w, columns=ct_names)
-                weights_df.index = weights_df.index.astype(str)
-                weights_cache = cache_file.replace(".parquet", "_weights.parquet")
-                weights_df.to_parquet(weights_cache)
-                print(f"  RCTD: weights saved ({weights_df.shape[1]} types)", flush=True)
-            except Exception as _we:
-                print(f"  RCTD: weight extraction failed: {_we}", flush=True)
-        weights_key = f"rctd_weights_{labels_key}"
-        with _annot_lock:
-            _annot_state[weights_key] = weights_df
-
-        _set("done", f"Done — {len(unique_types)} cell types in {len(labels):,} cells",
-             labels=labels)
-
-        # Cleanup R temporaries (best-effort)
-        try:
-            ro.r("rm(list=ls(pattern='^\\._rctd_'))")
-        except Exception:
-            pass
-        import shutil; shutil.rmtree(tmpdir, ignore_errors=True)
+                ro.r("rm(list=ls(pattern='^\\._rctd_'))")
+            except Exception:
+                pass
+            import shutil; shutil.rmtree(tmpdir, ignore_errors=True)
 
     except Exception as exc:
         import traceback; traceback.print_exc()
@@ -626,52 +628,54 @@ def _run_seurat_annotation(rds_path: str, label_col: str = "Names", labels_key: 
         import rpy2.robjects as ro
         from rpy2.robjects import pandas2ri
         from rpy2.robjects.packages import importr
+        from rpy2.rinterface_lib import openrlib
         pandas2ri.activate()
 
-        base = importr("base")
-        rds  = base.readRDS(rds_path)
+        with openrlib.rlock:
+            base = importr("base")
+            rds  = base.readRDS(rds_path)
 
-        # ── 2. Extract metadata → label vector ──────────────────────────
-        _set("running", f"Extracting '{label_col}' labels…")
-        meta_r = ro.r['slot'](rds, "meta.data")
-        meta_df = pandas2ri.rpy2py(meta_r)
-        if label_col not in meta_df.columns:
-            cols = list(meta_df.columns)
-            _set("error", f"Column '{label_col}' not found. Available: {cols[:10]}")
-            return
+            # ── 2. Extract metadata → label vector ──────────────────────────
+            _set("running", f"Extracting '{label_col}' labels…")
+            meta_r = ro.r['slot'](rds, "meta.data")
+            meta_df = pandas2ri.rpy2py(meta_r)
+            if label_col not in meta_df.columns:
+                cols = list(meta_df.columns)
+                _set("error", f"Column '{label_col}' not found. Available: {cols[:10]}")
+                return
 
-        ref_labels = meta_df[label_col].astype(str)  # index = ref cell barcodes
+            ref_labels = meta_df[label_col].astype(str)  # index = ref cell barcodes
 
-        unique_types = ref_labels.unique().tolist()
-        print(f"  Reference: {len(ref_labels)} cells, {len(unique_types)} cell types", flush=True)
+            unique_types = ref_labels.unique().tolist()
+            print(f"  Reference: {len(ref_labels)} cells, {len(unique_types)} cell types", flush=True)
 
-        # ── 3. Find shared genes first (before loading any matrix) ──────
-        import scipy.sparse as sp_
-        import tempfile
+            # ── 3. Find shared genes first (before loading any matrix) ──────
+            import scipy.sparse as sp_
+            import tempfile
 
-        importr("SeuratObject")
-        importr("Matrix")
+            importr("SeuratObject")
+            importr("Matrix")
 
-        _set("running", "Reading reference gene list…")
-        ro.r.assign("._annot_rds_tmp", rds)
-        mat_r = ro.r("slot(slot(._annot_rds_tmp, 'assays')[['RNA']], 'data')")
-        ref_genes_all = list(ro.r['rownames'](mat_r))
-        ref_bcs = list(ro.r['colnames'](mat_r))
+            _set("running", "Reading reference gene list…")
+            ro.r.assign("._annot_rds_tmp", rds)
+            mat_r = ro.r("SeuratObject::LayerData(._annot_rds_tmp[['RNA']], layer='data')")
+            ref_genes_all = list(ro.r['rownames'](mat_r))
+            ref_bcs = list(ro.r['colnames'](mat_r))
 
-        xenium_genes = list(DATA["gene_names"])
-        shared = sorted(set(xenium_genes) & set(ref_genes_all))
-        if len(shared) < 10:
-            _set("error", f"Only {len(shared)} shared genes — not enough for label transfer.")
-            return
-        print(f"  Shared genes for label transfer: {len(shared)}", flush=True)
+            xenium_genes = list(DATA["gene_names"])
+            shared = sorted(set(xenium_genes) & set(ref_genes_all))
+            if len(shared) < 10:
+                _set("error", f"Only {len(shared)} shared genes — not enough for label transfer.")
+                return
+            print(f"  Shared genes for label transfer: {len(shared)}", flush=True)
 
-        # ── 4. Export ONLY shared-gene rows via rpy2 (no subprocess) ────
-        _set("running", f"Extracting {len(shared)} shared-gene submatrix…")
-        tmpdir = tempfile.mkdtemp(prefix="xenium_annot_")
-        ro.r.assign("._annot_mat",   mat_r)
-        ro.r.assign("._annot_genes", ro.StrVector(shared))
-        ro.r.assign("._annot_dir",   tmpdir)
-        ro.r("""
+            # ── 4. Export ONLY shared-gene rows via rpy2 (no subprocess) ────
+            _set("running", f"Extracting {len(shared)} shared-gene submatrix…")
+            tmpdir = tempfile.mkdtemp(prefix="xenium_annot_")
+            ro.r.assign("._annot_mat",   mat_r)
+            ro.r.assign("._annot_genes", ro.StrVector(shared))
+            ro.r.assign("._annot_dir",   tmpdir)
+            ro.r("""
 mat_sub <- ._annot_mat[._annot_genes, , drop = FALSE]
 Matrix::writeMM(mat_sub, file.path(._annot_dir, "matrix.mtx"))
 write.table(data.frame(gene = rownames(mat_sub)),
@@ -705,7 +709,7 @@ rm(._annot_mat, ._annot_genes, ._annot_dir, ._annot_rds_tmp, mat_sub)
         row_sums[row_sums == 0] = 1.0
         xen_shared = np.log1p(xen_shared / row_sums * 10_000)
 
-        # Also normalize reference (already log-normalized from Seurat @data, but z-score both)
+        # Also normalize reference (already log-normalized from Seurat data layer, but z-score both)
         import scipy.stats as st_
         from sklearn.decomposition import TruncatedSVD
         from sklearn.neighbors import NearestNeighbors
@@ -1279,6 +1283,20 @@ def _load_cached_baysor(out_dir: str) -> None:
     print(f"Loading cached Baysor: {os.path.basename(out_dir)}…", flush=True)
     try:
         _set("running", "Loading cached Baysor result…")
+        # Restore SpaGE result reference written by _run_spage_imputation
+        _spage_rpath, _spage_rgenes = None, None
+        _spage_ref_file = os.path.join(out_dir, "spage_result.json")
+        if os.path.exists(_spage_ref_file):
+            try:
+                import json as _jref
+                with open(_spage_ref_file) as _jf:
+                    _sref = _jref.load(_jf)
+                if os.path.isdir(_sref.get("path", "")):
+                    _spage_rpath  = _sref["path"]
+                    _spage_rgenes = _sref.get("genes", [])
+                    print(f"  Baysor: restored SpaGE result ({len(_spage_rgenes)} genes)", flush=True)
+            except Exception:
+                pass
         zarr_path_fast = os.path.join(out_dir, "spatialdata_baysor.zarr")
         if os.path.isdir(zarr_path_fast):
             try:
@@ -1300,6 +1318,8 @@ def _load_cached_baysor(out_dir: str) -> None:
                     "sdata_path": zarr_path_fast,
                     "split_corrected_expr": _baysor_corr,
                     "split_corrected_imputed_genes": _baysor_corr_imp,
+                    "spage_result_path": _spage_rpath,
+                    "spage_result_genes": _spage_rgenes,
                 })
                 print(f"Loaded cached Baysor (fast): {n_cells:,} cells, "
                       f"{len(cell_bounds):,} boundaries", flush=True)
@@ -1399,6 +1419,8 @@ def _load_cached_baysor(out_dir: str) -> None:
             "sdata_path": zarr_path,
             "split_corrected_expr": _baysor_corr,
             "split_corrected_imputed_genes": _baysor_corr_imp,
+            "spage_result_path": _spage_rpath,
+            "spage_result_genes": _spage_rgenes,
         })
         print(f"Loaded cached Baysor: {n_cells:,} cells, {len(cell_bounds):,} boundaries "
               f"from {os.path.basename(out_dir)}", flush=True)
@@ -1418,6 +1440,20 @@ def _load_cached_proseg(out_dir: str) -> None:
     print(f"Loading cached Proseg: {os.path.basename(out_dir)}…", flush=True)
     try:
         _set("running", "Loading cached Proseg result…")
+        # Restore SpaGE result reference written by _run_spage_imputation
+        _spage_rpath, _spage_rgenes = None, None
+        _spage_ref_file = os.path.join(out_dir, "spage_result.json")
+        if os.path.exists(_spage_ref_file):
+            try:
+                import json as _jref
+                with open(_spage_ref_file) as _jf:
+                    _sref = _jref.load(_jf)
+                if os.path.isdir(_sref.get("path", "")):
+                    _spage_rpath  = _sref["path"]
+                    _spage_rgenes = _sref.get("genes", [])
+                    print(f"  Proseg: restored SpaGE result ({len(_spage_rgenes)} genes)", flush=True)
+            except Exception:
+                pass
         zarr_path_fast = os.path.join(out_dir, "spatialdata_proseg.zarr")
         if os.path.isdir(zarr_path_fast):
             try:
@@ -1439,6 +1475,8 @@ def _load_cached_proseg(out_dir: str) -> None:
                     "sdata_path": zarr_path_fast,
                     "split_corrected_expr": _proseg_corr,
                     "split_corrected_imputed_genes": _proseg_corr_imp,
+                    "spage_result_path": _spage_rpath,
+                    "spage_result_genes": _spage_rgenes,
                 })
                 print(f"Loaded cached Proseg (fast): {n_cells:,} cells, "
                       f"{len(cell_bounds):,} boundaries", flush=True)
@@ -1592,6 +1630,8 @@ def _load_cached_proseg(out_dir: str) -> None:
             "sdata_path": zarr_path,
             "split_corrected_expr": _proseg_corr,
             "split_corrected_imputed_genes": _proseg_corr_imp,
+            "spage_result_path": _spage_rpath,
+            "spage_result_genes": _spage_rgenes,
         })
         print(f"Loaded cached Proseg: {n_cells:,} cells, {len(cell_bounds):,} boundaries "
               f"from {os.path.basename(out_dir)}", flush=True)
@@ -2349,53 +2389,55 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
         n_cells, n_genes = expr_panel.shape
         print(f"  SPLIT: {n_cells:,} cells × {n_genes} panel genes", flush=True)
 
-        # ── 2. Check R packages ──────────────────────────────────────────────
-        _set("running", "Loading R packages (spacexr, SPLIT)…")
-        try:
-            importr("spacexr")
-        except Exception:
-            _set("error", "spacexr not installed. In R: devtools::install_github('dmcable/spacexr')")
-            return
-        try:
-            importr("SPLIT")
-        except Exception:
-            _set("error", "SPLIT not installed. In R: remotes::install_github('bdsc-tds/SPLIT')")
-            return
-        importr("SeuratObject")
-        importr("Matrix")
-        base = importr("base")
+        from rpy2.rinterface_lib import openrlib
+        with openrlib.rlock:
+            # ── 2. Check R packages ──────────────────────────────────────────────
+            _set("running", "Loading R packages (spacexr, SPLIT)…")
+            try:
+                importr("spacexr")
+            except Exception:
+                _set("error", "spacexr not installed. In R: devtools::install_github('dmcable/spacexr')")
+                return
+            try:
+                importr("SPLIT")
+            except Exception:
+                _set("error", "SPLIT not installed. In R: remotes::install_github('bdsc-tds/SPLIT')")
+                return
+            importr("SeuratObject")
+            importr("Matrix")
+            base = importr("base")
 
-        # ── 3. Load Seurat reference ─────────────────────────────────────────
-        _set("running", "Loading Seurat reference…")
-        rds = base.readRDS(rds_path)
-        meta_r  = ro.r['slot'](rds, "meta.data")
-        meta_df = pandas2ri.rpy2py(meta_r)
-        if label_col not in meta_df.columns:
-            _set("error", f"Column '{label_col}' not found. Available: {list(meta_df.columns)[:10]}")
-            return
+            # ── 3. Load Seurat reference ─────────────────────────────────────────
+            _set("running", "Loading Seurat reference…")
+            rds = base.readRDS(rds_path)
+            meta_r  = ro.r['slot'](rds, "meta.data")
+            meta_df = pandas2ri.rpy2py(meta_r)
+            if label_col not in meta_df.columns:
+                _set("error", f"Column '{label_col}' not found. Available: {list(meta_df.columns)[:10]}")
+                return
 
-        # ── 4. Shared genes ──────────────────────────────────────────────────
-        _set("running", "Finding shared genes…")
-        ro.r.assign("._split_rds", rds)
-        mat_r     = ro.r("slot(slot(._split_rds, 'assays')[['RNA']], 'counts')")
-        ref_genes = list(ro.r['rownames'](mat_r))
-        shared_genes = sorted(set(panel_genes) & set(ref_genes))
-        if len(shared_genes) < 10:
-            _set("error", f"Only {len(shared_genes)} shared genes between reference and panel.")
-            return
-        print(f"  SPLIT: {len(shared_genes)} shared genes", flush=True)
+            # ── 4. Shared genes ──────────────────────────────────────────────────
+            _set("running", "Finding shared genes…")
+            ro.r.assign("._split_rds", rds)
+            mat_r     = ro.r("SeuratObject::LayerData(._split_rds[['RNA']], layer='counts')")
+            ref_genes = list(ro.r['rownames'](mat_r))
+            shared_genes = sorted(set(panel_genes) & set(ref_genes))
+            if len(shared_genes) < 10:
+                _set("error", f"Only {len(shared_genes)} shared genes between reference and panel.")
+                return
+            print(f"  SPLIT: {len(shared_genes)} shared genes", flush=True)
 
-        # ── 5. Build Reference ───────────────────────────────────────────────
-        _set("running", f"Building RCTD Reference ({len(meta_df):,} ref cells)…")
-        ro.r.assign("._split_genes", ro.StrVector(shared_genes))
-        ro.r("""
-._split_ref_mat <- slot(slot(._split_rds, 'assays')[['RNA']], 'counts')[._split_genes, , drop=FALSE]
+            # ── 5. Build Reference ───────────────────────────────────────────────
+            _set("running", f"Building RCTD Reference ({len(meta_df):,} ref cells)…")
+            ro.r.assign("._split_genes", ro.StrVector(shared_genes))
+            ro.r("""
+._split_ref_mat <- SeuratObject::LayerData(._split_rds[['RNA']], layer='counts')[._split_genes, , drop=FALSE]
 ._split_ref_mat <- as(._split_ref_mat, 'dgCMatrix')
 """)
-        ref_labels_r       = ro.StrVector(meta_df[label_col].astype(str).tolist())
-        ref_labels_r.names = ro.StrVector(list(meta_df.index.astype(str)))
-        ro.r.assign("._split_ref_labels", ref_labels_r)
-        ro.r("""
+            ref_labels_r       = ro.StrVector(meta_df[label_col].astype(str).tolist())
+            ref_labels_r.names = ro.StrVector(list(meta_df.index.astype(str)))
+            ro.r.assign("._split_ref_labels", ref_labels_r)
+            ro.r("""
 ._split_ref_factor <- as.factor(._split_ref_labels)
 ._split_numi_ref   <- colSums(._split_ref_mat)
 ._split_reference  <- spacexr::Reference(
@@ -2405,32 +2447,32 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
 )
 """)
 
-        # ── 6. Build SpatialRNA (panel genes only) ───────────────────────────
-        _set("running", f"Building SpatialRNA object ({n_cells:,} cells)…")
-        # Subset expr_panel to shared genes
-        shared_idx = [gni[g] for g in shared_genes if g in gni and gni[g] < n_panel]
-        shared_genes_present = [g for g in shared_genes if g in gni and gni[g] < n_panel]
-        expr_shared = expr_panel[:, shared_idx]  # cells × shared_genes
-        # gene × cells for R
-        expr_t = expr_shared.T.toarray() if hasattr(expr_shared, 'toarray') else expr_shared.T
-        counts_r_mat = ro.r.matrix(
-            ro.FloatVector(expr_t.flatten(order='F').tolist()),
-            nrow=len(shared_genes_present),
-            ncol=n_cells
-        )
-        cell_ids = [str(c) for c in cells_df.index]
-        ro.r.assign("._split_counts_mat", counts_r_mat)
-        ro.r.assign("._split_rownames", ro.StrVector(shared_genes_present))
-        ro.r.assign("._split_colnames", ro.StrVector(cell_ids))
-        ro.r("""
+            # ── 6. Build SpatialRNA (panel genes only) ───────────────────────────
+            _set("running", f"Building SpatialRNA object ({n_cells:,} cells)…")
+            # Subset expr_panel to shared genes
+            shared_idx = [gni[g] for g in shared_genes if g in gni and gni[g] < n_panel]
+            shared_genes_present = [g for g in shared_genes if g in gni and gni[g] < n_panel]
+            expr_shared = expr_panel[:, shared_idx]  # cells × shared_genes
+            # gene × cells for R
+            expr_t = expr_shared.T.toarray() if hasattr(expr_shared, 'toarray') else expr_shared.T
+            counts_r_mat = ro.r.matrix(
+                ro.FloatVector(expr_t.flatten(order='F').tolist()),
+                nrow=len(shared_genes_present),
+                ncol=n_cells
+            )
+            cell_ids = [str(c) for c in cells_df.index]
+            ro.r.assign("._split_counts_mat", counts_r_mat)
+            ro.r.assign("._split_rownames", ro.StrVector(shared_genes_present))
+            ro.r.assign("._split_colnames", ro.StrVector(cell_ids))
+            ro.r("""
 rownames(._split_counts_mat) <- ._split_rownames
 colnames(._split_counts_mat) <- ._split_colnames
 ._split_counts_mat <- as(._split_counts_mat, 'dgCMatrix')
 """)
 
-        ro.r.assign("._split_x", ro.FloatVector(cells_df["x_centroid"].astype(float).tolist()))
-        ro.r.assign("._split_y", ro.FloatVector(cells_df["y_centroid"].astype(float).tolist()))
-        ro.r("""
+            ro.r.assign("._split_x", ro.FloatVector(cells_df["x_centroid"].astype(float).tolist()))
+            ro.r.assign("._split_y", ro.FloatVector(cells_df["y_centroid"].astype(float).tolist()))
+            ro.r("""
 ._split_coords <- data.frame(x=._split_x, y=._split_y)
 rownames(._split_coords) <- colnames(._split_counts_mat)
 ._split_numi <- colSums(._split_counts_mat)
@@ -2441,97 +2483,97 @@ rownames(._split_coords) <- colnames(._split_counts_mat)
 )
 """)
 
-        # ── 7. Run RCTD (doublet mode) — with caching ────────────────────────
-        # Compute a stable key for this RCTD run so we can skip it on re-runs.
-        _rctd_lkey = "labels_rctd_doublet"
-        if _alt_res is not None:
-            _rctd_tag  = hashlib.md5((_alt_res.get("out_dir", "")).encode()).hexdigest()[:8]
-            _rctd_tool = _alt_res.get("source", "baysor")
-            _rctd_lkey = f"labels_rctd_doublet_{_rctd_tool}_{_rctd_tag}"
-        _rctd_cache_key  = (f"rctd_{os.path.basename(rds_path)}_{label_col}_doublet"
-                            f"_umi{min_umi}_sig{min_umi_sigma}_{_rctd_lkey}")
-        _rctd_cache_file = _cache_path(_rctd_cache_key)
-        _rctd_obj_file   = _rctd_cache_file.replace(".parquet", "_rctd_obj.rds")
+            # ── 7. Run RCTD (doublet mode) — with caching ────────────────────────
+            # Compute a stable key for this RCTD run so we can skip it on re-runs.
+            _rctd_lkey = "labels_rctd_doublet"
+            if _alt_res is not None:
+                _rctd_tag  = hashlib.md5((_alt_res.get("out_dir", "")).encode()).hexdigest()[:8]
+                _rctd_tool = _alt_res.get("source", "baysor")
+                _rctd_lkey = f"labels_rctd_doublet_{_rctd_tool}_{_rctd_tag}"
+            _rctd_cache_key  = (f"rctd_{os.path.basename(rds_path)}_{label_col}_doublet"
+                                f"_umi{min_umi}_sig{min_umi_sigma}_{_rctd_lkey}")
+            _rctd_cache_file = _cache_path(_rctd_cache_key)
+            _rctd_obj_file   = _rctd_cache_file.replace(".parquet", "_rctd_obj.rds")
 
-        _rctd_from_cache = False
-        if os.path.exists(_rctd_cache_file) and os.path.exists(_rctd_obj_file):
-            try:
-                _cached_rctd = pd.read_parquet(_rctd_cache_file)
-                _split_labels_cached = _cached_rctd["label"].astype(str)
-                _split_labels_cached.index = _split_labels_cached.index.astype(str)
-                _sample = set(cell_ids[:200])
-                _overlap = len(set(_split_labels_cached.index[:200]) & _sample)
-                if _overlap >= max(1, len(_sample) * 0.05):
-                    ro.r(f'._split_rctd <- readRDS("{_rctd_obj_file}")')
-                    _split_labels = _split_labels_cached
-                    _rctd_from_cache = True
-                    _set("running", "RCTD loaded from cache, running SPLIT::purify()…")
-                    print("  SPLIT: RCTD loaded from cache", flush=True)
-                else:
-                    print(f"  SPLIT: RCTD cache index mismatch ({_overlap}/{len(_sample)}) — re-running", flush=True)
-            except Exception as _ce:
-                print(f"  SPLIT: RCTD cache load failed: {_ce}", flush=True)
+            _rctd_from_cache = False
+            if os.path.exists(_rctd_cache_file) and os.path.exists(_rctd_obj_file):
+                try:
+                    _cached_rctd = pd.read_parquet(_rctd_cache_file)
+                    _split_labels_cached = _cached_rctd["label"].astype(str)
+                    _split_labels_cached.index = _split_labels_cached.index.astype(str)
+                    _sample = set(cell_ids[:200])
+                    _overlap = len(set(_split_labels_cached.index[:200]) & _sample)
+                    if _overlap >= max(1, len(_sample) * 0.05):
+                        ro.r(f'._split_rctd <- readRDS("{_rctd_obj_file}")')
+                        _split_labels = _split_labels_cached
+                        _rctd_from_cache = True
+                        _set("running", "RCTD loaded from cache, running SPLIT::purify()…")
+                        print("  SPLIT: RCTD loaded from cache", flush=True)
+                    else:
+                        print(f"  SPLIT: RCTD cache index mismatch ({_overlap}/{len(_sample)}) — re-running", flush=True)
+                except Exception as _ce:
+                    print(f"  SPLIT: RCTD cache load failed: {_ce}", flush=True)
 
-        if not _rctd_from_cache:
-            _set("running", f"Running RCTD doublet mode (max_cores={max_cores})… [~20-40 min]")
-            print("  SPLIT: starting RCTD doublet mode…", flush=True)
-            ro.r.assign("._split_max_cores",    ro.IntVector([max_cores]))
-            ro.r.assign("._split_min_umi",      ro.IntVector([min_umi]))
-            ro.r.assign("._split_min_umi_sigma", ro.IntVector([min_umi_sigma]))
-            ro.r("""
+            if not _rctd_from_cache:
+                _set("running", f"Running RCTD doublet mode (max_cores={max_cores})… [~20-40 min]")
+                print("  SPLIT: starting RCTD doublet mode…", flush=True)
+                ro.r.assign("._split_max_cores",    ro.IntVector([max_cores]))
+                ro.r.assign("._split_min_umi",      ro.IntVector([min_umi]))
+                ro.r.assign("._split_min_umi_sigma", ro.IntVector([min_umi_sigma]))
+                ro.r("""
 ._split_rctd <- spacexr::create.RCTD(._split_spatialrna, ._split_reference,
     max_cores=._split_max_cores[1], CELL_MIN_INSTANCE=5,
     UMI_min=._split_min_umi[1], UMI_min_sigma=._split_min_umi_sigma[1])
 ._split_rctd <- spacexr::run.RCTD(._split_rctd, doublet_mode='doublet')
 ._split_rctd <- SPLIT::run_post_process_RCTD(._split_rctd)
 """)
-            # Save RCTD object + labels to cache for future re-runs.
-            # Use as.character() in R to avoid rpy2 converting factor levels to
-            # integer codes (which would show numbers instead of cell type names).
-            try:
-                ro.r(f'saveRDS(._split_rctd, "{_rctd_obj_file}")')
-                ro.r("""
+                # Save RCTD object + labels to cache for future re-runs.
+                # Use as.character() in R to avoid rpy2 converting factor levels to
+                # integer codes (which would show numbers instead of cell type names).
+                try:
+                    ro.r(f'saveRDS(._split_rctd, "{_rctd_obj_file}")')
+                    ro.r("""
 ._split_rctd_res   <- ._split_rctd@results$results_df
 ._split_rctd_types <- as.character(._split_rctd_res$first_type)
 names(._split_rctd_types) <- rownames(._split_rctd_res)
 """)
-                _types_r = ro.r("._split_rctd_types")
-                _names_r = ro.r("names(._split_rctd_types)")
-                _split_labels = pd.Series(
-                    list(_types_r), index=list(_names_r), name="label"
-                ).astype(str)
-                pd.DataFrame({"label": _split_labels}).to_parquet(_rctd_cache_file)
-                print(f"  SPLIT: RCTD cached ({len(_split_labels.unique())} types)", flush=True)
-            except Exception as _se:
-                print(f"  SPLIT: RCTD cache save failed: {_se}", flush=True)
-                _split_labels = None
+                    _types_r = ro.r("._split_rctd_types")
+                    _names_r = ro.r("names(._split_rctd_types)")
+                    _split_labels = pd.Series(
+                        list(_types_r), index=list(_names_r), name="label"
+                    ).astype(str)
+                    pd.DataFrame({"label": _split_labels}).to_parquet(_rctd_cache_file)
+                    print(f"  SPLIT: RCTD cached ({len(_split_labels.unique())} types)", flush=True)
+                except Exception as _se:
+                    print(f"  SPLIT: RCTD cache save failed: {_se}", flush=True)
+                    _split_labels = None
 
-        # Store RCTD labels in _annot_state so cell-type coloring works
-        if _split_labels is not None:
-            _rctd_generic_key = "_".join(_rctd_lkey.split("_")[:2] + _rctd_lkey.split("_")[3:])
-            with _annot_lock:
-                _annot_state[_rctd_lkey]       = _split_labels
-                _annot_state[_rctd_generic_key] = _split_labels
+            # Store RCTD labels in _annot_state so cell-type coloring works
+            if _split_labels is not None:
+                _rctd_generic_key = "_".join(_rctd_lkey.split("_")[:2] + _rctd_lkey.split("_")[3:])
+                with _annot_lock:
+                    _annot_state[_rctd_lkey]       = _split_labels
+                    _annot_state[_rctd_generic_key] = _split_labels
 
-        print("  SPLIT: RCTD done, running purify()…", flush=True)
+            print("  SPLIT: RCTD done, running purify()…", flush=True)
 
-        # ── 8. Run SPLIT::purify ─────────────────────────────────────────────
-        _set("running", "Running SPLIT::purify()…")
-        # Full counts matrix (all panel genes) gene × cells
-        expr_full_t = expr_panel.T.toarray() if hasattr(expr_panel, 'toarray') else expr_panel.T
-        full_r_mat = ro.r.matrix(
-            ro.FloatVector(expr_full_t.flatten(order='F').tolist()),
-            nrow=n_panel,
-            ncol=n_cells
-        )
-        ro.r.assign("._split_full_counts", full_r_mat)
-        ro.r.assign("._split_panel_genes", ro.StrVector(list(panel_genes)))
-        ro.r("""
+            # ── 8. Run SPLIT::purify ─────────────────────────────────────────────
+            _set("running", "Running SPLIT::purify()…")
+            # Full counts matrix (all panel genes) gene × cells
+            expr_full_t = expr_panel.T.toarray() if hasattr(expr_panel, 'toarray') else expr_panel.T
+            full_r_mat = ro.r.matrix(
+                ro.FloatVector(expr_full_t.flatten(order='F').tolist()),
+                nrow=n_panel,
+                ncol=n_cells
+            )
+            ro.r.assign("._split_full_counts", full_r_mat)
+            ro.r.assign("._split_panel_genes", ro.StrVector(list(panel_genes)))
+            ro.r("""
 rownames(._split_full_counts) <- ._split_panel_genes
 colnames(._split_full_counts) <- ._split_colnames
 """)
-        ro.r("""._split_full_counts <- as(._split_full_counts, 'dgCMatrix')""")
-        ro.r("""
+            ro.r("""._split_full_counts <- as(._split_full_counts, 'dgCMatrix')""")
+            ro.r("""
 ._split_res <- SPLIT::purify(
     counts          = ._split_full_counts,
     rctd            = ._split_rctd,
@@ -2540,16 +2582,16 @@ colnames(._split_full_counts) <- ._split_colnames
 ._split_purified <- ._split_res$purified_counts
 """)
 
-        # ── 9. Convert back to Python ────────────────────────────────────────
-        _set("running", "Converting corrected counts to Python…")
-        purified_r = ro.r["._split_purified"]
-        # Extract cell IDs from R colnames — RCTD may drop low-UMI cells
-        try:
-            corrected_cell_ids = list(ro.r['colnames'](purified_r))
-        except Exception:
-            corrected_cell_ids = None
-        # Convert dgCMatrix → scipy CSR (cells × genes)
-        purified_csr_t = _r_dgcmatrix_to_scipy(purified_r)  # gene × cells
+            # ── 9. Convert back to Python ────────────────────────────────────────
+            _set("running", "Converting corrected counts to Python…")
+            purified_r = ro.r["._split_purified"]
+            # Extract cell IDs from R colnames — RCTD may drop low-UMI cells
+            try:
+                corrected_cell_ids = list(ro.r['colnames'](purified_r))
+            except Exception:
+                corrected_cell_ids = None
+            # Convert dgCMatrix → scipy CSR (cells × genes)
+            purified_csr_t = _r_dgcmatrix_to_scipy(purified_r)  # gene × cells
         corrected_mat  = purified_csr_t.T.tocsr()             # cells × genes
         corrected_mat.data = np.clip(corrected_mat.data, 0, None)
         n_corr = corrected_mat.shape[0]
@@ -3196,13 +3238,16 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                         _alt_res = _proseg_state["result"]
 
         # ── Load reference gene list ─────────────────────────────────────
+        from rpy2.rinterface_lib import openrlib
         _set("running", "Opening Seurat reference (this may take a few minutes)…")
-        importr("SeuratObject")
-        importr("Matrix")
-        ro.r(f'seurat_ref <- readRDS("{rds_path}")')
-        ro.r('rna_ref    <- seurat_ref[["RNA"]]')
-        ro.r('rna_genes  <- rownames(rna_ref@data)')
-        rna_genes_all = list(ro.r("rna_genes"))
+        with openrlib.rlock:
+            importr("SeuratObject")
+            importr("Matrix")
+            ro.r(f'seurat_ref <- readRDS("{rds_path}")')
+            ro.r('rna_ref    <- seurat_ref[["RNA"]]')
+            ro.r('rna_mat_data <- SeuratObject::LayerData(rna_ref, layer="data")')
+            ro.r('rna_genes  <- rownames(rna_mat_data)')
+            rna_genes_all = list(ro.r("rna_genes"))
 
         # Use only panel (non-imputed) genes for shared-gene computation
         gene_var = DATA.get("gene_var")
@@ -3247,7 +3292,20 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                     with _spage_lock:
                         _spage_state["result_path"]  = zarr_cache
                         _spage_state["result_genes"] = _genes_c
-                    _spage_index_update(zarr_cache)
+                    if _alt_res is not None:
+                        try:
+                            import json as _json_sc
+                            _sj = {"path": zarr_cache, "genes": _genes_c}
+                            with open(os.path.join(_alt_res["out_dir"], "spage_result.json"), "w") as _sjf:
+                                _json_sc.dump(_sj, _sjf)
+                        except Exception:
+                            pass
+                        _alock = _baysor_lock if _seg_tool(seg_source or "") == "baysor" else _proseg_lock
+                        with _alock:
+                            _alt_res["spage_result_path"]  = zarr_cache
+                            _alt_res["spage_result_genes"] = _genes_c
+                    else:
+                        _spage_index_update(zarr_cache)
                     _set("done", f"Done (cached) — {len(_genes_c):,} genes (streaming)", result=None)
                     return
             except Exception as _zce:
@@ -3285,10 +3343,11 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
 
             # Build R character vector of needed genes
             genes_r = "c(" + ",".join(f'"{g}"' for g in genes_needed) + ")"
-            ro.r(f"""
+            with openrlib.rlock:
+                ro.r(f"""
 genes_needed <- {genes_r}
 genes_needed <- genes_needed[genes_needed %in% rna_genes]
-mat_sub <- rna_ref@data[genes_needed, ]
+mat_sub <- rna_mat_data[genes_needed, ]
 Matrix::writeMM(mat_sub, "{mat_file}")
 writeLines(rownames(mat_sub), "{genes_file}")
 writeLines(colnames(mat_sub), "{cells_file}")
@@ -3300,7 +3359,8 @@ writeLines(colnames(mat_sub), "{cells_file}")
                 rna_cells = [l.strip() for l in f]
 
         # Free R memory
-        ro.r("rm(seurat_ref, rna_ref, mat_sub); gc()")
+        with openrlib.rlock:
+            ro.r("rm(seurat_ref, rna_ref, rna_mat_data, mat_sub); gc()")
 
         # ── Convert to dense DataFrame ───────────────────────────────────
         _set("running", f"Building expression matrices ({len(rna_cells):,} ref cells)…")
@@ -3393,6 +3453,18 @@ writeLines(colnames(mat_sub), "{cells_file}")
                 _spage_state["result_genes"] = genes_to_predict
             if _alt_res is None:
                 _spage_index_update(zarr_cache)
+            else:
+                try:
+                    import json as _json_sc
+                    _sj = {"path": zarr_cache, "genes": genes_to_predict}
+                    with open(os.path.join(_alt_res["out_dir"], "spage_result.json"), "w") as _sjf:
+                        _json_sc.dump(_sj, _sjf)
+                except Exception as _sje:
+                    print(f"  SpaGE: could not persist result ref: {_sje}", flush=True)
+                _alock = _baysor_lock if _seg_tool(seg_source or "") == "baysor" else _proseg_lock
+                with _alock:
+                    _alt_res["spage_result_path"]  = zarr_cache
+                    _alt_res["spage_result_genes"] = genes_to_predict
             _set("done", f"Done — {len(genes_to_predict):,} genes imputed (streaming)")
             return
 
@@ -3405,6 +3477,18 @@ writeLines(colnames(mat_sub), "{cells_file}")
         imp_df.to_parquet(cache_file)
         if _alt_res is None:
             _spage_index_update(cache_file)
+        else:
+            try:
+                import json as _json_sc
+                _sj = {"path": cache_file, "genes": genes_to_predict}
+                with open(os.path.join(_alt_res["out_dir"], "spage_result.json"), "w") as _sjf:
+                    _json_sc.dump(_sj, _sjf)
+            except Exception as _sje:
+                print(f"  SpaGE: could not persist result ref: {_sje}", flush=True)
+            _alock = _baysor_lock if _seg_tool(seg_source or "") == "baysor" else _proseg_lock
+            with _alock:
+                _alt_res["spage_result_path"]  = cache_file
+                _alt_res["spage_result_genes"] = genes_to_predict
         print(f"  SpaGE: {len(imp_df.columns)} genes cached to {cache_file}", flush=True)
 
         def _spage_write_zarr(sdata_path, imp_df_sub, lock_ctx=None):
@@ -3779,7 +3863,7 @@ def run_spage(rds_path: str, genes_file: str = None, n_pv: int = 50,
     Example
     -------
     run_spage(
-        rds_path="/Users/ikuz/Documents/XeniumWorkflow/Post_R3_FINAL_with_counts.rds",
+        rds_path="/Users/ikuz/Documents/XeniumWorkflow/snRV_ref.rds",
         genes_file="/Users/ikuz/Documents/XeniumWorkflow/to_impute.txt",
         n_pv=50,
     )
@@ -4884,9 +4968,16 @@ def _get_expr_values(gene: str, alt_res=None, use_corrected: bool = False) -> "n
         if idx < expr.shape[1]:
             return np.log1p(expr.getcol(idx).toarray().ravel().astype(np.float32))
     # Streaming SpaGE fallback — gene in zarr but not in expr index
-    with _spage_lock:
-        _rp = _spage_state.get("result_path")
-        _rg = _spage_state.get("result_genes") or []
+    # For reseg: prefer per-alt_res zarr (correct row count) over global spage_state
+    if alt_res is not None:
+        _rp = alt_res.get("spage_result_path")
+        _rg = alt_res.get("spage_result_genes") or []
+    else:
+        _rp, _rg = None, []
+    if not (_rp and lookup in _rg):
+        with _spage_lock:
+            _rp = _spage_state.get("result_path")
+            _rg = _spage_state.get("result_genes") or []
     if _rp and lookup in _rg:
         try:
             if os.path.isdir(_rp):
@@ -7170,7 +7261,7 @@ app.layout = html.Div([
                 dcc.Input(
                     id="annot-rds-path",
                     type="text",
-                    value="/Users/ikuz/Documents/XeniumWorkflow/Post_R3_FINAL_with_counts.rds",
+                    value="/Users/ikuz/Documents/XeniumWorkflow/snRV_ref.rds",
                     style={
                         "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
                         "border": f"1px solid {BORDER}", "borderRadius": "4px",
@@ -7278,7 +7369,7 @@ app.layout = html.Div([
             dcc.Input(
                 id="spage-rds-path",
                 type="text",
-                value="/Users/ikuz/Documents/XeniumWorkflow/Post_R3_FINAL_with_counts.rds",
+                value="/Users/ikuz/Documents/XeniumWorkflow/snRV_ref.rds",
                 debounce=True,
                 style={
                     "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
@@ -8635,7 +8726,7 @@ def start_spage(n_clicks, rds_path, n_pv, genes_input, seg_source):
         if _spage_state["status"] == "running":
             return False, "Already running…", "Already running…", True
         _spage_state.update({"status": "running", "message": "Starting…", "result": None})
-    rds_path = rds_path or "/Users/ikuz/Documents/XeniumWorkflow/Post_R3_FINAL_with_counts.rds"
+    rds_path = rds_path or "/Users/ikuz/Documents/XeniumWorkflow/snRV_ref.rds"
     n_pv = int(n_pv or 50)
     genes_str = genes_input or ""
     seg_src = seg_source or "xenium"
@@ -10278,51 +10369,53 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
         _rconv.set_conversion(ro.default_converter)
         pandas2ri.activate()
 
-        # ── 1. Check spacexr ─────────────────────────────────────────────
-        _set("running", "Loading spacexr…")
-        try:
-            importr("spacexr")
-        except Exception as _spacexr_err:
-            print(f"  RCTD: importr('spacexr') failed: {_spacexr_err}", flush=True)
-            _set("error", f"spacexr not found by rpy2: {str(_spacexr_err)[:200]}")
-            return
+        from rpy2.rinterface_lib import openrlib
+        with openrlib.rlock:
+            # ── 1. Check spacexr ─────────────────────────────────────────────
+            _set("running", "Loading spacexr…")
+            try:
+                importr("spacexr")
+            except Exception as _spacexr_err:
+                print(f"  RCTD: importr('spacexr') failed: {_spacexr_err}", flush=True)
+                _set("error", f"spacexr not found by rpy2: {str(_spacexr_err)[:200]}")
+                return
 
-        importr("SeuratObject")
-        importr("Matrix")
-        base = importr("base")
+            importr("SeuratObject")
+            importr("Matrix")
+            base = importr("base")
 
-        # ── 2. Load Seurat reference ─────────────────────────────────────
-        _set("running", "Loading Seurat reference…")
-        rds = base.readRDS(rds_path)
-        meta_r  = ro.r['slot'](rds, "meta.data")
-        meta_df = pandas2ri.rpy2py(meta_r)
-        if label_col not in meta_df.columns:
-            _set("error", f"Column '{label_col}' not found. Available: {list(meta_df.columns)[:10]}")
-            return
+            # ── 2. Load Seurat reference ─────────────────────────────────────
+            _set("running", "Loading Seurat reference…")
+            rds = base.readRDS(rds_path)
+            meta_r  = ro.r['slot'](rds, "meta.data")
+            meta_df = pandas2ri.rpy2py(meta_r)
+            if label_col not in meta_df.columns:
+                _set("error", f"Column '{label_col}' not found. Available: {list(meta_df.columns)[:10]}")
+                return
 
-        # ── 3. Determine shared genes ────────────────────────────────────
-        _set("running", "Finding shared genes…")
-        ro.r.assign("._rctd_rds", rds)
-        mat_r     = ro.r("slot(slot(._rctd_rds, 'assays')[['RNA']], 'counts')")
-        ref_genes = list(ro.r['rownames'](mat_r))
-        xenium_genes = list(DATA["gene_names"])
-        shared_genes = sorted(set(xenium_genes) & set(ref_genes))
-        if len(shared_genes) < 10:
-            _set("error", f"Only {len(shared_genes)} shared genes between reference and panel.")
-            return
-        print(f"  RCTD: {len(shared_genes)} shared genes", flush=True)
+            # ── 3. Determine shared genes ────────────────────────────────────
+            _set("running", "Finding shared genes…")
+            ro.r.assign("._rctd_rds", rds)
+            mat_r     = ro.r("SeuratObject::LayerData(._rctd_rds[['RNA']], layer='counts')")
+            ref_genes = list(ro.r['rownames'](mat_r))
+            xenium_genes = list(DATA["gene_names"])
+            shared_genes = sorted(set(xenium_genes) & set(ref_genes))
+            if len(shared_genes) < 10:
+                _set("error", f"Only {len(shared_genes)} shared genes between reference and panel.")
+                return
+            print(f"  RCTD: {len(shared_genes)} shared genes", flush=True)
 
-        # ── 4. Build Reference object ────────────────────────────────────
-        _set("running", f"Building RCTD Reference ({len(meta_df):,} ref cells)…")
-        ro.r.assign("._rctd_genes", ro.StrVector(shared_genes))
-        ro.r("""
-._rctd_ref_mat <- slot(slot(._rctd_rds, 'assays')[['RNA']], 'counts')[._rctd_genes, , drop=FALSE]
+            # ── 4. Build Reference object ────────────────────────────────────
+            _set("running", f"Building RCTD Reference ({len(meta_df):,} ref cells)…")
+            ro.r.assign("._rctd_genes", ro.StrVector(shared_genes))
+            ro.r("""
+._rctd_ref_mat <- SeuratObject::LayerData(._rctd_rds[['RNA']], layer='counts')[._rctd_genes, , drop=FALSE]
 ._rctd_ref_mat <- as(._rctd_ref_mat, 'dgCMatrix')
 """)
-        ref_labels_r       = ro.StrVector(meta_df[label_col].astype(str).tolist())
-        ref_labels_r.names = ro.StrVector(list(meta_df.index.astype(str)))
-        ro.r.assign("._rctd_ref_labels", ref_labels_r)
-        ro.r("""
+            ref_labels_r       = ro.StrVector(meta_df[label_col].astype(str).tolist())
+            ref_labels_r.names = ro.StrVector(list(meta_df.index.astype(str)))
+            ro.r.assign("._rctd_ref_labels", ref_labels_r)
+            ro.r("""
 ._rctd_ref_factor <- as.factor(._rctd_ref_labels)
 ._rctd_numi_ref   <- colSums(._rctd_ref_mat)
 ._rctd_reference  <- spacexr::Reference(
@@ -10332,32 +10425,32 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
 )
 """)
 
-        # ── 5. Build SpatialRNA from Xenium ──────────────────────────────
-        _set("running", "Building SpatialRNA object…")
-        df = DATA["df"]
-        if expr_override is not None:
-            xen_mat_full = expr_override.T        # genes × cells
-            cell_ids     = [str(c) for c in (cell_ids_override or range(expr_override.shape[0]))]
-            coords_df    = df[["x_centroid", "y_centroid"]].reindex(
-                               pd.Index(cell_ids)).fillna(0.0)
-        else:
-            xen_mat_full = DATA["expr"].T  # genes × cells
-            cell_ids     = [str(c) for c in df.index.tolist()]
-            coords_df    = df[["x_centroid", "y_centroid"]].copy()
-            coords_df.index = cell_ids
+            # ── 5. Build SpatialRNA from Xenium ──────────────────────────────
+            _set("running", "Building SpatialRNA object…")
+            df = DATA["df"]
+            if expr_override is not None:
+                xen_mat_full = expr_override.T        # genes × cells
+                cell_ids     = [str(c) for c in (cell_ids_override or range(expr_override.shape[0]))]
+                coords_df    = df[["x_centroid", "y_centroid"]].reindex(
+                                   pd.Index(cell_ids)).fillna(0.0)
+            else:
+                xen_mat_full = DATA["expr"].T  # genes × cells
+                cell_ids     = [str(c) for c in df.index.tolist()]
+                coords_df    = df[["x_centroid", "y_centroid"]].copy()
+                coords_df.index = cell_ids
 
-        gene_idx   = {g: i for i, g in enumerate(xenium_genes)}
-        shared_idx = [gene_idx[g] for g in shared_genes]
-        xen_sub    = sp_.csc_matrix(xen_mat_full[shared_idx, :])   # shared_genes × cells
+            gene_idx   = {g: i for i, g in enumerate(xenium_genes)}
+            shared_idx = [gene_idx[g] for g in shared_genes]
+            xen_sub    = sp_.csc_matrix(xen_mat_full[shared_idx, :])   # shared_genes × cells
 
-        tmpdir = tempfile.mkdtemp(prefix="xenium_rctd_")
-        sio.mmwrite(os.path.join(tmpdir, "xenium.mtx"), xen_sub)
-        with open(os.path.join(tmpdir, "genes.txt"),    "w") as f: f.write("\n".join(shared_genes) + "\n")
-        with open(os.path.join(tmpdir, "barcodes.txt"), "w") as f: f.write("\n".join(cell_ids) + "\n")
-        coords_df.to_csv(os.path.join(tmpdir, "coords.csv"))
+            tmpdir = tempfile.mkdtemp(prefix="xenium_rctd_")
+            sio.mmwrite(os.path.join(tmpdir, "xenium.mtx"), xen_sub)
+            with open(os.path.join(tmpdir, "genes.txt"),    "w") as f: f.write("\n".join(shared_genes) + "\n")
+            with open(os.path.join(tmpdir, "barcodes.txt"), "w") as f: f.write("\n".join(cell_ids) + "\n")
+            coords_df.to_csv(os.path.join(tmpdir, "coords.csv"))
 
-        ro.r.assign("._rctd_tmpdir", tmpdir)
-        ro.r("""
+            ro.r.assign("._rctd_tmpdir", tmpdir)
+            ro.r("""
 ._rctd_xen_mat  <- Matrix::readMM(file.path(._rctd_tmpdir, "xenium.mtx"))
 ._rctd_xen_genes <- readLines(file.path(._rctd_tmpdir, "genes.txt"))
 ._rctd_xen_bcs   <- readLines(file.path(._rctd_tmpdir, "barcodes.txt"))
@@ -10374,75 +10467,75 @@ colnames(._rctd_coords) <- c('x', 'y')
 )
 """)
 
-        # ── 6. Create and run RCTD ───────────────────────────────────────
-        _set("running", f"Running RCTD ({mode} mode, {n_cores} cores)…")
-        ro.r.assign("._rctd_mode",    mode)
-        ro.r.assign("._rctd_cores",   n_cores)
-        ro.r.assign("._rctd_umi_min",       ro.IntVector([umi_min]))
-        ro.r.assign("._rctd_umi_min_sigma", ro.IntVector([umi_min_sigma]))
-        ro.r("""
+            # ── 6. Create and run RCTD ───────────────────────────────────────
+            _set("running", f"Running RCTD ({mode} mode, {n_cores} cores)…")
+            ro.r.assign("._rctd_mode",    mode)
+            ro.r.assign("._rctd_cores",   n_cores)
+            ro.r.assign("._rctd_umi_min",       ro.IntVector([umi_min]))
+            ro.r.assign("._rctd_umi_min_sigma", ro.IntVector([umi_min_sigma]))
+            ro.r("""
 ._rctd_obj <- spacexr::create.RCTD(._rctd_puck, ._rctd_reference, max_cores=._rctd_cores,
     UMI_min=._rctd_umi_min[1], UMI_min_sigma=._rctd_umi_min_sigma[1])
 ._rctd_obj <- spacexr::run.RCTD(._rctd_obj, doublet_mode=._rctd_mode)
 """)
-        print("  RCTD: run complete — extracting results…", flush=True)
+            print("  RCTD: run complete — extracting results…", flush=True)
 
-        # ── 7. Extract per-cell labels ────────────────────────────────────
-        _set("running", "Extracting RCTD results…")
-        if mode == "full":
-            ro.r("""
+            # ── 7. Extract per-cell labels ────────────────────────────────────
+            _set("running", "Extracting RCTD results…")
+            if mode == "full":
+                ro.r("""
 ._rctd_weights <- ._rctd_obj@results$weights
 ._rctd_types   <- colnames(._rctd_weights)[apply(._rctd_weights, 1, which.max)]
 names(._rctd_types) <- rownames(._rctd_weights)
 """)
-        else:  # doublet / multi
-            ro.r("""
+            else:  # doublet / multi
+                ro.r("""
 ._rctd_res   <- ._rctd_obj@results$results_df
 ._rctd_types <- as.character(._rctd_res$first_type)
 names(._rctd_types) <- rownames(._rctd_res)
 """)
 
-        types_r   = ro.r("._rctd_types")
-        names_r   = ro.r("names(._rctd_types)")
-        cell_ids  = list(names_r)
-        cell_vals = [str(v) for v in types_r]
-        labels    = pd.Series(dict(zip(cell_ids, cell_vals)), name="label").astype(str)
-        labels.index  = labels.index.astype(str)
+            types_r   = ro.r("._rctd_types")
+            names_r   = ro.r("names(._rctd_types)")
+            cell_ids  = list(names_r)
+            cell_vals = [str(v) for v in types_r]
+            labels    = pd.Series(dict(zip(cell_ids, cell_vals)), name="label").astype(str)
+            labels.index  = labels.index.astype(str)
 
-        unique_types = labels.unique().tolist()
-        print(f"  RCTD: {len(labels):,} cells → {len(unique_types)} types", flush=True)
+            unique_types = labels.unique().tolist()
+            print(f"  RCTD: {len(labels):,} cells → {len(unique_types)} types", flush=True)
 
-        pd.DataFrame({"label": labels}).to_parquet(cache_file)
+            pd.DataFrame({"label": labels}).to_parquet(cache_file)
 
-        # ── 8. Extract and cache weight matrix (full mode only) ───────────
-        weights_df = None
-        if mode == "full":
-            _set("running", "Extracting RCTD weight matrix…")
+            # ── 8. Extract and cache weight matrix (full mode only) ───────────
+            weights_df = None
+            if mode == "full":
+                _set("running", "Extracting RCTD weight matrix…")
+                try:
+                    ro.r("._rctd_weights_dense <- as.matrix(._rctd_weights)")
+                    ct_names   = list(ro.r("colnames(._rctd_weights)"))
+                    cell_ids_w = list(ro.r("rownames(._rctd_weights)"))
+                    w_arr      = np.array(ro.r("._rctd_weights_dense"))
+                    weights_df = pd.DataFrame(w_arr, index=cell_ids_w, columns=ct_names)
+                    weights_df.index = weights_df.index.astype(str)
+                    weights_cache = cache_file.replace(".parquet", "_weights.parquet")
+                    weights_df.to_parquet(weights_cache)
+                    print(f"  RCTD: weights saved ({weights_df.shape[1]} types)", flush=True)
+                except Exception as _we:
+                    print(f"  RCTD: weight extraction failed: {_we}", flush=True)
+            weights_key = f"rctd_weights_{labels_key}"
+            with _annot_lock:
+                _annot_state[weights_key] = weights_df
+
+            _set("done", f"Done — {len(unique_types)} cell types in {len(labels):,} cells",
+                 labels=labels)
+
+            # Cleanup R temporaries (best-effort)
             try:
-                ro.r("._rctd_weights_dense <- as.matrix(._rctd_weights)")
-                ct_names   = list(ro.r("colnames(._rctd_weights)"))
-                cell_ids_w = list(ro.r("rownames(._rctd_weights)"))
-                w_arr      = np.array(ro.r("._rctd_weights_dense"))
-                weights_df = pd.DataFrame(w_arr, index=cell_ids_w, columns=ct_names)
-                weights_df.index = weights_df.index.astype(str)
-                weights_cache = cache_file.replace(".parquet", "_weights.parquet")
-                weights_df.to_parquet(weights_cache)
-                print(f"  RCTD: weights saved ({weights_df.shape[1]} types)", flush=True)
-            except Exception as _we:
-                print(f"  RCTD: weight extraction failed: {_we}", flush=True)
-        weights_key = f"rctd_weights_{labels_key}"
-        with _annot_lock:
-            _annot_state[weights_key] = weights_df
-
-        _set("done", f"Done — {len(unique_types)} cell types in {len(labels):,} cells",
-             labels=labels)
-
-        # Cleanup R temporaries (best-effort)
-        try:
-            ro.r("rm(list=ls(pattern='^\\._rctd_'))")
-        except Exception:
-            pass
-        import shutil; shutil.rmtree(tmpdir, ignore_errors=True)
+                ro.r("rm(list=ls(pattern='^\\._rctd_'))")
+            except Exception:
+                pass
+            import shutil; shutil.rmtree(tmpdir, ignore_errors=True)
 
     except Exception as exc:
         import traceback; traceback.print_exc()
@@ -10503,52 +10596,54 @@ def _run_seurat_annotation(rds_path: str, label_col: str = "Names", labels_key: 
         import rpy2.robjects as ro
         from rpy2.robjects import pandas2ri
         from rpy2.robjects.packages import importr
+        from rpy2.rinterface_lib import openrlib
         pandas2ri.activate()
 
-        base = importr("base")
-        rds  = base.readRDS(rds_path)
+        with openrlib.rlock:
+            base = importr("base")
+            rds  = base.readRDS(rds_path)
 
-        # ── 2. Extract metadata → label vector ──────────────────────────
-        _set("running", f"Extracting '{label_col}' labels…")
-        meta_r = ro.r['slot'](rds, "meta.data")
-        meta_df = pandas2ri.rpy2py(meta_r)
-        if label_col not in meta_df.columns:
-            cols = list(meta_df.columns)
-            _set("error", f"Column '{label_col}' not found. Available: {cols[:10]}")
-            return
+            # ── 2. Extract metadata → label vector ──────────────────────────
+            _set("running", f"Extracting '{label_col}' labels…")
+            meta_r = ro.r['slot'](rds, "meta.data")
+            meta_df = pandas2ri.rpy2py(meta_r)
+            if label_col not in meta_df.columns:
+                cols = list(meta_df.columns)
+                _set("error", f"Column '{label_col}' not found. Available: {cols[:10]}")
+                return
 
-        ref_labels = meta_df[label_col].astype(str)  # index = ref cell barcodes
+            ref_labels = meta_df[label_col].astype(str)  # index = ref cell barcodes
 
-        unique_types = ref_labels.unique().tolist()
-        print(f"  Reference: {len(ref_labels)} cells, {len(unique_types)} cell types", flush=True)
+            unique_types = ref_labels.unique().tolist()
+            print(f"  Reference: {len(ref_labels)} cells, {len(unique_types)} cell types", flush=True)
 
-        # ── 3. Find shared genes first (before loading any matrix) ──────
-        import scipy.sparse as sp_
-        import tempfile
+            # ── 3. Find shared genes first (before loading any matrix) ──────
+            import scipy.sparse as sp_
+            import tempfile
 
-        importr("SeuratObject")
-        importr("Matrix")
+            importr("SeuratObject")
+            importr("Matrix")
 
-        _set("running", "Reading reference gene list…")
-        ro.r.assign("._annot_rds_tmp", rds)
-        mat_r = ro.r("slot(slot(._annot_rds_tmp, 'assays')[['RNA']], 'data')")
-        ref_genes_all = list(ro.r['rownames'](mat_r))
-        ref_bcs = list(ro.r['colnames'](mat_r))
+            _set("running", "Reading reference gene list…")
+            ro.r.assign("._annot_rds_tmp", rds)
+            mat_r = ro.r("SeuratObject::LayerData(._annot_rds_tmp[['RNA']], layer='data')")
+            ref_genes_all = list(ro.r['rownames'](mat_r))
+            ref_bcs = list(ro.r['colnames'](mat_r))
 
-        xenium_genes = list(DATA["gene_names"])
-        shared = sorted(set(xenium_genes) & set(ref_genes_all))
-        if len(shared) < 10:
-            _set("error", f"Only {len(shared)} shared genes — not enough for label transfer.")
-            return
-        print(f"  Shared genes for label transfer: {len(shared)}", flush=True)
+            xenium_genes = list(DATA["gene_names"])
+            shared = sorted(set(xenium_genes) & set(ref_genes_all))
+            if len(shared) < 10:
+                _set("error", f"Only {len(shared)} shared genes — not enough for label transfer.")
+                return
+            print(f"  Shared genes for label transfer: {len(shared)}", flush=True)
 
-        # ── 4. Export ONLY shared-gene rows via rpy2 (no subprocess) ────
-        _set("running", f"Extracting {len(shared)} shared-gene submatrix…")
-        tmpdir = tempfile.mkdtemp(prefix="xenium_annot_")
-        ro.r.assign("._annot_mat",   mat_r)
-        ro.r.assign("._annot_genes", ro.StrVector(shared))
-        ro.r.assign("._annot_dir",   tmpdir)
-        ro.r("""
+            # ── 4. Export ONLY shared-gene rows via rpy2 (no subprocess) ────
+            _set("running", f"Extracting {len(shared)} shared-gene submatrix…")
+            tmpdir = tempfile.mkdtemp(prefix="xenium_annot_")
+            ro.r.assign("._annot_mat",   mat_r)
+            ro.r.assign("._annot_genes", ro.StrVector(shared))
+            ro.r.assign("._annot_dir",   tmpdir)
+            ro.r("""
 mat_sub <- ._annot_mat[._annot_genes, , drop = FALSE]
 Matrix::writeMM(mat_sub, file.path(._annot_dir, "matrix.mtx"))
 write.table(data.frame(gene = rownames(mat_sub)),
@@ -10582,7 +10677,7 @@ rm(._annot_mat, ._annot_genes, ._annot_dir, ._annot_rds_tmp, mat_sub)
         row_sums[row_sums == 0] = 1.0
         xen_shared = np.log1p(xen_shared / row_sums * 10_000)
 
-        # Also normalize reference (already log-normalized from Seurat @data, but z-score both)
+        # Also normalize reference (already log-normalized from Seurat data layer, but z-score both)
         import scipy.stats as st_
         from sklearn.decomposition import TruncatedSVD
         from sklearn.neighbors import NearestNeighbors
@@ -11156,6 +11251,20 @@ def _load_cached_baysor(out_dir: str) -> None:
     print(f"Loading cached Baysor: {os.path.basename(out_dir)}…", flush=True)
     try:
         _set("running", "Loading cached Baysor result…")
+        # Restore SpaGE result reference written by _run_spage_imputation
+        _spage_rpath, _spage_rgenes = None, None
+        _spage_ref_file = os.path.join(out_dir, "spage_result.json")
+        if os.path.exists(_spage_ref_file):
+            try:
+                import json as _jref
+                with open(_spage_ref_file) as _jf:
+                    _sref = _jref.load(_jf)
+                if os.path.isdir(_sref.get("path", "")):
+                    _spage_rpath  = _sref["path"]
+                    _spage_rgenes = _sref.get("genes", [])
+                    print(f"  Baysor: restored SpaGE result ({len(_spage_rgenes)} genes)", flush=True)
+            except Exception:
+                pass
         zarr_path_fast = os.path.join(out_dir, "spatialdata_baysor.zarr")
         if os.path.isdir(zarr_path_fast):
             try:
@@ -11177,6 +11286,8 @@ def _load_cached_baysor(out_dir: str) -> None:
                     "sdata_path": zarr_path_fast,
                     "split_corrected_expr": _baysor_corr,
                     "split_corrected_imputed_genes": _baysor_corr_imp,
+                    "spage_result_path": _spage_rpath,
+                    "spage_result_genes": _spage_rgenes,
                 })
                 print(f"Loaded cached Baysor (fast): {n_cells:,} cells, "
                       f"{len(cell_bounds):,} boundaries", flush=True)
@@ -11276,6 +11387,8 @@ def _load_cached_baysor(out_dir: str) -> None:
             "sdata_path": zarr_path,
             "split_corrected_expr": _baysor_corr,
             "split_corrected_imputed_genes": _baysor_corr_imp,
+            "spage_result_path": _spage_rpath,
+            "spage_result_genes": _spage_rgenes,
         })
         print(f"Loaded cached Baysor: {n_cells:,} cells, {len(cell_bounds):,} boundaries "
               f"from {os.path.basename(out_dir)}", flush=True)
@@ -11295,6 +11408,20 @@ def _load_cached_proseg(out_dir: str) -> None:
     print(f"Loading cached Proseg: {os.path.basename(out_dir)}…", flush=True)
     try:
         _set("running", "Loading cached Proseg result…")
+        # Restore SpaGE result reference written by _run_spage_imputation
+        _spage_rpath, _spage_rgenes = None, None
+        _spage_ref_file = os.path.join(out_dir, "spage_result.json")
+        if os.path.exists(_spage_ref_file):
+            try:
+                import json as _jref
+                with open(_spage_ref_file) as _jf:
+                    _sref = _jref.load(_jf)
+                if os.path.isdir(_sref.get("path", "")):
+                    _spage_rpath  = _sref["path"]
+                    _spage_rgenes = _sref.get("genes", [])
+                    print(f"  Proseg: restored SpaGE result ({len(_spage_rgenes)} genes)", flush=True)
+            except Exception:
+                pass
         zarr_path_fast = os.path.join(out_dir, "spatialdata_proseg.zarr")
         if os.path.isdir(zarr_path_fast):
             try:
@@ -11316,6 +11443,8 @@ def _load_cached_proseg(out_dir: str) -> None:
                     "sdata_path": zarr_path_fast,
                     "split_corrected_expr": _proseg_corr,
                     "split_corrected_imputed_genes": _proseg_corr_imp,
+                    "spage_result_path": _spage_rpath,
+                    "spage_result_genes": _spage_rgenes,
                 })
                 print(f"Loaded cached Proseg (fast): {n_cells:,} cells, "
                       f"{len(cell_bounds):,} boundaries", flush=True)
@@ -11469,6 +11598,8 @@ def _load_cached_proseg(out_dir: str) -> None:
             "sdata_path": zarr_path,
             "split_corrected_expr": _proseg_corr,
             "split_corrected_imputed_genes": _proseg_corr_imp,
+            "spage_result_path": _spage_rpath,
+            "spage_result_genes": _spage_rgenes,
         })
         print(f"Loaded cached Proseg: {n_cells:,} cells, {len(cell_bounds):,} boundaries "
               f"from {os.path.basename(out_dir)}", flush=True)
@@ -12226,53 +12357,55 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
         n_cells, n_genes = expr_panel.shape
         print(f"  SPLIT: {n_cells:,} cells × {n_genes} panel genes", flush=True)
 
-        # ── 2. Check R packages ──────────────────────────────────────────────
-        _set("running", "Loading R packages (spacexr, SPLIT)…")
-        try:
-            importr("spacexr")
-        except Exception:
-            _set("error", "spacexr not installed. In R: devtools::install_github('dmcable/spacexr')")
-            return
-        try:
-            importr("SPLIT")
-        except Exception:
-            _set("error", "SPLIT not installed. In R: remotes::install_github('bdsc-tds/SPLIT')")
-            return
-        importr("SeuratObject")
-        importr("Matrix")
-        base = importr("base")
+        from rpy2.rinterface_lib import openrlib
+        with openrlib.rlock:
+            # ── 2. Check R packages ──────────────────────────────────────────────
+            _set("running", "Loading R packages (spacexr, SPLIT)…")
+            try:
+                importr("spacexr")
+            except Exception:
+                _set("error", "spacexr not installed. In R: devtools::install_github('dmcable/spacexr')")
+                return
+            try:
+                importr("SPLIT")
+            except Exception:
+                _set("error", "SPLIT not installed. In R: remotes::install_github('bdsc-tds/SPLIT')")
+                return
+            importr("SeuratObject")
+            importr("Matrix")
+            base = importr("base")
 
-        # ── 3. Load Seurat reference ─────────────────────────────────────────
-        _set("running", "Loading Seurat reference…")
-        rds = base.readRDS(rds_path)
-        meta_r  = ro.r['slot'](rds, "meta.data")
-        meta_df = pandas2ri.rpy2py(meta_r)
-        if label_col not in meta_df.columns:
-            _set("error", f"Column '{label_col}' not found. Available: {list(meta_df.columns)[:10]}")
-            return
+            # ── 3. Load Seurat reference ─────────────────────────────────────────
+            _set("running", "Loading Seurat reference…")
+            rds = base.readRDS(rds_path)
+            meta_r  = ro.r['slot'](rds, "meta.data")
+            meta_df = pandas2ri.rpy2py(meta_r)
+            if label_col not in meta_df.columns:
+                _set("error", f"Column '{label_col}' not found. Available: {list(meta_df.columns)[:10]}")
+                return
 
-        # ── 4. Shared genes ──────────────────────────────────────────────────
-        _set("running", "Finding shared genes…")
-        ro.r.assign("._split_rds", rds)
-        mat_r     = ro.r("slot(slot(._split_rds, 'assays')[['RNA']], 'counts')")
-        ref_genes = list(ro.r['rownames'](mat_r))
-        shared_genes = sorted(set(panel_genes) & set(ref_genes))
-        if len(shared_genes) < 10:
-            _set("error", f"Only {len(shared_genes)} shared genes between reference and panel.")
-            return
-        print(f"  SPLIT: {len(shared_genes)} shared genes", flush=True)
+            # ── 4. Shared genes ──────────────────────────────────────────────────
+            _set("running", "Finding shared genes…")
+            ro.r.assign("._split_rds", rds)
+            mat_r     = ro.r("SeuratObject::LayerData(._split_rds[['RNA']], layer='counts')")
+            ref_genes = list(ro.r['rownames'](mat_r))
+            shared_genes = sorted(set(panel_genes) & set(ref_genes))
+            if len(shared_genes) < 10:
+                _set("error", f"Only {len(shared_genes)} shared genes between reference and panel.")
+                return
+            print(f"  SPLIT: {len(shared_genes)} shared genes", flush=True)
 
-        # ── 5. Build Reference ───────────────────────────────────────────────
-        _set("running", f"Building RCTD Reference ({len(meta_df):,} ref cells)…")
-        ro.r.assign("._split_genes", ro.StrVector(shared_genes))
-        ro.r("""
-._split_ref_mat <- slot(slot(._split_rds, 'assays')[['RNA']], 'counts')[._split_genes, , drop=FALSE]
+            # ── 5. Build Reference ───────────────────────────────────────────────
+            _set("running", f"Building RCTD Reference ({len(meta_df):,} ref cells)…")
+            ro.r.assign("._split_genes", ro.StrVector(shared_genes))
+            ro.r("""
+._split_ref_mat <- SeuratObject::LayerData(._split_rds[['RNA']], layer='counts')[._split_genes, , drop=FALSE]
 ._split_ref_mat <- as(._split_ref_mat, 'dgCMatrix')
 """)
-        ref_labels_r       = ro.StrVector(meta_df[label_col].astype(str).tolist())
-        ref_labels_r.names = ro.StrVector(list(meta_df.index.astype(str)))
-        ro.r.assign("._split_ref_labels", ref_labels_r)
-        ro.r("""
+            ref_labels_r       = ro.StrVector(meta_df[label_col].astype(str).tolist())
+            ref_labels_r.names = ro.StrVector(list(meta_df.index.astype(str)))
+            ro.r.assign("._split_ref_labels", ref_labels_r)
+            ro.r("""
 ._split_ref_factor <- as.factor(._split_ref_labels)
 ._split_numi_ref   <- colSums(._split_ref_mat)
 ._split_reference  <- spacexr::Reference(
@@ -12282,32 +12415,32 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
 )
 """)
 
-        # ── 6. Build SpatialRNA (panel genes only) ───────────────────────────
-        _set("running", f"Building SpatialRNA object ({n_cells:,} cells)…")
-        # Subset expr_panel to shared genes
-        shared_idx = [gni[g] for g in shared_genes if g in gni and gni[g] < n_panel]
-        shared_genes_present = [g for g in shared_genes if g in gni and gni[g] < n_panel]
-        expr_shared = expr_panel[:, shared_idx]  # cells × shared_genes
-        # gene × cells for R
-        expr_t = expr_shared.T.toarray() if hasattr(expr_shared, 'toarray') else expr_shared.T
-        counts_r_mat = ro.r.matrix(
-            ro.FloatVector(expr_t.flatten(order='F').tolist()),
-            nrow=len(shared_genes_present),
-            ncol=n_cells
-        )
-        cell_ids = [str(c) for c in cells_df.index]
-        ro.r.assign("._split_counts_mat", counts_r_mat)
-        ro.r.assign("._split_rownames", ro.StrVector(shared_genes_present))
-        ro.r.assign("._split_colnames", ro.StrVector(cell_ids))
-        ro.r("""
+            # ── 6. Build SpatialRNA (panel genes only) ───────────────────────────
+            _set("running", f"Building SpatialRNA object ({n_cells:,} cells)…")
+            # Subset expr_panel to shared genes
+            shared_idx = [gni[g] for g in shared_genes if g in gni and gni[g] < n_panel]
+            shared_genes_present = [g for g in shared_genes if g in gni and gni[g] < n_panel]
+            expr_shared = expr_panel[:, shared_idx]  # cells × shared_genes
+            # gene × cells for R
+            expr_t = expr_shared.T.toarray() if hasattr(expr_shared, 'toarray') else expr_shared.T
+            counts_r_mat = ro.r.matrix(
+                ro.FloatVector(expr_t.flatten(order='F').tolist()),
+                nrow=len(shared_genes_present),
+                ncol=n_cells
+            )
+            cell_ids = [str(c) for c in cells_df.index]
+            ro.r.assign("._split_counts_mat", counts_r_mat)
+            ro.r.assign("._split_rownames", ro.StrVector(shared_genes_present))
+            ro.r.assign("._split_colnames", ro.StrVector(cell_ids))
+            ro.r("""
 rownames(._split_counts_mat) <- ._split_rownames
 colnames(._split_counts_mat) <- ._split_colnames
 ._split_counts_mat <- as(._split_counts_mat, 'dgCMatrix')
 """)
 
-        ro.r.assign("._split_x", ro.FloatVector(cells_df["x_centroid"].astype(float).tolist()))
-        ro.r.assign("._split_y", ro.FloatVector(cells_df["y_centroid"].astype(float).tolist()))
-        ro.r("""
+            ro.r.assign("._split_x", ro.FloatVector(cells_df["x_centroid"].astype(float).tolist()))
+            ro.r.assign("._split_y", ro.FloatVector(cells_df["y_centroid"].astype(float).tolist()))
+            ro.r("""
 ._split_coords <- data.frame(x=._split_x, y=._split_y)
 rownames(._split_coords) <- colnames(._split_counts_mat)
 ._split_numi <- colSums(._split_counts_mat)
@@ -12318,97 +12451,97 @@ rownames(._split_coords) <- colnames(._split_counts_mat)
 )
 """)
 
-        # ── 7. Run RCTD (doublet mode) — with caching ────────────────────────
-        # Compute a stable key for this RCTD run so we can skip it on re-runs.
-        _rctd_lkey = "labels_rctd_doublet"
-        if _alt_res is not None:
-            _rctd_tag  = hashlib.md5((_alt_res.get("out_dir", "")).encode()).hexdigest()[:8]
-            _rctd_tool = _alt_res.get("source", "baysor")
-            _rctd_lkey = f"labels_rctd_doublet_{_rctd_tool}_{_rctd_tag}"
-        _rctd_cache_key  = (f"rctd_{os.path.basename(rds_path)}_{label_col}_doublet"
-                            f"_umi{min_umi}_sig{min_umi_sigma}_{_rctd_lkey}")
-        _rctd_cache_file = _cache_path(_rctd_cache_key)
-        _rctd_obj_file   = _rctd_cache_file.replace(".parquet", "_rctd_obj.rds")
+            # ── 7. Run RCTD (doublet mode) — with caching ────────────────────────
+            # Compute a stable key for this RCTD run so we can skip it on re-runs.
+            _rctd_lkey = "labels_rctd_doublet"
+            if _alt_res is not None:
+                _rctd_tag  = hashlib.md5((_alt_res.get("out_dir", "")).encode()).hexdigest()[:8]
+                _rctd_tool = _alt_res.get("source", "baysor")
+                _rctd_lkey = f"labels_rctd_doublet_{_rctd_tool}_{_rctd_tag}"
+            _rctd_cache_key  = (f"rctd_{os.path.basename(rds_path)}_{label_col}_doublet"
+                                f"_umi{min_umi}_sig{min_umi_sigma}_{_rctd_lkey}")
+            _rctd_cache_file = _cache_path(_rctd_cache_key)
+            _rctd_obj_file   = _rctd_cache_file.replace(".parquet", "_rctd_obj.rds")
 
-        _rctd_from_cache = False
-        if os.path.exists(_rctd_cache_file) and os.path.exists(_rctd_obj_file):
-            try:
-                _cached_rctd = pd.read_parquet(_rctd_cache_file)
-                _split_labels_cached = _cached_rctd["label"].astype(str)
-                _split_labels_cached.index = _split_labels_cached.index.astype(str)
-                _sample = set(cell_ids[:200])
-                _overlap = len(set(_split_labels_cached.index[:200]) & _sample)
-                if _overlap >= max(1, len(_sample) * 0.05):
-                    ro.r(f'._split_rctd <- readRDS("{_rctd_obj_file}")')
-                    _split_labels = _split_labels_cached
-                    _rctd_from_cache = True
-                    _set("running", "RCTD loaded from cache, running SPLIT::purify()…")
-                    print("  SPLIT: RCTD loaded from cache", flush=True)
-                else:
-                    print(f"  SPLIT: RCTD cache index mismatch ({_overlap}/{len(_sample)}) — re-running", flush=True)
-            except Exception as _ce:
-                print(f"  SPLIT: RCTD cache load failed: {_ce}", flush=True)
+            _rctd_from_cache = False
+            if os.path.exists(_rctd_cache_file) and os.path.exists(_rctd_obj_file):
+                try:
+                    _cached_rctd = pd.read_parquet(_rctd_cache_file)
+                    _split_labels_cached = _cached_rctd["label"].astype(str)
+                    _split_labels_cached.index = _split_labels_cached.index.astype(str)
+                    _sample = set(cell_ids[:200])
+                    _overlap = len(set(_split_labels_cached.index[:200]) & _sample)
+                    if _overlap >= max(1, len(_sample) * 0.05):
+                        ro.r(f'._split_rctd <- readRDS("{_rctd_obj_file}")')
+                        _split_labels = _split_labels_cached
+                        _rctd_from_cache = True
+                        _set("running", "RCTD loaded from cache, running SPLIT::purify()…")
+                        print("  SPLIT: RCTD loaded from cache", flush=True)
+                    else:
+                        print(f"  SPLIT: RCTD cache index mismatch ({_overlap}/{len(_sample)}) — re-running", flush=True)
+                except Exception as _ce:
+                    print(f"  SPLIT: RCTD cache load failed: {_ce}", flush=True)
 
-        if not _rctd_from_cache:
-            _set("running", f"Running RCTD doublet mode (max_cores={max_cores})… [~20-40 min]")
-            print("  SPLIT: starting RCTD doublet mode…", flush=True)
-            ro.r.assign("._split_max_cores",    ro.IntVector([max_cores]))
-            ro.r.assign("._split_min_umi",      ro.IntVector([min_umi]))
-            ro.r.assign("._split_min_umi_sigma", ro.IntVector([min_umi_sigma]))
-            ro.r("""
+            if not _rctd_from_cache:
+                _set("running", f"Running RCTD doublet mode (max_cores={max_cores})… [~20-40 min]")
+                print("  SPLIT: starting RCTD doublet mode…", flush=True)
+                ro.r.assign("._split_max_cores",    ro.IntVector([max_cores]))
+                ro.r.assign("._split_min_umi",      ro.IntVector([min_umi]))
+                ro.r.assign("._split_min_umi_sigma", ro.IntVector([min_umi_sigma]))
+                ro.r("""
 ._split_rctd <- spacexr::create.RCTD(._split_spatialrna, ._split_reference,
     max_cores=._split_max_cores[1], CELL_MIN_INSTANCE=5,
     UMI_min=._split_min_umi[1], UMI_min_sigma=._split_min_umi_sigma[1])
 ._split_rctd <- spacexr::run.RCTD(._split_rctd, doublet_mode='doublet')
 ._split_rctd <- SPLIT::run_post_process_RCTD(._split_rctd)
 """)
-            # Save RCTD object + labels to cache for future re-runs.
-            # Use as.character() in R to avoid rpy2 converting factor levels to
-            # integer codes (which would show numbers instead of cell type names).
-            try:
-                ro.r(f'saveRDS(._split_rctd, "{_rctd_obj_file}")')
-                ro.r("""
+                # Save RCTD object + labels to cache for future re-runs.
+                # Use as.character() in R to avoid rpy2 converting factor levels to
+                # integer codes (which would show numbers instead of cell type names).
+                try:
+                    ro.r(f'saveRDS(._split_rctd, "{_rctd_obj_file}")')
+                    ro.r("""
 ._split_rctd_res   <- ._split_rctd@results$results_df
 ._split_rctd_types <- as.character(._split_rctd_res$first_type)
 names(._split_rctd_types) <- rownames(._split_rctd_res)
 """)
-                _types_r = ro.r("._split_rctd_types")
-                _names_r = ro.r("names(._split_rctd_types)")
-                _split_labels = pd.Series(
-                    list(_types_r), index=list(_names_r), name="label"
-                ).astype(str)
-                pd.DataFrame({"label": _split_labels}).to_parquet(_rctd_cache_file)
-                print(f"  SPLIT: RCTD cached ({len(_split_labels.unique())} types)", flush=True)
-            except Exception as _se:
-                print(f"  SPLIT: RCTD cache save failed: {_se}", flush=True)
-                _split_labels = None
+                    _types_r = ro.r("._split_rctd_types")
+                    _names_r = ro.r("names(._split_rctd_types)")
+                    _split_labels = pd.Series(
+                        list(_types_r), index=list(_names_r), name="label"
+                    ).astype(str)
+                    pd.DataFrame({"label": _split_labels}).to_parquet(_rctd_cache_file)
+                    print(f"  SPLIT: RCTD cached ({len(_split_labels.unique())} types)", flush=True)
+                except Exception as _se:
+                    print(f"  SPLIT: RCTD cache save failed: {_se}", flush=True)
+                    _split_labels = None
 
-        # Store RCTD labels in _annot_state so cell-type coloring works
-        if _split_labels is not None:
-            _rctd_generic_key = "_".join(_rctd_lkey.split("_")[:2] + _rctd_lkey.split("_")[3:])
-            with _annot_lock:
-                _annot_state[_rctd_lkey]       = _split_labels
-                _annot_state[_rctd_generic_key] = _split_labels
+            # Store RCTD labels in _annot_state so cell-type coloring works
+            if _split_labels is not None:
+                _rctd_generic_key = "_".join(_rctd_lkey.split("_")[:2] + _rctd_lkey.split("_")[3:])
+                with _annot_lock:
+                    _annot_state[_rctd_lkey]       = _split_labels
+                    _annot_state[_rctd_generic_key] = _split_labels
 
-        print("  SPLIT: RCTD done, running purify()…", flush=True)
+            print("  SPLIT: RCTD done, running purify()…", flush=True)
 
-        # ── 8. Run SPLIT::purify ─────────────────────────────────────────────
-        _set("running", "Running SPLIT::purify()…")
-        # Full counts matrix (all panel genes) gene × cells
-        expr_full_t = expr_panel.T.toarray() if hasattr(expr_panel, 'toarray') else expr_panel.T
-        full_r_mat = ro.r.matrix(
-            ro.FloatVector(expr_full_t.flatten(order='F').tolist()),
-            nrow=n_panel,
-            ncol=n_cells
-        )
-        ro.r.assign("._split_full_counts", full_r_mat)
-        ro.r.assign("._split_panel_genes", ro.StrVector(list(panel_genes)))
-        ro.r("""
+            # ── 8. Run SPLIT::purify ─────────────────────────────────────────────
+            _set("running", "Running SPLIT::purify()…")
+            # Full counts matrix (all panel genes) gene × cells
+            expr_full_t = expr_panel.T.toarray() if hasattr(expr_panel, 'toarray') else expr_panel.T
+            full_r_mat = ro.r.matrix(
+                ro.FloatVector(expr_full_t.flatten(order='F').tolist()),
+                nrow=n_panel,
+                ncol=n_cells
+            )
+            ro.r.assign("._split_full_counts", full_r_mat)
+            ro.r.assign("._split_panel_genes", ro.StrVector(list(panel_genes)))
+            ro.r("""
 rownames(._split_full_counts) <- ._split_panel_genes
 colnames(._split_full_counts) <- ._split_colnames
 """)
-        ro.r("""._split_full_counts <- as(._split_full_counts, 'dgCMatrix')""")
-        ro.r("""
+            ro.r("""._split_full_counts <- as(._split_full_counts, 'dgCMatrix')""")
+            ro.r("""
 ._split_res <- SPLIT::purify(
     counts          = ._split_full_counts,
     rctd            = ._split_rctd,
@@ -12417,16 +12550,16 @@ colnames(._split_full_counts) <- ._split_colnames
 ._split_purified <- ._split_res$purified_counts
 """)
 
-        # ── 9. Convert back to Python ────────────────────────────────────────
-        _set("running", "Converting corrected counts to Python…")
-        purified_r = ro.r["._split_purified"]
-        # Extract cell IDs from R colnames — RCTD may drop low-UMI cells
-        try:
-            corrected_cell_ids = list(ro.r['colnames'](purified_r))
-        except Exception:
-            corrected_cell_ids = None
-        # Convert dgCMatrix → scipy CSR (cells × genes)
-        purified_csr_t = _r_dgcmatrix_to_scipy(purified_r)  # gene × cells
+            # ── 9. Convert back to Python ────────────────────────────────────────
+            _set("running", "Converting corrected counts to Python…")
+            purified_r = ro.r["._split_purified"]
+            # Extract cell IDs from R colnames — RCTD may drop low-UMI cells
+            try:
+                corrected_cell_ids = list(ro.r['colnames'](purified_r))
+            except Exception:
+                corrected_cell_ids = None
+            # Convert dgCMatrix → scipy CSR (cells × genes)
+            purified_csr_t = _r_dgcmatrix_to_scipy(purified_r)  # gene × cells
         corrected_mat  = purified_csr_t.T.tocsr()             # cells × genes
         corrected_mat.data = np.clip(corrected_mat.data, 0, None)
         n_corr = corrected_mat.shape[0]
@@ -13073,13 +13206,16 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                         _alt_res = _proseg_state["result"]
 
         # ── Load reference gene list ─────────────────────────────────────
+        from rpy2.rinterface_lib import openrlib
         _set("running", "Opening Seurat reference (this may take a few minutes)…")
-        importr("SeuratObject")
-        importr("Matrix")
-        ro.r(f'seurat_ref <- readRDS("{rds_path}")')
-        ro.r('rna_ref    <- seurat_ref[["RNA"]]')
-        ro.r('rna_genes  <- rownames(rna_ref@data)')
-        rna_genes_all = list(ro.r("rna_genes"))
+        with openrlib.rlock:
+            importr("SeuratObject")
+            importr("Matrix")
+            ro.r(f'seurat_ref <- readRDS("{rds_path}")')
+            ro.r('rna_ref    <- seurat_ref[["RNA"]]')
+            ro.r('rna_mat_data <- SeuratObject::LayerData(rna_ref, layer="data")')
+            ro.r('rna_genes  <- rownames(rna_mat_data)')
+            rna_genes_all = list(ro.r("rna_genes"))
 
         # Use only panel (non-imputed) genes for shared-gene computation
         gene_var = DATA.get("gene_var")
@@ -13124,7 +13260,20 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                     with _spage_lock:
                         _spage_state["result_path"]  = zarr_cache
                         _spage_state["result_genes"] = _genes_c
-                    _spage_index_update(zarr_cache)
+                    if _alt_res is not None:
+                        try:
+                            import json as _json_sc
+                            _sj = {"path": zarr_cache, "genes": _genes_c}
+                            with open(os.path.join(_alt_res["out_dir"], "spage_result.json"), "w") as _sjf:
+                                _json_sc.dump(_sj, _sjf)
+                        except Exception:
+                            pass
+                        _alock = _baysor_lock if _seg_tool(seg_source or "") == "baysor" else _proseg_lock
+                        with _alock:
+                            _alt_res["spage_result_path"]  = zarr_cache
+                            _alt_res["spage_result_genes"] = _genes_c
+                    else:
+                        _spage_index_update(zarr_cache)
                     _set("done", f"Done (cached) — {len(_genes_c):,} genes (streaming)", result=None)
                     return
             except Exception as _zce:
@@ -13162,10 +13311,11 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
 
             # Build R character vector of needed genes
             genes_r = "c(" + ",".join(f'"{g}"' for g in genes_needed) + ")"
-            ro.r(f"""
+            with openrlib.rlock:
+                ro.r(f"""
 genes_needed <- {genes_r}
 genes_needed <- genes_needed[genes_needed %in% rna_genes]
-mat_sub <- rna_ref@data[genes_needed, ]
+mat_sub <- rna_mat_data[genes_needed, ]
 Matrix::writeMM(mat_sub, "{mat_file}")
 writeLines(rownames(mat_sub), "{genes_file}")
 writeLines(colnames(mat_sub), "{cells_file}")
@@ -13177,7 +13327,8 @@ writeLines(colnames(mat_sub), "{cells_file}")
                 rna_cells = [l.strip() for l in f]
 
         # Free R memory
-        ro.r("rm(seurat_ref, rna_ref, mat_sub); gc()")
+        with openrlib.rlock:
+            ro.r("rm(seurat_ref, rna_ref, rna_mat_data, mat_sub); gc()")
 
         # ── Convert to dense DataFrame ───────────────────────────────────
         _set("running", f"Building expression matrices ({len(rna_cells):,} ref cells)…")
@@ -13270,6 +13421,18 @@ writeLines(colnames(mat_sub), "{cells_file}")
                 _spage_state["result_genes"] = genes_to_predict
             if _alt_res is None:
                 _spage_index_update(zarr_cache)
+            else:
+                try:
+                    import json as _json_sc
+                    _sj = {"path": zarr_cache, "genes": genes_to_predict}
+                    with open(os.path.join(_alt_res["out_dir"], "spage_result.json"), "w") as _sjf:
+                        _json_sc.dump(_sj, _sjf)
+                except Exception as _sje:
+                    print(f"  SpaGE: could not persist result ref: {_sje}", flush=True)
+                _alock = _baysor_lock if _seg_tool(seg_source or "") == "baysor" else _proseg_lock
+                with _alock:
+                    _alt_res["spage_result_path"]  = zarr_cache
+                    _alt_res["spage_result_genes"] = genes_to_predict
             _set("done", f"Done — {len(genes_to_predict):,} genes imputed (streaming)")
             return
 
@@ -13282,6 +13445,18 @@ writeLines(colnames(mat_sub), "{cells_file}")
         imp_df.to_parquet(cache_file)
         if _alt_res is None:
             _spage_index_update(cache_file)
+        else:
+            try:
+                import json as _json_sc
+                _sj = {"path": cache_file, "genes": genes_to_predict}
+                with open(os.path.join(_alt_res["out_dir"], "spage_result.json"), "w") as _sjf:
+                    _json_sc.dump(_sj, _sjf)
+            except Exception as _sje:
+                print(f"  SpaGE: could not persist result ref: {_sje}", flush=True)
+            _alock = _baysor_lock if _seg_tool(seg_source or "") == "baysor" else _proseg_lock
+            with _alock:
+                _alt_res["spage_result_path"]  = cache_file
+                _alt_res["spage_result_genes"] = genes_to_predict
         print(f"  SpaGE: {len(imp_df.columns)} genes cached to {cache_file}", flush=True)
 
         def _spage_write_zarr(sdata_path, imp_df_sub, lock_ctx=None):
@@ -13670,7 +13845,7 @@ def run_spage(rds_path: str, genes_file: str = None, n_pv: int = 50,
     Example
     -------
     run_spage(
-        rds_path="/Users/ikuz/Documents/XeniumWorkflow/Post_R3_FINAL_with_counts.rds",
+        rds_path="/Users/ikuz/Documents/XeniumWorkflow/snRV_ref.rds",
         genes_file="/Users/ikuz/Documents/XeniumWorkflow/to_impute.txt",
         n_pv=50,
     )
@@ -14775,9 +14950,16 @@ def _get_expr_values(gene: str, alt_res=None, use_corrected: bool = False) -> "n
         if idx < expr.shape[1]:
             return np.log1p(expr.getcol(idx).toarray().ravel().astype(np.float32))
     # Streaming SpaGE fallback — gene in zarr but not in expr index
-    with _spage_lock:
-        _rp = _spage_state.get("result_path")
-        _rg = _spage_state.get("result_genes") or []
+    # For reseg: prefer per-alt_res zarr (correct row count) over global spage_state
+    if alt_res is not None:
+        _rp = alt_res.get("spage_result_path")
+        _rg = alt_res.get("spage_result_genes") or []
+    else:
+        _rp, _rg = None, []
+    if not (_rp and lookup in _rg):
+        with _spage_lock:
+            _rp = _spage_state.get("result_path")
+            _rg = _spage_state.get("result_genes") or []
     if _rp and lookup in _rg:
         try:
             if os.path.isdir(_rp):
@@ -17061,7 +17243,7 @@ app.layout = html.Div([
                 dcc.Input(
                     id="annot-rds-path",
                     type="text",
-                    value="/Users/ikuz/Documents/XeniumWorkflow/Post_R3_FINAL_with_counts.rds",
+                    value="/Users/ikuz/Documents/XeniumWorkflow/snRV_ref.rds",
                     style={
                         "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
                         "border": f"1px solid {BORDER}", "borderRadius": "4px",
@@ -17169,7 +17351,7 @@ app.layout = html.Div([
             dcc.Input(
                 id="spage-rds-path",
                 type="text",
-                value="/Users/ikuz/Documents/XeniumWorkflow/Post_R3_FINAL_with_counts.rds",
+                value="/Users/ikuz/Documents/XeniumWorkflow/snRV_ref.rds",
                 debounce=True,
                 style={
                     "width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
@@ -18526,7 +18708,7 @@ def start_spage(n_clicks, rds_path, n_pv, genes_input, seg_source):
         if _spage_state["status"] == "running":
             return False, "Already running…", "Already running…", True
         _spage_state.update({"status": "running", "message": "Starting…", "result": None})
-    rds_path = rds_path or "/Users/ikuz/Documents/XeniumWorkflow/Post_R3_FINAL_with_counts.rds"
+    rds_path = rds_path or "/Users/ikuz/Documents/XeniumWorkflow/snRV_ref.rds"
     n_pv = int(n_pv or 50)
     genes_str = genes_input or ""
     seg_src = seg_source or "xenium"
