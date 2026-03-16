@@ -191,11 +191,16 @@ Once complete:
 
 **Proseg** — Rust-based probabilistic algorithm ([Proseg](https://github.com/dcjones/proseg)); faster than Baysor, morphologically constrained:
 
-| Parameter | Default |
-|-----------|---------|
-| Spatial region X/Y (µm) | full slide |
-| Voxel size (µm) | auto |
-| Threads | all cores |
+| Parameter | Flag | Default |
+|-----------|------|---------|
+| Spatial region X/Y (µm) | — | full slide |
+| Initial voxel size (µm) | `--initial-voxel-size` | 4 |
+| Threads | `--nthreads` | all cores |
+| Components | `--ncomponents` | 10 |
+| Recorded samples | `--recorded-samples` | 100 |
+| Sampler schedule | `--schedule` | `150 150 300` |
+| Nuclear reassignment prob | `--nuclear-reassignment-prob` | 0.2 |
+| Prior seg reassignment prob | `--prior-seg-reassignment-prob` | 0.5 |
 
 Resegmentation output is cached per run (keyed by parameters) in `~/.xenium_explorer_cache/baysor_{dataset}_{tag}/` or `proseg_{dataset}_{tag}/`. Multiple cached runs per tool are accessible from the segmentation source dropdown.
 
@@ -268,6 +273,7 @@ Click **"✦ Correct Ambient RNA"** in the sidebar to open the SPLIT correction 
 | Max R cores | 4 | Parallel workers for RCTD |
 | Min UMI | 10 | Cells with fewer UMIs are excluded from RCTD (`UMI_min`) |
 | Min UMI sigma | 100 | Minimum UMI count for sigma parameter estimation in RCTD (`UMI_min_sigma`) |
+| Purify singlets | ✓ | Also remove ambient RNA from singlet cells (`DO_purify_singlets`). Disable if corrected expression appears over-reduced. |
 
 Click **▶ Run SPLIT** to start. Progress is streamed to the server log. When complete:
 

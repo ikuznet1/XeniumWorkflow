@@ -4596,6 +4596,8 @@ def load_xenium_data(data_dir: str) -> dict:
 
 def _build_boundary_dict(df: pd.DataFrame) -> dict:
     """Return {cell_id: (vertex_x_array, vertex_y_array)} for fast polygon lookup."""
+    if df.empty:
+        return {}
     # Pre-sort by cell_id for contiguous slicing via numpy split
     cell_ids = df["cell_id"].values
     vx = df["vertex_x"].values
@@ -4702,8 +4704,11 @@ def _build_xenium_sdata(data_dir: str) -> None:
 
     # Build boundary GeoDataFrames
     print("  Building cell boundary shapes…", flush=True)
-    cb_df = pd.read_parquet(os.path.join(data_dir, "cell_boundaries.parquet"))
-    nb_df = pd.read_parquet(os.path.join(data_dir, "nucleus_boundaries.parquet"))
+    _empty_bounds = pd.DataFrame(columns=["cell_id", "vertex_x", "vertex_y"])
+    cb_path = os.path.join(data_dir, "cell_boundaries.parquet")
+    nb_path = os.path.join(data_dir, "nucleus_boundaries.parquet")
+    cb_df = pd.read_parquet(cb_path) if os.path.exists(cb_path) else _empty_bounds
+    nb_df = pd.read_parquet(nb_path) if os.path.exists(nb_path) else _empty_bounds
 
     def _bounds_to_gdf(bounds_dict):
         geoms = {}
