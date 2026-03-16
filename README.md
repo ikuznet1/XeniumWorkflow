@@ -89,7 +89,7 @@ The left sidebar is hidden by default and slides in when the mouse moves to the 
 
 - **Tissue info** — Run name, region, and dataset stats (cells, transcripts, panel). Stats collapse by default and expand on hover. Includes buttons to load a different sample, save as SpatialData, and clear cache.
 - **Color By** — Dropdown to select the coloring mode.
-- **Segmentation source** — Dropdown to switch between Xenium (original), Baysor, and Proseg segmentations. Shows all cached runs per tool (labeled by parameters); select any cached run to load it instantly.
+- **Segmentation source** — Dropdown to switch between Xenium (original), Baysor, and Proseg segmentations. Shows all cached runs per tool (labeled by parameters); select any cached run to load it instantly. A 🗑 delete button appears next to the dropdown to permanently remove a cached run (requires confirmation).
 - **Overlays** — Multi-select checklist: Xenium Cell Boundaries, Xenium Nuclei Boundaries, Baysor Boundaries, Proseg Boundaries, and Morphology Image. Multiple overlays can be active simultaneously.
 - **Point style** — Size and opacity sliders.
 - **Resegmentation** — Single "Resegment Cells" button opens a modal with SpatialData patch setup (Step 1) and Baysor/Proseg algorithm tabs (Step 2).
@@ -163,7 +163,7 @@ Configure patch parameters, then click **▶ Prepare Patches** to build the Spat
 | Patch width (µm) | 1200 |
 | Min transcripts/patch | 10 |
 
-The ROI and patch grid are displayed as overlays on the spatial plot. Click **✓ Patches look good — proceed** to unlock Step 2. Use **↺ Re-build** to clear the cache and re-run with different parameters.
+The ROI and patch grid are displayed as overlays on the spatial plot. Click **✓ Patches look good — proceed** to unlock Step 2, or **⏭ Skip — run on full tissue** to bypass patch setup and run directly on the full slide. Use **↺ Re-build** to clear the cache and re-run with different parameters.
 
 **Step 2 — Algorithm selection**
 
@@ -462,11 +462,39 @@ Requires: `rpy2`, R packages `Seurat`, `SeuratObject`, `Matrix`.
 
 ---
 
+### `functions/merge_spatialdata.py` — Merge multiple SpatialData zarrs
+
+Merges two or more SpatialData zarr stores into a single store, offsetting x/y coordinates so datasets don't spatially overlap. Useful for side-by-side comparison of multiple Xenium runs, or combining Baysor/Proseg outputs from different conditions.
+
+```python
+from functions.merge_spatialdata import merge_spatialdata
+
+merge_spatialdata(
+    input_paths=["ctrl.zarr", "treat.zarr"],
+    output_path="merged.zarr",
+    gap=500,           # µm gap between datasets (default: 200)
+    layout="row",      # "row" | "column" | "grid"
+    labels=["ctrl", "treat"],   # cell-ID prefix per dataset (default: s0, s1, …)
+    genes="union",     # "union" (fill missing with 0) | "intersect"
+)
+```
+
+CLI:
+```bash
+python functions/merge_spatialdata.py ctrl.zarr treat.zarr -o merged.zarr --labels ctrl treat
+python functions/merge_spatialdata.py s1.zarr s2.zarr s3.zarr -o merged.zarr --layout grid --gap 500
+```
+
+Coordinate offsets are printed per dataset. Cell IDs are prefixed with the label (e.g. `ctrl_cell123`). A `dataset` column is added to `obs`. Requires `geopandas` and `shapely` for shape merging (optional; shapes are skipped with a warning if unavailable).
+
+---
+
 ### Other functions
 
 | Script | Purpose |
 |--------|---------|
 | `functions/run_split.py` | Standalone RCTD + SPLIT ambient RNA correction; reads/writes directly to zarr |
+| `functions/merge_spatialdata.py` | Merge multiple SpatialData zarr stores into one, offsetting coordinates so datasets don't overlap |
 | `functions/export_to_cellnest.py` | Export SpatialData zarr to CellNEST-ready AnnData `.h5ad` |
 | `functions/migrate_baysor_cache.py` | Migrate old-format Baysor cache directories to current zarr format |
 
