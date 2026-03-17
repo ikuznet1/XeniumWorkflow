@@ -14,6 +14,7 @@ import sys
 import warnings
 warnings.filterwarnings("ignore", message=".*not recognized as a component of a Zarr hierarchy.*")
 warnings.filterwarnings("ignore", message=".*R is not initialized by the main thread.*")
+warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*invalid value encountered in divide.*")
 import json
 import io
 import base64
@@ -128,6 +129,10 @@ _sdata_version = 0  # incremented when ROI/patches change, to trigger overlay re
 # ─── SPLIT ambient RNA correction state ───────────────────────────────────────
 _split_state: dict = {"status": "idle", "message": "", "result": None}
 _split_lock   = threading.Lock()
+
+# ─── Spatial niches state ─────────────────────────────────────────────────────
+_niche_state: dict = {"status": "idle", "message": ""}
+_niche_lock   = threading.Lock()
 
 # ─── ROI Annotation state ─────────────────────────────────────────────────────
 _roi_state: dict = {
@@ -874,7 +879,8 @@ def _baysor_run_single(tx_df, patch_dir, baysor_bin, scale, min_mol, use_prior, 
 
 def _proseg_run_single(tx_df, patch_dir, proseg_bin, voxel_size, n_threads, n_samples=None,
                        recorded_samples=None, schedule=None,
-                       nuclear_reassign_prob=None, prior_seg_prob=None):
+                       nuclear_reassign_prob=None, prior_seg_prob=None,
+                       prior_type: str = "nucleus"):
     """Run Proseg on tx_df (written as parquet), write outputs to patch_dir.
     Returns (cells_df, cell_bounds_dict, tx_meta_df) or raises on failure.
     """
@@ -887,7 +893,20 @@ def _proseg_run_single(tx_df, patch_dir, proseg_bin, voxel_size, n_threads, n_sa
     meta_out    = os.path.join(patch_dir, "cell-metadata.csv.gz")
     tx_meta_out = os.path.join(patch_dir, "transcript-metadata.csv.gz")
 
-    cmd = [proseg_bin, "--xenium", tx_path,
+    # Adjust prior based on prior_type before writing parquet
+    if prior_type == "cell" and "overlaps_nucleus" in tx_df.columns and "cell_id" in tx_df.columns:
+        # Override overlaps_nucleus: treat all cell-assigned transcripts as "in nucleus"
+        # so Proseg uses cell boundaries as the prior instead of nuclear boundaries.
+        tx_df = tx_df.copy()
+        tx_df["overlaps_nucleus"] = (tx_df["cell_id"] != 0).astype(tx_df["overlaps_nucleus"].dtype)
+        tx_df.to_parquet(tx_path, index=False)
+    elif prior_type == "none":
+        # No prior: write parquet without the overlaps_nucleus column if present
+        tx_df = tx_df.drop(columns=["overlaps_nucleus"], errors="ignore")
+        tx_df.to_parquet(tx_path, index=False)
+
+    use_xenium_flag = prior_type != "none"
+    cmd = ([proseg_bin, "--xenium"] if use_xenium_flag else [proseg_bin]) + [tx_path,
            "--output-cell-polygons",       poly_out,
            "--output-cell-metadata",       meta_out,
            "--output-transcript-metadata", tx_meta_out]
@@ -1714,7 +1733,8 @@ def _load_cached_proseg(out_dir: str) -> None:
 
 def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
                 x_min=None, x_max=None, y_min=None, y_max=None,
-                scale_std=None, n_clusters=10, use_patches=True) -> None:
+                scale_std=None, n_clusters=10, use_patches=True,
+                prior_type: str = "nucleus") -> None:
     """Background thread: run Baysor resegmentation, using sopa patches if available."""
 
     def _set(status, message, result=None):
@@ -1749,6 +1769,7 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
 
         _param_str = (f"s{scale}_ss{scale_std}_m{min_mol}_i{n_clusters}_p{int(use_prior)}"
                       f"{'_c'+str(prior_conf) if use_prior else ''}"
+                      f"{'_pt'+prior_type if use_prior else ''}"
                       f"_x{x_min or 'A'}-{x_max or 'A'}_y{y_min or 'A'}-{y_max or 'A'}")
         _param_tag = hashlib.md5(_param_str.encode()).hexdigest()[:8]
         out_dir = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache",
@@ -1776,16 +1797,23 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
         tx_all["cell_id"] = cid.map(id_map).fillna(0).astype("int64")
         # Build nucleus_prior_id: cell_id only for transcripts overlapping a nucleus.
         # This gives Baysor a tighter nuclear prior instead of the full cell boundary prior.
-        if "overlaps_nucleus" in tx_all.columns:
-            tx_all["nucleus_prior_id"] = (
-                tx_all["cell_id"].where(tx_all["overlaps_nucleus"].astype(bool), 0)
-            )
-            print(f"  Baysor: nucleus prior — "
-                  f"{int((tx_all['nucleus_prior_id'] != 0).sum()):,} / {len(tx_all):,} "
-                  f"transcripts inside nuclei", flush=True)
+        if prior_type == "nucleus":
+            if "overlaps_nucleus" in tx_all.columns:
+                tx_all["nucleus_prior_id"] = (
+                    tx_all["cell_id"].where(tx_all["overlaps_nucleus"].astype(bool), 0)
+                )
+                print(f"  Baysor: nucleus prior — "
+                      f"{int((tx_all['nucleus_prior_id'] != 0).sum()):,} / {len(tx_all):,} "
+                      f"transcripts inside nuclei", flush=True)
+            else:
+                tx_all["nucleus_prior_id"] = tx_all["cell_id"]
+                print("  Baysor: overlaps_nucleus column not found — using cell_id as prior", flush=True)
         else:
-            tx_all["nucleus_prior_id"] = tx_all["cell_id"]
-            print("  Baysor: overlaps_nucleus column not found — using cell_id as prior", flush=True)
+            # prior_type == "cell": use all cell-assigned transcripts as prior (no nucleus restriction).
+            # _baysor_run_single falls back to "cell_id" column when "nucleus_prior_id" is absent.
+            print(f"  Baysor: cell boundary prior — "
+                  f"{int((tx_all['cell_id'] != 0).sum()):,} / {len(tx_all):,} "
+                  f"transcripts in cells", flush=True)
 
         # Apply user's region filter
         if x_min is not None: tx_all = tx_all[tx_all["x_location"] >= x_min]
@@ -1903,6 +1931,8 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
         _set("running", "Computing UMAP and clusters…")
         _compute_reseg_clusters_umap(cells_df, expr_mat,
                                      progress_fn=lambda msg: _set("running", msg))
+        # Normalize cell_bounds keys to strings (GeoJSON may produce int keys)
+        cell_bounds = {str(k): v for k, v in cell_bounds.items()}
         _set("running", "Writing SpatialData zarr…")
         zarr_path = _build_reseg_sdata(
             cells_df, cell_bounds, expr_mat, DATA["gene_names"], "baysor", out_dir
@@ -1928,7 +1958,8 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
 def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
                 recorded_samples=None, schedule=None,
                 nuclear_reassign_prob=None, prior_seg_prob=None,
-                x_min=None, x_max=None, y_min=None, y_max=None) -> None:
+                x_min=None, x_max=None, y_min=None, y_max=None,
+                prior_type: str = "nucleus") -> None:
     """Background thread: run Proseg resegmentation, using sopa patches if available."""
 
     def _set(status, message, result=None):
@@ -2022,7 +2053,8 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
                     cells_i, bounds_i, tx_meta_i = _proseg_run_single(
                         tx_patch, patch_dir, proseg_bin, voxel_size, n_threads, n_samples,
                         recorded_samples=recorded_samples, schedule=schedule,
-                        nuclear_reassign_prob=nuclear_reassign_prob, prior_seg_prob=prior_seg_prob
+                        nuclear_reassign_prob=nuclear_reassign_prob, prior_seg_prob=prior_seg_prob,
+                        prior_type=prior_type,
                     )
                 except Exception as pe:
                     print(f"  Proseg: patch {pi + 1} failed: {pe}", flush=True)
@@ -2078,7 +2110,8 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
                 cells_df, cell_bounds, tx_meta_merged = _proseg_run_single(
                     tx, out_dir, proseg_bin, voxel_size, n_threads, n_samples,
                     recorded_samples=recorded_samples, schedule=schedule,
-                    nuclear_reassign_prob=nuclear_reassign_prob, prior_seg_prob=prior_seg_prob
+                    nuclear_reassign_prob=nuclear_reassign_prob, prior_seg_prob=prior_seg_prob,
+                    prior_type=prior_type,
                 )
             except Exception as e:
                 _set("error", str(e)[:300])
@@ -2100,6 +2133,8 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
         _set("running", "Computing UMAP and clusters…")
         _compute_reseg_clusters_umap(cells_df, expr_mat,
                                      progress_fn=lambda msg: _set("running", msg))
+        # Normalize cell_bounds keys to strings (GeoJSON may produce int keys)
+        cell_bounds = {str(k): v for k, v in cell_bounds.items()}
         _set("running", "Writing SpatialData zarr…")
         zarr_path = _build_reseg_sdata(
             cells_df, cell_bounds, expr_mat, DATA["gene_names"], "proseg", out_dir
@@ -2203,6 +2238,9 @@ def _compute_split_clusters_umap(cells_df: pd.DataFrame, corrected_mat,
         from sklearn.decomposition import TruncatedSVD
         from sklearn.cluster import KMeans
         try:
+            import sys as _sys_umap, types as _types_umap
+            if "tensorflow" not in _sys_umap.modules:
+                _sys_umap.modules["tensorflow"] = _types_umap.ModuleType("tensorflow")
             from umap.umap_ import UMAP as _UMAP
             _have_umap = True
         except Exception:
@@ -2236,10 +2274,17 @@ def _compute_split_clusters_umap(cells_df: pd.DataFrame, corrected_mat,
         if _have_umap:
             if progress_fn:
                 progress_fn("SPLIT: computing UMAP…")
-            n_neighbors = min(30, n_cells - 1)
-            reducer = _UMAP(n_components=2, n_neighbors=n_neighbors,
-                                min_dist=0.3, random_state=42)
-            embedding = reducer.fit_transform(pca)
+            try:
+                n_neighbors = min(30, n_cells - 1)
+                reducer = _UMAP(n_components=2, n_neighbors=n_neighbors,
+                                    min_dist=0.3, random_state=42)
+                embedding = reducer.fit_transform(pca)
+                print(f"  [SPLIT UMAP] computed embedding shape={embedding.shape}", flush=True)
+            except Exception as _umap_err:
+                print(f"  [SPLIT UMAP] FAILED: {_umap_err}", flush=True)
+                import traceback; traceback.print_exc()
+        else:
+            print("  [SPLIT UMAP] umap-learn not available, skipping", flush=True)
 
         # Write back to cells_df — handle subset case (RCTD may drop low-UMI cells)
         if corrected_cell_ids is not None and len(corrected_cell_ids) < len(cells_df):
@@ -2602,6 +2647,9 @@ rownames(._split_coords) <- colnames(._split_counts_mat)
                 ro.r.assign("._split_min_umi",      ro.IntVector([min_umi]))
                 ro.r.assign("._split_min_umi_sigma", ro.IntVector([min_umi_sigma]))
                 ro.r("""
+options(mc.cores = ._split_max_cores[1])
+cat("  SPLIT R: detected cores =", parallel::detectCores(),
+    "| requesting =", ._split_max_cores[1], "\n")
 ._split_rctd <- spacexr::create.RCTD(._split_spatialrna, ._split_reference,
     max_cores=._split_max_cores[1], CELL_MIN_INSTANCE=5,
     UMI_min=._split_min_umi[1], UMI_min_sigma=._split_min_umi_sigma[1])
@@ -2688,6 +2736,8 @@ colnames(._split_full_counts) <- ._split_colnames
         _compute_split_clusters_umap(cells_df, corrected_mat,
                                       corrected_cell_ids=corrected_cell_ids,
                                       progress_fn=lambda msg: _set("running", msg))
+        print(f"  [SPLIT] after cluster+umap: cols={[c for c in cells_df.columns if 'split' in c]}, "
+              f"has_split_umap={'split_umap_1' in cells_df.columns}", flush=True)
 
         # ── 11. Write to zarr ────────────────────────────────────────────────
         if sdata_path and os.path.isdir(sdata_path):
@@ -2741,6 +2791,10 @@ colnames(._split_full_counts) <- ._split_colnames
             for col in ["cluster_split_10", "split_umap_1", "split_umap_2"]:
                 if col in cells_df.columns:
                     DATA["df"][col] = cells_df[col].values
+                    print(f"  [SPLIT] wrote {col} to DATA['df']", flush=True)
+                else:
+                    print(f"  [SPLIT] WARNING: {col} NOT in cells_df — skipping", flush=True)
+            _umap_df_cache.clear()  # split_umap_1/2 added; invalidate cached UMAP df
 
         _set("done", f"SPLIT complete — {n_cells:,} cells corrected", result={"n_cells": n_cells})
         print(f"  SPLIT: done — {n_cells:,} cells corrected", flush=True)
@@ -2891,14 +2945,15 @@ def _run_reseg_umap() -> None:
                                random_state=0).fit_transform(_pca2)
 
             if _sub_mask is not None:
-                # Write NaN for cells SPLIT dropped, UMAP coords for cells it kept
+                # Write NaN for cells SPLIT dropped, UMAP coords for cells it kept.
+                # Use split_umap_1/2 so make_umap_fig can distinguish corrected vs original UMAP.
                 _u1 = np.full(len(_xen_df), np.nan)
                 _u2 = np.full(len(_xen_df), np.nan)
                 _sub_idx = np.where(_sub_mask)[0]
                 _u1[_sub_idx] = _emb2[:, 0]
                 _u2[_sub_idx] = _emb2[:, 1]
-                DATA["df"]["umap_1"] = _u1
-                DATA["df"]["umap_2"] = _u2
+                DATA["df"]["split_umap_1"] = _u1
+                DATA["df"]["split_umap_2"] = _u2
             else:
                 DATA["df"]["umap_1"] = _emb2[:, 0]
                 DATA["df"]["umap_2"] = _emb2[:, 1]
@@ -3740,7 +3795,8 @@ def subset(cluster=None, cell_type=None,
         with _annot_lock:
             labels = next((v for m in _ANNOT_METHODS
                            for k, v in _annot_state.items()
-                           if k == f"labels_{m}" and v is not None), None)
+                           if (k == f"labels_{m}" or k.startswith(f"labels_{m}_"))
+                           and v is not None), None)
         if labels is None:
             print("  subset: no cell type annotation loaded — skipping cell_type filter", flush=True)
         else:
@@ -3807,9 +3863,12 @@ def subset(cluster=None, cell_type=None,
 
         # Cell type filter
         if cell_type is not None:
-            _lk = f"labels_{_tool}"
             with _annot_lock:
-                _blabels = _annot_state.get(_lk)
+                _blabels = None
+                for _m in _ANNOT_METHODS:
+                    _blabels = _annot_state.get(_labels_key_for_method(_m, _alt_res))
+                    if _blabels is not None:
+                        break
             if _blabels is None:
                 print(f"  subset reseg: no cell type annotation for {_tool} — skipping cell_type filter", flush=True)
             else:
@@ -3960,6 +4019,108 @@ def get_genes(file: str = None) -> list:
             fh.write("\n".join(genes) + "\n")
         print(f"  Saved to {file}", flush=True)
     return genes
+
+
+def _run_spatial_niches(n_clusters: int, n_neighbors: int, label_key: str | None,
+                        alt_res) -> None:
+    """Background thread: compute spatial niches via BuildNicheAssay-style KMeans."""
+    from sklearn.neighbors import NearestNeighbors
+    from sklearn.cluster import KMeans
+    try:
+        with _niche_lock:
+            _niche_state["status"] = "running"
+            _niche_state["message"] = "Computing niches…"
+
+        # Get cells_df and coordinates
+        if alt_res is not None:
+            cells_df = alt_res["cells_df"]
+        else:
+            cells_df = DATA["df"]
+
+        coords = cells_df[["x_centroid", "y_centroid"]].values
+        n_cells = len(coords)
+        k = min(n_neighbors + 1, n_cells)
+
+        with _niche_lock:
+            _niche_state["message"] = f"Finding {n_neighbors} neighbors for {n_cells:,} cells…"
+
+        nn = NearestNeighbors(n_neighbors=k, algorithm="ball_tree", n_jobs=-1)
+        nn.fit(coords)
+        _, indices = nn.kneighbors(coords)
+        # Exclude self (first column)
+        neighbor_indices = indices[:, 1:]
+
+        if label_key is not None:
+            with _annot_lock:
+                labels_series = _annot_state.get(label_key)
+        else:
+            labels_series = None
+
+        if labels_series is not None:
+            # Align labels to cells_df index
+            aligned = labels_series.reindex(cells_df.index).fillna("Unknown")
+            cell_types = sorted(aligned.unique())
+            ct_to_idx = {ct: i for i, ct in enumerate(cell_types)}
+            label_arr = aligned.map(ct_to_idx).values  # int array
+
+            with _niche_lock:
+                _niche_state["message"] = "Building neighborhood composition matrix…"
+
+            n_types = len(cell_types)
+            composition = np.zeros((n_cells, n_types), dtype=np.float32)
+            for i, nbrs in enumerate(neighbor_indices):
+                for nb in nbrs:
+                    ct_i = label_arr[nb]
+                    if ct_i >= 0:
+                        composition[i, ct_i] += 1
+            # Normalize to proportions
+            row_sums = composition.sum(axis=1, keepdims=True)
+            row_sums[row_sums == 0] = 1
+            composition /= row_sums
+        else:
+            # Fall back: KMeans on raw spatial coordinates (normalized)
+            composition = (coords - coords.mean(axis=0)) / (coords.std(axis=0) + 1e-8)
+            cell_types = None
+
+        with _niche_lock:
+            _niche_state["message"] = f"KMeans clustering into {n_clusters} niches…"
+
+        km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        niche_labels = km.fit_predict(composition).astype(str)
+
+        # Write niche column to cells_df
+        cells_df = cells_df.copy()
+        cells_df["niche"] = niche_labels
+        if alt_res is not None:
+            alt_res["cells_df"] = cells_df
+        else:
+            DATA["df"]["niche"] = niche_labels
+
+        # Print proportion table if cell types available
+        if cell_types is not None and labels_series is not None:
+            import pandas as _pd_inner
+            niche_arr = km.labels_
+            rows = {}
+            for niche_id in range(n_clusters):
+                mask = niche_arr == niche_id
+                if mask.sum() == 0:
+                    continue
+                ct_counts = np.bincount(label_arr[mask], minlength=len(cell_types))
+                rows[f"Niche {niche_id + 1}"] = ct_counts / max(ct_counts.sum(), 1)
+            prop_df = _pd_inner.DataFrame(rows, index=cell_types).T
+            print("\n── Spatial Niche × Cell Type proportions ──", flush=True)
+            print(prop_df.to_string(float_format=lambda v: f"{v:.2f}"), flush=True)
+            print("", flush=True)
+
+        with _niche_lock:
+            _niche_state["status"] = "done"
+            _niche_state["message"] = f"Done — {n_clusters} niches computed for {n_cells:,} cells"
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        with _niche_lock:
+            _niche_state["status"] = "error"
+            _niche_state["message"] = str(exc)
 
 
 def run_spage(rds_path: str, genes_file: str = None, n_pv: int = 50,
@@ -4726,12 +4887,15 @@ def _build_xenium_sdata(data_dir: str) -> None:
         except Exception:
             return gdf
 
-    cell_shapes = _bounds_to_gdf(_build_boundary_dict(cb_df))
-    nuc_shapes  = _bounds_to_gdf(_build_boundary_dict(nb_df))
+    shapes = {}
+    for key, bdf in (("cell_boundaries", cb_df), ("nucleus_boundaries", nb_df)):
+        d = _build_boundary_dict(bdf)
+        if d:
+            shapes[key] = _bounds_to_gdf(d)
 
     sdata = spatialdata.SpatialData(
         tables={"table": adata},
-        shapes={"cell_boundaries": cell_shapes, "nucleus_boundaries": nuc_shapes},
+        shapes=shapes,
     )
 
     zarr_path = os.path.join(data_dir, "spatialdata_xenium.zarr")
@@ -5082,6 +5246,7 @@ def _cell_type_traces(x, y, df, size, opacity, mode="spatial", labels_key="label
 def _get_expr_values(gene: str, alt_res=None, use_corrected: bool = False) -> "np.ndarray | None":
     """Unified expression lookup supporting original and SPLIT-corrected counts."""
     lookup = gene.replace(" [imp]", "").replace(" [corr+imp]", "")
+    is_imputed_gene = ("[imp]" in gene) or ("[corr+imp]" in gene)
     if alt_res is not None:
         _corr = alt_res.get("split_corrected_expr") if use_corrected else None
         expr = _corr if _corr is not None else alt_res.get("expr")
@@ -5094,6 +5259,13 @@ def _get_expr_values(gene: str, alt_res=None, use_corrected: bool = False) -> "n
         idx = gni[lookup]
         if idx < expr.shape[1]:
             return np.log1p(expr.getcol(idx).toarray().ravel().astype(np.float32))
+    # If corrected mode is active and this is an imputed gene not in the corrected-imputed list,
+    # do NOT fall through to the zarr fallback (which holds uncorrected imputed values).
+    if use_corrected and is_imputed_gene:
+        _corr_imp = (alt_res.get("split_corrected_imputed_genes", []) if alt_res is not None
+                     else DATA.get("split_corrected_imputed_genes", []))
+        if lookup not in _corr_imp:
+            return None
     # Streaming SpaGE fallback — gene in zarr but not in expr index
     # For reseg: prefer per-alt_res zarr (correct row count) over global spage_state
     if alt_res is not None:
@@ -5165,7 +5337,26 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
         show_legend  = False
         traces       = None   # filled below
 
-        if color_by == "cluster":
+        if color_by == "niche":
+            if "niche" in bdf.columns:
+                niche_vals = bdf["niche"].astype(str)
+                unique_niches = sorted(niche_vals.unique(), key=lambda v: (0, int(v)) if v.isdigit() else (1, v))
+                cmap = {n: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, n in enumerate(unique_niches)}
+                traces = []
+                for n in unique_niches:
+                    mask = (niche_vals == n).values
+                    traces.append(go.Scattergl(
+                        x=x[mask], y=y[mask], mode="markers",
+                        marker=dict(size=size, color=cmap[n], opacity=opacity),
+                        name=f"Niche {n}", legendgroup=n, showlegend=True,
+                        text=np.array(cell_ids_str)[mask].tolist(),
+                        customdata=np.array(cell_ids_str)[mask].tolist(),
+                        hovertemplate="<b>%{text}</b><extra>Niche " + n + "</extra>",
+                    ))
+                show_legend = True
+            # else fall through to transcript_counts
+
+        elif color_by == "cluster":
             # Look for any cluster column in cells_df (added after UMAP/clustering on reseg cells)
             cluster_col = next((c for c in bdf.columns if c.startswith("cluster")), None)
             if cluster_col is not None:
@@ -5453,7 +5644,26 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
             # _separator_shapes already = [] from function-level init
 
             # ── Cell scatter traces ──────────────────────────────────────────
-            if color_by == "cluster":
+            if color_by == "niche":
+                if "niche" in df.columns:
+                    _niche_vals = df["niche"].astype(str)
+                    _unique_niches = sorted(_niche_vals.unique(), key=lambda v: (0, int(v)) if v.isdigit() else (1, v))
+                    _ncmap = {n: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, n in enumerate(_unique_niches)}
+                    traces = []
+                    for _n in _unique_niches:
+                        _nmask = (_niche_vals == _n).values
+                        _nids = df.index.tolist()
+                        traces.append(go.Scattergl(
+                            x=x[_nmask], y=y[_nmask], mode="markers",
+                            marker=dict(size=size, color=_ncmap[_n], opacity=opacity),
+                            name=f"Niche {_n}", legendgroup=_n, showlegend=True,
+                            text=np.array(_nids)[_nmask].tolist(),
+                            customdata=np.array(_nids)[_nmask].tolist(),
+                            hovertemplate="<b>%{text}</b><extra>Niche " + _n + "</extra>",
+                        ))
+                    show_legend = True
+                # else fall through — no niche column yet
+            elif color_by == "cluster":
                 traces, show_legend = _categorical_traces(x, y, df, method, size, opacity), True
             elif color_by.startswith("cell_type:"):
                 _method = color_by.split(":")[1]
@@ -5635,8 +5845,15 @@ def make_umap_fig(color_by, method, gene, size, opacity,
     if alt_res is not None and reseg_umap is not None:
         # Reseg UMAP: color by whatever is available
         udf = reseg_umap
-        # Use SPLIT UMAP coordinates when corrected counts are active and available
+        # Use SPLIT UMAP coordinates when corrected counts are active and available.
+        # The stored reseg UMAP result may only have umap_1/2 if it was computed without
+        # corrected counts — fall back to cells_df for split_umap coords in that case.
+        _bdf = alt_res["cells_df"]
         if use_corrected and "split_umap_1" in udf.columns and udf["split_umap_1"].notna().any():
+            xu = udf["split_umap_1"].values
+            yu = udf["split_umap_2"].values
+        elif use_corrected and "split_umap_1" in _bdf.columns and _bdf["split_umap_1"].notna().any():
+            udf = _bdf.dropna(subset=["split_umap_1", "split_umap_2"])
             xu = udf["split_umap_1"].values
             yu = udf["split_umap_2"].values
         else:
@@ -5676,6 +5893,26 @@ def make_umap_fig(color_by, method, gene, size, opacity,
                     text=cell_ids, customdata=cell_ids,
                     hovertemplate="<b>%{text}</b><extra></extra>", name=gene,
                 )]
+            else:
+                color_by = "transcript_counts"
+
+        if color_by == "niche":
+            bdf = alt_res["cells_df"]
+            if "niche" in bdf.columns:
+                _nv = bdf["niche"].reindex(udf.index).astype(str)
+                _un = sorted(_nv.unique(), key=lambda v: (0, int(v)) if v.isdigit() else (1, v))
+                _nm = {n: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, n in enumerate(_un)}
+                traces = []
+                for _n in _un:
+                    _mask = (_nv == _n).values
+                    traces.append(go.Scattergl(
+                        x=xu[_mask], y=yu[_mask], mode="markers",
+                        marker=dict(size=mk, color=_nm[_n], opacity=opacity),
+                        name=_n, showlegend=False,
+                        text=np.array(cell_ids)[_mask].tolist(),
+                        customdata=np.array(cell_ids)[_mask].tolist(),
+                        hovertemplate="<b>%{text}</b><extra>Niche " + _n + "</extra>",
+                    ))
             else:
                 color_by = "transcript_counts"
 
@@ -5722,24 +5959,62 @@ def make_umap_fig(color_by, method, gene, size, opacity,
 
         title = "UMAP [Proseg]" if pres else "UMAP [Baysor]"
     else:
-        # Original Xenium UMAP
-        if "df" not in _umap_df_cache:
-            _umap_df_cache["df"] = DATA["df"].dropna(subset=["umap_1", "umap_2"])
-        df = _umap_df_cache["df"]
-        xu = df["umap_1"].values
-        yu = df["umap_2"].values
+        # Original Xenium UMAP — switch to SPLIT UMAP coordinates when corrected counts active
+        _has_split_umap = (use_corrected
+                           and "split_umap_1" in DATA["df"].columns
+                           and DATA["df"]["split_umap_1"].notna().any())
+        print(f"  [UMAP] use_corrected={use_corrected}, "
+              f"has_split={'split_umap_1' in DATA['df'].columns}, "
+              f"using={'split' if _has_split_umap else 'original'} coords, "
+              f"n_cells={len(DATA['df'])}", flush=True)
+        if _has_split_umap:
+            if "split_df" not in _umap_df_cache:
+                _umap_df_cache["split_df"] = DATA["df"].dropna(subset=["split_umap_1", "split_umap_2"])
+            df = _umap_df_cache["split_df"]
+            xu = df["split_umap_1"].values
+            yu = df["split_umap_2"].values
+        else:
+            if "df" not in _umap_df_cache:
+                _umap_df_cache["df"] = DATA["df"].dropna(subset=["umap_1", "umap_2"])
+            df = _umap_df_cache["df"]
+            xu = df["umap_1"].values
+            yu = df["umap_2"].values
 
-        if color_by == "cluster":
+        if color_by == "niche":
+            if "niche" in df.columns:
+                _nv = df["niche"].astype(str)
+                _un = sorted(_nv.unique(), key=lambda v: (0, int(v)) if v.isdigit() else (1, v))
+                _nm = {n: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, n in enumerate(_un)}
+                traces = []
+                for _n in _un:
+                    _mask = (_nv == _n).values
+                    traces.append(go.Scattergl(
+                        x=xu[_mask], y=yu[_mask], mode="markers",
+                        marker=dict(size=mk, color=_nm[_n], opacity=opacity),
+                        name=_n, showlegend=False,
+                        text=df.index[_mask].tolist(),
+                        customdata=df.index[_mask].tolist(),
+                        hovertemplate="<b>%{text}</b><extra>Niche " + _n + "</extra>",
+                    ))
+            else:
+                color_by = "cluster"
+                traces = _categorical_traces(xu, yu, df, method, mk, opacity, mode="umap")
+        elif color_by == "cluster":
             traces = _categorical_traces(xu, yu, df, method, mk, opacity, mode="umap")
         elif color_by.startswith("cell_type:"):
             _method = color_by.split(":")[1]
             traces = _cell_type_traces(xu, yu, df, mk, opacity, mode="umap",
                                        labels_key=f"labels_{_method}")
         elif color_by == "gene":
-            has_umap = DATA["df"]["umap_1"].notna()
-            _cv = _get_expr_values(gene, use_corrected=use_corrected) if use_corrected else None
-            vals = (_cv[has_umap.values] if _cv is not None
-                    else get_gene_expression(gene)[has_umap.values])
+            # df may be a subset of DATA["df"] (cells with valid UMAP coords).
+            # Use positional index into the full DATA["df"] to align expression values.
+            _df_idx = DATA["df"].index.get_indexer(df.index)
+            _cv_full = _get_expr_values(gene, use_corrected=use_corrected) if use_corrected else None
+            if _cv_full is not None:
+                vals = _cv_full[_df_idx]
+            else:
+                _ge_full = get_gene_expression(gene)
+                vals = _ge_full[_df_idx]
             traces = [go.Scattergl(
                 x=xu, y=yu, mode="markers",
                 marker=dict(size=mk, color=vals, colorscale="Plasma",
@@ -6783,6 +7058,7 @@ sidebar = html.Div([
             {"label": "Transcript Counts",          "value": "transcript_counts"},
             {"label": "Cell Area",         "value": "cell_area"},
             {"label": "Nucleus Area",      "value": "nucleus_area"},
+            {"label": "Spatial Niches",    "value": "niche",          "disabled": True},
         ],
         value="cluster",
         clearable=False,
@@ -6985,6 +7261,15 @@ sidebar = html.Div([
              style={"fontSize":"0.75rem","marginTop":"4px","color":"#8b949e"}),
     dcc.Interval(id="split-poll", interval=3000, disabled=True),
     html.Hr(style={"borderColor": BORDER, "margin": "14px 0"}),
+    ctrl_label("Spatial Analysis"),
+    html.Button("⬡ Generate Spatial Niches", id="niche-modal-open-btn", n_clicks=0,
+                style={"width": "100%", "backgroundColor": "#0d6efd", "color": "white",
+                       "border": "none", "borderRadius": "4px", "padding": "6px 10px",
+                       "fontSize": "0.82rem", "cursor": "pointer", "marginBottom": "4px"}),
+    html.Div(id="niche-status", style={"fontSize": "11px", "color": MUTED, "minHeight": "16px",
+                                       "marginBottom": "6px"}),
+    dcc.Interval(id="niche-poll", interval=2000, disabled=True),
+    html.Hr(style={"borderColor": BORDER, "margin": "14px 0"}),
     ctrl_label("Active Counts"),
     dcc.RadioItems(
         id="counts-mode",
@@ -7079,6 +7364,7 @@ app.layout = html.Div([
     dcc.Store(id="subset-version",   data=0),
     dcc.Store(id="sdata-done",       data=0),
     dcc.Store(id="split-done",        data=0),
+    dcc.Store(id="niche-done",        data=0),
     dcc.Store(id="counts-mode-store", data="original"),
     dcc.Store(id="roi-done",          data=0),
     dcc.Store(id="roi-pending",       data=None),
@@ -7343,6 +7629,17 @@ app.layout = html.Div([
                         marks={0: "0", 0.5: "0.5", 1: "1"},
                         tooltip={"placement": "bottom", "always_visible": False},
                     ),
+                    ctrl_label("Prior Type"),
+                    dcc.RadioItems(
+                        id="baysor-prior-type",
+                        options=[
+                            {"label": html.Span(" Nucleus boundaries", style={"fontSize": "12px", "color": TEXT}), "value": "nucleus"},
+                            {"label": html.Span(" Cell boundaries",    style={"fontSize": "12px", "color": TEXT}), "value": "cell"},
+                        ],
+                        value="nucleus",
+                        inputStyle={"marginRight": "6px"},
+                        labelStyle={"display": "flex", "alignItems": "center", "marginBottom": "4px"},
+                    ),
                     html.Div(style={"marginBottom": "6px"}),
                 ]),
             ]),
@@ -7392,6 +7689,19 @@ app.layout = html.Div([
                     style={"width": "100%", "padding": "4px 0", "backgroundColor": CARD_BG,
                            "color": MUTED, "border": f"1px solid {BORDER}", "borderRadius": "4px",
                            "cursor": "pointer", "fontSize": "11px", "marginBottom": "10px"},
+                ),
+                ctrl_label("Prior Type"),
+                dcc.RadioItems(
+                    id="proseg-prior-type",
+                    options=[
+                        {"label": html.Span(" Nucleus boundaries (default)", style={"fontSize": "12px", "color": TEXT}), "value": "nucleus"},
+                        {"label": html.Span(" Cell boundaries",              style={"fontSize": "12px", "color": TEXT}), "value": "cell"},
+                        {"label": html.Span(" None (unsupervised)",          style={"fontSize": "12px", "color": TEXT}), "value": "none"},
+                    ],
+                    value="nucleus",
+                    inputStyle={"marginRight": "6px"},
+                    labelStyle={"display": "flex", "alignItems": "center", "marginBottom": "4px"},
+                    style={"marginBottom": "8px"},
                 ),
                 ctrl_label("Initial voxel size (µm) — leave blank for default (4)"),
                 dcc.Input(
@@ -7678,6 +7988,47 @@ app.layout = html.Div([
        style={"color": TEXT},
        content_style={"backgroundColor": DARK_BG, "color": TEXT},
        backdrop=True),
+
+# ─── Spatial Niches modal ─────────────────────────────────────────────────────
+dbc.Modal([
+    dbc.ModalHeader("Generate Spatial Niches"),
+    dbc.ModalBody([
+        html.Div("Cluster cells by neighborhood cell-type composition (BuildNicheAssay-style).",
+                 style={"fontSize": "0.85rem", "color": MUTED, "marginBottom": "14px"}),
+        dbc.Row([
+            dbc.Col([
+                html.Label("N Clusters", style={"fontSize": "0.82rem", "color": MUTED}),
+                dcc.Input(id="niche-n-clusters", type="number", value=10, min=2, max=50,
+                          style={"width": "100%", "backgroundColor": CARD_BG,
+                                 "color": TEXT, "border": f"1px solid {BORDER}",
+                                 "borderRadius": "4px", "padding": "4px 8px"}),
+            ], width=6),
+            dbc.Col([
+                html.Label("N Neighbors", style={"fontSize": "0.82rem", "color": MUTED}),
+                dcc.Input(id="niche-n-neighbors", type="number", value=20, min=5, max=200,
+                          style={"width": "100%", "backgroundColor": CARD_BG,
+                                 "color": TEXT, "border": f"1px solid {BORDER}",
+                                 "borderRadius": "4px", "padding": "4px 8px"}),
+            ], width=6),
+        ], style={"marginBottom": "12px"}),
+        html.Label("Cell Type Method", style={"fontSize": "0.82rem", "color": MUTED}),
+        dcc.Dropdown(id="niche-label-method", options=[], value=None, clearable=True,
+                     placeholder="None (spatial coordinates only)",
+                     style={"fontSize": "12px", "marginBottom": "14px",
+                            "backgroundColor": CARD_BG, "color": TEXT}),
+        dbc.Button("Run", id="niche-run-btn", color="primary",
+                   style={"width": "100%", "marginBottom": "8px"}),
+        html.Div(id="niche-modal-status",
+                 style={"fontSize": "0.82rem", "color": MUTED, "minHeight": "18px"}),
+    ]),
+    dbc.ModalFooter(
+        dbc.Button("Close", id="niche-modal-close-btn", outline=True,
+                   style={"color": TEXT, "borderColor": BORDER}),
+    ),
+], id="niche-modal", is_open=False, size="md",
+   style={"color": TEXT},
+   content_style={"backgroundColor": DARK_BG, "color": TEXT},
+   backdrop=True),
 
 # ─── ROI Save modal ───────────────────────────────────────────────────────────
 dbc.Modal([
@@ -8180,13 +8531,14 @@ def store_relayout(relayout_data, current):
     Input("split-done",             "data"),
     Input("roi-done",               "data"),
     Input("counts-mode-store",      "data"),
+    Input("niche-done",             "data"),
 )
 def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
                  _annot_done, morph_enable, morph_zlevel, morph_channels,
                  morph_brightness, morph_opacity, relayout,
                  _baysor_done, _proseg_done, seg_source,
                  _spage_done, _subset_ver, _startup, _ds_version, _extra_ds_version,
-                 _split_done, _roi_done, counts_mode):
+                 _split_done, _roi_done, counts_mode, _niche_done):
     # If only the viewport changed, avoid full figure rebuild
     triggered = callback_context.triggered_id
     boundaries_active = bool(boundary_toggles)
@@ -8251,11 +8603,18 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
 
     use_corr = (counts_mode == "corrected")
 
+    # When counts mode or SPLIT status changes, clear cached UMAP so fresh coords/colors are used
+    if triggered in ("counts-mode-store", "split-done"):
+        _umap_df_cache.clear()
+        _umap_fig_cache.clear()
+
     # UMAP cache: skip rebuild when only spatial-related inputs changed
     _umap_key = (color_by, method, gene, size, opacity, baysor_on, proseg_on, use_corr,
                  _annot_done, _spage_done, _ds_version, _extra_ds_version,
-                 _baysor_done, _proseg_done, _split_done, _subset_ver)
-    if _umap_key in _umap_fig_cache:
+                 _baysor_done, _proseg_done, _split_done, _subset_ver, _niche_done)
+    _cache_hit = _umap_key in _umap_fig_cache
+    print(f"  [UMAP cache] use_corr={use_corr}, hit={_cache_hit}, triggered={triggered}", flush=True)
+    if _cache_hit:
         umap_fig = _umap_fig_cache[_umap_key]
     else:
         umap_fig = make_umap_fig(color_by, method, gene, size, opacity,
@@ -8615,6 +8974,27 @@ def poll_annotation(_, current_options, done_version, modal_open):
 
 app.clientside_callback(
     """function(n_clicks) {
+        var sp = document.getElementById('spatial-plot');
+        var xr0, xr1, yr0, yr1, hasRanges = false;
+        if (sp && sp._fullLayout) {
+            var xl = sp._fullLayout.xaxis, yl = sp._fullLayout.yaxis;
+            if (xl && xl.range && yl && yl.range) {
+                xr0 = xl.range[0]; xr1 = xl.range[1];
+                yr0 = yl.range[0]; yr1 = yl.range[1];
+                hasRanges = true;
+            }
+        }
+        setTimeout(function() {
+            window.dispatchEvent(new Event('resize'));
+            if (hasRanges && sp) {
+                setTimeout(function() {
+                    Plotly.relayout(sp, {
+                        'xaxis.range[0]': xr0, 'xaxis.range[1]': xr1,
+                        'yaxis.range[0]': yr0, 'yaxis.range[1]': yr1
+                    });
+                }, 80);
+            }
+        }, 50);
         if (n_clicks % 2 === 1) return [{"display": "none"}, "Show UMAP"];
         return [{"flex": "1", "minWidth": "0"}, "Hide UMAP"];
     }""",
@@ -8802,6 +9182,7 @@ def switch_reseg_tab(algo):
     State("baysor-use-patches", "value"),
     State("baysor-use-prior", "value"),
     State("baysor-prior-conf", "value"),
+    State("baysor-prior-type", "value"),
     # Proseg states
     State("proseg-xmin", "value"),
     State("proseg-xmax", "value"),
@@ -8814,12 +9195,13 @@ def switch_reseg_tab(algo):
     State("proseg-schedule", "value"),
     State("proseg-nuclear-reassign-prob", "value"),
     State("proseg-prior-seg-prob", "value"),
+    State("proseg-prior-type", "value"),
     prevent_initial_call=True,
 )
 def run_reseg_modal(n_clicks, algo, patches_confirmed,
-                    bxmin, bxmax, bymin, bymax, bscale, bscale_std, bmin_mol, bn_clusters, buse_patches, buse_prior, bprior_conf,
+                    bxmin, bxmax, bymin, bymax, bscale, bscale_std, bmin_mol, bn_clusters, buse_patches, buse_prior, bprior_conf, bprior_type,
                     pxmin, pxmax, pymin, pymax, pvoxel, pthreads, psamples,
-                    precorded_samples, pschedule, pnuclear_prob, pprior_seg_prob):
+                    precorded_samples, pschedule, pnuclear_prob, pprior_seg_prob, pprior_type):
     if not patches_confirmed:
         return "✗ Please confirm patches in Step 1 before running segmentation.", no_update, no_update, no_update
     if algo == "baysor":
@@ -8841,7 +9223,8 @@ def run_reseg_modal(n_clicks, algo, patches_confirmed,
             target=_run_baysor,
             args=(scale, min_mol, use_prior_bool, prior_conf),
             kwargs=dict(**region, scale_std=scale_std, n_clusters=n_clusters,
-                        use_patches=use_patches),
+                        use_patches=use_patches,
+                        prior_type=bprior_type or "nucleus"),
             daemon=True,
         ).start()
         return "Baysor starting…", False, False, True
@@ -8861,6 +9244,7 @@ def run_reseg_modal(n_clicks, algo, patches_confirmed,
                         schedule=pschedule.strip() if pschedule else None,
                         nuclear_reassign_prob=float(pnuclear_prob) if pnuclear_prob is not None else None,
                         prior_seg_prob=float(pprior_seg_prob) if pprior_seg_prob is not None else None,
+                        prior_type=pprior_type or "nucleus",
                         **region),
             daemon=True,
         ).start()
@@ -9900,25 +10284,43 @@ def run_split(n_clicks, rds_path, label_col, max_cores, min_umi, min_umi_sigma, 
      Output("split-run-btn", "disabled", allow_duplicate=True),
      Output("split-done", "data"),
      Output("counts-mode", "value", allow_duplicate=True),
-     Output("dataset-version", "data", allow_duplicate=True)],
+     Output("dataset-version", "data", allow_duplicate=True),
+     Output("color-by", "options", allow_duplicate=True)],
     Input("split-poll", "n_intervals"),
     [State("split-done", "data"),
-     State("dataset-version", "data")],
+     State("dataset-version", "data"),
+     State("color-by", "options")],
     prevent_initial_call=True,
 )
-def poll_split(_, done_version, ds_version):
+def poll_split(_, done_version, ds_version, current_color_options):
     with _split_lock:
         status  = _split_state["status"]
         message = _split_state["message"]
     if status == "idle":
-        return "", "", no_update, True, False, done_version, no_update, no_update
+        return "", "", no_update, True, False, no_update, no_update, no_update, no_update
     if status == "running":
-        return message, message, no_update, False, True, done_version, no_update, no_update
+        return message, message, no_update, False, True, no_update, no_update, no_update, no_update
     if status == "done":
-        return f"✓ {message}", f"✓ {message}", False, True, False, done_version + 1, "corrected", no_update
+        # Enable cell_type:rctd in color-by dropdown since SPLIT stores RCTD labels
+        with _annot_lock:
+            methods_with_labels = {
+                m for m in _ANNOT_METHODS
+                if any(k.startswith(f"labels_{m}") and v is not None
+                       for k, v in _annot_state.items())
+            }
+        updated_options = []
+        for opt in (current_color_options or []):
+            val = opt.get("value", "")
+            if val.startswith("cell_type:"):
+                m = val.split(":")[1]
+                updated_options.append({**opt, "disabled": m not in methods_with_labels})
+            else:
+                updated_options.append(opt)
+        return (f"✓ {message}", f"✓ {message}", False, True, False,
+                done_version + 1, "corrected", no_update, updated_options)
     if status == "error":
-        return f"✗ {message}", f"✗ {message}", no_update, True, False, done_version, no_update, no_update
-    return "", "", no_update, True, False, done_version, no_update, no_update
+        return f"✗ {message}", f"✗ {message}", no_update, True, False, done_version, no_update, no_update, no_update
+    return "", "", no_update, True, False, done_version, no_update, no_update, no_update
 
 
 @app.callback(
@@ -9937,14 +10339,15 @@ def sync_counts_mode(value):
 @app.callback(
     [Output("counts-mode", "options"),
      Output("counts-mode", "value", allow_duplicate=True)],
-    [Input("split-done",   "data"),
-     Input("seg-source",   "value"),
-     Input("baysor-done",  "data"),
-     Input("proseg-done",  "data")],
+    [Input("split-done",      "data"),
+     Input("seg-source",      "value"),
+     Input("baysor-done",     "data"),
+     Input("proseg-done",     "data"),
+     Input("startup-trigger", "n_intervals")],
     State("counts-mode", "value"),
     prevent_initial_call=True,
 )
-def update_counts_options(_, seg_source, _bd, _pd, current_value):
+def update_counts_options(_, seg_source, _bd, _pd, _startup, current_value):
     _tool = _seg_tool(seg_source)
     with _baysor_lock:
         bres = _baysor_state["result"] if _baysor_state["status"] == "done" else None
@@ -9968,6 +10371,112 @@ def update_counts_options(_, seg_source, _bd, _pd, current_value):
     # Any other case: no_update avoids spuriously triggering sync_counts_mode's log print.
     new_value = "original" if (not has_corrected and current_value == "corrected") else no_update
     return options, new_value
+
+
+# ─── Spatial Niches callbacks ─────────────────────────────────────────────────
+
+@app.callback(
+    Output("niche-modal",        "is_open"),
+    Output("niche-label-method", "options"),
+    Input("niche-modal-open-btn",  "n_clicks"),
+    Input("niche-modal-close-btn", "n_clicks"),
+    State("niche-modal", "is_open"),
+    prevent_initial_call=True,
+)
+def open_niche_modal(open_clicks, close_clicks, is_open):
+    if not open_clicks and not close_clicks:
+        raise dash.exceptions.PreventUpdate
+    triggered = callback_context.triggered_id
+    if triggered == "niche-modal-close-btn":
+        return False, no_update
+    if not open_clicks:
+        raise dash.exceptions.PreventUpdate
+    # Build cell-type method options from available _annot_state labels
+    with _annot_lock:
+        method_options = []
+        for key in _annot_state:
+            if not key.startswith("labels_"):
+                continue
+            suffix = key[len("labels_"):]
+            label = suffix.replace("_", " ").title()
+            method_options.append({"label": label, "value": key})
+    return True, method_options
+
+
+@app.callback(
+    Output("niche-run-btn",      "disabled"),
+    Output("niche-poll",         "disabled", allow_duplicate=True),
+    Output("niche-modal-status", "children"),
+    Input("niche-run-btn",       "n_clicks"),
+    State("niche-n-clusters",    "value"),
+    State("niche-n-neighbors",   "value"),
+    State("niche-label-method",  "value"),
+    State("seg-source",          "value"),
+    prevent_initial_call=True,
+)
+def run_niche(n_clicks, n_clusters, n_neighbors, label_key, seg_source):
+    if not n_clicks:
+        raise dash.exceptions.PreventUpdate
+    n_clusters  = int(n_clusters  or 10)
+    n_neighbors = int(n_neighbors or 20)
+
+    tool = _seg_tool(seg_source)
+    with _baysor_lock:
+        bres = _baysor_state["result"] if tool == "baysor" and _baysor_state["result"] else None
+    with _proseg_lock:
+        pres = _proseg_state["result"] if tool == "proseg" and _proseg_state["result"] else None
+    alt_res = pres or bres
+
+    with _niche_lock:
+        _niche_state["status"]  = "starting"
+        _niche_state["message"] = "Starting…"
+
+    ctx = contextvars.copy_context()
+    t = threading.Thread(
+        target=ctx.run,
+        args=(_run_spatial_niches, n_clusters, n_neighbors, label_key, alt_res),
+        daemon=True,
+    )
+    t.start()
+    return True, False, "Starting niche computation…"
+
+
+@app.callback(
+    Output("niche-status",       "children"),
+    Output("niche-poll",         "disabled"),
+    Output("niche-run-btn",      "disabled", allow_duplicate=True),
+    Output("niche-done",         "data"),
+    Output("color-by",           "options", allow_duplicate=True),
+    Input("niche-poll",          "n_intervals"),
+    State("niche-done",          "data"),
+    State("color-by",            "options"),
+    prevent_initial_call=True,
+)
+def poll_niche(_, done_ver, current_options):
+    with _niche_lock:
+        status  = _niche_state["status"]
+        message = _niche_state["message"]
+
+    if status == "idle":
+        raise dash.exceptions.PreventUpdate
+
+    if status == "running" or status == "starting":
+        return message, False, True, no_update, no_update
+
+    if status == "done":
+        # Enable "Spatial Niches" in color-by dropdown
+        new_options = []
+        for opt in (current_options or []):
+            if opt.get("value") == "niche":
+                new_options.append({**opt, "disabled": False})
+            else:
+                new_options.append(opt)
+        return message, True, False, (done_ver or 0) + 1, new_options
+
+    if status == "error":
+        return f"Error: {message}", True, False, no_update, no_update
+
+    raise dash.exceptions.PreventUpdate
 
 
 # ─── ROI Annotation callbacks ─────────────────────────────────────────────────
