@@ -1002,7 +1002,7 @@ def _build_proseg_expr(tx_meta_df, cells_df):
                 else "assignment" if "assignment" in tx_meta_df.columns else None)
     if not gene_col or not cell_col:
         return None
-    cell_to_row = {c: i for i, c in enumerate(cells_df.index)}
+    cell_to_row = {str(c): i for i, c in enumerate(cells_df.index)}
     assigned = tx_meta_df[tx_meta_df[cell_col].notna()].copy()
     if cell_col == "assignment":
         # Filter out proseg's "unassigned" sentinel value (0xFFFFFFFF)
@@ -1255,6 +1255,9 @@ def _fast_load_reseg_zarr(zarr_path: str):
         )
     else:
         expr_mat = sp.csr_matrix(np.array(_xgrp, dtype=np.float32))
+
+    if expr_mat.nnz == 0:
+        raise ValueError("Zarr expression matrix is all zeros — rebuilding from transcripts")
 
     # ── X_corrected layer + imputed gene list ────────────────────────
     X_corrected = None
@@ -2076,10 +2079,15 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
                     if old_id in valid_ids:
                         all_bounds[remap[old_id]] = bnd
                 if tx_meta_i is not None:
-                    cell_col = "cell" if "cell" in tx_meta_i.columns else None
-                    if cell_col:
-                        tx_meta_i = tx_meta_i[tx_meta_i[cell_col].isin(valid_ids)].copy()
-                        tx_meta_i[cell_col] = tx_meta_i[cell_col].map(remap)
+                    _UNASSIGNED_P = 4294967295
+                    tx_meta_i = tx_meta_i.copy()
+                    if "cell" in tx_meta_i.columns:
+                        tx_meta_i = tx_meta_i[tx_meta_i["cell"].isin(valid_ids)]
+                        tx_meta_i["cell"] = tx_meta_i["cell"].map(remap)
+                    elif "assignment" in tx_meta_i.columns:
+                        _asgn = tx_meta_i["assignment"].astype(float).astype(int)
+                        _valid_mask = (_asgn != _UNASSIGNED_P) & (_asgn.isin(valid_ids))
+                        tx_meta_i.loc[_valid_mask, "assignment"] = _asgn[_valid_mask].map(remap)
                     all_tx_meta.append(tx_meta_i)
                 cell_offset += CELL_ID_STRIDE
 
@@ -3442,8 +3450,11 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
             genes_needed = shared_genes + genes_to_predict
             genes_key = ",".join(sorted(genes_to_predict))
 
-        # Reseg runs get a separate cache key so their imputed values don't clash with Xenium
-        _cache_seg_suffix = f"__{seg_source.replace(':', '_')}" if (seg_source and seg_source != "xenium") else ""
+        # Reseg runs get a separate cache key so their imputed values don't clash with Xenium.
+        # use_corrected also gets its own key so corrected/uncorrected runs don't share caches.
+        _cache_corr_suffix = "_corr" if use_corrected else ""
+        _cache_seg_suffix = (f"__{seg_source.replace(':', '_')}{_cache_corr_suffix}"
+                             if (seg_source and seg_source != "xenium") else _cache_corr_suffix)
         cache_file = _spage_cache_path(rds_path, genes_key + _cache_seg_suffix)
         zarr_cache = cache_file.replace(".parquet", ".zarr")
         if os.path.isdir(zarr_cache):
@@ -3792,13 +3803,24 @@ def subset(cluster=None, cell_type=None,
 
     # ── Cell type filter ──────────────────────────────────────────────────
     if cell_type is not None:
+        _reseg_active = _proseg_state["status"] == "done" or _baysor_state["status"] == "done"
         with _annot_lock:
-            labels = next((v for m in _ANNOT_METHODS
-                           for k, v in _annot_state.items()
-                           if (k == f"labels_{m}" or k.startswith(f"labels_{m}_"))
-                           and v is not None), None)
+            # Only use Xenium-specific labels (exact key "labels_{method}") — not reseg-suffixed ones.
+            # Reseg annotation labels (labels_{method}_proseg_xxx) have reseg cell IDs, not barcodes.
+            if _reseg_active:
+                labels = next((v for m in _ANNOT_METHODS
+                               for k, v in _annot_state.items()
+                               if k == f"labels_{m}" and v is not None), None)
+            else:
+                labels = next((v for m in _ANNOT_METHODS
+                               for k, v in _annot_state.items()
+                               if (k == f"labels_{m}" or k.startswith(f"labels_{m}_"))
+                               and v is not None), None)
         if labels is None:
-            print("  subset: no cell type annotation loaded — skipping cell_type filter", flush=True)
+            if _reseg_active:
+                print("  subset: no Xenium cell type annotation — skipping Xenium cell_type filter", flush=True)
+            else:
+                print("  subset: no cell type annotation loaded — skipping cell_type filter", flush=True)
         else:
             vals = [cell_type] if isinstance(cell_type, str) else list(cell_type)
             mask &= labels.reindex(df.index.astype(str)).isin(vals)
@@ -4163,6 +4185,22 @@ def run_spage(rds_path: str, genes_file: str = None, n_pv: int = 50,
     if use_corrected:
         print("  SpaGE: will use SPLIT-corrected counts as input", flush=True)
 
+    # Detect active reseg so imputation runs against the right cells
+    seg_source = None
+    with _proseg_lock:
+        if _proseg_state["status"] == "done" and _proseg_state.get("result"):
+            _res_od = _proseg_state["result"].get("out_dir", "")
+            _tag = os.path.basename(_res_od).rsplit("_", 1)[-1] if _res_od else ""
+            seg_source = f"proseg:{_tag}" if _tag else "proseg"
+    if seg_source is None:
+        with _baysor_lock:
+            if _baysor_state["status"] == "done" and _baysor_state.get("result"):
+                _res_od = _baysor_state["result"].get("out_dir", "")
+                _tag = os.path.basename(_res_od).rsplit("_", 1)[-1] if _res_od else ""
+                seg_source = f"baysor:{_tag}" if _tag else "baysor"
+    if seg_source:
+        print(f"  SpaGE: reseg mode — imputing against {_seg_tool(seg_source)} cells", flush=True)
+
     # Build genes_input string (same format _run_spage_imputation expects)
     genes_input = ""
     if genes_file:
@@ -4185,7 +4223,7 @@ def run_spage(rds_path: str, genes_file: str = None, n_pv: int = 50,
     ctx = contextvars.copy_context()
     threading.Thread(
         target=lambda: ctx.run(_run_spage_imputation, rds_path, n_pv, genes_input,
-                               use_corrected=use_corrected),
+                               seg_source, use_corrected=use_corrected),
         daemon=True,
     ).start()
 
@@ -5358,7 +5396,12 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
 
         elif color_by == "cluster":
             # Look for any cluster column in cells_df (added after UMAP/clustering on reseg cells)
-            cluster_col = next((c for c in bdf.columns if c.startswith("cluster")), None)
+            # When corrected counts are active, prefer cluster_split_* columns
+            _cluster_cols = [c for c in bdf.columns if c.startswith("cluster")]
+            if use_corrected:
+                cluster_col = next((c for c in _cluster_cols if "split" in c), None) or next(iter(_cluster_cols), None)
+            else:
+                cluster_col = next((c for c in _cluster_cols if "split" not in c), None) or next(iter(_cluster_cols), None)
             if cluster_col is not None:
                 cluster_vals = bdf[cluster_col].astype(str)
                 unique_clusters = sorted(cluster_vals.unique(), key=lambda v: (0, int(v)) if v.isdigit() else (1, v))
@@ -5388,21 +5431,28 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                 if n_unknown > len(aligned) * 0.95:
                     print(f"  Warning: cell_type:{_method} produced {n_unknown}/{len(aligned)} Unknown "
                           f"— labels index sample: {list(labels.index[:3])!r}, "
-                          f"cells sample: {cell_ids_str[:3]!r}", flush=True)
-                cell_types = sorted(aligned.unique())
-                cmap = {ct: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, ct in enumerate(cell_types)}
-                traces = []
-                for ct in cell_types:
-                    mask = (aligned == ct).values
-                    traces.append(go.Scattergl(
-                        x=x[mask], y=y[mask], mode="markers",
-                        marker=dict(size=size, color=cmap[ct], opacity=opacity),
-                        name=ct, legendgroup=ct, showlegend=True,
-                        text=np.array(cell_ids_str)[mask].tolist(),
-                        customdata=np.array(cell_ids_str)[mask].tolist(),
-                        hovertemplate="<b>%{text}</b><extra>" + ct + "</extra>",
-                    ))
-                show_legend = True
+                          f"cells sample: {cell_ids_str[:3]!r}"
+                          f" — stale labels cleared, re-run annotation", flush=True)
+                    with _annot_lock:
+                        _annot_state.pop(_lkey, None)
+                    labels = None
+                if labels is None:
+                    color_by = "transcript_counts"
+                else:
+                    cell_types = sorted(aligned.unique())
+                    cmap = {ct: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, ct in enumerate(cell_types)}
+                    traces = []
+                    for ct in cell_types:
+                        mask = (aligned == ct).values
+                        traces.append(go.Scattergl(
+                            x=x[mask], y=y[mask], mode="markers",
+                            marker=dict(size=size, color=cmap[ct], opacity=opacity),
+                            name=ct, legendgroup=ct, showlegend=True,
+                            text=np.array(cell_ids_str)[mask].tolist(),
+                            customdata=np.array(cell_ids_str)[mask].tolist(),
+                            hovertemplate="<b>%{text}</b><extra>" + ct + "</extra>",
+                        ))
+                    show_legend = True
 
         elif color_by == "gene":
             vals = _get_expr_values(gene, alt_res, use_corrected=use_corrected)
@@ -5859,14 +5909,15 @@ def make_umap_fig(color_by, method, gene, size, opacity,
         else:
             xu = udf["umap_1"].values
             yu = udf["umap_2"].values
-        cell_ids  = udf.index.tolist()
+        cell_ids     = udf.index.tolist()
+        cell_ids_str = [str(c) for c in cell_ids]
         if color_by.startswith("cell_type:"):
             _method    = color_by.split(":")[1]
             labels_key = _labels_key_for_method(_method, alt_res)
             with _annot_lock:
                 labels = _annot_state.get(labels_key)
             if labels is not None:
-                aligned    = labels.reindex(pd.Index(cell_ids)).fillna("Unknown")
+                aligned    = labels.reindex(pd.Index(cell_ids_str)).fillna("Unknown")
                 cell_types = sorted(aligned.unique())
                 cmap = {ct: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, ct in enumerate(cell_types)}
                 traces = []
@@ -5876,8 +5927,8 @@ def make_umap_fig(color_by, method, gene, size, opacity,
                         x=xu[mask], y=yu[mask], mode="markers",
                         marker=dict(size=mk, color=cmap[ct], opacity=opacity),
                         name=ct, showlegend=False,
-                        text=np.array(cell_ids)[mask].tolist(),
-                        customdata=np.array(cell_ids)[mask].tolist(),
+                        text=np.array(cell_ids_str)[mask].tolist(),
+                        customdata=np.array(cell_ids_str)[mask].tolist(),
                         hovertemplate="<b>%{text}</b><extra>" + ct + "</extra>",
                     ))
             else:
@@ -5918,7 +5969,11 @@ def make_umap_fig(color_by, method, gene, size, opacity,
 
         if color_by == "cluster" and not color_by.startswith("cell_type:") and color_by != "gene":
             bdf = alt_res["cells_df"]
-            _cluster_col = next((c for c in bdf.columns if c.startswith("cluster")), None)
+            _all_cluster_cols = [c for c in bdf.columns if c.startswith("cluster")]
+            if use_corrected:
+                _cluster_col = next((c for c in _all_cluster_cols if "split" in c), None) or next(iter(_all_cluster_cols), None)
+            else:
+                _cluster_col = next((c for c in _all_cluster_cols if "split" not in c), None) or next(iter(_all_cluster_cols), None)
             if _cluster_col is not None:
                 _cvals = bdf[_cluster_col].reindex(udf.index).astype(str)
                 _unique = sorted(_cvals.unique(), key=lambda v: (0, int(v)) if v.isdigit() else (1, v))
@@ -6722,17 +6777,21 @@ def to_spatialdata(qv_threshold: int = 20, force: bool = False) -> None:
             if not force and os.path.isdir(cache):
                 _set("running", "Loading from cache…")
                 print(f"  to_spatialdata: loading from cache {cache} …", flush=True)
-                import warnings
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    sdata = spatialdata.read_zarr(cache)
-                _sdata_fix_categories(sdata)
-                summary = _sdata_summary(sdata)
-                msg = f"Done (cached) — {summary}"
-                print(f"  to_spatialdata: {msg}", flush=True)
-                _sdata_version += 1
-                _set("done", msg, sdata=sdata)
-                return
+                try:
+                    import warnings
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        sdata = spatialdata.read_zarr(cache)
+                    _sdata_fix_categories(sdata)
+                    summary = _sdata_summary(sdata)
+                    msg = f"Done (cached) — {summary}"
+                    print(f"  to_spatialdata: {msg}", flush=True)
+                    _sdata_version += 1
+                    _set("done", msg, sdata=sdata)
+                    return
+                except (KeyError, Exception) as cache_err:
+                    print(f"  to_spatialdata: cache read failed ({cache_err}), "
+                          f"rebuilding from raw files…", flush=True)
 
             # ── Read from raw Xenium files ────────────────────────────────
             _set("running", f"Reading Xenium data (qv≥{qv_threshold})…")
@@ -8494,6 +8553,10 @@ def toggle_morph_controls(enabled):
 def store_relayout(relayout_data, current):
     if not relayout_data:
         return current or {}
+    # If the event contains width/height, it's a container resize — ignore range
+    # changes to prevent progressive zoom-out when UMAP panel opens/closes.
+    if "width" in relayout_data or "height" in relayout_data:
+        return current or {}
     merged = dict(current or {})
     # Ignore autosize/autorange signals that would override explicit ranges
     ignore = {"autosize", "xaxis.autorange", "yaxis.autorange",
@@ -8613,7 +8676,8 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
                  _annot_done, _spage_done, _ds_version, _extra_ds_version,
                  _baysor_done, _proseg_done, _split_done, _subset_ver, _niche_done)
     _cache_hit = _umap_key in _umap_fig_cache
-    print(f"  [UMAP cache] use_corr={use_corr}, hit={_cache_hit}, triggered={triggered}", flush=True)
+    if not _cache_hit:
+        print(f"  [UMAP cache] miss — use_corr={use_corr}, triggered={triggered}", flush=True)
     if _cache_hit:
         umap_fig = _umap_fig_cache[_umap_key]
     else:
@@ -8807,7 +8871,7 @@ def toggle_spage_modal(open_clicks, close_clicks, is_open):
 )
 def toggle_annot_modal(open_clicks, close_clicks, is_open):
     triggered = callback_context.triggered_id
-    if triggered == "annot-modal-open-btn":
+    if triggered == "annot-modal-open-btn" and open_clicks:
         return True
     if triggered == "annot-modal-close-btn":
         return False
@@ -8946,6 +9010,9 @@ def poll_annotation(_, current_options, done_version, modal_open):
         message = _annot_state["message"]
         done    = (status == "done")
         error   = (status == "error")
+        if done:
+            # Consume the signal so repeated poll fires don't re-bump done_version
+            _annot_state["status"] = "loaded"
 
     # Enable each cell_type:method option if that method has any labels
     with _annot_lock:
@@ -8969,6 +9036,9 @@ def poll_annotation(_, current_options, done_version, modal_open):
     if error:
         # Keep the modal open so user can see the error
         return f"✗ {message}", True, False, options, done_version, f"✗ {message}", modal_open
+    if status == "loaded":
+        # Already reported done — disable interval but don't re-bump done_version
+        return f"✓ {message}", True, False, options, done_version, f"✓ {message}", modal_open
     return message, False, True, options, done_version, message, modal_open   # keep polling
 
 
@@ -9058,8 +9128,8 @@ def poll_baysor(_, done_version):
         seg_val = f"baysor:{param_tag}" if param_tag else "baysor"
         return f"✓ {message}", True, (done_version or 0) + 1, seg_val
     if status == "error":
-        return f"✗ {message}", True, done_version, no_update
-    return message, False, done_version, no_update
+        return f"✗ {message}", True, no_update, no_update
+    return message, False, no_update, no_update
 
 
 # ─── Proseg callbacks ─────────────────────────────────────────────────────────
@@ -9106,8 +9176,8 @@ def poll_proseg(_, done_version):
         seg_val = f"proseg:{param_tag}" if param_tag else "proseg"
         return f"✓ {message}", True, (done_version or 0) + 1, seg_val
     if status == "error":
-        return f"✗ {message}", True, done_version, no_update
-    return message, False, done_version, no_update
+        return f"✗ {message}", True, no_update, no_update
+    return message, False, no_update, no_update
 
 
 # ─── Resegmentation modal callbacks ───────────────────────────────────────────
@@ -9595,12 +9665,11 @@ def update_gene_options(_spage_version, _ds_version, seg_source):
             if imp_genes:
                 imp = [{"label": f"{g} [imp]", "value": f"{g} [imp]"} for g in sorted(imp_genes)]
                 return base + imp
-        # Streaming SpaGE: genes not written to alt_res["expr"] — fall back to result_genes
-        with _spage_lock:
-            streaming_genes = _spage_state.get("result_genes") or []
-        if streaming_genes:
-            imp = [{"label": f"{g} [imp]", "value": f"{g} [imp]"} for g in sorted(streaming_genes)]
-            return base + imp
+            # Streaming SpaGE: genes not written to alt_res["expr"] — use reseg-specific gene list
+            streaming_genes = res.get("spage_result_genes") or []
+            if streaming_genes:
+                imp = [{"label": f"{g} [imp]", "value": f"{g} [imp]"} for g in sorted(streaming_genes)]
+                return base + imp
         return base
 
     # Xenium active: add imputed genes from zarr (already in DATA["expr"]) or _spage_state fallback
