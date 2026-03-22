@@ -3195,6 +3195,9 @@ def _annot_autoload() -> None:
                     if os.path.basename(f).endswith("_weights.parquet")]
     if not label_files and not weight_files:
         return
+    # Sort by modification time (newest last) so the most recent annotation wins
+    # when multiple cache files map to the same labels_key.
+    label_files.sort(key=lambda f: os.path.getmtime(f))
     loaded = 0
     for fpath in label_files:
         name = os.path.basename(fpath)
@@ -6132,7 +6135,7 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
 _umap_df_cache = {}
 
 
-def make_cell_type_abundance_fig():
+def make_cell_type_abundance_fig(width=None, height=None):
     """Build bar chart of cell type abundances for all computed annotation methods."""
     from plotly.subplots import make_subplots
     import plotly.graph_objects as go
@@ -6223,7 +6226,6 @@ def make_cell_type_abundance_fig():
         plot_bgcolor=PLOT_BG,
         font=dict(color=TEXT, size=11),
         margin=dict(l=50, r=20, t=40, b=60),
-        height=max(300, 280 * n),
         showlegend=False,
     )
     for ann in fig.layout.annotations:
@@ -6243,7 +6245,7 @@ def _make_placeholder_fig(msg="No analysis computed yet."):
     return fig
 
 
-def make_cooccurrence_fig():
+def make_cooccurrence_fig(zmin=None, zmax=None, width=None, height=None):
     with _spatial_lock:
         result = _spatial_state.get("result")
     if result is None:
@@ -6251,18 +6253,24 @@ def make_cooccurrence_fig():
     cell_types = result["cell_types"]
     matrix = result["cooccurrence"]
     n = len(cell_types)
+    hm_kw = {}
+    if zmin is not None or zmax is not None:
+        if zmin is not None: hm_kw["zmin"] = zmin
+        if zmax is not None: hm_kw["zmax"] = zmax
+    else:
+        hm_kw["zmid"] = 0
     fig = go.Figure(go.Heatmap(
         z=matrix, x=cell_types, y=cell_types,
-        colorscale="RdBu_r", zmid=0,
+        colorscale="RdBu_r",
         hovertemplate="%{y} → %{x}<br>log2 score: %{z:.2f}<extra></extra>",
         colorbar=dict(title=dict(text="log2 score", font=dict(color=TEXT)), tickfont=dict(color=TEXT)),
+        **hm_kw,
     ))
-    h = max(400, 30 * n)
     fig.update_layout(
         paper_bgcolor=CARD_BG, plot_bgcolor=PLOT_BG,
         font=dict(color=TEXT, size=10),
         margin=dict(l=120, r=20, t=30, b=120),
-        height=h,
+        height=max(400, 30 * n),
         xaxis=dict(tickangle=-45, gridcolor=BORDER, linecolor=BORDER),
         yaxis=dict(gridcolor=BORDER, linecolor=BORDER),
         title=dict(text="Co-occurrence (log2 observed/expected)", font=dict(color=TEXT, size=12), x=0.5),
@@ -6270,7 +6278,7 @@ def make_cooccurrence_fig():
     return fig
 
 
-def make_enrichment_fig():
+def make_enrichment_fig(zmin=None, zmax=None, width=None, height=None):
     with _spatial_lock:
         result = _spatial_state.get("result")
     if result is None:
@@ -6278,18 +6286,24 @@ def make_enrichment_fig():
     cell_types = result["cell_types"]
     matrix = result["enrichment"]
     n = len(cell_types)
+    hm_kw = {}
+    if zmin is not None or zmax is not None:
+        if zmin is not None: hm_kw["zmin"] = zmin
+        if zmax is not None: hm_kw["zmax"] = zmax
+    else:
+        hm_kw["zmid"] = 0
     fig = go.Figure(go.Heatmap(
         z=matrix, x=cell_types, y=cell_types,
-        colorscale="RdBu_r", zmid=0,
+        colorscale="RdBu_r",
         hovertemplate="%{y} → %{x}<br>log2 enrichment: %{z:.2f}<extra></extra>",
         colorbar=dict(title=dict(text="log2 enrichment", font=dict(color=TEXT)), tickfont=dict(color=TEXT)),
+        **hm_kw,
     ))
-    h = max(400, 30 * n)
     fig.update_layout(
         paper_bgcolor=CARD_BG, plot_bgcolor=PLOT_BG,
         font=dict(color=TEXT, size=10),
         margin=dict(l=120, r=20, t=30, b=120),
-        height=h,
+        height=max(400, 30 * n),
         xaxis=dict(tickangle=-45, gridcolor=BORDER, linecolor=BORDER),
         yaxis=dict(gridcolor=BORDER, linecolor=BORDER),
         title=dict(text="Neighborhood Enrichment (log2 observed/expected)", font=dict(color=TEXT, size=12), x=0.5),
@@ -6297,17 +6311,24 @@ def make_enrichment_fig():
     return fig
 
 
-def make_interaction_graph_fig():
+def make_interaction_graph_fig(width=None, height=None, normalize=False, min_freq=0.0):
     with _spatial_lock:
         result = _spatial_state.get("result")
     if result is None:
         return _make_placeholder_fig()
-    cell_types = result["cell_types"]
-    adjacency = result["adjacency"]
-    freqs = result["freqs"]
+    cell_types = list(result["cell_types"])
+    adjacency = result["adjacency"].copy()
+    freqs = result["freqs"].copy()
+    if min_freq and min_freq > 0:
+        keep = freqs >= (min_freq / 100.0)
+        cell_types = [ct for i, ct in enumerate(cell_types) if keep[i]]
+        adjacency = adjacency[np.ix_(keep, keep)]
+        freqs = freqs[keep]
+        if freqs.sum() > 0:
+            freqs = freqs / freqs.sum()
     n = len(cell_types)
     if n == 0:
-        return _make_placeholder_fig("No cell types found.")
+        return _make_placeholder_fig("No cell types above frequency threshold.")
 
     angles = [2 * np.pi * i / n for i in range(n)]
     node_x = [np.cos(a) for a in angles]
@@ -6317,9 +6338,18 @@ def make_interaction_graph_fig():
     edges = []
     for a in range(n):
         for b in range(a, n):
-            w = adjacency[a, b] + adjacency[b, a]
-            if w > 0:
-                edges.append((w, a, b))
+            raw_w = adjacency[a, b] + adjacency[b, a]
+            if raw_w > 0:
+                if normalize:
+                    # Observed / expected under random mixing
+                    expected = freqs[a] * freqs[b] * adjacency.sum()
+                    if a != b:
+                        expected *= 2  # both orderings
+                    w = (raw_w / expected) if expected > 0 else 0
+                else:
+                    w = raw_w
+                if w > 0:
+                    edges.append((w, a, b))
     edges.sort(reverse=True)
     edges = edges[:30]
     max_w = edges[0][0] if edges else 1
@@ -6328,12 +6358,13 @@ def make_interaction_graph_fig():
     for w, a, b in edges:
         lw = max(0.5, 5 * w / max_w)
         alpha = max(0.1, 0.7 * w / max_w)
+        hover_txt = f"{cell_types[a]} ↔ {cell_types[b]}<br>{'O/E ratio' if normalize else 'count'}: {w:.2f}"
         traces.append(go.Scatter(
             x=[node_x[a], node_x[b], None],
             y=[node_y[a], node_y[b], None],
             mode="lines",
             line=dict(width=lw, color=f"rgba(150,150,200,{alpha:.2f})"),
-            hoverinfo="skip",
+            hoverinfo="text", text=[hover_txt, hover_txt, None],
             showlegend=False,
         ))
 
@@ -6350,6 +6381,7 @@ def make_interaction_graph_fig():
         showlegend=False,
     ))
 
+    title_text = "Interaction Graph — O/E normalized (top 30)" if normalize else "Interaction Graph — raw counts (top 30)"
     fig = go.Figure(traces)
     fig.update_layout(
         paper_bgcolor=CARD_BG, plot_bgcolor=PLOT_BG,
@@ -6357,23 +6389,29 @@ def make_interaction_graph_fig():
         margin=dict(l=20, r=20, t=40, b=20),
         xaxis=dict(visible=False, range=[-1.4, 1.4]),
         yaxis=dict(visible=False, range=[-1.4, 1.4], scaleanchor="x"),
-        title=dict(text="Cell Type Interaction Graph (top 30 edges)", font=dict(color=TEXT, size=12), x=0.5),
-        height=500,
+        title=dict(text=title_text, font=dict(color=TEXT, size=12), x=0.5),
     )
     return fig
 
 
-def make_chord_fig():
+def make_chord_fig(width=None, height=None, normalize=False, min_freq=0.0):
     with _spatial_lock:
         result = _spatial_state.get("result")
     if result is None:
         return _make_placeholder_fig()
-    cell_types = result["cell_types"]
-    adjacency = result["adjacency"]
-    freqs = result["freqs"]
+    cell_types = list(result["cell_types"])
+    adjacency = result["adjacency"].copy()
+    freqs = result["freqs"].copy()
+    if min_freq and min_freq > 0:
+        keep = freqs >= (min_freq / 100.0)
+        cell_types = [ct for i, ct in enumerate(cell_types) if keep[i]]
+        adjacency = adjacency[np.ix_(keep, keep)]
+        freqs = freqs[keep]
+        if freqs.sum() > 0:
+            freqs = freqs / freqs.sum()
     n = len(cell_types)
     if n == 0:
-        return _make_placeholder_fig("No cell types found.")
+        return _make_placeholder_fig("No cell types above frequency threshold.")
 
     gap = 0.02  # radians between arcs
     total_arc = 2 * np.pi - n * gap
@@ -6393,15 +6431,27 @@ def make_chord_fig():
     traces = []
     colors = [CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i in range(n)]
 
-    # Draw ribbons (Bezier quadratic through origin)
+    # Build weight matrix — optionally normalize by expected frequency
     adj_sym = adjacency + adjacency.T
-    max_adj = adj_sym.max()
+    if normalize:
+        total = adj_sym.sum() / 2  # total undirected edges
+        norm_mat = np.zeros_like(adj_sym, dtype=float)
+        for a in range(n):
+            for b in range(n):
+                expected = freqs[a] * freqs[b] * total
+                if a != b:
+                    expected *= 2
+                norm_mat[a, b] = (adj_sym[a, b] / expected) if expected > 0 else 0
+        weight_mat = norm_mat
+    else:
+        weight_mat = adj_sym.astype(float)
+    max_adj = weight_mat.max()
     if max_adj == 0:
         max_adj = 1
 
     for a in range(n):
         for b in range(a, n):
-            w = adj_sym[a, b]
+            w = weight_mat[a, b]
             if w < max_adj * 0.01:
                 continue
             alpha = max(0.05, 0.4 * w / max_adj)
@@ -6444,33 +6494,43 @@ def make_chord_fig():
         margin=dict(l=20, r=20, t=40, b=20),
         xaxis=dict(visible=False, range=[-1.5, 1.5]),
         yaxis=dict(visible=False, range=[-1.5, 1.5], scaleanchor="x"),
-        title=dict(text="Chord Diagram — Cell Type Interactions", font=dict(color=TEXT, size=12), x=0.5),
-        height=500,
+        title=dict(text="Chord Diagram — " + ("O/E normalized" if normalize else "raw counts"),
+                   font=dict(color=TEXT, size=12), x=0.5),
         showlegend=False,
     )
     return fig
 
 
-def make_niche_umap_fig():
+def make_niche_umap_fig(width=None, height=None):
     if DATA is None or DATA.get("df") is None:
         return _make_placeholder_fig()
     df = DATA["df"]
     if "niche" not in df.columns:
         return _make_placeholder_fig("Run Spatial Niches to populate this tab.")
-    umap = DATA.get("umap")
-    if umap is None or len(umap) != len(df):
+    # Use re-run UMAP columns if present, otherwise fall back to bundled DATA["umap"]
+    if "umap_1" in df.columns and "umap_2" in df.columns:
+        xu = df["umap_1"].values.astype(float)
+        yu = df["umap_2"].values.astype(float)
+    elif DATA.get("umap") is not None and len(DATA["umap"]) == len(df):
+        xu = DATA["umap"][:, 0].astype(float)
+        yu = DATA["umap"][:, 1].astype(float)
+    else:
         return _make_placeholder_fig("No UMAP coordinates available.")
-    niches = df["niche"].values
-    unique_niches = sorted(set(str(n) for n in niches if pd.notna(n)))
+    niche_arr = df["niche"].values.astype(str)
+    valid_mask = ~(np.isnan(xu) | np.isnan(yu))
+    xu = xu[valid_mask]
+    yu = yu[valid_mask]
+    niches = niche_arr[valid_mask]
+    unique_niches = sorted(set(niches), key=lambda v: (0, int(v)) if v.isdigit() else (1, v))
     traces = []
     for j, niche in enumerate(unique_niches):
-        mask = np.array([str(x) == niche for x in niches])
+        mask = niches == niche
         color = CLUSTER_COLORS[j % len(CLUSTER_COLORS)]
-        traces.append(go.Scatter(
-            x=umap[mask, 0], y=umap[mask, 1],
+        traces.append(go.Scattergl(
+            x=xu[mask], y=yu[mask],
             mode="markers",
             marker=dict(size=3, color=color, opacity=0.7),
-            name=str(niche),
+            name=f"Niche {niche}",
             hovertemplate=f"Niche {niche}<extra></extra>",
         ))
     fig = go.Figure(traces)
@@ -6482,7 +6542,6 @@ def make_niche_umap_fig():
         yaxis=dict(title="UMAP 2", gridcolor=BORDER, linecolor=BORDER, color=TEXT),
         legend=dict(bgcolor=CARD_BG, bordercolor=BORDER, font=dict(color=TEXT, size=9)),
         title=dict(text="Niche UMAP", font=dict(color=TEXT, size=12), x=0.5),
-        height=500,
     )
     return fig
 
@@ -6745,6 +6804,73 @@ def make_umap_fig(color_by, method, gene, size, opacity,
         showlegend=False, uirevision="umap",
     )
     return fig
+
+
+# ─── Plot tab control helpers ─────────────────────────────────────────────────
+_PLOT_CTRL_INPUT = {
+    "width": "60px", "backgroundColor": "#0d1117", "color": TEXT,
+    "border": f"1px solid {BORDER}", "borderRadius": "4px",
+    "fontSize": "11px", "padding": "2px 4px",
+}
+
+def _plot_dim_controls(prefix: str):
+    """Width × Height inputs for a plot tab."""
+    return html.Div([
+        html.Span("W", style={"color": MUTED, "fontSize": "10px"}),
+        dcc.Input(id=f"{prefix}-plot-w", type="number", placeholder="W",
+                  debounce=True, style=_PLOT_CTRL_INPUT),
+        html.Span("×", style={"color": MUTED, "fontSize": "10px", "margin": "0 2px"}),
+        html.Span("H", style={"color": MUTED, "fontSize": "10px"}),
+        dcc.Input(id=f"{prefix}-plot-h", type="number", placeholder="H",
+                  debounce=True, style=_PLOT_CTRL_INPUT),
+    ], style={"display": "flex", "alignItems": "center", "gap": "4px",
+              "padding": "4px 6px", "flexShrink": "0", "borderTop": f"1px solid {BORDER}"})
+
+def _plot_normalize_and_dim_controls(prefix: str):
+    """Normalize toggle + min-freq filter + dimensions for interaction/chord tabs."""
+    return html.Div([
+        dcc.Checklist(
+            id=f"{prefix}-normalize",
+            options=[{"label": html.Span(" O/E normalize", style={"fontSize": "11px", "color": TEXT}),
+                      "value": "on"}],
+            value=[], inputStyle={"marginRight": "4px"},
+            labelStyle={"display": "flex", "alignItems": "center", "cursor": "pointer"},
+            style={"display": "inline-flex"},
+        ),
+        html.Span("", style={"width": "10px"}),
+        html.Span("Min%", style={"color": MUTED, "fontSize": "10px"}),
+        dcc.Input(id=f"{prefix}-min-freq", type="number", placeholder="0", min=0, max=100,
+                  debounce=True, style=_PLOT_CTRL_INPUT),
+        html.Span("", style={"width": "10px"}),
+        html.Span("W", style={"color": MUTED, "fontSize": "10px"}),
+        dcc.Input(id=f"{prefix}-plot-w", type="number", placeholder="W",
+                  debounce=True, style=_PLOT_CTRL_INPUT),
+        html.Span("×", style={"color": MUTED, "fontSize": "10px", "margin": "0 2px"}),
+        html.Span("H", style={"color": MUTED, "fontSize": "10px"}),
+        dcc.Input(id=f"{prefix}-plot-h", type="number", placeholder="H",
+                  debounce=True, style=_PLOT_CTRL_INPUT),
+    ], style={"display": "flex", "alignItems": "center", "gap": "4px",
+              "padding": "4px 6px", "flexShrink": "0", "borderTop": f"1px solid {BORDER}"})
+
+def _plot_range_and_dim_controls(prefix: str):
+    """Color range (min/max) + dimensions for heatmap tabs."""
+    return html.Div([
+        html.Span("Color:", style={"color": MUTED, "fontSize": "10px"}),
+        dcc.Input(id=f"{prefix}-cbar-min", type="number", placeholder="Min",
+                  debounce=True, style=_PLOT_CTRL_INPUT),
+        html.Span("–", style={"color": MUTED, "fontSize": "10px"}),
+        dcc.Input(id=f"{prefix}-cbar-max", type="number", placeholder="Max",
+                  debounce=True, style=_PLOT_CTRL_INPUT),
+        html.Span("", style={"width": "12px"}),
+        html.Span("W", style={"color": MUTED, "fontSize": "10px"}),
+        dcc.Input(id=f"{prefix}-plot-w", type="number", placeholder="W",
+                  debounce=True, style=_PLOT_CTRL_INPUT),
+        html.Span("×", style={"color": MUTED, "fontSize": "10px", "margin": "0 2px"}),
+        html.Span("H", style={"color": MUTED, "fontSize": "10px"}),
+        dcc.Input(id=f"{prefix}-plot-h", type="number", placeholder="H",
+                  debounce=True, style=_PLOT_CTRL_INPUT),
+    ], style={"display": "flex", "alignItems": "center", "gap": "4px",
+              "padding": "4px 6px", "flexShrink": "0", "borderTop": f"1px solid {BORDER}"})
 
 
 # ─── App layout ───────────────────────────────────────────────────────────────
@@ -9064,8 +9190,8 @@ dbc.Modal([
         ], id="sidebar-hover-zone", style={
             "position": "fixed", "top": "0", "left": "0",
             "height": "100vh", "zIndex": "100",
-            # Wide enough to keep hover active while using sidebar
-            "width": "250px",
+            # Only the narrow trigger strip — sidebar stays open via #sidebar-wrapper:hover
+            "width": "8px",
         }),
 
         html.Div([
@@ -9113,45 +9239,74 @@ dbc.Modal([
                              children=[
                         dbc.Tab(label="UMAP", tab_id="tab-umap",
                                 label_style={"fontSize": "12px", "padding": "4px 12px"},
-                                children=[
+                                children=[html.Div([
                                     dcc.Graph(id="umap-plot", responsive=True,
                                               config={"displayModeBar": True,
                                                       "modeBarButtonsToRemove": ["select2d", "lasso2d"],
                                                       "toImageButtonOptions": {"format": "svg", "filename": "xenium_umap"}},
-                                              style={"height": "calc(100% - 36px)"}),
-                                ]),
+                                              style={"flex": "1", "minHeight": "0"}),
+                                    _plot_dim_controls("umap"),
+                                ], style={"display": "flex", "flexDirection": "column", "height": "calc(100% - 36px)"})]),
                         dbc.Tab(label="Cell Type Abundance", tab_id="tab-abundance",
                                 label_style={"fontSize": "12px", "padding": "4px 12px"},
-                                children=[
-                                    dcc.Graph(id="cell-type-abundance-plot", responsive=True,
+                                children=[html.Div([
+                                    html.Div(dcc.Graph(id="cell-type-abundance-plot", responsive=True,
                                               config={"displayModeBar": False},
-                                              style={"height": "calc(100% - 36px)"}),
-                                ]),
+                                              style={"width": "100%", "height": "100%"}),
+                                             id="abundance-plot-container",
+                                             style={"flex": "1", "minHeight": "0"}),
+                                    _plot_dim_controls("abundance"),
+                                ], style={"display": "flex", "flexDirection": "column", "height": "calc(100% - 36px)"})]),
                         dbc.Tab(label="Co-occurrence", tab_id="tab-cooccurrence",
                                 label_style={"fontSize": "12px", "padding": "4px 12px"},
-                                children=[dcc.Graph(id="cooccurrence-plot", responsive=True,
-                                                    config={"displayModeBar": False},
-                                                    style={"height": "calc(100% - 36px)"})]),
+                                children=[html.Div([
+                                    html.Div(dcc.Graph(id="cooccurrence-plot", responsive=True,
+                                              config={"displayModeBar": False},
+                                              style={"width": "100%", "height": "100%"}),
+                                             id="cooccurrence-plot-container",
+                                             style={"flex": "1", "minHeight": "0"}),
+                                    _plot_range_and_dim_controls("cooccurrence"),
+                                ], style={"display": "flex", "flexDirection": "column", "height": "calc(100% - 36px)"})]),
                         dbc.Tab(label="Neighborhood Enrichment", tab_id="tab-enrichment",
                                 label_style={"fontSize": "12px", "padding": "4px 12px"},
-                                children=[dcc.Graph(id="enrichment-plot", responsive=True,
-                                                    config={"displayModeBar": False},
-                                                    style={"height": "calc(100% - 36px)"})]),
+                                children=[html.Div([
+                                    html.Div(dcc.Graph(id="enrichment-plot", responsive=True,
+                                              config={"displayModeBar": False},
+                                              style={"width": "100%", "height": "100%"}),
+                                             id="enrichment-plot-container",
+                                             style={"flex": "1", "minHeight": "0"}),
+                                    _plot_range_and_dim_controls("enrichment"),
+                                ], style={"display": "flex", "flexDirection": "column", "height": "calc(100% - 36px)"})]),
                         dbc.Tab(label="Interaction Graph", tab_id="tab-interaction",
                                 label_style={"fontSize": "12px", "padding": "4px 12px"},
-                                children=[dcc.Graph(id="interaction-plot", responsive=True,
-                                                    config={"displayModeBar": False},
-                                                    style={"height": "calc(100% - 36px)"})]),
+                                children=[html.Div([
+                                    html.Div(dcc.Graph(id="interaction-plot", responsive=True,
+                                              config={"displayModeBar": False},
+                                              style={"width": "100%", "height": "100%"}),
+                                             id="interaction-plot-container",
+                                             style={"flex": "1", "minHeight": "0"}),
+                                    _plot_normalize_and_dim_controls("interaction"),
+                                ], style={"display": "flex", "flexDirection": "column", "height": "calc(100% - 36px)"})]),
                         dbc.Tab(label="Chord Diagram", tab_id="tab-chord",
                                 label_style={"fontSize": "12px", "padding": "4px 12px"},
-                                children=[dcc.Graph(id="chord-plot", responsive=True,
-                                                    config={"displayModeBar": False},
-                                                    style={"height": "calc(100% - 36px)"})]),
+                                children=[html.Div([
+                                    html.Div(dcc.Graph(id="chord-plot", responsive=True,
+                                              config={"displayModeBar": False},
+                                              style={"width": "100%", "height": "100%"}),
+                                             id="chord-plot-container",
+                                             style={"flex": "1", "minHeight": "0"}),
+                                    _plot_normalize_and_dim_controls("chord"),
+                                ], style={"display": "flex", "flexDirection": "column", "height": "calc(100% - 36px)"})]),
                         dbc.Tab(label="Niche UMAP", tab_id="tab-niche-umap",
                                 label_style={"fontSize": "12px", "padding": "4px 12px"},
-                                children=[dcc.Graph(id="niche-umap-plot", responsive=True,
-                                                    config={"displayModeBar": False},
-                                                    style={"height": "calc(100% - 36px)"})]),
+                                children=[html.Div([
+                                    html.Div(dcc.Graph(id="niche-umap-plot", responsive=True,
+                                              config={"displayModeBar": False},
+                                              style={"width": "100%", "height": "100%"}),
+                                             id="niche-umap-plot-container",
+                                             style={"flex": "1", "minHeight": "0"}),
+                                    _plot_dim_controls("niche-umap"),
+                                ], style={"display": "flex", "flexDirection": "column", "height": "calc(100% - 36px)"})]),
                     ]),
                 ], id="umap-panel", style={"display": "none"}),
             ], id="plots-row", style={"display": "flex", "flex": "1", "gap": "10px", "minHeight": "0"}),
@@ -9867,6 +10022,38 @@ def update_abundance_plot(_annot_done, _seg_source, _ds_version):
     return make_cell_type_abundance_fig()
 
 
+_PLOT_RESIZE_JS = """function(w, h) {
+    var s = {"flex": "1", "minHeight": "0"};
+    if (w) s["width"] = w + "px";
+    if (h) { s["height"] = h + "px"; s["flex"] = "none"; }
+    return s;
+}"""
+
+app.clientside_callback(
+    _PLOT_RESIZE_JS,
+    Output("umap-plot", "style"),
+    Input("umap-plot-w", "value"),
+    Input("umap-plot-h", "value"),
+    prevent_initial_call=True,
+)
+
+for _container_id, _prefix in [
+    ("abundance-plot-container",    "abundance"),
+    ("cooccurrence-plot-container", "cooccurrence"),
+    ("enrichment-plot-container",   "enrichment"),
+    ("interaction-plot-container",  "interaction"),
+    ("chord-plot-container",        "chord"),
+    ("niche-umap-plot-container",   "niche-umap"),
+]:
+    app.clientside_callback(
+        _PLOT_RESIZE_JS,
+        Output(_container_id, "style"),
+        Input(f"{_prefix}-plot-w", "value"),
+        Input(f"{_prefix}-plot-h", "value"),
+        prevent_initial_call=True,
+    )
+
+
 # ─── Baysor callbacks ─────────────────────────────────────────────────────────
 
 app.clientside_callback(
@@ -10486,7 +10673,28 @@ def update_gene_options(_spage_version, _ds_version, seg_source):
 
 app.clientside_callback(
     """function(n) {
-        if (n % 2 === 1) return [{"display": "none"}, "▲"];
+        var infoBar = document.getElementById('info-bar');
+        var vHandle = document.getElementById('vertical-resize-handle');
+        if (n % 2 === 1) {
+            // Hide: collapse the entire info bar and resize handle
+            if (infoBar) {
+                infoBar._savedHeight = infoBar.style.height;
+                infoBar.style.height = '28px';
+                infoBar.style.minHeight = '28px';
+                infoBar.style.overflow = 'hidden';
+            }
+            if (vHandle) vHandle.style.display = 'none';
+            setTimeout(function() { window.dispatchEvent(new Event('resize')); }, 50);
+            return [{"display": "none"}, "▲"];
+        }
+        // Show: restore the info bar
+        if (infoBar) {
+            infoBar.style.height = infoBar._savedHeight || '180px';
+            infoBar.style.minHeight = '';
+            infoBar.style.overflow = '';
+        }
+        if (vHandle) vHandle.style.display = '';
+        setTimeout(function() { window.dispatchEvent(new Event('resize')); }, 50);
         return [{"display": "flex", "gap": "10px", "height": "100%", "overflow": "hidden"}, "▼"];
     }""",
     Output("info-bar-body",    "style"),
@@ -11534,18 +11742,33 @@ def poll_spatial(_, done_ver):
     Output("chord-plot", "figure"),
     Input("spatial-done", "data"),
     Input("dataset-version", "data"),
+    Input("cooccurrence-cbar-min", "value"),
+    Input("cooccurrence-cbar-max", "value"),
+    Input("enrichment-cbar-min", "value"),
+    Input("enrichment-cbar-max", "value"),
+    Input("interaction-normalize", "value"),
+    Input("interaction-min-freq", "value"),
+    Input("chord-normalize", "value"),
+    Input("chord-min-freq", "value"),
 )
-def update_spatial_plots(_spatial_done, _ds_version):
-    return (make_cooccurrence_fig(), make_enrichment_fig(),
-            make_interaction_graph_fig(), make_chord_fig())
+def update_spatial_plots(_spatial_done, _ds_version,
+                         co_cmin, co_cmax,
+                         en_cmin, en_cmax,
+                         int_norm, int_min_freq,
+                         ch_norm, ch_min_freq):
+    return (make_cooccurrence_fig(zmin=co_cmin, zmax=co_cmax),
+            make_enrichment_fig(zmin=en_cmin, zmax=en_cmax),
+            make_interaction_graph_fig(normalize="on" in (int_norm or []), min_freq=int_min_freq or 0.0),
+            make_chord_fig(normalize="on" in (ch_norm or []), min_freq=ch_min_freq or 0.0))
 
 
 @app.callback(
     Output("niche-umap-plot", "figure"),
     Input("niche-done", "data"),
+    Input("spatial-done", "data"),
     Input("dataset-version", "data"),
 )
-def update_niche_umap(_niche_done, _ds_version):
+def update_niche_umap(_niche_done, _spatial_done, _ds_version):
     return make_niche_umap_fig()
 
 

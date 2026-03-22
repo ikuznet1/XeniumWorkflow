@@ -2,6 +2,42 @@
 
 An interactive web application for visualizing and analyzing 10x Genomics Xenium spatial transcriptomics data. Supports cell clustering, gene expression, morphology overlays, cell type annotation, gene imputation, resegmentation, and ambient RNA correction (SPLIT) — all in a browser-based interface.
 
+## Cloud Run Deployment
+
+The app can be deployed to **Google Cloud Run** for remote access. A `Dockerfile`, `requirements-cloud.txt`, and `.dockerignore` are provided. Detailed step-by-step instructions are in `deployment_instructions.txt`.
+
+**Quick summary:**
+
+```bash
+# 1. Upload data to GCS
+gsutil -m cp -r /path/to/output-XETG... gs://YOUR_BUCKET/
+
+# 2. Build and push container
+gcloud builds submit --tag gcr.io/YOUR_PROJECT/xenium-explorer
+
+# 3. Deploy with GCS FUSE mount
+gcloud run deploy xenium-explorer \
+  --image gcr.io/YOUR_PROJECT/xenium-explorer \
+  --memory 8Gi --cpu 4 --timeout 3600 \
+  --max-instances 1 --concurrency 1 \
+  --execution-environment gen2 \
+  --add-volume name=data-vol,type=cloud-storage,bucket=YOUR_BUCKET \
+  --add-volume-mount volume=data-vol,mount-path=/data \
+  --set-env-vars DATA_DIR=/data/output-XETG...
+```
+
+**Env vars** (all optional locally, required or useful on Cloud Run):
+
+| Env var | Purpose |
+|---------|---------|
+| `DATA_DIR` | Path to Xenium output directory (overrides `sys.argv[1]`) |
+| `XENIUM_CACHE_DIR` | Cache root directory (default: `~/.xenium_explorer_cache`) |
+| `PORT` | Server port (default: 8050; Cloud Run sets this automatically) |
+
+**Cloud Run limitations:** R/Julia/Rust features (Seurat, RCTD, SpaGE, Baysor, Proseg, SPLIT) are unavailable in the slim container image. CellTypist annotation works. See `deployment_instructions.txt` for a full feature comparison and troubleshooting guide.
+
+---
+
 ## Installation
 
 ### Option A — Conda (recommended)
@@ -107,10 +143,13 @@ A gold **⬡ SUBSET ACTIVE** banner appears below the tissue info when a cell su
 - **Cluster** — Categorical coloring by clustering method; multiple methods supported via a secondary dropdown. For Baysor/Proseg cells, KMeans clusters (`cluster_kmeans_10`) are computed automatically after resegmentation. After running SPLIT, a `cluster_split_10` column (KMeans on corrected counts) also appears in the dropdown.
 - **Gene Expression** — Continuous coloring by log1p expression; supports panel genes, SpaGE-imputed genes (marked `[imp]`), and genes imputed on corrected counts (marked `[corr+imp]`). The "Active Counts" toggle transparently switches the expression source between original and SPLIT-corrected matrices.
 - **Cell Type** — Categorical coloring by annotation result (enabled after running annotation)
-- **Transcript Counts** — QC metric, Viridis colorscale
+- **Transcript Counts** — log1p(transcript count), Viridis colorscale
 - **Cell Area / Nucleus Area** — Cell size QC metrics, Plasma/Cividis colorscales
+- **Spatial Niche** — Categorical coloring by spatial niche assignment (enabled after running spatial niche analysis in the Plot tab)
 
 All color modes work on Xenium, Baysor, and Proseg cells after switching the segmentation source.
+
+**Colorbar controls** — When coloring by a continuous variable (gene expression, transcript counts, cell area, nucleus area), a **Colorbar Range** control appears in the sidebar with Min and Max inputs and a Reset button. Drag the inputs to clamp the colorscale to a specific range without changing the underlying data.
 
 **Plots:**
 - **Spatial plot** — 2D scatter of all cells at their µm centroids
@@ -119,6 +158,10 @@ All color modes work on Xenium, Baysor, and Proseg cells after switching the seg
 **Point rendering:**
 - Point size: 1–8 px (default 2)
 - Opacity: 0.1–1.0 (default 0.85)
+
+**Layout:**
+- The plots row and the bottom info bar are separated by a **vertical drag handle** — drag it to resize the panels.
+- The bottom info bar can be **fully collapsed** with the ▼ button (the spatial/UMAP plots expand to fill the space). Click ▲ to restore.
 
 ### Overlays
 
@@ -141,6 +184,24 @@ Select any combination of overlays from the checklist in the sidebar:
 - Brightness: 0.5–8× (default 2×)
 - Image opacity: 0.1–1.0 (default 0.85)
 - Pan/zoom updates the overlay automatically; a low-resolution overview is pre-generated for zoomed-out views
+
+### Plot Tab (right panel)
+
+The right-side panel contains additional analysis plots, each in its own tab:
+
+| Tab | Content | Controls |
+|-----|---------|---------|
+| **Cell Type Abundance** | Bar chart of cell type proportions | W × H dimension inputs |
+| **Co-occurrence** | Spatial co-occurrence score heatmap | Colorbar min/max, W × H |
+| **Neighborhood Enrichment** | Neighborhood enrichment Z-score heatmap | Colorbar min/max, W × H |
+| **Interaction Graph** | Node-edge graph of cell type contacts | O/E normalize toggle, W × H |
+| **Chord Diagram** | Chord diagram of cell type contacts | O/E normalize toggle, W × H |
+| **Niche UMAP** | UMAP colored by spatial niche | W × H |
+| **UMAP** | UMAP plot (alternative to sidebar toggle) | W × H |
+
+**O/E normalization** (Interaction Graph + Chord Diagram) — When enabled, each edge weight is divided by the expected number of contacts under a random mixing model (`observed / (freq_A × freq_B × total_edges)`). This removes bias from abundant cell types and highlights interactions that exceed random expectation.
+
+**Dimension controls** — Each tab has W × H inputs (in pixels) at the bottom. The graph fills the remaining tab space automatically.
 
 ### Cell Info Panel
 
@@ -436,7 +497,8 @@ Converts a SpatialData zarr to a Seurat RDS equivalent to `LoadXenium()` output.
 |---|---|
 | `@assays$Xenium` | Panel gene raw counts (dgCMatrix, genes × cells) |
 | `@assays$Imputed` | SpaGE-imputed genes, if present |
-| `@meta.data` | All obs columns + `nCount_Xenium`, `nFeature_Xenium` |
+| `@meta.data` | All obs columns + `nCount_Xenium`, `nFeature_Xenium` + cell type annotation columns (Seurat kNN, RCTD, CellTypist — if present in cache) |
+| `@reductions$umap` | UMAP coordinates (`split_umap_1/2` when `--use_corrected`, else `umap_1/2`) |
 | `@images$fov` | Centroids + cell segmentation + nucleus segmentation |
 
 ```python
@@ -448,12 +510,20 @@ spatialdata2seurat(
     output_rds="/data/xenium.rds",
 )
 
-# SPLIT-corrected counts, skip imputed assay
+# SPLIT-corrected counts (drops uncorrected cells), skip imputed assay
 spatialdata2seurat(
     sdata_path="/data/xenium.zarr",
     output_rds="/data/xenium_corrected.rds",
     use_corrected=True,
     include_imputed=False,
+)
+
+# Only cells within a named ROI
+spatialdata2seurat(
+    sdata_path="/data/xenium.zarr",
+    output_rds="/data/xenium_roi.rds",
+    roi_path="/path/to/rois.json",
+    roi_name="Infarct zone",
 )
 ```
 
@@ -462,9 +532,30 @@ CLI:
 python functions/spatialdata2seurat.py /data/xenium.zarr /data/xenium.rds
 python functions/spatialdata2seurat.py /data/xenium.zarr /data/xenium.rds \
     --use_corrected --no_imputed --no_nucleus
+python functions/spatialdata2seurat.py /data/xenium.zarr /data/xenium_roi.rds \
+    --roi ~/.xenium_explorer_cache/rois_XXXXXXXX.json \
+    --roi_name "Infarct zone"
+python functions/spatialdata2seurat.py /data/xenium.zarr /data/xenium_roi.rds \
+    --roi rois.json --roi_cls "lesion"
 ```
 
-Requires: `rpy2`, R packages `Seurat`, `SeuratObject`, `Matrix`.
+**Flags:**
+
+| Flag | Description |
+|------|-------------|
+| `--use_corrected` | Use `X_corrected` (SPLIT-corrected) counts; drops cells without correction |
+| `--no_imputed` | Skip the `Imputed` assay |
+| `--no_nucleus` | Skip nucleus segmentation from `@images$fov` |
+| `--roi PATH` | Path to ROI JSON (exported from the app's cache) |
+| `--roi_cls CLS` | Filter ROIs to those with `cls == CLS` |
+| `--roi_name NAME` | Filter ROIs to the named ROI only |
+
+**Notes:**
+- Cell type annotations (Seurat kNN, RCTD, CellTypist) are automatically discovered from `~/.xenium_explorer_cache/` and written to `@meta.data`. Run annotation in the app first.
+- `@reductions$umap` is written from the pre-computed UMAP stored in zarr. If `--use_corrected`, the SPLIT-corrected UMAP (`split_umap_1/2`) is used. Load the run in the app at least once to ensure UMAP is cached; re-run this script if the warning `split_umap_1/2 not found` appears after the UMAP has been recomputed.
+- The ROI JSON path is printed to the server log when ROIs are saved; it is also at `~/.xenium_explorer_cache/rois_<hash>.json`.
+
+Requires: `rpy2`, R packages `Seurat`, `SeuratObject`, `Matrix`; `shapely` (for `--roi`).
 
 ---
 
