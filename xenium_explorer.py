@@ -22,6 +22,10 @@ import threading
 import subprocess
 import hashlib
 import contextvars
+
+# ─── Configurable paths (override via env vars for cloud deployment) ─────────
+CACHE_BASE_DIR = os.environ.get("XENIUM_CACHE_DIR",
+                                os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache"))
 from concurrent.futures import ThreadPoolExecutor
 from dash import no_update, Patch
 import numpy as np
@@ -134,6 +138,10 @@ _split_lock   = threading.Lock()
 _niche_state: dict = {"status": "idle", "message": ""}
 _niche_lock   = threading.Lock()
 
+# ─── Spatial analysis state ───────────────────────────────────────────────────
+_spatial_state: dict = {"status": "idle", "message": "", "result": None}
+_spatial_lock   = threading.Lock()
+
 # ─── ROI Annotation state ─────────────────────────────────────────────────────
 _roi_state: dict = {
     "rois": [],           # [{name, cls, polygon_xy:[[x,y],...], color}]
@@ -202,7 +210,7 @@ CELLTYPIST_MODELS = {
 def _cache_path(model_name: str) -> str:
     """Return path for the cached annotation parquet file."""
     safe = model_name.replace(".pkl", "").replace("/", "_")
-    cache_dir = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache")
+    cache_dir = CACHE_BASE_DIR
     os.makedirs(cache_dir, exist_ok=True)
     # Include a hash of the data dir so caches from different datasets don't clash
     tag = hashlib.md5(DATA["data_dir"].encode()).hexdigest()[:8]
@@ -1088,9 +1096,10 @@ def _update_reseg_zarr_obs(zarr_path: str, cells_df: pd.DataFrame) -> None:
             return
         _obs_grp = _zroot["tables"]["table"]["obs"]
         existing_cols = set(_obs_grp.keys()) - {"__categories", "_index"}
-        # Always re-write roi_* columns (may have changed due to add/delete)
+        # Always re-write roi_* and split_* columns (may have changed or been fixed)
         new_cols = [c for c in cells_df.columns
-                    if c not in existing_cols or c.startswith("roi_")]
+                    if c not in existing_cols or c.startswith("roi_")
+                    or c.startswith("split_umap_") or c == "cluster_split_10"]
         if not new_cols:
             return
         # Read the existing index to align values correctly
@@ -1124,7 +1133,8 @@ def _update_reseg_zarr_obs(zarr_path: str, cells_df: pd.DataFrame) -> None:
             from anndata.experimental import write_elem as _write_elem
         for col in new_cols:
             try:
-                _ser = cells_df[col]
+                _ser = cells_df[col].copy()
+                _ser.index = _ser.index.astype(str)
                 if _existing_idx is not None:
                     _ser = _ser.reindex(_existing_idx)
                 # For string/object columns bypass _write_elem (zarr warns on object dtype)
@@ -1345,6 +1355,21 @@ def _load_cached_baysor(out_dir: str) -> None:
                     _compute_reseg_clusters_umap(cells_df, expr_mat,
                                                  progress_fn=lambda msg: _set("running", msg))
                     _update_reseg_zarr_obs(zarr_path_fast, cells_df)
+                # If X_corrected exists but split_umap is all NaN (zarr write bug),
+                # recompute SPLIT clusters + UMAP from the corrected matrix.
+                _split_umap_missing = (
+                    _baysor_corr is not None
+                    and ("split_umap_1" not in cells_df.columns
+                         or not cells_df["split_umap_1"].notna().any())
+                )
+                if _split_umap_missing:
+                    _set("running", f"Recomputing SPLIT UMAP for {n_cells:,} cells (one-time fix)…")
+                    _compute_split_clusters_umap(
+                        cells_df, _baysor_corr,
+                        progress_fn=lambda msg: _set("running", msg))
+                    _update_reseg_zarr_obs(zarr_path_fast, cells_df)
+                    print(f"  Baysor: recomputed SPLIT UMAP ({cells_df['split_umap_1'].notna().sum()} "
+                          f"non-NaN values)", flush=True)
                 with _roi_lock:
                     _roi_apply_metadata_to_df(cells_df, _roi_state["rois"])
                 _set("done", f"Loaded — {n_cells:,} cells", result={
@@ -1547,6 +1572,21 @@ def _load_cached_proseg(out_dir: str) -> None:
                     _compute_reseg_clusters_umap(cells_df, expr_mat,
                                                  progress_fn=lambda msg: _set("running", msg))
                     _update_reseg_zarr_obs(zarr_path_fast, cells_df)
+                # If X_corrected exists but split_umap is all NaN (zarr write bug),
+                # recompute SPLIT clusters + UMAP from the corrected matrix.
+                _split_umap_missing = (
+                    _proseg_corr is not None
+                    and ("split_umap_1" not in cells_df.columns
+                         or not cells_df["split_umap_1"].notna().any())
+                )
+                if _split_umap_missing:
+                    _set("running", f"Recomputing SPLIT UMAP for {n_cells:,} cells (one-time fix)…")
+                    _compute_split_clusters_umap(
+                        cells_df, _proseg_corr,
+                        progress_fn=lambda msg: _set("running", msg))
+                    _update_reseg_zarr_obs(zarr_path_fast, cells_df)
+                    print(f"  Proseg: recomputed SPLIT UMAP ({cells_df['split_umap_1'].notna().sum()} "
+                          f"non-NaN values)", flush=True)
                 # Patch runs build the zarr without cell_boundaries shapes — load from polygon files
                 if not cell_bounds:
                     _fp_patch_names = sorted([
@@ -1775,7 +1815,7 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
                       f"{'_pt'+prior_type if use_prior else ''}"
                       f"_x{x_min or 'A'}-{x_max or 'A'}_y{y_min or 'A'}-{y_max or 'A'}")
         _param_tag = hashlib.md5(_param_str.encode()).hexdigest()[:8]
-        out_dir = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache",
+        out_dir = os.path.join(CACHE_BASE_DIR,
                                f"baysor_{os.path.basename(DATA['data_dir'])}_{_param_tag}")
         os.makedirs(out_dir, exist_ok=True)
         print(f"  Baysor: cache dir = {os.path.basename(out_dir)} ({_param_str})", flush=True)
@@ -2002,7 +2042,7 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
         _param_str = (f"v{voxel_size or 'A'}_t{n_threads or 'A'}"
                       f"_x{x_min or 'A'}-{x_max or 'A'}_y{y_min or 'A'}-{y_max or 'A'}")
         _param_tag = hashlib.md5(_param_str.encode()).hexdigest()[:8]
-        out_dir = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache",
+        out_dir = os.path.join(CACHE_BASE_DIR,
                                f"proseg_{os.path.basename(DATA['data_dir'])}_{_param_tag}")
         os.makedirs(out_dir, exist_ok=True)
         print(f"  Proseg: cache dir = {os.path.basename(out_dir)} ({_param_str})", flush=True)
@@ -2417,7 +2457,11 @@ def _split_write_zarr(sdata_path: str, corrected_mat, cells_df: pd.DataFrame,
             for col in ["cluster_split_10", "split_umap_1", "split_umap_2"]:
                 if col not in cells_df.columns:
                     continue
-                ser = cells_df[col].reindex(zarr_ids)
+                # Ensure index types match for reindex — cells_df may have int index,
+                # zarr_ids are strings.  Align both to string.
+                _cdf_col = cells_df[col].copy()
+                _cdf_col.index = _cdf_col.index.astype(str)
+                ser = _cdf_col.reindex(zarr_ids)
                 if cells_df[col].dtype == object or pd.api.types.is_string_dtype(cells_df[col]):
                     arr = np.array(ser.fillna("").values, dtype=str)
                     obs_grp.create_dataset(col, data=arr, shape=arr.shape,
@@ -3110,7 +3154,7 @@ SPAGE_REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SpaGE_rep
 
 
 def _spage_cache_dir() -> str:
-    d = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache")
+    d = CACHE_BASE_DIR
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -3142,7 +3186,7 @@ def _annot_autoload() -> None:
     """On startup, load all cached Xenium annotations for this dataset (all methods)."""
     import glob
     tag       = hashlib.md5(DATA["data_dir"].encode()).hexdigest()[:8]
-    cache_dir = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache")
+    cache_dir = CACHE_BASE_DIR
     pattern   = os.path.join(cache_dir, f"*_{tag}.parquet")
     label_files  = [f for f in glob.glob(pattern)
                     if not os.path.basename(f).startswith(("labels_", "spage_", "spatialdata_"))
@@ -4043,6 +4087,151 @@ def get_genes(file: str = None) -> list:
     return genes
 
 
+def _build_raw_neighbor_matrix(label_arr, neighbor_indices, n_types):
+    """Build raw count matrix of type-type neighbor pairs (vectorized)."""
+    n_cells, k = neighbor_indices.shape
+    src = np.repeat(label_arr, k)
+    tgt = label_arr[neighbor_indices.ravel()]
+    # Remove self-neighbors (where neighbor_indices[i,j] == i)
+    rows_idx = np.repeat(np.arange(n_cells), k)
+    valid = neighbor_indices.ravel() != rows_idx
+    src, tgt = src[valid], tgt[valid]
+    matrix = np.zeros((n_types, n_types), dtype=np.float64)
+    np.add.at(matrix, (src, tgt), 1)
+    return matrix
+
+
+def _compute_cooccurrence_from_raw(raw_matrix, freqs):
+    """Compute log2 co-occurrence score matrix from pre-built raw counts."""
+    total_pairs = raw_matrix.sum()
+    if total_pairs == 0:
+        return raw_matrix.copy()
+    expected = np.outer(freqs, freqs) * total_pairs * 2
+    return np.log2(raw_matrix / (expected + 1e-9) + 1e-9)
+
+
+def _compute_enrichment_from_raw(raw_matrix, row_counts, freqs):
+    """Compute log2 neighborhood enrichment matrix from pre-built raw counts."""
+    matrix = raw_matrix.copy()
+    # Normalize rows by count of source type
+    safe_row = np.where(row_counts > 0, row_counts, 1)
+    matrix /= safe_row[:, None]
+    # Normalize cols by global frequency of target type
+    safe_freq = np.where(freqs > 0, freqs, 1e-9)
+    return np.log2(matrix / safe_freq[None, :] + 1e-9)
+
+
+def _run_spatial_analysis(label_key, n_neighbors, alt_res):
+    """Background thread: compute spatial analysis plots."""
+    global _spatial_state
+    try:
+        with _spatial_lock:
+            _spatial_state["status"] = "running"
+            _spatial_state["message"] = "Building neighbor graph…"
+            _spatial_state["result"] = None
+
+        # Get cells and coordinates
+        if alt_res is not None:
+            cells_df = alt_res["cells_df"].copy()
+            x_col = "centroid_x" if "centroid_x" in cells_df.columns else "x_centroid"
+            y_col = "centroid_y" if "centroid_y" in cells_df.columns else "y_centroid"
+        else:
+            cells_df = DATA["df"].copy()
+            x_col, y_col = "x_centroid", "y_centroid"
+
+        coords = cells_df[[x_col, y_col]].values
+
+        # Get labels
+        with _annot_lock:
+            labels = _annot_state.get(label_key)
+        if labels is None:
+            with _spatial_lock:
+                _spatial_state["status"] = "error"
+                _spatial_state["message"] = f"No annotation found for key '{label_key}'. Run annotation first."
+            return
+
+        # Align labels to cells_df index
+        if hasattr(labels, "index"):
+            labels = labels.reindex(cells_df.index)
+        else:
+            if len(labels) != len(cells_df):
+                with _spatial_lock:
+                    _spatial_state["status"] = "error"
+                    _spatial_state["message"] = "Label length mismatch."
+                return
+
+        # Drop NaN labels
+        valid_mask = ~pd.isna(labels.values if hasattr(labels, "values") else labels)
+        labels_arr = labels.values if hasattr(labels, "values") else np.array(labels)
+        labels_arr = labels_arr[valid_mask]
+        coords_valid = coords[valid_mask]
+
+        cell_types = sorted(set(labels_arr))
+        label_to_idx = {ct: i for i, ct in enumerate(cell_types)}
+        label_int = np.array([label_to_idx[l] for l in labels_arr], dtype=np.int32)
+        n_types = len(cell_types)
+
+        with _spatial_lock:
+            _spatial_state["message"] = f"Computing nearest neighbors (k={n_neighbors})…"
+
+        from sklearn.neighbors import NearestNeighbors
+        nn = NearestNeighbors(n_neighbors=min(n_neighbors + 1, len(coords_valid)), algorithm="ball_tree")
+        nn.fit(coords_valid)
+        _, neighbor_indices = nn.kneighbors(coords_valid)
+        # Remove self (first neighbor is usually self)
+        neighbor_indices = neighbor_indices[:, 1:]
+
+        with _spatial_lock:
+            _spatial_state["message"] = "Computing neighbor type matrix…"
+
+        # Build raw count matrix ONCE (vectorized), reuse for all analyses
+        raw_matrix = _build_raw_neighbor_matrix(label_int, neighbor_indices, n_types)
+        counts = np.bincount(label_int, minlength=n_types).astype(np.float64)
+        freqs = counts / counts.sum()
+
+        with _spatial_lock:
+            _spatial_state["message"] = "Computing co-occurrence…"
+
+        cooccurrence = _compute_cooccurrence_from_raw(raw_matrix, freqs)
+
+        with _spatial_lock:
+            _spatial_state["message"] = "Computing enrichment…"
+
+        enrichment = _compute_enrichment_from_raw(raw_matrix, counts, freqs)
+
+        adjacency = raw_matrix
+
+        # Niche labels and UMAP coords if available
+        niche_labels = None
+        umap_coords = None
+        if "niche" in cells_df.columns:
+            niche_labels = cells_df["niche"]
+        if "umap_1" in cells_df.columns and "umap_2" in cells_df.columns:
+            umap_coords = (cells_df["umap_1"].values, cells_df["umap_2"].values)
+        elif DATA.get("umap") is not None:
+            u = DATA["umap"]
+            if len(u) == len(cells_df):
+                umap_coords = (u[:, 0], u[:, 1])
+
+        with _spatial_lock:
+            _spatial_state["status"] = "done"
+            _spatial_state["message"] = f"Done. {n_types} cell types, {len(coords_valid):,} cells."
+            _spatial_state["result"] = {
+                "cell_types": cell_types,
+                "cooccurrence": cooccurrence,
+                "enrichment": enrichment,
+                "adjacency": adjacency,
+                "freqs": freqs,
+                "niche_labels": niche_labels,
+                "umap_coords": umap_coords,
+            }
+    except Exception as e:
+        import traceback
+        with _spatial_lock:
+            _spatial_state["status"] = "error"
+            _spatial_state["message"] = f"Error: {e}\n{traceback.format_exc()}"
+
+
 def _run_spatial_niches(n_clusters: int, n_neighbors: int, label_key: str | None,
                         alt_res) -> None:
     """Background thread: compute spatial niches via BuildNicheAssay-style KMeans."""
@@ -4090,11 +4279,12 @@ def _run_spatial_niches(n_clusters: int, n_neighbors: int, label_key: str | None
 
             n_types = len(cell_types)
             composition = np.zeros((n_cells, n_types), dtype=np.float32)
-            for i, nbrs in enumerate(neighbor_indices):
-                for nb in nbrs:
-                    ct_i = label_arr[nb]
-                    if ct_i >= 0:
-                        composition[i, ct_i] += 1
+            k = neighbor_indices.shape[1]
+            flat_labels = label_arr[neighbor_indices.ravel()]
+            valid = flat_labels >= 0
+            src = np.repeat(np.arange(n_cells), k)[valid]
+            tgt = flat_labels[valid]
+            np.add.at(composition, (src, tgt), 1)
             # Normalize to proportions
             row_sums = composition.sum(axis=1, keepdims=True)
             row_sums[row_sums == 0] = 1
@@ -4382,7 +4572,7 @@ def _get_morph_handles(data_dir: str, z_level: int):
 
 def _overview_cache_path(data_dir: str, z_level: int, medium: bool = False) -> str:
     tag = hashlib.md5(data_dir.encode()).hexdigest()[:8]
-    cache_dir = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache")
+    cache_dir = CACHE_BASE_DIR
     os.makedirs(cache_dir, exist_ok=True)
     suffix = "med_" if medium else ""
     return os.path.join(cache_dir, f"morph_overview_{suffix}{tag}_z{z_level}.npz")
@@ -4620,6 +4810,8 @@ def make_morphology_overlay(data_dir, relayout, z_level, channels, brightness, i
       4. Progressive rendering: overview returned instantly; hires queued in bg.
       5. Medium-stride (stride~8) overview covers the 1,300–4,400 µm range.
     """
+    if not data_dir:
+        return None, ""
     if not channels or not relayout:
         return None, ""
 
@@ -4785,6 +4977,7 @@ def info_chip(label, value):
 
 # ─── Data loading ─────────────────────────────────────────────────────────────
 def load_xenium_data(data_dir: str) -> dict:
+    data_dir = os.path.abspath(data_dir)  # normalise so cache hashes are stable
     print(f"Loading from: {data_dir}", flush=True)
     zarr_path = os.path.join(data_dir, "spatialdata_xenium.zarr")
     if not os.path.isdir(zarr_path):
@@ -4998,17 +5191,35 @@ def _load_from_xenium_sdata(zarr_path: str, data_dir: str) -> dict:
     }
 
 
+def load_from_sdata_zarr(zarr_path: str) -> dict:
+    """Load DATA dict from an exported SpatialData zarr (e.g. from _save_sdata_to_disk).
+    Sets data_dir=None as a sentinel meaning no OME-TIFF image data is available."""
+    zarr_path = os.path.abspath(zarr_path)
+    data = _load_from_xenium_sdata(zarr_path, data_dir=None)
+    # Ensure umap columns exist so make_umap_fig doesn't crash
+    for col in ("umap_1", "umap_2"):
+        if col not in data["df"].columns:
+            data["df"][col] = np.nan
+    data["sdata_path"] = zarr_path
+    return data
+
+
 # ─── Locate & load data ───────────────────────────────────────────────────────
-if len(sys.argv) > 1:
-    DATA_DIR = sys.argv[1]
+if os.environ.get("DATA_DIR"):
+    _startup_arg = os.environ["DATA_DIR"]
+elif len(sys.argv) > 1:
+    _startup_arg = sys.argv[1]
 else:
     dirs = [d for d in os.listdir(".") if d.startswith("output-") and os.path.isdir(d)]
     if not dirs:
-        print("ERROR: No Xenium output directory found. Pass path as argument.")
+        print("ERROR: No Xenium output directory found. Pass path as argument or set DATA_DIR env var.")
         sys.exit(1)
-    DATA_DIR = dirs[0]
+    _startup_arg = dirs[0]
 
-DATA = load_xenium_data(DATA_DIR)
+if _startup_arg.rstrip("/").endswith(".zarr"):
+    DATA = load_from_sdata_zarr(_startup_arg)
+else:
+    DATA = load_xenium_data(_startup_arg)
 
 # Precompute CSC matrix for fast column (gene) access — O(nnz_col) vs O(nnz_total) for CSR
 if DATA.get("expr") is not None:
@@ -5194,8 +5405,10 @@ def _base_layout(title, xlabel, ylabel, equal_aspect=False):
         hoverlabel=dict(bgcolor=CARD_BG, font_color=TEXT),
     )
     if equal_aspect:
-        layout["yaxis"]["scaleanchor"] = "x"
-        layout["yaxis"]["scaleratio"]  = 1
+        layout["yaxis"]["scaleanchor"]  = "x"
+        layout["yaxis"]["scaleratio"]   = 1
+        layout["yaxis"]["constrain"]    = "domain"   # shrink plot domain, not data range
+        layout["xaxis"]["constrain"]    = "domain"   # keep both axes consistent
     return layout
 
 
@@ -5348,14 +5561,14 @@ def _get_reseg_expr_values(gene: str, alt_res: dict) -> "np.ndarray | None":
     if idx >= expr.shape[1]:
         return None
     col = expr.getcol(idx)
-    vals = np.asarray(col.todense()).flatten().astype(np.float32)
+    vals = col.toarray().ravel().astype(np.float32)
     return np.log1p(vals)
 
 
 def make_spatial_fig(color_by, method, gene, size, opacity,
                      boundary_toggles, relayout,
                      morph_image=None, extra_title="", baysor_active=False, proseg_active=False,
-                     use_corrected: bool = False):
+                     use_corrected: bool = False, cbar_range=None):
     # Choose data source: Proseg > Baysor > original Xenium (priority order)
     with _proseg_lock:
         pres = _proseg_state["result"] if proseg_active and _proseg_state["result"] else None
@@ -5365,6 +5578,19 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
     alt_res = pres or bres
     _separator_shapes = []   # populated later for multi-sample mode
     _pie_shapes = []         # RCTD pie chart wedge shapes (single-dataset, Xenium only)
+
+    # Helper: apply log1p for transcript_counts; build colorbar kwargs with optional cmin/cmax
+    def _color_vals(raw_vals, color_key):
+        v = np.log1p(raw_vals) if color_key == "transcript_counts" else raw_vals.astype(float)
+        return v
+    def _cbar_kwargs():
+        kw = {}
+        if cbar_range:
+            if cbar_range[0] is not None:
+                kw["cmin"] = cbar_range[0]
+            if cbar_range[1] is not None:
+                kw["cmax"] = cbar_range[1]
+        return kw
     if alt_res is not None:
         source_label = " [Proseg]" if pres else " [Baysor]"
         bdf      = alt_res["cells_df"]
@@ -5372,6 +5598,7 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
         y        = -bdf["y_centroid"].values
         cell_ids     = bdf.index.tolist()
         cell_ids_str = [str(c) for c in cell_ids]
+        _ids_arr     = np.asarray(cell_ids_str)
         show_legend  = False
         traces       = None   # filled below
 
@@ -5387,8 +5614,7 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                         x=x[mask], y=y[mask], mode="markers",
                         marker=dict(size=size, color=cmap[n], opacity=opacity),
                         name=f"Niche {n}", legendgroup=n, showlegend=True,
-                        text=np.array(cell_ids_str)[mask].tolist(),
-                        customdata=np.array(cell_ids_str)[mask].tolist(),
+                        text=_ids_arr[mask], customdata=_ids_arr[mask],
                         hovertemplate="<b>%{text}</b><extra>Niche " + n + "</extra>",
                     ))
                 show_legend = True
@@ -5413,8 +5639,7 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                         x=x[mask], y=y[mask], mode="markers",
                         marker=dict(size=size, color=cmap[cl], opacity=opacity),
                         name=f"Cluster {cl}", legendgroup=cl, showlegend=True,
-                        text=np.array(cell_ids_str)[mask].tolist(),
-                        customdata=np.array(cell_ids_str)[mask].tolist(),
+                        text=_ids_arr[mask], customdata=_ids_arr[mask],
                         hovertemplate="<b>%{text}</b><extra>Cluster " + cl + "</extra>",
                     ))
                 show_legend = True
@@ -5448,8 +5673,7 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                             x=x[mask], y=y[mask], mode="markers",
                             marker=dict(size=size, color=cmap[ct], opacity=opacity),
                             name=ct, legendgroup=ct, showlegend=True,
-                            text=np.array(cell_ids_str)[mask].tolist(),
-                            customdata=np.array(cell_ids_str)[mask].tolist(),
+                            text=_ids_arr[mask], customdata=_ids_arr[mask],
                             hovertemplate="<b>%{text}</b><extra>" + ct + "</extra>",
                         ))
                     show_legend = True
@@ -5461,7 +5685,8 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                     x=x, y=y, mode="markers",
                     marker=dict(size=size, color=vals, colorscale="Plasma", opacity=opacity,
                                 showscale=True,
-                                colorbar=dict(title=f"{gene}<br>(log1p)", thickness=12, len=0.5, x=1.02)),
+                                colorbar=dict(title=f"{gene}<br>(log1p)", thickness=12, len=0.5, x=1.02),
+                                **_cbar_kwargs()),
                     text=cell_ids_str, customdata=cell_ids_str,
                     hovertemplate="<b>%{text}</b><br>" + gene + ": %{marker.color:.2f}<extra></extra>",
                     name=gene,
@@ -5485,17 +5710,20 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
         if traces is None:
             # Fallback: QC column if available, otherwise transcript counts
             if color_by in bdf.columns:
-                vals  = bdf[color_by].values
+                vals  = _color_vals(bdf[color_by].values, color_by)
                 label = QC_METRICS.get(color_by, color_by)
+                if color_by == "transcript_counts":
+                    label = "Transcript Counts (log1p)"
                 cs    = COLORSCALES.get(color_by, "Viridis")
             else:
-                vals  = bdf["transcript_counts"].values
-                label = "Transcript Counts"
+                vals  = np.log1p(bdf["transcript_counts"].values)
+                label = "Transcript Counts (log1p)"
                 cs    = "Viridis"
             traces = [go.Scattergl(
                 x=x, y=y, mode="markers",
                 marker=dict(size=size, color=vals, colorscale=cs, opacity=opacity, showscale=True,
-                            colorbar=dict(title=label, thickness=12, len=0.5, x=1.02)),
+                            colorbar=dict(title=label, thickness=12, len=0.5, x=1.02),
+                            **_cbar_kwargs()),
                 text=cell_ids_str, customdata=cell_ids_str,
                 hovertemplate="<b>Cell %{text}</b><br>" + label + ": %{marker.color:.2f}<extra></extra>",
                 name=label,
@@ -5601,6 +5829,33 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                     ))
                 show_legend = True
 
+            elif color_by == "niche":
+                # Combine niche labels across datasets
+                all_niche_vals = []
+                for edf in all_dfs:
+                    if "niche" in edf.columns:
+                        all_niche_vals.extend(edf["niche"].astype(str).tolist())
+                    else:
+                        all_niche_vals.extend(["N/A"] * len(edf))
+                arr_niche = np.array(all_niche_vals)
+                arr_x   = x_combined
+                arr_y   = y_combined
+                arr_ids = np.array(ids_combined)
+                unique_niches = sorted(set(all_niche_vals), key=lambda v: (0, int(v)) if v.isdigit() else (1, v))
+                ncmap = {n: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, n in enumerate(unique_niches)}
+                traces = []
+                for _n in unique_niches:
+                    mask = arr_niche == _n
+                    traces.append(go.Scattergl(
+                        x=arr_x[mask], y=arr_y[mask], mode="markers",
+                        marker=dict(size=size, color=ncmap[_n], opacity=opacity),
+                        name=f"Niche {_n}", legendgroup=_n, showlegend=True,
+                        text=arr_ids[mask].tolist(),
+                        customdata=arr_ids[mask].tolist(),
+                        hovertemplate="<b>%{text}</b><extra>Niche " + _n + "</extra>",
+                    ))
+                show_legend = True
+
             elif color_by.startswith("cell_type:"):
                 # Combine cell type labels from each dataset's annotation state
                 _method = color_by.split(":")[1]
@@ -5658,7 +5913,8 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                     x=x_combined, y=y_combined, mode="markers",
                     marker=dict(size=size, color=vals_combined, colorscale="Plasma", opacity=opacity,
                                 showscale=True,
-                                colorbar=dict(title=f"{gene}<br>(log1p)", thickness=12, len=0.5, x=1.02)),
+                                colorbar=dict(title=f"{gene}<br>(log1p)", thickness=12, len=0.5, x=1.02),
+                                **_cbar_kwargs()),
                     text=ids_combined, customdata=ids_combined,
                     hovertemplate="<b>%{text}</b><br>" + gene + ": %{marker.color:.2f}<extra></extra>",
                     name=gene,
@@ -5672,15 +5928,18 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                 all_vals = []
                 for edf in all_dfs:
                     if color_by in edf.columns:
-                        all_vals.append(edf[color_by].values)
+                        all_vals.append(_color_vals(edf[color_by].values, color_by))
                     else:
                         all_vals.append(np.zeros(len(edf)))
+                if color_by == "transcript_counts":
+                    label = "Transcript Counts (log1p)"
                 vals_combined = np.concatenate(all_vals)
                 traces = [go.Scattergl(
                     x=x_combined, y=y_combined, mode="markers",
                     marker=dict(size=size, color=vals_combined, colorscale=cs, opacity=opacity,
                                 showscale=True,
-                                colorbar=dict(title=label, thickness=12, len=0.5, x=1.02)),
+                                colorbar=dict(title=label, thickness=12, len=0.5, x=1.02),
+                                **_cbar_kwargs()),
                     text=ids_combined, customdata=ids_combined,
                     hovertemplate="<b>%{text}</b><br>" + label + ": %{marker.color:.2f}<extra></extra>",
                     name=label,
@@ -5738,7 +5997,8 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                     x=x, y=y, mode="markers",
                     marker=dict(size=size, color=vals, colorscale="Plasma", opacity=opacity,
                                 showscale=True,
-                                colorbar=dict(title=f"{gene}<br>(log1p)", thickness=12, len=0.5, x=1.02)),
+                                colorbar=dict(title=f"{gene}<br>(log1p)", thickness=12, len=0.5, x=1.02),
+                                **_cbar_kwargs()),
                     text=df.index.tolist(), customdata=df.index.tolist(),
                     hovertemplate="<b>%{text}</b><br>" + gene + ": %{marker.color:.2f}<extra></extra>",
                     name=gene,
@@ -5761,12 +6021,16 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                 show_legend = False
             else:
                 label = QC_METRICS.get(color_by, color_by)
+                vals = _color_vals(df[color_by].values, color_by)
+                if color_by == "transcript_counts":
+                    label = "Transcript Counts (log1p)"
                 traces = [go.Scattergl(
                     x=x, y=y, mode="markers",
-                    marker=dict(size=size, color=df[color_by].values,
+                    marker=dict(size=size, color=vals,
                                 colorscale=COLORSCALES.get(color_by, "Viridis"),
                                 opacity=opacity, showscale=True,
-                                colorbar=dict(title=label, thickness=12, len=0.5, x=1.02)),
+                                colorbar=dict(title=label, thickness=12, len=0.5, x=1.02),
+                                **_cbar_kwargs()),
                     text=df.index.tolist(), customdata=df.index.tolist(),
                     hovertemplate="<b>%{text}</b><br>" + label + ": %{marker.color:.2f}<extra></extra>",
                     name=label,
@@ -5867,14 +6131,377 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
 
 _umap_df_cache = {}
 
+
+def make_cell_type_abundance_fig():
+    """Build bar chart of cell type abundances for all computed annotation methods."""
+    from plotly.subplots import make_subplots
+    import plotly.graph_objects as go
+
+    with _annot_lock:
+        label_keys = [k for k in _annot_state if k.startswith("labels_") and _annot_state[k] is not None]
+        # Skip generic keys (e.g. "labels_rctd") when a mode-specific key exists
+        # (e.g. "labels_rctd_doublet") — they hold the same data and would show as duplicates.
+        generic_with_specific = set()
+        for key in label_keys:
+            suffix = key[len("labels_"):]
+            parts = suffix.split("_")
+            if len(parts) >= 2 and parts[1] in ("full", "doublet", "multi"):
+                generic_with_specific.add(f"labels_{parts[0]}")
+        label_keys = [k for k in label_keys if k not in generic_with_specific]
+
+        method_data = []
+        for key in label_keys:
+            val = _annot_state[key]
+            suffix = key[len("labels_"):]
+            parts = suffix.split("_", 1)
+            base = parts[0].lower()
+            if base in ("baysor", "proseg"):
+                display = suffix.replace("_", " ").title()
+            elif base in ("celltypist", "seurat", "rctd"):
+                method_map = {"celltypist": "CellTypist", "seurat": "Seurat", "rctd": "RCTD"}
+                method_name = method_map.get(base, base.title())
+                if len(parts) > 1:
+                    display = f"{method_name} ({parts[1].replace('_', ':')})"
+                else:
+                    display = method_name
+            else:
+                display = suffix.replace("_", " ").title()
+            method_data.append((display, val))
+
+    if not method_data:
+        fig = go.Figure()
+        fig.update_layout(
+            paper_bgcolor=CARD_BG,
+            plot_bgcolor=PLOT_BG,
+            font=dict(color=TEXT, size=12),
+            margin=dict(l=10, r=10, t=10, b=10),
+            annotations=[dict(
+                text="No annotation computed yet",
+                xref="paper", yref="paper",
+                x=0.5, y=0.5, showarrow=False,
+                font=dict(size=14, color=TEXT),
+            )],
+        )
+        return fig
+
+    n = len(method_data)
+    colors = CLUSTER_COLORS if CLUSTER_COLORS else ["#5B9BD5"]
+    fig = make_subplots(
+        rows=n, cols=1,
+        subplot_titles=[m[0] for m in method_data],
+        shared_xaxes=False,
+        vertical_spacing=max(0.08, 0.15 / max(n, 1)),
+    )
+
+    for i, (name, labels) in enumerate(method_data):
+        if hasattr(labels, "value_counts"):
+            counts = labels.value_counts(normalize=True).sort_values(ascending=False)
+        else:
+            import pandas as _pd
+            counts = _pd.Series(labels).value_counts(normalize=True).sort_values(ascending=False)
+        cell_types = [str(c) for c in counts.index]
+        freqs = counts.values
+        color = colors[i % len(colors)]
+        fig.add_trace(
+            go.Bar(
+                x=cell_types,
+                y=freqs,
+                name=name,
+                marker_color=color,
+                text=[f"{v:.1%}" for v in freqs],
+                textposition="outside",
+                showlegend=False,
+            ),
+            row=i + 1, col=1,
+        )
+        fig.update_yaxes(tickformat=".0%", row=i + 1, col=1,
+                         gridcolor=BORDER, zeroline=False)
+        fig.update_xaxes(tickangle=-45, row=i + 1, col=1)
+
+    fig.update_layout(
+        paper_bgcolor=CARD_BG,
+        plot_bgcolor=PLOT_BG,
+        font=dict(color=TEXT, size=11),
+        margin=dict(l=50, r=20, t=40, b=60),
+        height=max(300, 280 * n),
+        showlegend=False,
+    )
+    for ann in fig.layout.annotations:
+        ann.font.color = TEXT
+        ann.font.size = 12
+
+    return fig
+
+
+def _make_placeholder_fig(msg="No analysis computed yet."):
+    fig = go.Figure()
+    fig.add_annotation(text=msg, xref="paper", yref="paper", x=0.5, y=0.5,
+                       showarrow=False, font=dict(color=MUTED, size=13))
+    fig.update_layout(paper_bgcolor=CARD_BG, plot_bgcolor=PLOT_BG,
+                      margin=dict(l=10, r=10, t=10, b=10),
+                      xaxis=dict(visible=False), yaxis=dict(visible=False))
+    return fig
+
+
+def make_cooccurrence_fig():
+    with _spatial_lock:
+        result = _spatial_state.get("result")
+    if result is None:
+        return _make_placeholder_fig()
+    cell_types = result["cell_types"]
+    matrix = result["cooccurrence"]
+    n = len(cell_types)
+    fig = go.Figure(go.Heatmap(
+        z=matrix, x=cell_types, y=cell_types,
+        colorscale="RdBu_r", zmid=0,
+        hovertemplate="%{y} → %{x}<br>log2 score: %{z:.2f}<extra></extra>",
+        colorbar=dict(title=dict(text="log2 score", font=dict(color=TEXT)), tickfont=dict(color=TEXT)),
+    ))
+    h = max(400, 30 * n)
+    fig.update_layout(
+        paper_bgcolor=CARD_BG, plot_bgcolor=PLOT_BG,
+        font=dict(color=TEXT, size=10),
+        margin=dict(l=120, r=20, t=30, b=120),
+        height=h,
+        xaxis=dict(tickangle=-45, gridcolor=BORDER, linecolor=BORDER),
+        yaxis=dict(gridcolor=BORDER, linecolor=BORDER),
+        title=dict(text="Co-occurrence (log2 observed/expected)", font=dict(color=TEXT, size=12), x=0.5),
+    )
+    return fig
+
+
+def make_enrichment_fig():
+    with _spatial_lock:
+        result = _spatial_state.get("result")
+    if result is None:
+        return _make_placeholder_fig()
+    cell_types = result["cell_types"]
+    matrix = result["enrichment"]
+    n = len(cell_types)
+    fig = go.Figure(go.Heatmap(
+        z=matrix, x=cell_types, y=cell_types,
+        colorscale="RdBu_r", zmid=0,
+        hovertemplate="%{y} → %{x}<br>log2 enrichment: %{z:.2f}<extra></extra>",
+        colorbar=dict(title=dict(text="log2 enrichment", font=dict(color=TEXT)), tickfont=dict(color=TEXT)),
+    ))
+    h = max(400, 30 * n)
+    fig.update_layout(
+        paper_bgcolor=CARD_BG, plot_bgcolor=PLOT_BG,
+        font=dict(color=TEXT, size=10),
+        margin=dict(l=120, r=20, t=30, b=120),
+        height=h,
+        xaxis=dict(tickangle=-45, gridcolor=BORDER, linecolor=BORDER),
+        yaxis=dict(gridcolor=BORDER, linecolor=BORDER),
+        title=dict(text="Neighborhood Enrichment (log2 observed/expected)", font=dict(color=TEXT, size=12), x=0.5),
+    )
+    return fig
+
+
+def make_interaction_graph_fig():
+    with _spatial_lock:
+        result = _spatial_state.get("result")
+    if result is None:
+        return _make_placeholder_fig()
+    cell_types = result["cell_types"]
+    adjacency = result["adjacency"]
+    freqs = result["freqs"]
+    n = len(cell_types)
+    if n == 0:
+        return _make_placeholder_fig("No cell types found.")
+
+    angles = [2 * np.pi * i / n for i in range(n)]
+    node_x = [np.cos(a) for a in angles]
+    node_y = [np.sin(a) for a in angles]
+
+    # Top 30 edges by weight
+    edges = []
+    for a in range(n):
+        for b in range(a, n):
+            w = adjacency[a, b] + adjacency[b, a]
+            if w > 0:
+                edges.append((w, a, b))
+    edges.sort(reverse=True)
+    edges = edges[:30]
+    max_w = edges[0][0] if edges else 1
+
+    traces = []
+    for w, a, b in edges:
+        lw = max(0.5, 5 * w / max_w)
+        alpha = max(0.1, 0.7 * w / max_w)
+        traces.append(go.Scatter(
+            x=[node_x[a], node_x[b], None],
+            y=[node_y[a], node_y[b], None],
+            mode="lines",
+            line=dict(width=lw, color=f"rgba(150,150,200,{alpha:.2f})"),
+            hoverinfo="skip",
+            showlegend=False,
+        ))
+
+    colors = [CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i in range(n)]
+    node_sizes = [max(8, 40 * f) for f in freqs]
+    traces.append(go.Scatter(
+        x=node_x, y=node_y,
+        mode="markers+text",
+        marker=dict(size=node_sizes, color=colors, line=dict(width=1, color=BORDER)),
+        text=cell_types, textposition="top center",
+        textfont=dict(color=TEXT, size=9),
+        hovertemplate="%{text}<br>freq: %{customdata:.1%}<extra></extra>",
+        customdata=freqs,
+        showlegend=False,
+    ))
+
+    fig = go.Figure(traces)
+    fig.update_layout(
+        paper_bgcolor=CARD_BG, plot_bgcolor=PLOT_BG,
+        font=dict(color=TEXT),
+        margin=dict(l=20, r=20, t=40, b=20),
+        xaxis=dict(visible=False, range=[-1.4, 1.4]),
+        yaxis=dict(visible=False, range=[-1.4, 1.4], scaleanchor="x"),
+        title=dict(text="Cell Type Interaction Graph (top 30 edges)", font=dict(color=TEXT, size=12), x=0.5),
+        height=500,
+    )
+    return fig
+
+
+def make_chord_fig():
+    with _spatial_lock:
+        result = _spatial_state.get("result")
+    if result is None:
+        return _make_placeholder_fig()
+    cell_types = result["cell_types"]
+    adjacency = result["adjacency"]
+    freqs = result["freqs"]
+    n = len(cell_types)
+    if n == 0:
+        return _make_placeholder_fig("No cell types found.")
+
+    gap = 0.02  # radians between arcs
+    total_arc = 2 * np.pi - n * gap
+    arc_sizes = freqs * total_arc  # arc in radians proportional to freq
+
+    # Compute start/end angles for each type
+    starts = np.zeros(n)
+    ends = np.zeros(n)
+    cur = 0.0
+    for i in range(n):
+        starts[i] = cur
+        ends[i] = cur + arc_sizes[i]
+        cur = ends[i] + gap
+
+    midpoints = (starts + ends) / 2
+
+    traces = []
+    colors = [CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i in range(n)]
+
+    # Draw ribbons (Bezier quadratic through origin)
+    adj_sym = adjacency + adjacency.T
+    max_adj = adj_sym.max()
+    if max_adj == 0:
+        max_adj = 1
+
+    for a in range(n):
+        for b in range(a, n):
+            w = adj_sym[a, b]
+            if w < max_adj * 0.01:
+                continue
+            alpha = max(0.05, 0.4 * w / max_adj)
+            t_vals = np.linspace(0, 1, 30)
+            p0x, p0y = np.cos(midpoints[a]), np.sin(midpoints[a])
+            p1x, p1y = np.cos(midpoints[b]), np.sin(midpoints[b])
+            pcx, pcy = 0.0, 0.0
+            bx = (1 - t_vals)**2 * p0x + 2 * t_vals * (1 - t_vals) * pcx + t_vals**2 * p1x
+            by = (1 - t_vals)**2 * p0y + 2 * t_vals * (1 - t_vals) * pcy + t_vals**2 * p1y
+            traces.append(go.Scatter(
+                x=np.append(bx, None), y=np.append(by, None),
+                mode="lines",
+                line=dict(width=max(1, 6 * w / max_adj), color=f"rgba(150,150,200,{alpha:.2f})"),
+                hoverinfo="skip", showlegend=False,
+            ))
+
+    # Draw arcs for each cell type
+    arc_pts = 40
+    for i in range(n):
+        theta = np.linspace(starts[i], ends[i], arc_pts)
+        ax = np.cos(theta)
+        ay = np.sin(theta)
+        traces.append(go.Scatter(
+            x=ax, y=ay, mode="lines",
+            line=dict(width=8, color=colors[i]),
+            name=cell_types[i],
+            hovertemplate=f"{cell_types[i]}<br>freq: {freqs[i]:.1%}<extra></extra>",
+        ))
+        mx, my = np.cos(midpoints[i]) * 1.12, np.sin(midpoints[i]) * 1.12
+        traces.append(go.Scatter(
+            x=[mx], y=[my], mode="text",
+            text=[cell_types[i]], textfont=dict(color=TEXT, size=9),
+            hoverinfo="skip", showlegend=False,
+        ))
+
+    fig = go.Figure(traces)
+    fig.update_layout(
+        paper_bgcolor=CARD_BG, plot_bgcolor=PLOT_BG,
+        font=dict(color=TEXT),
+        margin=dict(l=20, r=20, t=40, b=20),
+        xaxis=dict(visible=False, range=[-1.5, 1.5]),
+        yaxis=dict(visible=False, range=[-1.5, 1.5], scaleanchor="x"),
+        title=dict(text="Chord Diagram — Cell Type Interactions", font=dict(color=TEXT, size=12), x=0.5),
+        height=500,
+        showlegend=False,
+    )
+    return fig
+
+
+def make_niche_umap_fig():
+    if DATA is None or DATA.get("df") is None:
+        return _make_placeholder_fig()
+    df = DATA["df"]
+    if "niche" not in df.columns:
+        return _make_placeholder_fig("Run Spatial Niches to populate this tab.")
+    umap = DATA.get("umap")
+    if umap is None or len(umap) != len(df):
+        return _make_placeholder_fig("No UMAP coordinates available.")
+    niches = df["niche"].values
+    unique_niches = sorted(set(str(n) for n in niches if pd.notna(n)))
+    traces = []
+    for j, niche in enumerate(unique_niches):
+        mask = np.array([str(x) == niche for x in niches])
+        color = CLUSTER_COLORS[j % len(CLUSTER_COLORS)]
+        traces.append(go.Scatter(
+            x=umap[mask, 0], y=umap[mask, 1],
+            mode="markers",
+            marker=dict(size=3, color=color, opacity=0.7),
+            name=str(niche),
+            hovertemplate=f"Niche {niche}<extra></extra>",
+        ))
+    fig = go.Figure(traces)
+    fig.update_layout(
+        paper_bgcolor=CARD_BG, plot_bgcolor=PLOT_BG,
+        font=dict(color=TEXT),
+        margin=dict(l=30, r=10, t=30, b=30),
+        xaxis=dict(title="UMAP 1", gridcolor=BORDER, linecolor=BORDER, color=TEXT),
+        yaxis=dict(title="UMAP 2", gridcolor=BORDER, linecolor=BORDER, color=TEXT),
+        legend=dict(bgcolor=CARD_BG, bordercolor=BORDER, font=dict(color=TEXT, size=9)),
+        title=dict(text="Niche UMAP", font=dict(color=TEXT, size=12), x=0.5),
+        height=500,
+    )
+    return fig
+
+
 def make_umap_fig(color_by, method, gene, size, opacity,
                   baysor_active=False, proseg_active=False,
-                  use_corrected: bool = False):
+                  use_corrected: bool = False, cbar_range=None):
     mk = max(2, size * 1.2)
 
-    # Check if reseg UMAP is available and the matching source is active
+    # Check if reseg UMAP is available and the matching source is active.
+    # Only use the stored result if its counts_mode matches the current use_corrected,
+    # otherwise the coordinates were computed on a different expression matrix.
     with _umap_reseg_lock:
         reseg_umap = _umap_reseg_state["result"] if _umap_reseg_state["status"] == "done" else None
+        _reseg_umap_mode = _umap_reseg_state.get("counts_mode", "original")
+    _reseg_mode_matches = (use_corrected and _reseg_umap_mode == "corrected") or \
+                          (not use_corrected and _reseg_umap_mode != "corrected")
+    if reseg_umap is not None and not _reseg_mode_matches:
+        reseg_umap = None  # force fallback to cells_df which has both umap_1/2 and split_umap_1/2
 
     # Determine active reseg source
     with _proseg_lock:
@@ -5899,18 +6526,24 @@ def make_umap_fig(color_by, method, gene, size, opacity,
         # The stored reseg UMAP result may only have umap_1/2 if it was computed without
         # corrected counts — fall back to cells_df for split_umap coords in that case.
         _bdf = alt_res["cells_df"]
+        print(f"  [make_umap_fig reseg] use_corrected={use_corrected}, "
+              f"split_notna={_bdf['split_umap_1'].notna().sum() if 'split_umap_1' in _bdf.columns else 0}/{len(_bdf)}", flush=True)
         if use_corrected and "split_umap_1" in udf.columns and udf["split_umap_1"].notna().any():
             xu = udf["split_umap_1"].values
             yu = udf["split_umap_2"].values
+            print(f"  [make_umap_fig reseg] → using udf split_umap (corrected), xu range={xu.min():.2f}..{xu.max():.2f}", flush=True)
         elif use_corrected and "split_umap_1" in _bdf.columns and _bdf["split_umap_1"].notna().any():
             udf = _bdf.dropna(subset=["split_umap_1", "split_umap_2"])
             xu = udf["split_umap_1"].values
             yu = udf["split_umap_2"].values
+            print(f"  [make_umap_fig reseg] → using bdf split_umap (corrected fallback), xu range={xu.min():.2f}..{xu.max():.2f}", flush=True)
         else:
             xu = udf["umap_1"].values
             yu = udf["umap_2"].values
+            print(f"  [make_umap_fig reseg] → using umap_1/2 (original), xu range={xu.min():.2f}..{xu.max():.2f}", flush=True)
         cell_ids     = udf.index.tolist()
         cell_ids_str = [str(c) for c in cell_ids]
+        _ids_arr     = np.asarray(cell_ids_str)
         if color_by.startswith("cell_type:"):
             _method    = color_by.split(":")[1]
             labels_key = _labels_key_for_method(_method, alt_res)
@@ -5927,8 +6560,7 @@ def make_umap_fig(color_by, method, gene, size, opacity,
                         x=xu[mask], y=yu[mask], mode="markers",
                         marker=dict(size=mk, color=cmap[ct], opacity=opacity),
                         name=ct, showlegend=False,
-                        text=np.array(cell_ids_str)[mask].tolist(),
-                        customdata=np.array(cell_ids_str)[mask].tolist(),
+                        text=_ids_arr[mask], customdata=_ids_arr[mask],
                         hovertemplate="<b>%{text}</b><extra>" + ct + "</extra>",
                     ))
             else:
@@ -5985,28 +6617,34 @@ def make_umap_fig(color_by, method, gene, size, opacity,
                         x=xu[mask], y=yu[mask], mode="markers",
                         marker=dict(size=mk, color=_cmap[cl], opacity=opacity),
                         name=cl, showlegend=False,
-                        text=np.array(cell_ids)[mask].tolist(),
-                        customdata=np.array(cell_ids)[mask].tolist(),
+                        text=_ids_arr[mask], customdata=_ids_arr[mask],
                         hovertemplate="<b>%{text}</b><extra>Cluster " + cl + "</extra>",
                     ))
             else:
                 color_by = "transcript_counts"
 
-        if not color_by.startswith("cell_type:") and color_by != "gene" and color_by != "cluster":
+        if not color_by.startswith("cell_type:") and color_by not in ("gene", "cluster", "niche"):
             bdf = alt_res["cells_df"]
             if color_by in bdf.columns:
-                vals  = bdf["transcript_counts"].values if color_by == "transcript_counts" \
-                        else bdf[color_by].values
+                raw = bdf["transcript_counts"].values if color_by == "transcript_counts" \
+                      else bdf[color_by].values
+                vals  = np.log1p(raw) if color_by == "transcript_counts" else raw.astype(float)
                 label = QC_METRICS.get(color_by, color_by)
+                if color_by == "transcript_counts":
+                    label = "Transcript Counts (log1p)"
                 cs    = COLORSCALES.get(color_by, "Viridis")
             else:
-                vals  = bdf["transcript_counts"].values
-                label = "Transcript Counts"
+                vals  = np.log1p(bdf["transcript_counts"].values)
+                label = "Transcript Counts (log1p)"
                 cs    = "Viridis"
+            _ckw = {}
+            if cbar_range:
+                if cbar_range[0] is not None: _ckw["cmin"] = cbar_range[0]
+                if cbar_range[1] is not None: _ckw["cmax"] = cbar_range[1]
             traces = [go.Scattergl(
                 x=xu, y=yu, mode="markers",
                 marker=dict(size=mk, color=vals, colorscale=cs,
-                            opacity=opacity, showscale=False),
+                            opacity=opacity, showscale=False, **_ckw),
                 text=cell_ids, customdata=cell_ids,
                 hovertemplate="<b>%{text}</b><br>" + label + ": %{marker.color:.2f}<extra></extra>",
                 name=label,
@@ -6070,20 +6708,31 @@ def make_umap_fig(color_by, method, gene, size, opacity,
             else:
                 _ge_full = get_gene_expression(gene)
                 vals = _ge_full[_df_idx]
+            _ckw = {}
+            if cbar_range:
+                if cbar_range[0] is not None: _ckw["cmin"] = cbar_range[0]
+                if cbar_range[1] is not None: _ckw["cmax"] = cbar_range[1]
             traces = [go.Scattergl(
                 x=xu, y=yu, mode="markers",
                 marker=dict(size=mk, color=vals, colorscale="Plasma",
-                            opacity=opacity, showscale=False),
+                            opacity=opacity, showscale=False, **_ckw),
                 text=df.index.tolist(), customdata=df.index.tolist(),
                 hovertemplate="<b>%{text}</b><extra></extra>", name=gene,
             )]
         else:
             label = QC_METRICS.get(color_by, color_by)
+            vals = np.log1p(df[color_by].values) if color_by == "transcript_counts" else df[color_by].values
+            if color_by == "transcript_counts":
+                label = "Transcript Counts (log1p)"
+            _ckw = {}
+            if cbar_range:
+                if cbar_range[0] is not None: _ckw["cmin"] = cbar_range[0]
+                if cbar_range[1] is not None: _ckw["cmax"] = cbar_range[1]
             traces = [go.Scattergl(
                 x=xu, y=yu, mode="markers",
-                marker=dict(size=mk, color=df[color_by].values,
+                marker=dict(size=mk, color=vals,
                             colorscale=COLORSCALES.get(color_by, "Viridis"),
-                            opacity=opacity, showscale=False),
+                            opacity=opacity, showscale=False, **_ckw),
                 text=df.index.tolist(), customdata=df.index.tolist(),
                 hovertemplate="<b>%{text}</b><br>" + label + ": %{marker.color:.2f}<extra></extra>",
                 name=label,
@@ -6122,7 +6771,7 @@ _spage_autoload()
 def _sdata_cache_path() -> str:
     """Return the directory path for the SpatialData Zarr cache for this dataset."""
     tag = hashlib.md5(DATA["data_dir"].encode()).hexdigest()[:12]
-    cache_dir = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache")
+    cache_dir = CACHE_BASE_DIR
     os.makedirs(cache_dir, exist_ok=True)
     return os.path.join(cache_dir, f"spatialdata_{tag}.zarr")
 
@@ -6358,7 +7007,7 @@ def _annot_load_from_sdata(sdata) -> None:
 # ─── Cache utilities ───────────────────────────────────────────────────────────
 
 def _cache_dir() -> str:
-    return os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache")
+    return CACHE_BASE_DIR
 
 
 def _cache_size_str() -> str:
@@ -6414,7 +7063,7 @@ def _format_seg_label(tool: str, params: dict) -> str:
 
 def _list_cached_seg_runs() -> list:
     """Return list of {label, value} dicts for all complete cached Baysor/Proseg runs for the current dataset."""
-    cache_base = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache")
+    cache_base = CACHE_BASE_DIR
     dataset = os.path.basename(DATA.get("data_dir", ""))
     opts = []
     if not os.path.isdir(cache_base):
@@ -6466,7 +7115,7 @@ def _roi_color(index: int) -> str:
 
 
 def _roi_cache_path() -> str:
-    cache_dir = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache")
+    cache_dir = CACHE_BASE_DIR
     os.makedirs(cache_dir, exist_ok=True)
     tag = hashlib.md5(DATA["data_dir"].encode()).hexdigest()[:8]
     return os.path.join(cache_dir, f"rois_{tag}.json")
@@ -6684,6 +7333,24 @@ def _roi_shapes_for_fig(rois: list, pending_hull=None) -> list:
 def _auto_load_rois() -> None:
     """Load ROIs from cache at startup and apply metadata to DATA['df']."""
     rois = _roi_load_cache()
+    # Migration: if no ROIs found at the absolute-path hash (new scheme),
+    # also try the relative-path hash that was used before os.path.abspath normalisation.
+    if not rois:
+        _rel_tag = hashlib.md5(os.path.basename(DATA["data_dir"]).encode()).hexdigest()[:8]
+        _cache_dir_path = CACHE_BASE_DIR
+        for _try_tag in (_rel_tag,):
+            _old_path = os.path.join(_cache_dir_path, f"rois_{_try_tag}.json")
+            if os.path.exists(_old_path):
+                try:
+                    with open(_old_path) as _f:
+                        rois = json.load(_f)
+                    if rois:
+                        _roi_state["rois"] = rois
+                        _roi_save_cache()  # re-save under new absolute-path hash
+                        print(f"  ROI: migrated {len(rois)} ROIs from rois_{_try_tag}.json", flush=True)
+                except Exception:
+                    pass
+                break
     with _roi_lock:
         _roi_state["rois"] = rois
     if rois and "df" in DATA:
@@ -7194,6 +7861,33 @@ sidebar = html.Div([
         tooltip={"placement": "bottom", "always_visible": False},
     ),
 
+    html.Div(style={"marginBottom": "12px"}),
+
+    # Colorbar range controls (visible only for continuous color modes)
+    html.Div(id="colorbar-ctrl", children=[
+        ctrl_label("Color Range"),
+        html.Div([
+            dcc.Input(id="colorbar-min", type="number", placeholder="Min",
+                      debounce=True, style={
+                          "width": "70px", "backgroundColor": "#0d1117", "color": TEXT,
+                          "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                          "fontSize": "12px", "padding": "2px 6px",
+                      }),
+            html.Span("–", style={"color": MUTED, "margin": "0 6px"}),
+            dcc.Input(id="colorbar-max", type="number", placeholder="Max",
+                      debounce=True, style={
+                          "width": "70px", "backgroundColor": "#0d1117", "color": TEXT,
+                          "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                          "fontSize": "12px", "padding": "2px 6px",
+                      }),
+            html.Button("Reset", id="colorbar-reset-btn", n_clicks=0,
+                        style={"marginLeft": "8px", "fontSize": "11px", "padding": "2px 8px",
+                               "backgroundColor": "transparent", "color": MUTED,
+                               "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                               "cursor": "pointer"}),
+        ], style={"display": "flex", "alignItems": "center", "marginBottom": "8px"}),
+    ], style={"display": "none"}),
+
     html.Hr(style={"borderColor": BORDER, "margin": "14px 0"}),
 
     # ── Morphology image overlay ────────────────────────────────────────
@@ -7321,12 +8015,15 @@ sidebar = html.Div([
     dcc.Interval(id="split-poll", interval=3000, disabled=True),
     html.Hr(style={"borderColor": BORDER, "margin": "14px 0"}),
     ctrl_label("Spatial Analysis"),
-    html.Button("⬡ Generate Spatial Niches", id="niche-modal-open-btn", n_clicks=0,
+    html.Button("⬡ Spatial Analysis Tools", id="niche-modal-open-btn", n_clicks=0,
                 style={"width": "100%", "backgroundColor": "#0d6efd", "color": "white",
                        "border": "none", "borderRadius": "4px", "padding": "6px 10px",
                        "fontSize": "0.82rem", "cursor": "pointer", "marginBottom": "4px"}),
     html.Div(id="niche-status", style={"fontSize": "11px", "color": MUTED, "minHeight": "16px",
                                        "marginBottom": "6px"}),
+    html.Div(id="spatial-analysis-status",
+             style={"fontSize": "11px", "color": MUTED, "minHeight": "16px",
+                    "marginBottom": "6px"}),
     dcc.Interval(id="niche-poll", interval=2000, disabled=True),
     html.Hr(style={"borderColor": BORDER, "margin": "14px 0"}),
     ctrl_label("Active Counts"),
@@ -7368,7 +8065,7 @@ sidebar = html.Div([
 
     # UMAP toggle
     html.Button(
-        "Show UMAP",
+        "Show Plots",
         id="umap-toggle",
         n_clicks=1,
         style={
@@ -7424,6 +8121,8 @@ app.layout = html.Div([
     dcc.Store(id="sdata-done",       data=0),
     dcc.Store(id="split-done",        data=0),
     dcc.Store(id="niche-done",        data=0),
+    dcc.Store(id="spatial-done", data=0),
+    dcc.Interval(id="spatial-poll", interval=2000, disabled=True),
     dcc.Store(id="counts-mode-store", data="original"),
     dcc.Store(id="roi-done",          data=0),
     dcc.Store(id="roi-pending",       data=None),
@@ -8050,7 +8749,7 @@ app.layout = html.Div([
 
 # ─── Spatial Niches modal ─────────────────────────────────────────────────────
 dbc.Modal([
-    dbc.ModalHeader("Generate Spatial Niches"),
+    dbc.ModalHeader("Spatial Analysis Tools"),
     dbc.ModalBody([
         html.Div("Cluster cells by neighborhood cell-type composition (BuildNicheAssay-style).",
                  style={"fontSize": "0.85rem", "color": MUTED, "marginBottom": "14px"}),
@@ -8079,6 +8778,13 @@ dbc.Modal([
                    style={"width": "100%", "marginBottom": "8px"}),
         html.Div(id="niche-modal-status",
                  style={"fontSize": "0.82rem", "color": MUTED, "minHeight": "18px"}),
+        html.Hr(style={"borderColor": BORDER, "margin": "16px 0"}),
+        html.Div("Spatial Analysis Plots", style={"fontWeight": "600", "marginBottom": "6px", "color": TEXT}),
+        html.Div("Generates co-occurrence heatmap, neighborhood enrichment, interaction graph, and chord diagram.",
+                 style={"fontSize": "11px", "color": MUTED, "marginBottom": "10px"}),
+        dbc.Button("Generate Analysis Plots", id="spatial-run-btn", color="primary", size="sm",
+                   style={"marginBottom": "8px"}),
+        html.Div(id="spatial-modal-status", style={"fontSize": "11px", "color": MUTED}),
     ]),
     dbc.ModalFooter(
         dbc.Button("Close", id="niche-modal-close-btn", outline=True,
@@ -8393,21 +9099,68 @@ dbc.Modal([
                         },
                         style={"height": "100%"},
                     )
-                ], id="spatial-panel", style={"flex": "2", "minWidth": "0"}),
+                ], id="spatial-panel", style={"flex": "2", "minWidth": "200px"}),
+
+                html.Div(id="panel-resize-handle", style={
+                    "width": "6px", "cursor": "col-resize", "flexShrink": "0",
+                    "alignSelf": "stretch", "backgroundColor": "transparent",
+                    "borderRadius": "3px", "transition": "background-color 0.15s",
+                }),
 
                 html.Div([
-                    dcc.Graph(
-                        id="umap-plot",
-                        responsive=True,
-                        config={
-                            "displayModeBar": True,
-                            "modeBarButtonsToRemove": ["select2d", "lasso2d"],
-                            "toImageButtonOptions": {"format": "svg", "filename": "xenium_umap"},
-                        },
-                        style={"height": "100%"},
-                    )
+                    dbc.Tabs(id="plots-tabs", active_tab="tab-umap",
+                             style={"borderBottom": f"1px solid {BORDER}", "marginBottom": "6px"},
+                             children=[
+                        dbc.Tab(label="UMAP", tab_id="tab-umap",
+                                label_style={"fontSize": "12px", "padding": "4px 12px"},
+                                children=[
+                                    dcc.Graph(id="umap-plot", responsive=True,
+                                              config={"displayModeBar": True,
+                                                      "modeBarButtonsToRemove": ["select2d", "lasso2d"],
+                                                      "toImageButtonOptions": {"format": "svg", "filename": "xenium_umap"}},
+                                              style={"height": "calc(100% - 36px)"}),
+                                ]),
+                        dbc.Tab(label="Cell Type Abundance", tab_id="tab-abundance",
+                                label_style={"fontSize": "12px", "padding": "4px 12px"},
+                                children=[
+                                    dcc.Graph(id="cell-type-abundance-plot", responsive=True,
+                                              config={"displayModeBar": False},
+                                              style={"height": "calc(100% - 36px)"}),
+                                ]),
+                        dbc.Tab(label="Co-occurrence", tab_id="tab-cooccurrence",
+                                label_style={"fontSize": "12px", "padding": "4px 12px"},
+                                children=[dcc.Graph(id="cooccurrence-plot", responsive=True,
+                                                    config={"displayModeBar": False},
+                                                    style={"height": "calc(100% - 36px)"})]),
+                        dbc.Tab(label="Neighborhood Enrichment", tab_id="tab-enrichment",
+                                label_style={"fontSize": "12px", "padding": "4px 12px"},
+                                children=[dcc.Graph(id="enrichment-plot", responsive=True,
+                                                    config={"displayModeBar": False},
+                                                    style={"height": "calc(100% - 36px)"})]),
+                        dbc.Tab(label="Interaction Graph", tab_id="tab-interaction",
+                                label_style={"fontSize": "12px", "padding": "4px 12px"},
+                                children=[dcc.Graph(id="interaction-plot", responsive=True,
+                                                    config={"displayModeBar": False},
+                                                    style={"height": "calc(100% - 36px)"})]),
+                        dbc.Tab(label="Chord Diagram", tab_id="tab-chord",
+                                label_style={"fontSize": "12px", "padding": "4px 12px"},
+                                children=[dcc.Graph(id="chord-plot", responsive=True,
+                                                    config={"displayModeBar": False},
+                                                    style={"height": "calc(100% - 36px)"})]),
+                        dbc.Tab(label="Niche UMAP", tab_id="tab-niche-umap",
+                                label_style={"fontSize": "12px", "padding": "4px 12px"},
+                                children=[dcc.Graph(id="niche-umap-plot", responsive=True,
+                                                    config={"displayModeBar": False},
+                                                    style={"height": "calc(100% - 36px)"})]),
+                    ]),
                 ], id="umap-panel", style={"display": "none"}),
-            ], style={"display": "flex", "flex": "1", "gap": "10px", "minHeight": "0"}),
+            ], id="plots-row", style={"display": "flex", "flex": "1", "gap": "10px", "minHeight": "0"}),
+
+            html.Div(id="vertical-resize-handle", style={
+                "height": "6px", "cursor": "row-resize", "flexShrink": "0",
+                "backgroundColor": "transparent", "borderRadius": "3px",
+                "transition": "background-color 0.15s",
+            }),
 
             # ── Bottom info bar (collapsible) ───────────────────────────────
             html.Div([
@@ -8491,13 +9244,13 @@ dbc.Modal([
                         }),
                     ],
                 ),
-            ], style={
+            ], id="info-bar", style={
                 "position": "relative",
                 "backgroundColor": CARD_BG, "border": f"1px solid {BORDER}",
                 "borderRadius": "6px", "padding": "10px 16px",
                 "height": "180px",  # fixed height — both columns scroll independently
                 "display": "flex", "flexDirection": "column",
-                "boxSizing": "border-box",
+                "boxSizing": "border-box", "flexShrink": "0",
             }),
         ], style={
             "flex": "1", "display": "flex", "flexDirection": "column",
@@ -8523,12 +9276,19 @@ app.clientside_callback(
     """function(colorBy) {
         var show = {"marginBottom": "14px"};
         var hide = {"marginBottom": "14px", "display": "none"};
-        if (colorBy === "cluster") return [show, hide];
-        if (colorBy === "gene") return [hide, show];
-        return [hide, hide];
+        var cbShow = {};
+        var cbHide = {"display": "none"};
+        // Continuous color modes that have a colorbar
+        var continuous = ["transcript_counts", "cell_area", "nucleus_area", "total_counts", "gene"];
+        var isCont = continuous.indexOf(colorBy) >= 0;
+        if (colorBy === "cluster") return [show, hide, cbHide];
+        if (colorBy === "gene") return [hide, show, cbShow];
+        if (isCont) return [hide, hide, cbShow];
+        return [hide, hide, cbHide];
     }""",
-    Output("cluster-ctrl", "style"),
-    Output("gene-ctrl",    "style"),
+    Output("cluster-ctrl",  "style"),
+    Output("gene-ctrl",     "style"),
+    Output("colorbar-ctrl", "style"),
     Input("color-by", "value"),
 )
 
@@ -8542,6 +9302,15 @@ app.clientside_callback(
 def toggle_morph_controls(enabled):
     active = "show" in (enabled or [])
     return ({} if active else {"display": "none"}), (not active)
+
+
+app.clientside_callback(
+    """function(n) { return [null, null]; }""",
+    Output("colorbar-min", "value"),
+    Output("colorbar-max", "value"),
+    Input("colorbar-reset-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
 
 
 @app.callback(
@@ -8595,13 +9364,16 @@ def store_relayout(relayout_data, current):
     Input("roi-done",               "data"),
     Input("counts-mode-store",      "data"),
     Input("niche-done",             "data"),
+    Input("colorbar-min",           "value"),
+    Input("colorbar-max",           "value"),
 )
 def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
                  _annot_done, morph_enable, morph_zlevel, morph_channels,
                  morph_brightness, morph_opacity, relayout,
                  _baysor_done, _proseg_done, seg_source,
                  _spage_done, _subset_ver, _startup, _ds_version, _extra_ds_version,
-                 _split_done, _roi_done, counts_mode, _niche_done):
+                 _split_done, _roi_done, counts_mode, _niche_done,
+                 cbar_min, cbar_max):
     # If only the viewport changed, avoid full figure rebuild
     triggered = callback_context.triggered_id
     boundaries_active = bool(boundary_toggles)
@@ -8665,16 +9437,20 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
         )
 
     use_corr = (counts_mode == "corrected")
+    cbar_range = (cbar_min, cbar_max) if cbar_min is not None or cbar_max is not None else None
 
-    # When counts mode or SPLIT status changes, clear cached UMAP so fresh coords/colors are used
-    if triggered in ("counts-mode-store", "split-done"):
+    # When counts mode, SPLIT status, or subset changes, clear cached UMAP
+    if triggered in ("counts-mode-store", "split-done", "subset-version"):
         _umap_df_cache.clear()
         _umap_fig_cache.clear()
+        if triggered == "subset-version":
+            print(f"  [update_plots] subset-version triggered, _subset_ver={_subset_ver}", flush=True)
 
     # UMAP cache: skip rebuild when only spatial-related inputs changed
     _umap_key = (color_by, method, gene, size, opacity, baysor_on, proseg_on, use_corr,
                  _annot_done, _spage_done, _ds_version, _extra_ds_version,
-                 _baysor_done, _proseg_done, _split_done, _subset_ver, _niche_done)
+                 _baysor_done, _proseg_done, _split_done, _subset_ver, _niche_done,
+                 cbar_min, cbar_max)
     _cache_hit = _umap_key in _umap_fig_cache
     if not _cache_hit:
         print(f"  [UMAP cache] miss — use_corr={use_corr}, triggered={triggered}", flush=True)
@@ -8683,7 +9459,7 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
     else:
         umap_fig = make_umap_fig(color_by, method, gene, size, opacity,
                                  baysor_active=baysor_on, proseg_active=proseg_on,
-                                 use_corrected=use_corr)
+                                 use_corrected=use_corr, cbar_range=cbar_range)
         _umap_fig_cache.clear()  # keep only latest entry
         _umap_fig_cache[_umap_key] = umap_fig
 
@@ -8692,7 +9468,7 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
                          boundary_toggles, relayout,
                          morph_image=morph_image, extra_title=morph_title,
                          baysor_active=baysor_on, proseg_active=proseg_on,
-                         use_corrected=use_corr),
+                         use_corrected=use_corr, cbar_range=cbar_range),
         umap_fig,
     )
 
@@ -9045,6 +9821,7 @@ def poll_annotation(_, current_options, done_version, modal_open):
 app.clientside_callback(
     """function(n_clicks) {
         var sp = document.getElementById('spatial-plot');
+        var spatialPanel = document.getElementById('spatial-panel');
         var xr0, xr1, yr0, yr1, hasRanges = false;
         if (sp && sp._fullLayout) {
             var xl = sp._fullLayout.xaxis, yl = sp._fullLayout.yaxis;
@@ -9053,6 +9830,12 @@ app.clientside_callback(
                 yr0 = yl.range[0]; yr1 = yl.range[1];
                 hasRanges = true;
             }
+        }
+        var hiding = (n_clicks % 2 === 1);
+        if (hiding && spatialPanel) {
+            // Reset spatial panel to flex layout so it fills the space
+            spatialPanel.style.flex = '1';
+            spatialPanel.style.width = '';
         }
         setTimeout(function() {
             window.dispatchEvent(new Event('resize'));
@@ -9065,13 +9848,23 @@ app.clientside_callback(
                 }, 80);
             }
         }, 50);
-        if (n_clicks % 2 === 1) return [{"display": "none"}, "Show UMAP"];
-        return [{"flex": "1", "minWidth": "0"}, "Hide UMAP"];
+        if (hiding) return [{"display": "none"}, "Show Plots"];
+        return [{"flex": "1", "minWidth": "0"}, "Hide Plots"];
     }""",
     Output("umap-panel",  "style"),
     Output("umap-toggle", "children"),
     Input("umap-toggle",  "n_clicks"),
 )
+
+
+@app.callback(
+    Output("cell-type-abundance-plot", "figure"),
+    Input("annot-done", "data"),
+    Input("seg-source", "value"),
+    Input("dataset-version", "data"),
+)
+def update_abundance_plot(_annot_done, _seg_source, _ds_version):
+    return make_cell_type_abundance_fig()
 
 
 # ─── Baysor callbacks ─────────────────────────────────────────────────────────
@@ -9516,7 +10309,7 @@ def load_seg_run_from_cache(seg_value, baysor_ver, proseg_ver):
         return no_update, no_update, no_update, no_update, no_update
 
     tool, param_tag = seg_value.split(":", 1)
-    cache_base = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache")
+    cache_base = CACHE_BASE_DIR
     dataset = os.path.basename(DATA.get("data_dir", ""))
     out_dir = os.path.join(cache_base, f"{tool}_{dataset}_{param_tag}")
 
@@ -9700,6 +10493,104 @@ app.clientside_callback(
     Output("info-bar-toggle",  "children"),
     Input("info-bar-toggle",   "n_clicks"),
     prevent_initial_call=True,
+)
+
+
+app.clientside_callback(
+    """function(triggerVal) {
+        // Wire up drag-to-resize between spatial-panel and umap-panel
+        function setupResize() {
+            var handle = document.getElementById('panel-resize-handle');
+            var leftPanel = document.getElementById('spatial-panel');
+            var rightPanel = document.getElementById('umap-panel');
+            if (!handle || !leftPanel || !rightPanel) {
+                setTimeout(setupResize, 300);
+                return;
+            }
+            // Highlight handle on hover
+            handle.addEventListener('mouseenter', function() {
+                handle.style.backgroundColor = '#444c56';
+            });
+            handle.addEventListener('mouseleave', function() {
+                if (!handle._dragging) handle.style.backgroundColor = 'transparent';
+            });
+            handle.addEventListener('mousedown', function(e) {
+                e.preventDefault();
+                handle._dragging = true;
+                handle.style.backgroundColor = '#58a6ff';
+                var startX = e.clientX;
+                var startLeft = leftPanel.getBoundingClientRect().width;
+                var startRight = rightPanel.getBoundingClientRect().width;
+                function onMove(ev) {
+                    var dx = ev.clientX - startX;
+                    var newLeft = startLeft + dx;
+                    var newRight = startRight - dx;
+                    if (newLeft > 150 && newRight > 150) {
+                        leftPanel.style.flex = 'none';
+                        leftPanel.style.width = newLeft + 'px';
+                        rightPanel.style.flex = 'none';
+                        rightPanel.style.width = newRight + 'px';
+                    }
+                }
+                function onUp() {
+                    handle._dragging = false;
+                    handle.style.backgroundColor = 'transparent';
+                    document.removeEventListener('mousemove', onMove);
+                    document.removeEventListener('mouseup', onUp);
+                    // Trigger Plotly resize so graphs reflow
+                    window.dispatchEvent(new Event('resize'));
+                }
+                document.addEventListener('mousemove', onMove);
+                document.addEventListener('mouseup', onUp);
+            });
+        }
+        setupResize();
+
+        // Wire up drag-to-resize between plots row and info bar (vertical)
+        function setupVerticalResize() {
+            var vHandle = document.getElementById('vertical-resize-handle');
+            var plotsRow = document.getElementById('plots-row');
+            var infoBar = document.getElementById('info-bar');
+            if (!vHandle || !plotsRow || !infoBar) {
+                setTimeout(setupVerticalResize, 300);
+                return;
+            }
+            vHandle.addEventListener('mouseenter', function() {
+                vHandle.style.backgroundColor = '#444c56';
+            });
+            vHandle.addEventListener('mouseleave', function() {
+                if (!vHandle._dragging) vHandle.style.backgroundColor = 'transparent';
+            });
+            vHandle.addEventListener('mousedown', function(e) {
+                e.preventDefault();
+                vHandle._dragging = true;
+                vHandle.style.backgroundColor = '#58a6ff';
+                var startY = e.clientY;
+                var startInfoH = infoBar.getBoundingClientRect().height;
+                function onMove(ev) {
+                    var dy = ev.clientY - startY;
+                    var newInfoH = startInfoH - dy;
+                    if (newInfoH >= 60 && newInfoH <= 600) {
+                        infoBar.style.height = newInfoH + 'px';
+                    }
+                }
+                function onUp() {
+                    vHandle._dragging = false;
+                    vHandle.style.backgroundColor = 'transparent';
+                    document.removeEventListener('mousemove', onMove);
+                    document.removeEventListener('mouseup', onUp);
+                    window.dispatchEvent(new Event('resize'));
+                }
+                document.addEventListener('mousemove', onMove);
+                document.addEventListener('mouseup', onUp);
+            });
+        }
+        setupVerticalResize();
+
+        return 'ready';
+    }""",
+    Output("panel-resize-handle", "title"),
+    Input("startup-trigger", "n_intervals"),
 )
 
 
@@ -10046,6 +10937,23 @@ def update_tissue_info(_, seg_source, _split_done):
 
 
 @app.callback(
+    Output("morph-enable", "options"),
+    Output("morph-enable", "labelStyle"),
+    Input("dataset-version", "data"),
+)
+def update_morph_enable_state(_):
+    """Disable morphology overlay toggle when no image data is available (zarr input)."""
+    has_images = DATA.get("data_dir") is not None
+    options = [{"label": html.Span(
+        " Enable Image Overlay" + ("" if has_images else " (no image data)"),
+        style={"fontSize": "13px", "color": TEXT if has_images else MUTED},
+    ), "value": "show", "disabled": not has_images}]
+    label_style = {"display": "flex", "alignItems": "center",
+                   "cursor": "pointer" if has_images else "not-allowed"}
+    return options, label_style
+
+
+@app.callback(
     Output("sample-modal", "is_open"),
     Output("sample-picker", "options"),
     Input("sample-modal-open-btn", "n_clicks"),
@@ -10074,12 +10982,19 @@ def load_sample(n_clicks, picked_path, custom_path, ds_version):
     if not new_dir:
         return "Select a sample or enter a path.", no_update, no_update
     new_dir = os.path.abspath(new_dir)
-    if not os.path.exists(os.path.join(new_dir, "experiment.xenium")):
-        return f"Not a valid Xenium directory: {new_dir}", no_update, no_update
-    if new_dir == DATA["data_dir"]:
-        return "Already loaded.", no_update, no_update
+    is_zarr = new_dir.rstrip("/").endswith(".zarr")
+    if is_zarr:
+        if not os.path.exists(os.path.join(new_dir, ".zgroup")):
+            return f"Not a valid SpatialData zarr: {new_dir}", no_update, no_update
+        if new_dir == DATA.get("sdata_path"):
+            return "Already loaded.", no_update, no_update
+    else:
+        if not os.path.exists(os.path.join(new_dir, "experiment.xenium")):
+            return f"Not a valid Xenium directory: {new_dir}", no_update, no_update
+        if new_dir == DATA["data_dir"]:
+            return "Already loaded.", no_update, no_update
     try:
-        new_data = load_xenium_data(new_dir)
+        new_data = load_from_sdata_zarr(new_dir) if is_zarr else load_xenium_data(new_dir)
         DATA.update(new_data)
         # Reset all per-dataset state
         with _baysor_lock:
@@ -10126,14 +11041,21 @@ def add_sample(n_clicks, picked_path, custom_path, extra_ver):
     if not new_dir:
         return "Select a sample or enter a path.", no_update, no_update, no_update
     new_dir = os.path.abspath(new_dir)
-    if not os.path.exists(os.path.join(new_dir, "experiment.xenium")):
-        return f"Not a valid Xenium directory: {new_dir}", no_update, no_update, no_update
-    # Check for duplicates
-    all_dirs = [DATA["data_dir"]] + [eds["data_dir"] for eds in EXTRA_DATASETS]
+    is_zarr = new_dir.rstrip("/").endswith(".zarr")
+    if is_zarr:
+        if not os.path.exists(os.path.join(new_dir, ".zgroup")):
+            return f"Not a valid SpatialData zarr: {new_dir}", no_update, no_update, no_update
+    else:
+        if not os.path.exists(os.path.join(new_dir, "experiment.xenium")):
+            return f"Not a valid Xenium directory: {new_dir}", no_update, no_update, no_update
+    # Check for duplicates (use sdata_path for zarr, data_dir for Xenium)
+    all_dirs = [DATA.get("sdata_path") if is_zarr else DATA["data_dir"]] + [
+        eds.get("sdata_path") if is_zarr else eds["data_dir"] for eds in EXTRA_DATASETS
+    ]
     if new_dir in all_dirs:
         return "Sample already loaded.", no_update, no_update, no_update
     try:
-        new_data = load_xenium_data(new_dir)
+        new_data = load_from_sdata_zarr(new_dir) if is_zarr else load_xenium_data(new_dir)
         # Compute x_offset: place new sample to the right of all current ones
         # x_offset = max(x_centroid) of the last dataset + 500 µm gap - min(x_centroid) of new dataset
         if EXTRA_DATASETS:
@@ -10464,11 +11386,14 @@ def open_niche_modal(open_clicks, close_clicks, is_open):
     with _annot_lock:
         method_options = []
         for key in _annot_state:
-            if not key.startswith("labels_"):
-                continue
-            suffix = key[len("labels_"):]
-            label = suffix.replace("_", " ").title()
-            method_options.append({"label": label, "value": key})
+            if key == "labels":
+                if _annot_state[key] is not None:
+                    method_options.append({"label": "Xenium (current)", "value": key})
+            elif key.startswith("labels_"):
+                if _annot_state[key] is not None:
+                    suffix = key[len("labels_"):]
+                    label = suffix.replace("_", " ").title()
+                    method_options.append({"label": label, "value": key})
     return True, method_options
 
 
@@ -10546,6 +11471,82 @@ def poll_niche(_, done_ver, current_options):
         return f"Error: {message}", True, False, no_update, no_update
 
     raise dash.exceptions.PreventUpdate
+
+
+# ─── Spatial analysis callbacks ───────────────────────────────────────────────
+
+@app.callback(
+    Output("spatial-run-btn", "disabled"),
+    Output("spatial-poll", "disabled"),
+    Output("spatial-modal-status", "children"),
+    Input("spatial-run-btn", "n_clicks"),
+    State("niche-label-method", "value"),
+    State("niche-n-neighbors", "value"),
+    State("seg-source", "value"),
+    prevent_initial_call=True,
+)
+def run_spatial_analysis(n_clicks, label_key, n_neighbors, seg_source):
+    if not n_clicks:
+        raise dash.exceptions.PreventUpdate
+    if not label_key:
+        return False, True, "Select a cell type annotation from the dropdown first."
+    n_neighbors = int(n_neighbors or 10)
+    tool = _seg_tool(seg_source)
+    alt_res = None
+    if tool == "baysor":
+        with _baysor_lock:
+            alt_res = _baysor_state.get("result")
+    elif tool == "proseg":
+        with _proseg_lock:
+            alt_res = _proseg_state.get("result")
+    # Determine label key: if "labels" and alt_res present, use tool-specific key
+    if label_key == "labels" and alt_res is not None:
+        label_key = f"labels_{tool}"
+    t = threading.Thread(target=_run_spatial_analysis, args=(label_key, n_neighbors, alt_res), daemon=True)
+    t.start()
+    return True, False, "Running…"
+
+
+@app.callback(
+    Output("spatial-analysis-status", "children"),
+    Output("spatial-poll", "disabled", allow_duplicate=True),
+    Output("spatial-run-btn", "disabled", allow_duplicate=True),
+    Output("spatial-done", "data"),
+    Input("spatial-poll", "n_intervals"),
+    State("spatial-done", "data"),
+    prevent_initial_call=True,
+)
+def poll_spatial(_, done_ver):
+    with _spatial_lock:
+        status = _spatial_state["status"]
+        msg = _spatial_state["message"]
+    if status == "done":
+        return msg, True, False, (done_ver or 0) + 1
+    if status == "error":
+        return msg, True, False, done_ver
+    return msg, False, True, done_ver
+
+
+@app.callback(
+    Output("cooccurrence-plot", "figure"),
+    Output("enrichment-plot", "figure"),
+    Output("interaction-plot", "figure"),
+    Output("chord-plot", "figure"),
+    Input("spatial-done", "data"),
+    Input("dataset-version", "data"),
+)
+def update_spatial_plots(_spatial_done, _ds_version):
+    return (make_cooccurrence_fig(), make_enrichment_fig(),
+            make_interaction_graph_fig(), make_chord_fig())
+
+
+@app.callback(
+    Output("niche-umap-plot", "figure"),
+    Input("niche-done", "data"),
+    Input("dataset-version", "data"),
+)
+def update_niche_umap(_niche_done, _ds_version):
+    return make_niche_umap_fig()
 
 
 # ─── ROI Annotation callbacks ─────────────────────────────────────────────────
@@ -10922,9 +11923,16 @@ def update_roi_sidebar_summary(roi_done):
     return f"{len(rois)} ROI{'s' if len(rois)!=1 else ''} ({', '.join(parts)})"
 
 
+# ─── Health check endpoint (for Cloud Run / load balancers) ──────────────────
+@app.server.route("/health")
+def health():
+    return "ok"
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import logging
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
-    print("\nXenium Explorer running at http://localhost:8050\n", flush=True)
-    app.run(debug=False, host="0.0.0.0", port=8050)
+    _port = int(os.environ.get("PORT", 8050))
+    print(f"\nXenium Explorer running at http://localhost:{_port}\n", flush=True)
+    app.run(debug=False, host="0.0.0.0", port=_port)
