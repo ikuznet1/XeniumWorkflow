@@ -947,7 +947,12 @@ def _proseg_run_single(tx_df, patch_dir, proseg_bin, voxel_size, n_threads, n_sa
     cells_df = cell_meta.rename(columns={
         "cell": "cell_id", "centroid_x": "x_centroid",
         "centroid_y": "y_centroid", "population": "transcript_counts",
-    }).set_index("cell_id")[["x_centroid", "y_centroid", "transcript_counts"]]
+        "volume": "cell_area",
+    }).set_index("cell_id")
+    _keep_cols = ["x_centroid", "y_centroid", "transcript_counts"]
+    if "cell_area" in cells_df.columns:
+        _keep_cols.append("cell_area")
+    cells_df = cells_df[_keep_cols]
 
     cell_bounds: dict = {}
     if os.path.exists(poly_out):
@@ -1099,7 +1104,8 @@ def _update_reseg_zarr_obs(zarr_path: str, cells_df: pd.DataFrame) -> None:
         # Always re-write roi_* and split_* columns (may have changed or been fixed)
         new_cols = [c for c in cells_df.columns
                     if c not in existing_cols or c.startswith("roi_")
-                    or c.startswith("split_umap_") or c == "cluster_split_10"]
+                    or c.startswith("split_umap_") or c == "cluster_split_10"
+                    or c == "cell_area"]
         if not new_cols:
             return
         # Read the existing index to align values correctly
@@ -1587,6 +1593,57 @@ def _load_cached_proseg(out_dir: str) -> None:
                     _update_reseg_zarr_obs(zarr_path_fast, cells_df)
                     print(f"  Proseg: recomputed SPLIT UMAP ({cells_df['split_umap_1'].notna().sum()} "
                           f"non-NaN values)", flush=True)
+                # One-time migration: read cell_area from cell-metadata.csv.gz if missing from zarr
+                _need_cell_area = (
+                    "cell_area" not in cells_df.columns
+                    or not cells_df["cell_area"].notna().any()
+                )
+                if _need_cell_area:
+                    try:
+                        _STRIDE = 10_000_000
+                        _patch_dirs = sorted([
+                            _pd for _pd in os.listdir(out_dir)
+                            if os.path.isdir(os.path.join(out_dir, _pd)) and _pd.startswith("patch_")
+                            and os.path.exists(os.path.join(out_dir, _pd, "cell-metadata.csv.gz"))
+                        ])
+                        if _patch_dirs:
+                            # Patch-based: read volumes, remap IDs, build lookup dict
+                            _area_map = {}
+                            for _pi, _pd in enumerate(_patch_dirs):
+                                _cm = pd.read_csv(os.path.join(out_dir, _pd, "cell-metadata.csv.gz"),
+                                                  usecols=["cell", "volume"])
+                                for _lid, _vol in zip(_cm["cell"].values, _cm["volume"].values):
+                                    _gid = str(int(_lid) + 1 + _pi * _STRIDE)
+                                    _area_map[_gid] = _vol
+                            cells_df["cell_area"] = cells_df.index.map(
+                                lambda x: _area_map.get(str(x), np.nan)
+                            )
+                        else:
+                            # Single-run: look for cell-metadata.csv.gz directly
+                            _cm_path = None
+                            for _root, _, _fnames in os.walk(out_dir):
+                                if "cell-metadata.csv.gz" in _fnames:
+                                    _cm_path = os.path.join(_root, "cell-metadata.csv.gz")
+                                    break
+                            if _cm_path:
+                                _cm = pd.read_csv(_cm_path)
+                                _cm = _cm.rename(columns={"cell": "cell_id", "volume": "cell_area"})
+                                if "cell_id" in _cm.columns and "cell_area" in _cm.columns:
+                                    _cm["cell_id"] = _cm["cell_id"].astype(str)
+                                    _cm = _cm.set_index("cell_id")
+                                    cells_df["cell_area"] = _cm["cell_area"].reindex(cells_df.index)
+                        _matched = cells_df["cell_area"].notna().sum()
+                        if _matched > 0:
+                            _update_reseg_zarr_obs(zarr_path_fast, cells_df)
+                            print(f"  Proseg: migrated cell_area ({_matched:,}/{len(cells_df):,} cells)", flush=True)
+                        else:
+                            print(f"  Proseg: cell_area migration found 0 matches "
+                                  f"(index sample: {list(cells_df.index[:3])})", flush=True)
+                    except Exception as _ce:
+                        import traceback
+                        traceback.print_exc()
+                        print(f"  Proseg: could not migrate cell_area: {_ce}", flush=True)
+
                 # Patch runs build the zarr without cell_boundaries shapes — load from polygon files
                 if not cell_bounds:
                     _fp_patch_names = sorted([
@@ -1731,6 +1788,9 @@ def _load_cached_proseg(out_dir: str) -> None:
                 _set("running", f"Computing UMAP and clusters for {n_cells:,} cells (one-time migration)…")
                 _compute_reseg_clusters_umap(cells_df, expr_mat,
                                              progress_fn=lambda msg: _set("running", msg))
+                _update_reseg_zarr_obs(zarr_path, cells_df)
+            elif "cell_area" in cells_df.columns and os.path.isdir(zarr_path):
+                # cell_area present in CSV but may be missing from old zarr — write back
                 _update_reseg_zarr_obs(zarr_path, cells_df)
 
             # Load expr (if missing), corrected expr + cell boundaries from zarr
@@ -1968,6 +2028,7 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
             "use_prior": use_prior, "prior_conf": prior_conf,
             "x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max,
             "n_cells": n_cells, "param_tag": _param_tag,
+            "dataset_hash": hashlib.md5(DATA["data_dir"].encode()).hexdigest()[:8],
         }
         with open(os.path.join(out_dir, "params.json"), "w") as _f:
             _json.dump(_params_out, _f)
@@ -2175,6 +2236,7 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
             "tool": "proseg", "voxel_size": voxel_size, "n_threads": n_threads,
             "x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max,
             "n_cells": n_cells, "param_tag": _param_tag,
+            "dataset_hash": hashlib.md5(DATA["data_dir"].encode()).hexdigest()[:8],
         }
         with open(os.path.join(out_dir, "params.json"), "w") as _f:
             _json.dump(_params_out, _f)
