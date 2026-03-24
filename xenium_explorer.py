@@ -116,6 +116,10 @@ _spage_repl_pending = False   # set by run_spage(); cleared once poll_spage_repl
 _spage_last_logged  = ""      # last message printed by poll_spage_repl (dedup)
 _active_counts_mode = "original"  # mirrors counts-mode-store; updated by sync_counts_mode
 
+# ─── CellNEST CCC state ───────────────────────────────────────────────────────
+_cellnest_state: dict = {"status": "idle", "message": "", "data": None}
+_cellnest_lock  = threading.Lock()
+
 # ─── Reseg UMAP state ─────────────────────────────────────────────────────────
 _umap_reseg_state: dict = {"status": "idle", "message": "", "result": None}
 _umap_reseg_lock  = threading.Lock()
@@ -1596,42 +1600,36 @@ def _load_cached_proseg(out_dir: str) -> None:
                 # One-time migration: read cell_area from cell-metadata.csv.gz if missing from zarr
                 _need_cell_area = (
                     "cell_area" not in cells_df.columns
-                    or not cells_df["cell_area"].notna().any()
+                    or cells_df["cell_area"].notna().sum() < len(cells_df) * 0.9
                 )
                 if _need_cell_area:
                     try:
                         _STRIDE = 10_000_000
-                        _patch_dirs = sorted([
-                            _pd for _pd in os.listdir(out_dir)
-                            if os.path.isdir(os.path.join(out_dir, _pd)) and _pd.startswith("patch_")
-                            and os.path.exists(os.path.join(out_dir, _pd, "cell-metadata.csv.gz"))
-                        ])
-                        if _patch_dirs:
-                            # Patch-based: read volumes, remap IDs, build lookup dict
-                            _area_map = {}
-                            for _pi, _pd in enumerate(_patch_dirs):
-                                _cm = pd.read_csv(os.path.join(out_dir, _pd, "cell-metadata.csv.gz"),
-                                                  usecols=["cell", "volume"])
-                                for _lid, _vol in zip(_cm["cell"].values, _cm["volume"].values):
-                                    _gid = str(int(_lid) + 1 + _pi * _STRIDE)
-                                    _area_map[_gid] = _vol
-                            cells_df["cell_area"] = cells_df.index.map(
-                                lambda x: _area_map.get(str(x), np.nan)
-                            )
+                        # Prefer top-level cell-metadata.csv.gz (single-run or combined output)
+                        _top_cm_path = os.path.join(out_dir, "cell-metadata.csv.gz")
+                        if os.path.exists(_top_cm_path):
+                            _cm = pd.read_csv(_top_cm_path, usecols=["cell", "volume"])
+                            _cm["cell"] = _cm["cell"].astype(str)
+                            _cm = _cm.rename(columns={"volume": "cell_area"}).set_index("cell")
+                            cells_df["cell_area"] = _cm["cell_area"].reindex(cells_df.index)
                         else:
-                            # Single-run: look for cell-metadata.csv.gz directly
-                            _cm_path = None
-                            for _root, _, _fnames in os.walk(out_dir):
-                                if "cell-metadata.csv.gz" in _fnames:
-                                    _cm_path = os.path.join(_root, "cell-metadata.csv.gz")
-                                    break
-                            if _cm_path:
-                                _cm = pd.read_csv(_cm_path)
-                                _cm = _cm.rename(columns={"cell": "cell_id", "volume": "cell_area"})
-                                if "cell_id" in _cm.columns and "cell_area" in _cm.columns:
-                                    _cm["cell_id"] = _cm["cell_id"].astype(str)
-                                    _cm = _cm.set_index("cell_id")
-                                    cells_df["cell_area"] = _cm["cell_area"].reindex(cells_df.index)
+                            # Patch-based: read volumes from each patch, remap IDs
+                            _patch_dirs = sorted([
+                                _pd for _pd in os.listdir(out_dir)
+                                if os.path.isdir(os.path.join(out_dir, _pd)) and _pd.startswith("patch_")
+                                and os.path.exists(os.path.join(out_dir, _pd, "cell-metadata.csv.gz"))
+                            ])
+                            if _patch_dirs:
+                                _area_map = {}
+                                for _pi, _pd in enumerate(_patch_dirs):
+                                    _cm = pd.read_csv(os.path.join(out_dir, _pd, "cell-metadata.csv.gz"),
+                                                      usecols=["cell", "volume"])
+                                    for _lid, _vol in zip(_cm["cell"].values, _cm["volume"].values):
+                                        _gid = str(int(_lid) + 1 + _pi * _STRIDE)
+                                        _area_map[_gid] = _vol
+                                cells_df["cell_area"] = cells_df.index.map(
+                                    lambda x: _area_map.get(str(x), np.nan)
+                                )
                         _matched = cells_df["cell_area"].notna().sum()
                         if _matched > 0:
                             _update_reseg_zarr_obs(zarr_path_fast, cells_df)
@@ -6608,6 +6606,76 @@ def make_niche_umap_fig(width=None, height=None):
     return fig
 
 
+def make_roi_area_fig(width=None, height=None):
+    """Bar chart of ROI polygon areas in µm²."""
+    with _roi_lock:
+        rois = list(_roi_state.get("rois", []))
+    if not rois:
+        return _make_placeholder_fig("No ROIs defined. Use lasso selection to draw ROIs.")
+
+    from shapely.geometry import Polygon as _Polygon
+
+    names, areas, colors, classes = [], [], [], []
+    for roi in rois:
+        pts = roi.get("polygon_xy", [])
+        if len(pts) < 3:
+            continue
+        try:
+            area = _Polygon(pts).area  # µm²
+        except Exception:
+            area = 0.0
+        names.append(roi.get("name", "?"))
+        areas.append(area)
+        colors.append(roi.get("color", "#aaaaaa"))
+        classes.append(roi.get("cls", ""))
+
+    if not names:
+        return _make_placeholder_fig("ROI polygons have insufficient points.")
+
+    # Sort by class then name
+    order = sorted(range(len(names)), key=lambda i: (classes[i], names[i]))
+    names  = [names[i]   for i in order]
+    areas  = [areas[i]   for i in order]
+    colors = [colors[i]  for i in order]
+    classes = [classes[i] for i in order]
+
+    # Build bar chart grouped by class
+    fig = go.Figure()
+    seen_cls = []
+    for cls in classes:
+        if cls not in seen_cls:
+            seen_cls.append(cls)
+
+    for cls in seen_cls:
+        idx = [i for i, c in enumerate(classes) if c == cls]
+        fig.add_trace(go.Bar(
+            x=[names[i] for i in idx],
+            y=[areas[i] for i in idx],
+            name=cls or "ROI",
+            marker_color=[colors[i] for i in idx],
+            text=[f"{areas[i]:,.0f} µm²" for i in idx],
+            textposition="outside",
+            hovertemplate="%{x}<br>%{y:,.0f} µm²<extra>" + (cls or "ROI") + "</extra>",
+        ))
+
+    fig.update_layout(
+        paper_bgcolor=CARD_BG, plot_bgcolor=PLOT_BG,
+        font=dict(color=TEXT),
+        margin=dict(l=60, r=20, t=40, b=80),
+        xaxis=dict(title="ROI", gridcolor=BORDER, linecolor=BORDER, color=TEXT,
+                   tickangle=-30),
+        yaxis=dict(title="Area (µm²)", gridcolor=BORDER, linecolor=BORDER, color=TEXT),
+        legend=dict(bgcolor=CARD_BG, bordercolor=BORDER, font=dict(color=TEXT, size=10)),
+        title=dict(text="ROI Areas", font=dict(color=TEXT, size=12), x=0.5),
+        barmode="group",
+    )
+    if width:
+        fig.update_layout(width=width)
+    if height:
+        fig.update_layout(height=height)
+    return fig
+
+
 def make_umap_fig(color_by, method, gene, size, opacity,
                   baysor_active=False, proseg_active=False,
                   use_corrected: bool = False, cbar_range=None):
@@ -6933,6 +7001,689 @@ def _plot_range_and_dim_controls(prefix: str):
                   debounce=True, style=_PLOT_CTRL_INPUT),
     ], style={"display": "flex", "alignItems": "center", "gap": "4px",
               "padding": "4px 6px", "flexShrink": "0", "borderTop": f"1px solid {BORDER}"})
+
+
+# ─── CellNEST helper functions ────────────────────────────────────────────────
+
+def _load_cellnest_data(folder: str, dataset_name: str, strip_suffix: str = ""):
+    """Load CellNEST output files in a background thread and store in _cellnest_state."""
+    import os, traceback
+    try:
+        with _cellnest_lock:
+            _cellnest_state["status"] = "loading"
+            _cellnest_state["message"] = "Loading CellNEST data…"
+
+        ccc_path = os.path.join(folder, "output", dataset_name,
+                                f"CellNEST_{dataset_name}_top20percent.csv")
+        freq_path = os.path.join(folder, "output", dataset_name,
+                                 f"CellNEST_{dataset_name}_histogram_byFrequency_table_top1500.csv")
+        bc_path  = os.path.join(folder, "metadata", dataset_name,
+                                f"cell_barcode_{dataset_name}.csv")
+
+        ccc_df  = pd.read_csv(ccc_path)
+        lr_freq = pd.read_csv(freq_path)
+        barcodes = pd.read_csv(bc_path, header=None)[0].tolist()
+
+        # Load CellNEST's own coordinate file (one row per cell, no header)
+        coord_path = os.path.join(folder, "metadata", dataset_name,
+                                  f"coordinates_{dataset_name}.csv")
+        coords = pd.read_csv(coord_path, header=None, names=["x", "y"])
+        n_coords = len(coords)
+        print(f"[CellNEST] Loaded {n_coords} cell coordinates", flush=True)
+
+        # from_id/to_id are 0-based row indices into barcodes & coordinates
+        def _lookup(idx):
+            try:
+                idx = int(idx)
+                if 0 <= idx < n_coords:
+                    return float(coords.iat[idx, 0]), float(coords.iat[idx, 1])
+            except Exception:
+                pass
+            return None, None
+
+        from_xy = [_lookup(i) for i in ccc_df["from_id"]]
+        to_xy   = [_lookup(i) for i in ccc_df["to_id"]]
+        ccc_df["from_x"] = [v[0] for v in from_xy]
+        ccc_df["from_y"] = [v[1] for v in from_xy]
+        ccc_df["to_x"]   = [v[0] for v in to_xy]
+        ccc_df["to_y"]   = [v[1] for v in to_xy]
+
+        # Drop rows with missing coordinates
+        ccc_df = ccc_df.dropna(subset=["from_x", "from_y", "to_x", "to_y"])
+
+        # ── Map CellNEST barcodes → Proseg/app cell IDs ──────────────────────
+        # Barcode format: "{cell_id}_4" — strip suffix to get the app cell ID directly.
+        # Build barcode → app_cell_id map from the barcodes list.
+        def _strip(barcode_str):
+            s = str(barcode_str)
+            if strip_suffix and s.endswith(strip_suffix):
+                return s[:-len(strip_suffix)]
+            return s
+
+        # from_id/to_id index into the barcodes list
+        bc_arr = np.array(barcodes)
+        from_barcodes = bc_arr[ccc_df["from_id"].values.astype(int)]
+        to_barcodes   = bc_arr[ccc_df["to_id"].values.astype(int)]
+        ccc_df["from_app_id"] = [_strip(b) for b in from_barcodes]
+        ccc_df["to_app_id"]   = [_strip(b) for b in to_barcodes]
+
+        print(f"[CellNEST] Direct barcode→ID mapping; "
+              f"sample from_app_id={ccc_df['from_app_id'].head(3).tolist()}", flush=True)
+
+        # ── Join Proseg/app annotations onto ccc_df ───────────────────────────
+        annot_cols = []
+        with _proseg_lock:
+            _pr = _proseg_state.get("result")
+        with _baysor_lock:
+            _br = _baysor_state.get("result")
+        seg_df = None
+        if _pr is not None and "cells_df" in _pr:
+            seg_df = _pr["cells_df"]
+        elif _br is not None and "cells_df" in _br:
+            seg_df = _br["cells_df"]
+        else:
+            seg_df = DATA["df"]
+
+        if seg_df is not None:
+            cand_cols = [c for c in seg_df.columns
+                         if c.startswith("cluster") or c.startswith("cell_type")]
+            if cand_cols:
+                seg_sub = seg_df[cand_cols].copy()
+                seg_sub.index = seg_sub.index.astype(str)
+                for col in cand_cols:
+                    ccc_df[f"from_{col}"] = ccc_df["from_app_id"].map(seg_sub[col])
+                    ccc_df[f"to_{col}"]   = ccc_df["to_app_id"].map(seg_sub[col])
+                    annot_cols.append(col)
+                print(f"[CellNEST] Joined {len(annot_cols)} annotation columns: {annot_cols[:5]}", flush=True)
+            else:
+                print("[CellNEST] No cluster/cell_type columns found in seg df", flush=True)
+
+        # ── Also join annotation labels from _annot_state (Seurat/RCTD/CellTypist) ──
+        with _annot_lock:
+            annot_series = [(k, v.copy()) for k, v in _annot_state.items()
+                            if isinstance(v, pd.Series) and len(v) > 0]
+        for key, labels in annot_series:
+            # key like "labels_proseg", "labels_seurat_proseg:abc12345"
+            # Make a short human-readable column name
+            col_name = key.replace("labels_", "celltype_", 1)
+            labels.index = labels.index.astype(str)
+            ccc_df[f"from_{col_name}"] = ccc_df["from_app_id"].map(labels)
+            ccc_df[f"to_{col_name}"]   = ccc_df["to_app_id"].map(labels)
+            annot_cols.append(col_name)
+        if annot_series:
+            print(f"[CellNEST] Joined annotation-state labels: {[k for k,_ in annot_series]}", flush=True)
+
+        with _cellnest_lock:
+            _cellnest_state["data"] = {
+                "ccc_df": ccc_df,
+                "lr_freq": lr_freq,
+                "barcodes": barcodes,
+                "dataset_name": dataset_name,
+                "folder": folder,
+                "coords": coords,
+                "annot_cols": annot_cols,
+            }
+            _cellnest_state["status"] = "done"
+            _cellnest_state["message"] = f"Loaded {len(ccc_df):,} interactions"
+    except Exception as exc:
+        with _cellnest_lock:
+            _cellnest_state["status"] = "error"
+            _cellnest_state["message"] = f"Error: {exc}"
+        print(f"[CellNEST] load error: {traceback.format_exc()}", flush=True)
+
+
+def _apply_cellnest_filters(ccc_df, f_ligand=None, f_receptor=None,
+                             f_sender=None, f_receiver=None, annot_col=None):
+    """Apply ligand/receptor/sender/receiver filters to a CellNEST interactions DataFrame."""
+    sub = ccc_df
+    if f_ligand:
+        vals = f_ligand if isinstance(f_ligand, list) else [f_ligand]
+        sub = sub[sub["ligand"].isin(vals)]
+    if f_receptor:
+        vals = f_receptor if isinstance(f_receptor, list) else [f_receptor]
+        sub = sub[sub["receptor"].isin(vals)]
+    if annot_col and f_sender:
+        col = f"from_{annot_col}"
+        if col in sub.columns:
+            vals = f_sender if isinstance(f_sender, list) else [f_sender]
+            sub = sub[sub[col].isin(vals)]
+    if annot_col and f_receiver:
+        col = f"to_{annot_col}"
+        if col in sub.columns:
+            vals = f_receiver if isinstance(f_receiver, list) else [f_receiver]
+            sub = sub[sub[col].isin(vals)]
+    return sub
+
+
+def _cellnest_make_bar(f_ligand=None, f_receptor=None,
+                       f_sender=None, f_receiver=None, annot_col=None):
+    """Return a Plotly bar chart of LR pair counts, filtered to current selection."""
+    with _cellnest_lock:
+        data = _cellnest_state.get("data")
+    if data is None:
+        return go.Figure()
+    sub = _apply_cellnest_filters(data["ccc_df"], f_ligand, f_receptor,
+                                  f_sender, f_receiver, annot_col)
+    if sub.empty:
+        return go.Figure(layout=go.Layout(paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG))
+    freq = (sub.groupby(["ligand", "receptor"]).size()
+              .reset_index(name="count")
+              .assign(lr_pair=lambda d: d["ligand"] + "-" + d["receptor"])
+              .sort_values("count", ascending=False)
+              .head(30))
+    fig = go.Figure(go.Bar(
+        x=freq["count"].tolist(),
+        y=freq["lr_pair"].tolist(),
+        orientation="h",
+        marker_color="#0d9488",
+    ))
+    fig.update_layout(
+        paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG,
+        font={"color": TEXT, "size": 10},
+        margin={"l": 10, "r": 10, "t": 30, "b": 10},
+        title={"text": "LR Pair Count (filtered, top 30)", "font": {"size": 12}},
+        xaxis={"gridcolor": BORDER, "title": "Count"},
+        yaxis={"autorange": "reversed"},
+    )
+    return fig
+
+
+def _cellnest_make_spatial(lr_pair, top_n=100, color_by="_default",
+                           annot_col=None, f_ligand=None, f_receptor=None,
+                           f_sender=None, f_receiver=None,
+                           edge_weight=False, show_autocrine=False, node_degree=False,
+                           edge_width=1):
+    """Return a Plotly figure showing communicating cell pairs for an LR pair."""
+    with _cellnest_lock:
+        data = _cellnest_state.get("data")
+    if data is None:
+        return go.Figure()
+    ccc_df = data["ccc_df"]
+
+    # Background dots from CellNEST coordinates file
+    coord_path = os.path.join(data["folder"], "metadata", data["dataset_name"],
+                              f"coordinates_{data['dataset_name']}.csv")
+    try:
+        bg_coords = pd.read_csv(coord_path, header=None, names=["x", "y"])
+    except Exception:
+        bg_coords = DATA["df"][["x_centroid", "y_centroid"]].rename(
+            columns={"x_centroid": "x", "y_centroid": "y"})
+    # Normalise lr_pair to a list early so we can compute degree
+    lr_pairs = lr_pair if isinstance(lr_pair, list) else ([lr_pair] if lr_pair else [])
+
+    # Node-degree background coloring
+    if node_degree and lr_pairs:
+        all_sub = []
+        for pair in lr_pairs:
+            lig, rec = pair.split("-", 1)
+            all_sub.append(ccc_df[(ccc_df["ligand"] == lig) & (ccc_df["receptor"] == rec)])
+        combined = pd.concat(all_sub) if all_sub else pd.DataFrame()
+        if not combined.empty:
+            from_counts = combined.groupby("from_id").size()
+            to_counts   = combined.groupby("to_id").size()
+            degree = (from_counts.add(to_counts, fill_value=0)
+                      .reindex(range(len(bg_coords)), fill_value=0).values)
+            bg_marker = {"size": 3, "color": degree, "colorscale": "Viridis",
+                         "showscale": True, "colorbar": {"title": "Degree", "thickness": 10,
+                                                          "len": 0.4, "x": 1.02}}
+        else:
+            bg_marker = {"size": 2, "color": "rgba(150,150,150,0.3)"}
+    else:
+        bg_marker = {"size": 2, "color": "rgba(150,150,150,0.3)"}
+
+    fig = go.Figure([go.Scattergl(
+        x=bg_coords["x"].tolist(), y=(-bg_coords["y"]).tolist(),
+        mode="markers", marker=bg_marker,
+        name="cells", hoverinfo="skip",
+    )])
+    pair_palette = qualitative.Plotly
+    # Pre-compute color maps for non-lr_pair edge coloring
+    if color_by == "ligand":
+        _lig_cmap = {l: pair_palette[i % len(pair_palette)]
+                     for i, l in enumerate(sorted(ccc_df["ligand"].unique()))}
+    elif color_by == "receptor":
+        _rec_cmap = {r: pair_palette[i % len(pair_palette)]
+                     for i, r in enumerate(sorted(ccc_df["receptor"].unique()))}
+
+    for pi, pair in enumerate(lr_pairs):
+        ligand, receptor = pair.split("-", 1)
+        sub = ccc_df[(ccc_df["ligand"] == ligand) & (ccc_df["receptor"] == receptor)]
+        sub = _apply_cellnest_filters(sub, f_ligand, f_receptor, f_sender, f_receiver, annot_col)
+        sub = sub.nlargest(int(top_n or 100), "attention_score")
+        if sub.empty:
+            continue
+
+        # Determine edge color for this pair
+        if color_by == "lr_pair":
+            edge_color_hex = pair_palette[pi % len(pair_palette)]
+        elif color_by == "ligand":
+            edge_color_hex = _lig_cmap.get(ligand, "#888888")
+        elif color_by == "receptor":
+            edge_color_hex = _rec_cmap.get(receptor, "#888888")
+        else:
+            edge_color_hex = None  # attention: handled per-edge below
+
+        # ── Edge lines ──────────────────────────────────────────────────────
+        if color_by == "attention":
+            import plotly.colors as _pc
+            scores = sub["attention_score"].values
+            s_min, s_max = scores.min(), scores.max()
+            s_range = s_max - s_min if s_max > s_min else 1
+            viridis = _pc.sample_colorscale("Viridis", list(np.linspace(0, 1, 10)))
+            for _, row in sub.iterrows():
+                bin_idx = int(min(9, (row["attention_score"] - s_min) / s_range * 10))
+                w = (1 + 4 * (row["attention_score"] - s_min) / s_range) * edge_width
+                fig.add_trace(go.Scattergl(
+                    x=[row["from_x"], row["to_x"], None],
+                    y=[-row["from_y"], -row["to_y"], None],
+                    mode="lines", line={"color": viridis[bin_idx], "width": w},
+                    opacity=0.5, showlegend=False, legendgroup=pair, hoverinfo="skip",
+                ))
+        elif edge_weight:
+            scores = sub["attention_score"].values
+            w_min, w_max2 = scores.min(), scores.max()
+            w_range = w_max2 - w_min if w_max2 > w_min else 1
+            for _, row in sub.iterrows():
+                w = (1 + 4 * (row["attention_score"] - w_min) / w_range) * edge_width
+                fig.add_trace(go.Scattergl(
+                    x=[row["from_x"], row["to_x"], None],
+                    y=[-row["from_y"], -row["to_y"], None],
+                    mode="lines", line={"color": edge_color_hex, "width": w},
+                    opacity=0.5, showlegend=False, legendgroup=pair, hoverinfo="skip",
+                ))
+        else:
+            xs, ys = [], []
+            for _, row in sub.iterrows():
+                xs += [row["from_x"], row["to_x"], None]
+                ys += [-row["from_y"], -row["to_y"], None]
+            fig.add_trace(go.Scattergl(
+                x=xs, y=ys, mode="lines",
+                line={"color": edge_color_hex, "width": edge_width},
+                opacity=0.4,
+                name=f"edges:{pair}", legendgroup=pair, showlegend=False,
+                hoverinfo="skip",
+            ))
+
+        # ── Autocrine / self-loop highlight ─────────────────────────────────
+        if show_autocrine:
+            auto = sub[sub["from_id"] == sub["to_id"]]
+            if not auto.empty:
+                fig.add_trace(go.Scattergl(
+                    x=auto["from_x"].tolist(), y=(-auto["from_y"]).tolist(),
+                    mode="markers",
+                    marker={"size": 14, "color": "rgba(0,0,0,0)", "symbol": "circle",
+                            "line": {"color": pair_color_hex, "width": 2}},
+                    name=f"autocrine:{pair}", legendgroup=pair,
+                    hovertemplate=f"Autocrine {pair}<extra></extra>",
+                ))
+
+        # ── Arrowheads at receiver (to) end ─────────────────────────────────
+        dx = (sub["to_x"] - sub["from_x"]).values
+        dy = (sub["from_y"] - sub["to_y"]).values   # note: plot y = -real_y
+        angles = np.degrees(np.arctan2(dx, dy))     # clockwise from north
+        fig.add_trace(go.Scatter(
+            x=sub["to_x"].tolist(), y=(-sub["to_y"]).tolist(),
+            mode="markers",
+            marker={"symbol": "arrow", "size": 8, "color": pair_color_hex,
+                    "angle": angles.tolist(), "line": {"width": 0}},
+            name=f"arrows:{pair}", legendgroup=pair, showlegend=False,
+            hoverinfo="skip",
+        ))
+
+        # ── Sender / receiver dots ───────────────────────────────────────────
+        from_col = f"from_{color_by}" if color_by != "_default" else None
+        to_col   = f"to_{color_by}"   if color_by != "_default" else None
+
+        if from_col and from_col in sub.columns:
+            _cats = pd.concat([sub[from_col], sub[to_col]]).dropna().unique()
+            _palette2 = qualitative.Plotly
+            _cmap = {c: _palette2[i % len(_palette2)] for i, c in enumerate(sorted(_cats, key=str))}
+            for cat in sorted(_cats, key=str):
+                s_mask = sub[from_col] == cat
+                r_mask = sub[to_col]   == cat
+                col_hex = _cmap[cat]
+                if s_mask.any():
+                    fig.add_trace(go.Scattergl(
+                        x=sub.loc[s_mask, "from_x"].tolist(),
+                        y=(-sub.loc[s_mask, "from_y"]).tolist(),
+                        mode="markers", marker={"size": 5, "color": col_hex},
+                        name=f"{pair} sender:{cat}", legendgroup=pair,
+                        hovertemplate=f"Sender [{cat}] {pair}<extra></extra>",
+                    ))
+                if r_mask.any():
+                    fig.add_trace(go.Scattergl(
+                        x=sub.loc[r_mask, "to_x"].tolist(),
+                        y=(-sub.loc[r_mask, "to_y"]).tolist(),
+                        mode="markers", marker={"size": 5, "color": col_hex,
+                                                "symbol": "diamond"},
+                        name=f"{pair} receiver:{cat}", legendgroup=pair,
+                        hovertemplate=f"Receiver [{cat}] {pair}<extra></extra>",
+                    ))
+        else:
+            fig.add_trace(go.Scattergl(
+                x=sub["from_x"].tolist(), y=(-sub["from_y"]).tolist(),
+                mode="markers", marker={"size": 5, "color": pair_color_hex},
+                name=f"{pair} senders", legendgroup=pair,
+                hovertemplate=f"Sender {pair}<extra></extra>",
+            ))
+            fig.add_trace(go.Scattergl(
+                x=sub["to_x"].tolist(), y=(-sub["to_y"]).tolist(),
+                mode="markers", marker={"size": 5, "color": pair_color_hex,
+                                        "symbol": "diamond"},
+                name=f"{pair} receivers", legendgroup=pair,
+                hovertemplate=f"Receiver {pair}<extra></extra>",
+            ))
+
+    fig.update_layout(
+        paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG,
+        font={"color": TEXT, "size": 10},
+        margin={"l": 10, "r": 10, "t": 30, "b": 10},
+        title={"text": f"CCC Spatial: {lr_pair or 'no pair selected'}", "font": {"size": 12}},
+        xaxis={"gridcolor": BORDER, "showticklabels": False},
+        yaxis={"gridcolor": BORDER, "showticklabels": False, "scaleanchor": "x"},
+        showlegend=color_by != "_default",
+        legend={"font": {"size": 9}, "itemsizing": "constant"},
+    )
+    return fig
+
+
+def _cellnest_make_circos(lr_pairs, annot_col, top_n=500, color_by="lr_pair",
+                          f_ligand=None, f_receptor=None,
+                          f_sender=None, f_receiver=None):
+    """Build a chord/circos diagram of cell-type interactions for selected LR pairs."""
+    with _cellnest_lock:
+        data = _cellnest_state.get("data")
+    if data is None:
+        return go.Figure(layout=go.Layout(paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG))
+    pairs = lr_pairs if isinstance(lr_pairs, list) else ([lr_pairs] if lr_pairs else [])
+    if not pairs:
+        return go.Figure(layout=go.Layout(paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG))
+
+    ccc_df = data["ccc_df"]
+    from_col = f"from_{annot_col}" if annot_col else None
+    to_col   = f"to_{annot_col}"   if annot_col else None
+
+    _no_annot_fig = go.Figure(layout=go.Layout(
+        paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG,
+        annotations=[{"text": "Select an Annotation column<br>to show the circos plot",
+                      "xref": "paper", "yref": "paper", "x": 0.5, "y": 0.5,
+                      "showarrow": False, "font": {"color": MUTED, "size": 12}}]))
+
+    if not from_col or from_col not in ccc_df.columns:
+        return _no_annot_fig
+
+    # Aggregate interactions by cell-type pair across all selected LR pairs
+    palette = qualitative.Plotly
+    # Pre-compute color maps for chord coloring
+    if color_by == "ligand":
+        all_ligs = sorted(ccc_df["ligand"].unique())
+        _chord_cmap = {l: palette[i % len(palette)] for i, l in enumerate(all_ligs)}
+    elif color_by == "receptor":
+        all_recs = sorted(ccc_df["receptor"].unique())
+        _chord_cmap = {r: palette[i % len(palette)] for i, r in enumerate(all_recs)}
+    else:
+        _chord_cmap = {p: palette[i % len(palette)] for i, p in enumerate(pairs)}
+
+    subs = []
+    for pair in pairs:
+        ligand, receptor = pair.split("-", 1)
+        sub = ccc_df[(ccc_df["ligand"] == ligand) & (ccc_df["receptor"] == receptor)]
+        sub = _apply_cellnest_filters(sub, f_ligand, f_receptor, f_sender, f_receiver, annot_col)
+        sub = sub.nlargest(int(top_n or 500), "attention_score")
+        if not sub.empty:
+            subs.append((pair, sub))
+
+    if not subs:
+        return _no_annot_fig
+
+    # Build per-pair aggregation: (pair, src_type, tgt_type) → sum weight
+    records = []
+    for pair, sub in subs:
+        ligand, receptor = pair.split("-", 1)
+        agg = (sub.groupby([from_col, to_col])["attention_score"]
+                  .sum().reset_index())
+        agg.columns = ["source", "target", "weight"]
+        agg["pair"] = pair
+        agg["ligand"] = ligand
+        agg["receptor"] = receptor
+        records.append(agg)
+    agg_df = pd.concat(records).dropna(subset=["source", "target"])
+
+    types = sorted(set(agg_df["source"]) | set(agg_df["target"]), key=str)
+    n = len(types)
+    if n == 0:
+        return _no_annot_fig
+
+    type_palette = qualitative.Plotly
+    type_color = {t: type_palette[i % len(type_palette)] for i, t in enumerate(types)}
+    # Node positions: evenly spaced on unit circle; gap between first and last
+    gap = 0.05
+    arc_span = (2 * np.pi - gap * n) / n
+    angles = {}   # centre angle per type
+    arc_start = {}
+    arc_end   = {}
+    theta = gap / 2
+    for t in types:
+        arc_start[t] = theta
+        angles[t]    = theta + arc_span / 2
+        arc_end[t]   = theta + arc_span
+        theta += arc_span + gap
+
+    fig = go.Figure()
+
+    # Draw arc segments for each cell type
+    for t in types:
+        th = np.linspace(arc_start[t], arc_end[t], 40)
+        r_outer, r_inner = 1.0, 0.85
+        x_arc = (np.cos(th) * r_outer).tolist() + (np.cos(th[::-1]) * r_inner).tolist()
+        y_arc = (np.sin(th) * r_outer).tolist() + (np.sin(th[::-1]) * r_inner).tolist()
+        fig.add_trace(go.Scatter(
+            x=x_arc + [x_arc[0]], y=y_arc + [y_arc[0]],
+            mode="lines", fill="toself",
+            fillcolor=type_color[t], line={"width": 0},
+            name=t, hovertemplate=f"{t}<extra></extra>",
+        ))
+        # Label
+        lx = np.cos(angles[t]) * 1.12
+        ly = np.sin(angles[t]) * 1.12
+        fig.add_annotation(x=lx, y=ly, text=t,
+                           font={"size": 8, "color": TEXT},
+                           showarrow=False, xanchor="center", yanchor="middle")
+
+    # Draw bezier chords
+    w_max = agg_df["weight"].max() or 1
+    if color_by == "attention":
+        import plotly.colors as _pc
+        _viridis = _pc.sample_colorscale("Viridis", list(np.linspace(0, 1, 10)))
+    for _, row in agg_df.iterrows():
+        src, tgt, w = row["source"], row["target"], row["weight"]
+        pair, ligand, receptor = row["pair"], row["ligand"], row["receptor"]
+        if src not in angles or tgt not in angles:
+            continue
+        # Chord color based on color_by
+        if color_by == "attention":
+            bin_idx = int(min(9, w / w_max * 10))
+            chord_col = _viridis[bin_idx]
+        elif color_by == "ligand":
+            chord_col = _chord_cmap.get(ligand, "#888888")
+        elif color_by == "receptor":
+            chord_col = _chord_cmap.get(receptor, "#888888")
+        else:  # lr_pair
+            chord_col = _chord_cmap.get(pair, "#888888")
+        a1, a2 = angles[src], angles[tgt]
+        x0, y0 = np.cos(a1) * 0.85, np.sin(a1) * 0.85
+        x1, y1 = np.cos(a2) * 0.85, np.sin(a2) * 0.85
+        t_vals = np.linspace(0, 1, 50)
+        bx = (1 - t_vals)**2 * x0 + 2*(1-t_vals)*t_vals*0.0 + t_vals**2 * x1
+        by = (1 - t_vals)**2 * y0 + 2*(1-t_vals)*t_vals*0.0 + t_vals**2 * y1
+        lw = max(0.5, 5 * w / w_max)
+        fig.add_trace(go.Scatter(
+            x=bx.tolist(), y=by.tolist(), mode="lines",
+            line={"color": chord_col, "width": lw},
+            opacity=0.55, showlegend=False,
+            hovertemplate=f"{pair}: {src} → {tgt} ({w:.0f})<extra></extra>",
+        ))
+
+    fig.update_layout(
+        paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG,
+        font={"color": TEXT, "size": 9},
+        margin={"l": 10, "r": 10, "t": 30, "b": 10},
+        title={"text": "Cell-Cell Communication (Circos)", "font": {"size": 11}},
+        xaxis={"showticklabels": False, "showgrid": False, "zeroline": False,
+               "range": [-1.35, 1.35]},
+        yaxis={"showticklabels": False, "showgrid": False, "zeroline": False,
+               "range": [-1.35, 1.35], "scaleanchor": "x"},
+        showlegend=False,
+    )
+    return fig
+
+
+def _cellnest_overlay_traces(lr_pair, top_n=100, edge_width=1, color_by="lr_pair"):
+    """Return list of Plotly trace dicts to overlay on the main spatial plot."""
+    with _cellnest_lock:
+        data = _cellnest_state.get("data")
+    if data is None or not lr_pair:
+        return []
+    ccc_df = data["ccc_df"]
+    pairs = lr_pair if isinstance(lr_pair, list) else [lr_pair]
+    palette = qualitative.Plotly
+    # Pre-compute color maps
+    if color_by == "ligand":
+        _lig_cmap = {l: palette[i % len(palette)]
+                     for i, l in enumerate(sorted(ccc_df["ligand"].unique()))}
+    elif color_by == "receptor":
+        _rec_cmap = {r: palette[i % len(palette)]
+                     for i, r in enumerate(sorted(ccc_df["receptor"].unique()))}
+    if color_by == "attention":
+        import plotly.colors as _pc
+        _viridis = _pc.sample_colorscale("Viridis", list(np.linspace(0, 1, 10)))
+
+    traces = []
+    for pi, pair in enumerate(pairs):
+        ligand, receptor = pair.split("-", 1)
+        sub = ccc_df[(ccc_df["ligand"] == ligand) & (ccc_df["receptor"] == receptor)]
+        sub = sub.nlargest(int(top_n or 100), "attention_score")
+        if sub.empty:
+            continue
+
+        # Node color always per-pair
+        node_col = palette[pi % len(palette)]
+        dx = (sub["to_x"] - sub["from_x"]).values
+        dy = (sub["from_y"] - sub["to_y"]).values
+        arrow_angles = np.degrees(np.arctan2(dx, dy))
+
+        # Edge coloring
+        if color_by == "attention":
+            scores = sub["attention_score"].values
+            s_min, s_max = scores.min(), scores.max()
+            s_range = s_max - s_min if s_max > s_min else 1
+            for _, row in sub.iterrows():
+                bin_idx = int(min(9, (row["attention_score"] - s_min) / s_range * 10))
+                traces.append(go.Scattergl(
+                    x=[row["from_x"], row["to_x"], None],
+                    y=[-row["from_y"], -row["to_y"], None],
+                    mode="lines",
+                    line={"color": _viridis[bin_idx], "width": edge_width},
+                    opacity=0.4, name=f"cellnest_lines_{pair}",
+                    hovertemplate=f"{pair}<extra></extra>"))
+        else:
+            if color_by == "ligand":
+                edge_col = _lig_cmap.get(ligand, node_col)
+            elif color_by == "receptor":
+                edge_col = _rec_cmap.get(receptor, node_col)
+            else:
+                edge_col = node_col  # lr_pair
+            xs, ys = [], []
+            for _, row in sub.iterrows():
+                xs += [row["from_x"], row["to_x"], None]
+                ys += [-row["from_y"], -row["to_y"], None]
+            traces.append(go.Scattergl(
+                x=xs, y=ys, mode="lines",
+                line={"color": edge_col, "width": edge_width}, opacity=0.4,
+                name=f"cellnest_lines_{pair}",
+                hovertemplate=f"{pair}<extra></extra>"))
+
+        traces += [
+            go.Scatter(x=sub["to_x"].tolist(), y=(-sub["to_y"]).tolist(),
+                       mode="markers",
+                       marker={"symbol": "arrow", "size": 8, "color": node_col,
+                               "angle": arrow_angles.tolist(), "line": {"width": 0}},
+                       name=f"cellnest_arrows_{pair}", hoverinfo="skip"),
+            go.Scattergl(x=sub["from_x"].tolist(), y=(-sub["from_y"]).tolist(),
+                         mode="markers", marker={"size": 5, "color": node_col},
+                         name=f"cellnest_senders_{pair}",
+                         hovertemplate=f"Sender {pair}<extra></extra>"),
+            go.Scattergl(x=sub["to_x"].tolist(), y=(-sub["to_y"]).tolist(),
+                         mode="markers", marker={"size": 5, "color": node_col, "symbol": "diamond"},
+                         name=f"cellnest_receivers_{pair}",
+                         hovertemplate=f"Receiver {pair}<extra></extra>"),
+        ]
+    return traces
+
+
+# ─── CellNEST downstream TF helpers ──────────────────────────────────────────
+
+_CELLNEST_DB_CACHE = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache", "cellnest_db")
+_CELLNEST_DB_URLS = {
+    "ppi":    "https://raw.githubusercontent.com/schwartzlab-methods/CellNEST/main/database/human_signaling_ppi.csv",
+    "tf":     "https://raw.githubusercontent.com/schwartzlab-methods/CellNEST/main/database/human_tf_target.csv",
+}
+_cellnest_db: dict = {}   # loaded lazily: {"ppi": df, "tf": df}
+_cellnest_db_lock = threading.Lock()
+
+
+def _ensure_cellnest_db():
+    """Download and cache PPI + TF databases if not already loaded. Returns (ppi_df, tf_df)."""
+    import urllib.request
+    with _cellnest_db_lock:
+        if "ppi" in _cellnest_db and "tf" in _cellnest_db:
+            return _cellnest_db["ppi"], _cellnest_db["tf"]
+    os.makedirs(_CELLNEST_DB_CACHE, exist_ok=True)
+    result = {}
+    for key, url in _CELLNEST_DB_URLS.items():
+        local = os.path.join(_CELLNEST_DB_CACHE, os.path.basename(url))
+        if not os.path.isfile(local):
+            print(f"[CellNEST-DB] Downloading {url} …", flush=True)
+            urllib.request.urlretrieve(url, local)
+            print(f"[CellNEST-DB] Saved to {local}", flush=True)
+        result[key] = pd.read_csv(local)
+    with _cellnest_db_lock:
+        _cellnest_db.update(result)
+    return result["ppi"], result["tf"]
+
+
+def _downstream_tfs(receptor_gene: str, n_hops: int = 2) -> list[str]:
+    """Return TF genes downstream of receptor_gene via PPI→TF network."""
+    ppi_df, tf_df = _ensure_cellnest_db()
+    # Build adjacency: source → set of targets
+    ppi_fwd = ppi_df.groupby(ppi_df.columns[0])[ppi_df.columns[1]].apply(set).to_dict()
+    # BFS from receptor up to n_hops
+    visited = {receptor_gene}
+    frontier = {receptor_gene}
+    for _ in range(n_hops):
+        next_frontier = set()
+        for node in frontier:
+            next_frontier |= ppi_fwd.get(node, set())
+        next_frontier -= visited
+        visited |= next_frontier
+        frontier = next_frontier
+    # TFs = proteins in visited that appear as source in tf_df
+    tf_genes = set(tf_df[tf_df.columns[0]].unique())
+    downstream = sorted(visited & tf_genes - {receptor_gene})
+    return downstream
+
+
+def _downstream_tf_targets(tf_genes: list[str], panel_genes: set) -> dict:
+    """Return {tf: [target_genes_in_panel]} for each TF in tf_genes."""
+    _, tf_df = _ensure_cellnest_db()
+    src_col = tf_df.columns[0]
+    tgt_col = tf_df.columns[1]
+    result = {}
+    for tf in tf_genes:
+        targets = set(tf_df.loc[tf_df[src_col] == tf, tgt_col].tolist()) & panel_genes
+        if targets:
+            result[tf] = sorted(targets)
+    return result
 
 
 # ─── App layout ───────────────────────────────────────────────────────────────
@@ -8202,6 +8953,33 @@ sidebar = html.Div([
              style={"fontSize":"0.75rem","marginTop":"4px","color":"#8b949e"}),
     dcc.Interval(id="split-poll", interval=3000, disabled=True),
     html.Hr(style={"borderColor": BORDER, "margin": "14px 0"}),
+    ctrl_label("CellNEST Cell-Cell Comm."),
+    html.Button(
+        "Load CellNEST Results",
+        id="cellnest-modal-open-btn",
+        n_clicks=0,
+        style={
+            "width": "100%", "padding": "7px 0",
+            "backgroundColor": "#0d9488", "color": "#fff",
+            "border": "none", "borderRadius": "5px",
+            "cursor": "pointer", "fontSize": "13px", "fontWeight": "600",
+            "marginBottom": "8px",
+        },
+    ),
+    html.Div(id="cellnest-sidebar-status",
+             style={"fontSize": "11px", "color": MUTED, "minHeight": "16px"}),
+    dcc.Checklist(
+        id="cellnest-overlay-enable",
+        options=[{"label": html.Span(" Show edges on map", style={"fontSize": "11px", "color": TEXT}),
+                  "value": "on"}],
+        value=[],
+        inputStyle={"marginRight": "4px"},
+        labelStyle={"display": "flex", "alignItems": "center", "cursor": "pointer"},
+        style={"marginTop": "4px"},
+    ),
+    dcc.Store(id="cellnest-version", data=0),
+    dcc.Interval(id="cellnest-poll", interval=1000, disabled=True),
+    html.Hr(style={"borderColor": BORDER, "margin": "14px 0"}),
     ctrl_label("Spatial Analysis"),
     html.Button("⬡ Spatial Analysis Tools", id="niche-modal-open-btn", n_clicks=0,
                 style={"width": "100%", "backgroundColor": "#0d6efd", "color": "white",
@@ -8935,6 +9713,49 @@ app.layout = html.Div([
        content_style={"backgroundColor": DARK_BG, "color": TEXT},
        backdrop=True),
 
+# ─── CellNEST modal ───────────────────────────────────────────────────────────
+dbc.Modal([
+    dbc.ModalHeader(dbc.ModalTitle("Load CellNEST Results"), close_button=True),
+    dbc.ModalBody([
+        html.Div("Point to a CellNEST output folder (the root containing output/, metadata/ subdirs).",
+                 style={"fontSize": "11px", "color": MUTED, "marginBottom": "14px", "lineHeight": "1.5"}),
+        ctrl_label("CellNEST Output Folder"),
+        dcc.Input(id="cellnest-folder-path", type="text", debounce=True,
+                  placeholder="/path/to/cellnest_output",
+                  style={"width": "100%", "backgroundColor": CARD_BG, "color": TEXT,
+                         "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                         "padding": "4px 8px", "fontSize": "11px", "marginBottom": "12px",
+                         "boxSizing": "border-box"}),
+        ctrl_label("Dataset Name"),
+        dcc.Dropdown(id="cellnest-dataset-dropdown", options=[], value=None,
+                     style={"fontSize": "11px", "marginBottom": "12px"}),
+        ctrl_label("Strip suffix from cell names"),
+        html.Div([
+            dcc.Input(id="cellnest-strip-suffix", type="text", debounce=True,
+                      placeholder="e.g. _4  (leave blank to use barcode as-is)",
+                      style={"flex": "1", "backgroundColor": CARD_BG, "color": TEXT,
+                             "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                             "padding": "4px 8px", "fontSize": "11px",
+                             "boxSizing": "border-box"}),
+        ], style={"display": "flex", "marginBottom": "12px"}),
+        html.Div(id="cellnest-modal-status",
+                 style={"fontSize": "11px", "color": MUTED, "minHeight": "16px"}),
+    ]),
+    dbc.ModalFooter([
+        html.Button("Detect Datasets", id="cellnest-detect-btn", n_clicks=0,
+                    style={"padding": "6px 14px", "backgroundColor": CARD_BG, "color": TEXT,
+                           "border": f"1px solid {BORDER}", "borderRadius": "5px",
+                           "cursor": "pointer", "fontSize": "12px", "marginRight": "auto"}),
+        html.Button("Load", id="cellnest-load-btn", n_clicks=0,
+                    style={"padding": "7px 20px", "backgroundColor": "#0d9488", "color": "#fff",
+                           "border": "none", "borderRadius": "5px",
+                           "cursor": "pointer", "fontSize": "13px", "fontWeight": "600"}),
+        dbc.Button("Close", id="cellnest-modal-close-btn", color="secondary", size="sm"),
+    ], style={"display": "flex", "alignItems": "center", "gap": "8px"}),
+], id="cellnest-modal", is_open=False, size="lg",
+   backdrop="static", style={"zIndex": 2000},
+   content_style={"backgroundColor": DARK_BG, "color": TEXT}),
+
 # ─── Spatial Niches modal ─────────────────────────────────────────────────────
 dbc.Modal([
     dbc.ModalHeader("Spatial Analysis Tools"),
@@ -9369,6 +10190,153 @@ dbc.Modal([
                                              style={"flex": "1", "minHeight": "0"}),
                                     _plot_dim_controls("niche-umap"),
                                 ], style={"display": "flex", "flexDirection": "column", "height": "calc(100% - 36px)"})]),
+                        dbc.Tab(label="CellNEST CCC", tab_id="tab-cellnest",
+                                label_style={"fontSize": "12px", "padding": "4px 12px"},
+                                children=[html.Div([
+                                    # Row 1: LR pair, top-n, color-by
+                                    html.Div([
+                                        html.Span("LR Pair:", style={"fontSize": "11px", "color": MUTED, "marginRight": "6px"}),
+                                        dcc.Dropdown(
+                                            id="cellnest-lr-pair",
+                                            options=[], value=None, clearable=True,
+                                            multi=True,
+                                            style={"flex": "1", "fontSize": "11px"},
+                                            placeholder="Select one or more LR pairs…",
+                                        ),
+                                        html.Span("Top N:", style={"fontSize": "11px", "color": MUTED, "margin": "0 6px"}),
+                                        dcc.Input(id="cellnest-top-n", type="number", value=100, min=1, max=5000,
+                                                  debounce=True,
+                                                  style={"width": "70px", "backgroundColor": CARD_BG, "color": TEXT,
+                                                         "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                                         "padding": "3px 6px", "fontSize": "11px"}),
+                                        html.Span("Edge W:", style={"fontSize": "11px", "color": MUTED, "margin": "0 6px"}),
+                                        dcc.Input(id="cellnest-edge-width", type="number", value=1, min=0.1, max=20,
+                                                  step=0.1, debounce=True,
+                                                  style={"width": "60px", "backgroundColor": CARD_BG, "color": TEXT,
+                                                         "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                                         "padding": "3px 6px", "fontSize": "11px"}),
+                                        html.Span("Color By:", style={"fontSize": "11px", "color": MUTED, "margin": "0 6px"}),
+                                        dcc.Dropdown(
+                                            id="cellnest-color-by",
+                                            options=[
+                                                {"label": "LR Pair",         "value": "lr_pair"},
+                                                {"label": "Ligand",          "value": "ligand"},
+                                                {"label": "Receptor",        "value": "receptor"},
+                                                {"label": "Attention Score", "value": "attention"},
+                                            ],
+                                            value="lr_pair", clearable=False,
+                                            style={"width": "160px", "fontSize": "11px"},
+                                        ),
+                                    ], style={"display": "flex", "alignItems": "center", "padding": "6px 8px",
+                                              "borderBottom": f"1px solid {BORDER}", "flexShrink": "0"}),
+                                    # Row 2: filters
+                                    html.Div([
+                                        html.Span("Annotation:", style={"fontSize": "11px", "color": MUTED, "marginRight": "4px"}),
+                                        dcc.Dropdown(id="cellnest-annot-col", options=[], value=None, clearable=True,
+                                                     placeholder="(none)",
+                                                     style={"width": "150px", "fontSize": "11px"}),
+                                        html.Span("Ligand:", style={"fontSize": "11px", "color": MUTED, "margin": "0 4px 0 10px"}),
+                                        dcc.Dropdown(id="cellnest-filter-ligand", options=[], value=None, clearable=True,
+                                                     multi=True, placeholder="All",
+                                                     style={"width": "130px", "fontSize": "11px"}),
+                                        html.Span("Receptor:", style={"fontSize": "11px", "color": MUTED, "margin": "0 4px 0 10px"}),
+                                        dcc.Dropdown(id="cellnest-filter-receptor", options=[], value=None, clearable=True,
+                                                     multi=True, placeholder="All",
+                                                     style={"width": "130px", "fontSize": "11px"}),
+                                        html.Span("Sender:", style={"fontSize": "11px", "color": MUTED, "margin": "0 4px 0 10px"}),
+                                        dcc.Dropdown(id="cellnest-filter-sender", options=[], value=None, clearable=True,
+                                                     multi=True, placeholder="All",
+                                                     style={"width": "130px", "fontSize": "11px"}),
+                                        html.Span("Receiver:", style={"fontSize": "11px", "color": MUTED, "margin": "0 4px 0 10px"}),
+                                        dcc.Dropdown(id="cellnest-filter-receiver", options=[], value=None, clearable=True,
+                                                     multi=True, placeholder="All",
+                                                     style={"width": "130px", "fontSize": "11px"}),
+                                    ], style={"display": "flex", "alignItems": "center", "flexWrap": "wrap",
+                                              "padding": "4px 8px", "borderBottom": f"1px solid {BORDER}",
+                                              "flexShrink": "0", "gap": "2px"}),
+                                    # Row 3: optional feature toggles
+                                    html.Div([
+                                        html.Span("Options:", style={"fontSize": "11px", "color": MUTED, "marginRight": "8px"}),
+                                        dcc.Checklist(
+                                            id="cellnest-options",
+                                            options=[
+                                                {"label": " Scale edge width by attention score", "value": "edge_weight"},
+                                                {"label": " Highlight autocrine (self-loops)",    "value": "autocrine"},
+                                                {"label": " Color background by interaction degree", "value": "node_degree"},
+                                                {"label": " Gray out non-participating cells on map", "value": "gray_bg"},
+                                            ],
+                                            value=[],
+                                            inline=True,
+                                            labelStyle={"fontSize": "11px", "color": TEXT, "marginRight": "14px",
+                                                        "cursor": "pointer"},
+                                            style={"display": "inline-flex", "flexWrap": "wrap"},
+                                        ),
+                                    ], style={"display": "flex", "alignItems": "center", "padding": "4px 8px",
+                                              "borderBottom": f"1px solid {BORDER}", "flexShrink": "0"}),
+                                    html.Div([
+                                        dcc.Graph(id="cellnest-bar-plot", responsive=True,
+                                                  config={"displayModeBar": False},
+                                                  style={"flex": "1", "minWidth": "200px"}),
+                                        dcc.Graph(id="cellnest-spatial-plot", responsive=True,
+                                                  config={"displayModeBar": False},
+                                                  style={"flex": "2", "minWidth": "200px"}),
+                                    ], id="cellnest-plots-container",
+                                       style={"display": "flex", "flex": "1", "minHeight": "0", "gap": "6px"}),
+                                    _plot_dim_controls("cellnest"),
+                                    # ── Downstream TF panel ─────────────────
+                                    html.Details([
+                                        html.Summary("▶ Downstream TF Analysis",
+                                                     style={"fontSize": "11px", "color": MUTED,
+                                                            "cursor": "pointer", "padding": "4px 8px",
+                                                            "borderTop": f"1px solid {BORDER}"}),
+                                        html.Div([
+                                            html.Div([
+                                                html.Span("Receptor:", style={"fontSize": "11px", "color": MUTED, "marginRight": "6px"}),
+                                                dcc.Input(id="cellnest-downstream-receptor", type="text", debounce=True,
+                                                          placeholder="e.g. CCR7",
+                                                          style={"width": "110px", "backgroundColor": CARD_BG, "color": TEXT,
+                                                                 "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                                                 "padding": "3px 6px", "fontSize": "11px"}),
+                                                html.Span("Hops:", style={"fontSize": "11px", "color": MUTED, "margin": "0 6px"}),
+                                                dcc.Input(id="cellnest-downstream-hops", type="number", value=2, min=1, max=4,
+                                                          style={"width": "50px", "backgroundColor": CARD_BG, "color": TEXT,
+                                                                 "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                                                 "padding": "3px 6px", "fontSize": "11px"}),
+                                                html.Button("Find TFs", id="cellnest-downstream-btn", n_clicks=0,
+                                                            style={"marginLeft": "8px", "padding": "4px 12px",
+                                                                   "backgroundColor": "#0d9488", "color": "#fff",
+                                                                   "border": "none", "borderRadius": "4px",
+                                                                   "cursor": "pointer", "fontSize": "11px"}),
+                                                html.Div(id="cellnest-downstream-status",
+                                                         style={"fontSize": "11px", "color": MUTED, "marginLeft": "10px"}),
+                                            ], style={"display": "flex", "alignItems": "center",
+                                                      "padding": "6px 8px", "flexWrap": "wrap", "gap": "4px"}),
+                                            html.Div([
+                                                html.Div([
+                                                    html.Span("TFs in panel:", style={"fontSize": "11px", "color": MUTED, "marginRight": "6px"}),
+                                                    dcc.Dropdown(id="cellnest-downstream-tf-select", options=[], value=None,
+                                                                 multi=True, placeholder="Select TF(s) to plot…",
+                                                                 style={"flex": "1", "fontSize": "11px"}),
+                                                ], style={"display": "flex", "alignItems": "center", "padding": "4px 8px"}),
+                                                dcc.Graph(id="cellnest-downstream-plot", responsive=True,
+                                                          config={"displayModeBar": False},
+                                                          style={"height": "220px"}),
+                                            ], id="cellnest-downstream-results",
+                                               style={"display": "none"}),
+                                        ], style={"backgroundColor": CARD_BG}),
+                                    ], style={"flexShrink": "0", "overflowY": "auto", "maxHeight": "260px"}),
+                                ], style={"display": "flex", "flexDirection": "column",
+                                          "height": "calc(100% - 36px)", "overflow": "hidden"})]),
+                        dbc.Tab(label="ROI Area", tab_id="tab-roi-area",
+                                label_style={"fontSize": "12px", "padding": "4px 12px"},
+                                children=[html.Div([
+                                    html.Div(dcc.Graph(id="roi-area-plot", responsive=True,
+                                              config={"displayModeBar": False},
+                                              style={"width": "100%", "height": "100%"}),
+                                             id="roi-area-plot-container",
+                                             style={"flex": "1", "minHeight": "0"}),
+                                    _plot_dim_controls("roi-area"),
+                                ], style={"display": "flex", "flexDirection": "column", "height": "calc(100% - 36px)"})]),
                     ]),
                 ], id="umap-panel", style={"display": "none"}),
             ], id="plots-row", style={"display": "flex", "flex": "1", "gap": "10px", "minHeight": "0"}),
@@ -9583,6 +10551,12 @@ def store_relayout(relayout_data, current):
     Input("niche-done",             "data"),
     Input("colorbar-min",           "value"),
     Input("colorbar-max",           "value"),
+    State("cellnest-lr-pair",        "value"),
+    State("cellnest-top-n",          "value"),
+    State("cellnest-edge-width",     "value"),
+    State("cellnest-overlay-enable", "value"),
+    State("cellnest-options",        "value"),
+    State("cellnest-color-by",       "value"),
 )
 def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
                  _annot_done, morph_enable, morph_zlevel, morph_channels,
@@ -9590,7 +10564,9 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
                  _baysor_done, _proseg_done, seg_source,
                  _spage_done, _subset_ver, _startup, _ds_version, _extra_ds_version,
                  _split_done, _roi_done, counts_mode, _niche_done,
-                 cbar_min, cbar_max):
+                 cbar_min, cbar_max,
+                 cn_lr_pair, cn_top_n, cn_edge_width, cn_overlay_enable, cn_options,
+                 cn_color_by):
     # If only the viewport changed, avoid full figure rebuild
     triggered = callback_context.triggered_id
     boundaries_active = bool(boundary_toggles)
@@ -9680,14 +10656,30 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
         _umap_fig_cache.clear()  # keep only latest entry
         _umap_fig_cache[_umap_key] = umap_fig
 
-    return (
-        make_spatial_fig(color_by, method, gene, size, opacity,
-                         boundary_toggles, relayout,
-                         morph_image=morph_image, extra_title=morph_title,
-                         baysor_active=baysor_on, proseg_active=proseg_on,
-                         use_corrected=use_corr, cbar_range=cbar_range),
-        umap_fig,
-    )
+    spatial_fig = make_spatial_fig(color_by, method, gene, size, opacity,
+                                   boundary_toggles, relayout,
+                                   morph_image=morph_image, extra_title=morph_title,
+                                   baysor_active=baysor_on, proseg_active=proseg_on,
+                                   use_corrected=use_corr, cbar_range=cbar_range)
+    # Re-add CellNEST overlay so it persists through pan/zoom rebuilds
+    with _cellnest_lock:
+        _cn_status = _cellnest_state.get("status")
+    if _cn_status == "done" and cn_lr_pair and "on" in (cn_overlay_enable or []):
+        _cn_opts = cn_options or []
+        if "gray_bg" in _cn_opts:
+            with _cellnest_lock:
+                _cn_coords = (_cellnest_state.get("data") or {}).get("coords")
+            if _cn_coords is not None:
+                spatial_fig.add_trace(go.Scattergl(
+                    x=_cn_coords["x"].tolist(), y=(-_cn_coords["y"]).tolist(),
+                    mode="markers", marker={"size": 3, "color": "rgba(30,30,40,0.82)"},
+                    name="cellnest_gray_bg", hoverinfo="skip",
+                ))
+        for _t in _cellnest_overlay_traces(cn_lr_pair, cn_top_n or 100,
+                                           edge_width=cn_edge_width or 1,
+                                           color_by=cn_color_by or "lr_pair"):
+            spatial_fig.add_trace(_t)
+    return spatial_fig, umap_fig
 
 
 @app.callback(
@@ -9853,6 +10845,280 @@ def toggle_spage_modal(open_clicks, close_clicks, is_open):
     if triggered == "spage-modal-close-btn":
         return False
     return is_open
+
+
+@app.callback(
+    Output("cellnest-modal", "is_open"),
+    Input("cellnest-modal-open-btn", "n_clicks"),
+    Input("cellnest-modal-close-btn", "n_clicks"),
+    State("cellnest-modal", "is_open"),
+    prevent_initial_call=True,
+)
+def toggle_cellnest_modal(open_clicks, close_clicks, is_open):
+    triggered = callback_context.triggered_id
+    if triggered == "cellnest-modal-open-btn" and open_clicks:
+        return True
+    if triggered == "cellnest-modal-close-btn":
+        return False
+    return is_open
+
+
+@app.callback(
+    Output("cellnest-dataset-dropdown", "options"),
+    Output("cellnest-modal-status", "children", allow_duplicate=True),
+    Input("cellnest-detect-btn", "n_clicks"),
+    State("cellnest-folder-path", "value"),
+    prevent_initial_call=True,
+)
+def detect_cellnest_datasets(n_clicks, folder_path):
+    import os
+    if not n_clicks or not folder_path:
+        return [], ""
+    out_dir = os.path.join(folder_path.strip(), "output")
+    if not os.path.isdir(out_dir):
+        return [], f"Not found: {out_dir}"
+    datasets = [d for d in os.listdir(out_dir) if os.path.isdir(os.path.join(out_dir, d))]
+    if not datasets:
+        return [], "No dataset subdirectories found in output/"
+    options = [{"label": d, "value": d} for d in sorted(datasets)]
+    return options, f"Found {len(datasets)} dataset(s)"
+
+
+@app.callback(
+    Output("cellnest-modal-status", "children", allow_duplicate=True),
+    Output("cellnest-poll", "disabled"),
+    Input("cellnest-load-btn", "n_clicks"),
+    State("cellnest-folder-path", "value"),
+    State("cellnest-dataset-dropdown", "value"),
+    State("cellnest-strip-suffix", "value"),
+    prevent_initial_call=True,
+)
+def load_cellnest(n_clicks, folder, dataset, strip_suffix):
+    import threading as _thr
+    if not n_clicks or not folder or not dataset:
+        raise dash.exceptions.PreventUpdate
+    with _cellnest_lock:
+        _cellnest_state["status"] = "loading"
+        _cellnest_state["message"] = "Loading…"
+        _cellnest_state["data"]   = None
+    t = _thr.Thread(target=_load_cellnest_data,
+                    args=(folder.strip(), dataset, strip_suffix or ""), daemon=True)
+    t.start()
+    return "Loading…", False   # enable poll interval
+
+
+@app.callback(
+    Output("cellnest-version", "data"),
+    Output("cellnest-sidebar-status", "children"),
+    Output("cellnest-modal-status", "children", allow_duplicate=True),
+    Output("cellnest-lr-pair", "options"),
+    Output("cellnest-lr-pair", "value"),
+    Output("cellnest-poll", "disabled", allow_duplicate=True),
+    Input("cellnest-poll", "n_intervals"),
+    State("cellnest-version", "data"),
+    prevent_initial_call=True,
+)
+def poll_cellnest(n_intervals, cur_version):
+    with _cellnest_lock:
+        status  = _cellnest_state.get("status", "idle")
+        message = _cellnest_state.get("message", "")
+        data    = _cellnest_state.get("data")
+
+    if status == "loading":
+        raise dash.exceptions.PreventUpdate
+
+    # done or error — disable poll and update UI
+    if status == "done" and data is not None:
+        lr_freq  = data["lr_freq"]
+        col_pair = lr_freq.columns[0]
+        col_cnt  = lr_freq.columns[1]
+        lr_sorted = lr_freq.sort_values(col_cnt, ascending=False)
+        lr_options = [{"label": p, "value": p} for p in lr_sorted[col_pair].tolist()]
+        first_val  = [lr_options[0]["value"]] if lr_options else []
+        return (cur_version or 0) + 1, message, message, lr_options, first_val, True
+    else:
+        return (cur_version or 0), message, message, [], None, True
+
+
+@app.callback(
+    Output("cellnest-filter-ligand",   "options"),
+    Output("cellnest-filter-receptor", "options"),
+    Output("cellnest-filter-sender",   "options"),
+    Output("cellnest-filter-receiver", "options"),
+    Output("cellnest-annot-col",       "options"),
+    Input("cellnest-version", "data"),
+    Input("cellnest-annot-col", "value"),
+    prevent_initial_call=True,
+)
+def populate_cellnest_filters(ccc_version, annot_col):
+    with _cellnest_lock:
+        data = _cellnest_state.get("data")
+    if data is None:
+        return [], [], [], [], []
+    ccc_df = data["ccc_df"]
+    ligands   = [{"label": v, "value": v} for v in sorted(ccc_df["ligand"].unique())]
+    receptors = [{"label": v, "value": v} for v in sorted(ccc_df["receptor"].unique())]
+    annot_opts = [{"label": c, "value": c} for c in data.get("annot_cols", [])]
+    sender_opts = receiver_opts = []
+    if annot_col:
+        from_col = f"from_{annot_col}"
+        to_col   = f"to_{annot_col}"
+        if from_col in ccc_df.columns:
+            sender_opts   = [{"label": str(v), "value": str(v)}
+                             for v in sorted(ccc_df[from_col].dropna().unique(), key=str)]
+        if to_col in ccc_df.columns:
+            receiver_opts = [{"label": str(v), "value": str(v)}
+                             for v in sorted(ccc_df[to_col].dropna().unique(), key=str)]
+    return ligands, receptors, sender_opts, receiver_opts, annot_opts
+
+
+@app.callback(
+    Output("cellnest-bar-plot", "figure"),
+    Output("cellnest-spatial-plot", "figure"),
+    Input("cellnest-version", "data"),
+    Input("cellnest-lr-pair", "value"),
+    Input("cellnest-top-n", "value"),
+    Input("cellnest-color-by", "value"),
+    Input("cellnest-annot-col", "value"),
+    Input("cellnest-filter-ligand",   "value"),
+    Input("cellnest-filter-receptor", "value"),
+    Input("cellnest-filter-sender",   "value"),
+    Input("cellnest-filter-receiver", "value"),
+    Input("cellnest-options", "value"),
+    Input("cellnest-edge-width", "value"),
+    prevent_initial_call=True,
+)
+def update_cellnest_tab(ccc_version, lr_pair, top_n, color_by, annot_col,
+                        f_ligand, f_receptor, f_sender, f_receiver, options, edge_width):
+    with _cellnest_lock:
+        status = _cellnest_state.get("status")
+    if status != "done":
+        return go.Figure(), go.Figure()
+    opts = options or []
+    ew = edge_width or 1
+    return (
+        _cellnest_make_bar(f_ligand=f_ligand, f_receptor=f_receptor,
+                           f_sender=f_sender, f_receiver=f_receiver,
+                           annot_col=annot_col),
+        _cellnest_make_circos(lr_pair, annot_col, top_n or 500,
+                              color_by=color_by or "lr_pair",
+                              f_ligand=f_ligand, f_receptor=f_receptor,
+                              f_sender=f_sender, f_receiver=f_receiver),
+    )
+
+
+@app.callback(
+    Output("spatial-plot", "figure", allow_duplicate=True),
+    Input("cellnest-lr-pair", "value"),
+    Input("cellnest-top-n", "value"),
+    Input("cellnest-version", "data"),
+    Input("cellnest-edge-width", "value"),
+    Input("cellnest-overlay-enable", "value"),
+    Input("cellnest-options", "value"),
+    Input("cellnest-color-by", "value"),
+    State("spatial-plot", "figure"),
+    prevent_initial_call=True,
+)
+def update_cellnest_main_overlay(lr_pair, top_n, ccc_version, edge_width,
+                                 overlay_enable, options, color_by, current_fig):
+    if current_fig is None:
+        raise dash.exceptions.PreventUpdate
+    # Remove existing CellNEST traces
+    data_traces = [t for t in current_fig.get("data", [])
+                   if not str(t.get("name", "")).startswith("cellnest_")]
+    with _cellnest_lock:
+        status = _cellnest_state.get("status")
+        cn_data = _cellnest_state.get("data")
+    overlay_on = "on" in (overlay_enable or [])
+    opts = options or []
+    if status == "done" and lr_pair and overlay_on:
+        # Optional: gray out non-participating cells
+        if "gray_bg" in opts and cn_data is not None:
+            coords = cn_data["coords"]
+            data_traces = data_traces + [go.Scattergl(
+                x=coords["x"].tolist(), y=(-coords["y"]).tolist(),
+                mode="markers", marker={"size": 3, "color": "rgba(30,30,40,0.82)"},
+                name="cellnest_gray_bg", hoverinfo="skip",
+            ).to_plotly_json()]
+        new_traces = _cellnest_overlay_traces(lr_pair, top_n or 100,
+                                              edge_width=edge_width or 1,
+                                              color_by=color_by or "lr_pair")
+        data_traces = data_traces + [t.to_plotly_json() for t in new_traces]
+    current_fig["data"] = data_traces
+    return current_fig
+
+
+@app.callback(
+    Output("cellnest-downstream-tf-select", "options"),
+    Output("cellnest-downstream-status", "children"),
+    Output("cellnest-downstream-results", "style"),
+    Input("cellnest-downstream-btn", "n_clicks"),
+    State("cellnest-downstream-receptor", "value"),
+    State("cellnest-downstream-hops", "value"),
+    prevent_initial_call=True,
+)
+def find_downstream_tfs(n_clicks, receptor, hops):
+    if not n_clicks or not receptor:
+        raise dash.exceptions.PreventUpdate
+    receptor = receptor.strip()
+    try:
+        panel = set(DATA["gene_names"])
+        tfs = _downstream_tfs(receptor, n_hops=int(hops or 2))
+        # Filter to TFs that are in panel OR have targets in panel
+        tf_targets = _downstream_tf_targets(tfs, panel)
+        # TFs themselves in panel take priority
+        tfs_in_panel = [tf for tf in tfs if tf in panel]
+        all_tfs = sorted(set(tfs_in_panel) | set(tf_targets.keys()))
+        if not all_tfs:
+            return [], f"No downstream TFs found in panel for {receptor}", {"display": "none"}
+        options = [{"label": f"{tf} {'✓' if tf in panel else '(targets only)'}", "value": tf}
+                   for tf in all_tfs]
+        msg = f"{len(all_tfs)} TF(s) found downstream of {receptor}"
+        return options, msg, {"display": "block"}
+    except Exception as exc:
+        return [], f"Error: {exc}", {"display": "none"}
+
+
+@app.callback(
+    Output("cellnest-downstream-plot", "figure"),
+    Input("cellnest-downstream-tf-select", "value"),
+    State("cellnest-downstream-receptor", "value"),
+    prevent_initial_call=True,
+)
+def plot_downstream_tfs(selected_tfs, receptor):
+    if not selected_tfs:
+        raise dash.exceptions.PreventUpdate
+    panel = set(DATA["gene_names"])
+    expr   = DATA["expr"]
+    genes  = DATA["gene_names"]
+    df_app = DATA["df"]
+
+    # Get expression for each selected TF
+    fig = go.Figure()
+    bg_coords = df_app[["x_centroid", "y_centroid"]]
+    for tf in selected_tfs:
+        if tf not in panel:
+            continue
+        idx = genes.index(tf)
+        vals = np.log1p(np.asarray(expr.getcol(idx).todense()).flatten())
+        fig.add_trace(go.Scattergl(
+            x=df_app["x_centroid"].tolist(),
+            y=(-df_app["y_centroid"]).tolist(),
+            mode="markers",
+            marker={"size": 2, "color": vals.tolist(), "colorscale": "Viridis",
+                    "showscale": True, "colorbar": {"title": tf, "thickness": 10, "len": 0.6}},
+            name=tf,
+            hovertemplate=f"{tf}: %{{marker.color:.2f}}<extra></extra>",
+        ))
+    fig.update_layout(
+        paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG,
+        font={"color": TEXT, "size": 10},
+        margin={"l": 10, "r": 10, "t": 25, "b": 10},
+        title={"text": f"Downstream TF expression (← {receptor or ''})", "font": {"size": 11}},
+        xaxis={"gridcolor": BORDER, "showticklabels": False},
+        yaxis={"gridcolor": BORDER, "showticklabels": False, "scaleanchor": "x"},
+    )
+    return fig
 
 
 @app.callback(
@@ -10106,6 +11372,7 @@ for _container_id, _prefix in [
     ("interaction-plot-container",  "interaction"),
     ("chord-plot-container",        "chord"),
     ("niche-umap-plot-container",   "niche-umap"),
+    ("roi-area-plot-container",     "roi-area"),
 ]:
     app.clientside_callback(
         _PLOT_RESIZE_JS,
@@ -10114,6 +11381,20 @@ for _container_id, _prefix in [
         Input(f"{_prefix}-plot-h", "value"),
         prevent_initial_call=True,
     )
+
+# CellNEST plots container — custom resize that preserves display:flex
+app.clientside_callback(
+    """function(w, h) {
+        var s = {"display": "flex", "flex": "1", "minHeight": "0", "gap": "6px"};
+        if (w) { s["width"] = w + "px"; s["flex"] = "none"; }
+        if (h) { s["height"] = h + "px"; s["flex"] = "none"; }
+        return s;
+    }""",
+    Output("cellnest-plots-container", "style"),
+    Input("cellnest-plot-w", "value"),
+    Input("cellnest-plot-h", "value"),
+    prevent_initial_call=True,
+)
 
 
 # ─── Baysor callbacks ─────────────────────────────────────────────────────────
@@ -11832,6 +13113,15 @@ def update_spatial_plots(_spatial_done, _ds_version,
 )
 def update_niche_umap(_niche_done, _spatial_done, _ds_version):
     return make_niche_umap_fig()
+
+
+@app.callback(
+    Output("roi-area-plot", "figure"),
+    Input("roi-done", "data"),
+    Input("dataset-version", "data"),
+)
+def update_roi_area_plot(_roi_done, _ds_version):
+    return make_roi_area_fig()
 
 
 # ─── ROI Annotation callbacks ─────────────────────────────────────────────────
