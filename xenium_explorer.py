@@ -4311,7 +4311,9 @@ def _run_spatial_niches(n_clusters: int, n_neighbors: int, label_key: str | None
         else:
             cells_df = DATA["df"]
 
-        coords = cells_df[["x_centroid", "y_centroid"]].values
+        x_col = "centroid_x" if "centroid_x" in cells_df.columns else "x_centroid"
+        y_col = "centroid_y" if "centroid_y" in cells_df.columns else "y_centroid"
+        coords = cells_df[[x_col, y_col]].values
         n_cells = len(coords)
         k = min(n_neighbors + 1, n_cells)
 
@@ -6568,12 +6570,18 @@ def make_niche_umap_fig(width=None, height=None):
     if "niche" not in df.columns:
         return _make_placeholder_fig("Run Spatial Niches to populate this tab.")
     # Use re-run UMAP columns if present, otherwise fall back to bundled DATA["umap"]
-    if "umap_1" in df.columns and "umap_2" in df.columns:
+    if "umap_1" in df.columns and "umap_2" in df.columns and df["umap_1"].notna().any():
         xu = df["umap_1"].values.astype(float)
         yu = df["umap_2"].values.astype(float)
+        axis_labels = ("UMAP 1", "UMAP 2")
     elif DATA.get("umap") is not None and len(DATA["umap"]) == len(df):
         xu = DATA["umap"][:, 0].astype(float)
         yu = DATA["umap"][:, 1].astype(float)
+        axis_labels = ("UMAP 1", "UMAP 2")
+    elif "x_centroid" in df.columns:
+        xu = df["x_centroid"].values.astype(float)
+        yu = -df["y_centroid"].values.astype(float)
+        axis_labels = ("X (µm)", "Y (µm)")
     else:
         return _make_placeholder_fig("No UMAP coordinates available.")
     niche_arr = df["niche"].values.astype(str)
@@ -6594,15 +6602,20 @@ def make_niche_umap_fig(width=None, height=None):
             hovertemplate=f"Niche {niche}<extra></extra>",
         ))
     fig = go.Figure(traces)
-    fig.update_layout(
+    layout_kw = dict(
         paper_bgcolor=CARD_BG, plot_bgcolor=PLOT_BG,
         font=dict(color=TEXT),
         margin=dict(l=30, r=10, t=30, b=30),
-        xaxis=dict(title="UMAP 1", gridcolor=BORDER, linecolor=BORDER, color=TEXT),
-        yaxis=dict(title="UMAP 2", gridcolor=BORDER, linecolor=BORDER, color=TEXT),
+        xaxis=dict(title=axis_labels[0], gridcolor=BORDER, linecolor=BORDER, color=TEXT),
+        yaxis=dict(title=axis_labels[1], gridcolor=BORDER, linecolor=BORDER, color=TEXT),
         legend=dict(bgcolor=CARD_BG, bordercolor=BORDER, font=dict(color=TEXT, size=9)),
         title=dict(text="Niche UMAP", font=dict(color=TEXT, size=12), x=0.5),
     )
+    if width:
+        layout_kw["width"] = int(width)
+    if height:
+        layout_kw["height"] = int(height)
+    fig.update_layout(**layout_kw)
     return fig
 
 
@@ -7157,23 +7170,34 @@ def _apply_cellnest_filters(ccc_df, f_ligand=None, f_receptor=None,
 
 def _cellnest_make_bar(f_ligand=None, f_receptor=None,
                        f_sender=None, f_receiver=None, annot_col=None):
-    """Return a Plotly bar chart of LR pair counts, filtered to current selection."""
+    """Return a Plotly bar chart using the pre-computed CellNEST histogram CSV."""
     with _cellnest_lock:
         data = _cellnest_state.get("data")
     if data is None:
         return go.Figure()
-    sub = _apply_cellnest_filters(data["ccc_df"], f_ligand, f_receptor,
-                                  f_sender, f_receiver, annot_col)
-    if sub.empty:
+    lr_freq = data.get("lr_freq")
+    if lr_freq is None or lr_freq.empty:
         return go.Figure(layout=go.Layout(paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG))
-    freq = (sub.groupby(["ligand", "receptor"]).size()
-              .reset_index(name="count")
-              .assign(lr_pair=lambda d: d["ligand"] + "-" + d["receptor"])
-              .sort_values("count", ascending=False)
-              .head(30))
+
+    # lr_freq columns: "Ligand-Receptor Pairs", "Total Count"
+    freq = lr_freq.copy()
+    freq.columns = [c.strip() for c in freq.columns]
+    pair_col  = freq.columns[0]   # "Ligand-Receptor Pairs"
+    count_col = freq.columns[1]   # "Total Count"
+
+    # Apply ligand/receptor name filters if set
+    if f_ligand:
+        freq = freq[freq[pair_col].str.startswith(f_ligand + "-")]
+    if f_receptor:
+        freq = freq[freq[pair_col].str.endswith("-" + f_receptor)]
+
+    freq = freq.head(30)
+    if freq.empty:
+        return go.Figure(layout=go.Layout(paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG))
+
     fig = go.Figure(go.Bar(
-        x=freq["count"].tolist(),
-        y=freq["lr_pair"].tolist(),
+        x=freq[count_col].tolist(),
+        y=freq[pair_col].tolist(),
         orientation="h",
         marker_color="#0d9488",
     ))
@@ -7181,9 +7205,161 @@ def _cellnest_make_bar(f_ligand=None, f_receptor=None,
         paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG,
         font={"color": TEXT, "size": 10},
         margin={"l": 10, "r": 10, "t": 30, "b": 10},
-        title={"text": "LR Pair Count (filtered, top 30)", "font": {"size": 12}},
-        xaxis={"gridcolor": BORDER, "title": "Count"},
+        title={"text": "CellNEST LR pair frequency (top 30)", "font": {"size": 12}},
+        xaxis={"gridcolor": BORDER, "title": "Total Count"},
         yaxis={"autorange": "reversed"},
+    )
+    return fig
+
+
+def _cellnest_make_lr_heatmap(f_ligand=None, f_receptor=None, f_sender=None,
+                               f_receiver=None, annot_col=None, top_n=20):
+    """Ligand × Receptor heatmap colored by mean attention score."""
+    with _cellnest_lock:
+        data = _cellnest_state.get("data")
+    if data is None:
+        return go.Figure(layout=go.Layout(paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG))
+    sub = _apply_cellnest_filters(data["ccc_df"], f_ligand, f_receptor, f_sender, f_receiver, annot_col)
+    if sub.empty:
+        return go.Figure(layout=go.Layout(paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG))
+    top_lig = sub.groupby("ligand")["attention_score"].sum().nlargest(top_n).index.tolist()
+    top_rec = sub.groupby("receptor")["attention_score"].sum().nlargest(top_n).index.tolist()
+    sub2 = sub[sub["ligand"].isin(top_lig) & sub["receptor"].isin(top_rec)]
+    pivot = (sub2.groupby(["ligand", "receptor"])["attention_score"].mean()
+               .unstack(fill_value=0)
+               .reindex(index=top_lig, columns=top_rec, fill_value=0))
+    fig = go.Figure(go.Heatmap(
+        z=pivot.values.tolist(), x=pivot.columns.tolist(), y=pivot.index.tolist(),
+        colorscale="Viridis", colorbar={"title": "Mean attn", "thickness": 10, "len": 0.6},
+        hovertemplate="Ligand: %{y}<br>Receptor: %{x}<br>Score: %{z:.4f}<extra></extra>",
+    ))
+    fig.update_layout(
+        paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG, font={"color": TEXT, "size": 10},
+        margin={"l": 10, "r": 60, "t": 30, "b": 80},
+        title={"text": f"Ligand × Receptor (mean attention, top {top_n})", "font": {"size": 11}},
+        xaxis={"tickangle": -45, "title": "Receptor", "gridcolor": BORDER},
+        yaxis={"autorange": "reversed", "title": "Ligand"},
+    )
+    return fig
+
+
+def _cellnest_make_ligtarget_heatmap(annot_col=None, f_ligand=None, f_receptor=None,
+                                      f_sender=None, f_receiver=None, top_n=20):
+    """Ligand (rows) × Receiver cell type (cols), color = mean attention score.
+    Falls back to LR heatmap when no annotation is selected."""
+    with _cellnest_lock:
+        data = _cellnest_state.get("data")
+    if data is None:
+        return go.Figure(layout=go.Layout(paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG))
+    sub = _apply_cellnest_filters(data["ccc_df"], f_ligand, f_receptor, f_sender, f_receiver, annot_col)
+    if sub.empty:
+        return go.Figure(layout=go.Layout(paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG))
+    if not annot_col:
+        return _cellnest_make_lr_heatmap(f_ligand=f_ligand, f_receptor=f_receptor,
+                                         f_sender=f_sender, f_receiver=f_receiver, top_n=top_n)
+    to_col = f"to_{annot_col}"
+    if to_col not in sub.columns:
+        return go.Figure(layout=go.Layout(paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG))
+    sub = sub.dropna(subset=[to_col])
+    if sub.empty:
+        return go.Figure(layout=go.Layout(paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG))
+    top_lig = sub.groupby("ligand")["attention_score"].sum().nlargest(top_n).index.tolist()
+    sub2 = sub[sub["ligand"].isin(top_lig)]
+    pivot = (sub2.groupby(["ligand", to_col])["attention_score"].mean()
+               .unstack(fill_value=0)
+               .reindex(index=top_lig, fill_value=0))
+    # Sort receiver cols by total attention
+    col_order = pivot.sum(axis=0).sort_values(ascending=False).index.tolist()
+    pivot = pivot[col_order]
+    fig = go.Figure(go.Heatmap(
+        z=pivot.values.tolist(), x=pivot.columns.tolist(), y=pivot.index.tolist(),
+        colorscale="Purples", colorbar={"title": "Mean attn", "thickness": 10, "len": 0.6},
+        hovertemplate="Ligand: %{y}<br>Receiver: %{x}<br>Score: %{z:.4f}<extra></extra>",
+    ))
+    fig.update_layout(
+        paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG, font={"color": TEXT, "size": 10},
+        margin={"l": 10, "r": 60, "t": 30, "b": 80},
+        title={"text": f"Ligand → Receiver cell type (mean attention, top {top_n})", "font": {"size": 11}},
+        xaxis={"tickangle": -45, "title": "Receiver cell type", "gridcolor": BORDER},
+        yaxis={"autorange": "reversed", "title": "Ligand"},
+    )
+    return fig
+
+
+def _cellnest_make_dotplot(annot_col=None, f_ligand=None, f_receptor=None,
+                            f_sender=None, f_receiver=None, top_n=20):
+    """DotPlot: top ligands (y) × sender cell types (x).
+    Dot size = fraction of sender-type cells sending this ligand.
+    Dot color = mean attention score."""
+    with _cellnest_lock:
+        data = _cellnest_state.get("data")
+    if data is None:
+        return go.Figure(layout=go.Layout(paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG))
+    ccc_df = data["ccc_df"]
+    sub = _apply_cellnest_filters(ccc_df, f_ligand, f_receptor, f_sender, f_receiver, annot_col)
+    if sub.empty or not annot_col:
+        return go.Figure(layout=go.Layout(
+            paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG,
+            annotations=[{"text": "Select an Annotation column to enable DotPlot",
+                           "showarrow": False, "font": {"color": MUTED, "size": 12},
+                           "xref": "paper", "yref": "paper", "x": 0.5, "y": 0.5}]))
+    from_col = f"from_{annot_col}"
+    if from_col not in sub.columns:
+        return go.Figure(layout=go.Layout(paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG))
+    sub = sub.dropna(subset=[from_col])
+    if sub.empty:
+        return go.Figure(layout=go.Layout(paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG))
+    top_lig = sub.groupby("ligand")["attention_score"].sum().nlargest(top_n).index.tolist()
+    sub2 = sub[sub["ligand"].isin(top_lig)]
+    sender_types = sorted(sub2[from_col].dropna().unique(), key=str)
+    # Total unique sender cell IDs per type (denominator for fraction)
+    if from_col in ccc_df.columns:
+        total_per_type = (ccc_df.dropna(subset=[from_col])
+                          .groupby(from_col)["from_id"].nunique())
+    else:
+        total_per_type = pd.Series(dtype=float)
+    rows = []
+    for lig in top_lig:
+        lig_sub = sub2[sub2["ligand"] == lig]
+        for st in sender_types:
+            st_sub = lig_sub[lig_sub[from_col] == st]
+            if st_sub.empty:
+                continue
+            n_send = st_sub["from_id"].nunique()
+            n_total = int(total_per_type.get(st, n_send))
+            rows.append({"ligand": lig, "sender": str(st),
+                         "fraction": n_send / max(n_total, 1),
+                         "mean_attn": st_sub["attention_score"].mean(),
+                         "n_send": n_send})
+    if not rows:
+        return go.Figure(layout=go.Layout(paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG))
+    df_dot = pd.DataFrame(rows)
+    fig = go.Figure(go.Scatter(
+        x=df_dot["sender"].tolist(),
+        y=df_dot["ligand"].tolist(),
+        mode="markers",
+        marker={
+            "size": (df_dot["fraction"] * 30).clip(lower=2).tolist(),
+            "color": df_dot["mean_attn"].tolist(),
+            "colorscale": "Teal",
+            "showscale": True,
+            "colorbar": {"title": "Mean<br>attn", "thickness": 10, "len": 0.6},
+            "line": {"width": 0},
+        },
+        hovertemplate=(
+            "Ligand: %{y}<br>Sender: %{x}<br>"
+            "Fraction: %{customdata[0]:.1%}<br>"
+            "Mean attn: %{customdata[1]:.4f}<br>"
+            "N sending: %{customdata[2]}<extra></extra>"
+        ),
+        customdata=list(zip(df_dot["fraction"], df_dot["mean_attn"], df_dot["n_send"])),
+    ))
+    fig.update_layout(
+        paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG, font={"color": TEXT, "size": 10},
+        margin={"l": 10, "r": 60, "t": 30, "b": 80},
+        title={"text": f"DotPlot: ligand × sender type (top {top_n})", "font": {"size": 11}},
+        xaxis={"title": "Sender cell type", "tickangle": -45, "gridcolor": BORDER},
+        yaxis={"title": "Ligand", "autorange": "reversed", "gridcolor": BORDER},
     )
     return fig
 
@@ -7490,7 +7666,17 @@ def _cellnest_make_circos(lr_pairs, annot_col, top_n=500, color_by="lr_pair",
                            font={"size": 8, "color": TEXT},
                            showarrow=False, xanchor="center", yanchor="middle")
 
-    # Draw bezier chords
+    # Draw filled ribbon chords (SVG path shapes for constant visual width)
+    def _col_rgba(col, alpha=0.55):
+        if col.startswith("#"):
+            h = col.lstrip("#")
+            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+            return f"rgba({r},{g},{b},{alpha})"
+        if col.startswith("rgb("):
+            parts = col[4:-1].split(",")
+            return f"rgba({parts[0].strip()},{parts[1].strip()},{parts[2].strip()},{alpha})"
+        return col
+
     w_max = agg_df["weight"].max() or 1
     if color_by == "attention":
         import plotly.colors as _pc
@@ -7500,27 +7686,40 @@ def _cellnest_make_circos(lr_pairs, annot_col, top_n=500, color_by="lr_pair",
         pair, ligand, receptor = row["pair"], row["ligand"], row["receptor"]
         if src not in angles or tgt not in angles:
             continue
-        # Chord color based on color_by
         if color_by == "attention":
             bin_idx = int(min(9, w / w_max * 10))
             chord_col = _viridis[bin_idx]
+        elif color_by == "sender_type":
+            chord_col = type_color.get(src, "#888888")
         elif color_by == "ligand":
             chord_col = _chord_cmap.get(ligand, "#888888")
         elif color_by == "receptor":
             chord_col = _chord_cmap.get(receptor, "#888888")
-        else:  # lr_pair
+        else:
             chord_col = _chord_cmap.get(pair, "#888888")
+        # Ribbon half-width proportional to sqrt(weight) — sqrt gives better perceptual contrast
+        half_w = max(0.008, 0.18 * np.sqrt(w / w_max))
         a1, a2 = angles[src], angles[tgt]
-        x0, y0 = np.cos(a1) * 0.85, np.sin(a1) * 0.85
-        x1, y1 = np.cos(a2) * 0.85, np.sin(a2) * 0.85
-        t_vals = np.linspace(0, 1, 50)
-        bx = (1 - t_vals)**2 * x0 + 2*(1-t_vals)*t_vals*0.0 + t_vals**2 * x1
-        by = (1 - t_vals)**2 * y0 + 2*(1-t_vals)*t_vals*0.0 + t_vals**2 * y1
-        lw = max(0.5, 5 * w / w_max)
+        r_in = 0.83
+        x0a = np.cos(a1 - half_w) * r_in;  y0a = np.sin(a1 - half_w) * r_in
+        x0b = np.cos(a1 + half_w) * r_in;  y0b = np.sin(a1 + half_w) * r_in
+        x1a = np.cos(a2 - half_w) * r_in;  y1a = np.sin(a2 - half_w) * r_in
+        x1b = np.cos(a2 + half_w) * r_in;  y1b = np.sin(a2 + half_w) * r_in
+        # SVG cubic bezier ribbon: forward + backward bezier, closed
+        path = (f"M {x0a:.4f},{y0a:.4f} "
+                f"C 0,0 0,0 {x1a:.4f},{y1a:.4f} "
+                f"L {x1b:.4f},{y1b:.4f} "
+                f"C 0,0 0,0 {x0b:.4f},{y0b:.4f} Z")
+        fig.add_shape(type="path", path=path,
+                      fillcolor=_col_rgba(chord_col, 0.55),
+                      line_width=0, layer="below")
+        # Invisible hover marker at chord midpoint
+        mx = (x0a + x0b + x1a + x1b) / 4
+        my = (y0a + y0b + y1a + y1b) / 4
         fig.add_trace(go.Scatter(
-            x=bx.tolist(), y=by.tolist(), mode="lines",
-            line={"color": chord_col, "width": lw},
-            opacity=0.55, showlegend=False,
+            x=[mx], y=[my], mode="markers",
+            marker={"size": max(8, int(18 * w / w_max)), "opacity": 0, "color": chord_col},
+            showlegend=False,
             hovertemplate=f"{pair}: {src} → {tgt} ({w:.0f})<extra></extra>",
         ))
 
@@ -7538,14 +7737,20 @@ def _cellnest_make_circos(lr_pairs, annot_col, top_n=500, color_by="lr_pair",
     return fig
 
 
-def _cellnest_overlay_traces(lr_pair, top_n=100, edge_width=1, color_by="lr_pair"):
+def _cellnest_overlay_traces(lr_pair, top_n=100, edge_width=1, color_by="lr_pair", options=None,
+                             f_ligand=None, f_receptor=None, f_sender=None, f_receiver=None,
+                             annot_col=None):
     """Return list of Plotly trace dicts to overlay on the main spatial plot."""
     with _cellnest_lock:
         data = _cellnest_state.get("data")
     if data is None or not lr_pair:
         return []
     ccc_df = data["ccc_df"]
+    coords = data.get("coords")
     pairs = lr_pair if isinstance(lr_pair, list) else [lr_pair]
+    opts = options or []
+    # Apply global filters (ligand/receptor/sender/receiver) before per-pair processing
+    ccc_df = _apply_cellnest_filters(ccc_df, f_ligand, f_receptor, f_sender, f_receiver, annot_col)
     palette = qualitative.Plotly
     # Pre-compute color maps
     if color_by == "ligand":
@@ -7559,12 +7764,18 @@ def _cellnest_overlay_traces(lr_pair, top_n=100, edge_width=1, color_by="lr_pair
         _viridis = _pc.sample_colorscale("Viridis", list(np.linspace(0, 1, 10)))
 
     traces = []
+    participating_ids = set()  # track from_id/to_id indices for gray-out exclusion
+
     for pi, pair in enumerate(pairs):
         ligand, receptor = pair.split("-", 1)
         sub = ccc_df[(ccc_df["ligand"] == ligand) & (ccc_df["receptor"] == receptor)]
         sub = sub.nlargest(int(top_n or 100), "attention_score")
         if sub.empty:
             continue
+
+        # Collect participating cell indices (for gray-out)
+        participating_ids.update(sub["from_id"].astype(int).tolist())
+        participating_ids.update(sub["to_id"].astype(int).tolist())
 
         # Node color always per-pair
         node_col = palette[pi % len(palette)]
@@ -7573,19 +7784,40 @@ def _cellnest_overlay_traces(lr_pair, top_n=100, edge_width=1, color_by="lr_pair
         arrow_angles = np.degrees(np.arctan2(dx, dy))
 
         # Edge coloring
+        arrow_size = max(6, int(edge_width * 3))
+        hover_size = max(10, int(edge_width * 5))
+        head_size = max(8, int(edge_width * 5))
+        mid_x = ((sub["from_x"] + sub["to_x"]) / 2).tolist()
+        mid_y = ((-sub["from_y"] + (-sub["to_y"])) / 2).tolist()
+
         if color_by == "attention":
             scores = sub["attention_score"].values
             s_min, s_max = scores.min(), scores.max()
             s_range = s_max - s_min if s_max > s_min else 1
-            for _, row in sub.iterrows():
+            # Collect arrowhead data across all rows for a single marker trace
+            head_x, head_y, head_colors, head_angles = [], [], [], []
+            for i, (_, row) in enumerate(sub.iterrows()):
                 bin_idx = int(min(9, (row["attention_score"] - s_min) / s_range * 10))
+                ew = edge_width * (0.5 + 1.5 * (row["attention_score"] - s_min) / s_range) if "edge_weight" in opts else edge_width
                 traces.append(go.Scattergl(
                     x=[row["from_x"], row["to_x"], None],
                     y=[-row["from_y"], -row["to_y"], None],
                     mode="lines",
-                    line={"color": _viridis[bin_idx], "width": edge_width},
+                    line={"color": _viridis[bin_idx], "width": ew},
                     opacity=0.4, name=f"cellnest_lines_{pair}",
-                    hovertemplate=f"{pair}<extra></extra>"))
+                    hoverinfo="skip"))
+                head_x.append(row["to_x"])
+                head_y.append(-row["to_y"])
+                head_colors.append(_viridis[bin_idx])
+                head_angles.append(arrow_angles[i])
+            if head_x:
+                traces.append(go.Scattergl(
+                    x=head_x, y=head_y, mode="markers",
+                    marker={"symbol": "arrow", "size": head_size,
+                            "angle": head_angles, "color": head_colors,
+                            "line": {"width": 0}},
+                    opacity=0.7, name=f"cellnest_heads_{pair}",
+                    hoverinfo="skip"))
         else:
             if color_by == "ligand":
                 edge_col = _lig_cmap.get(ligand, node_col)
@@ -7593,31 +7825,66 @@ def _cellnest_overlay_traces(lr_pair, top_n=100, edge_width=1, color_by="lr_pair
                 edge_col = _rec_cmap.get(receptor, node_col)
             else:
                 edge_col = node_col  # lr_pair
-            xs, ys = [], []
-            for _, row in sub.iterrows():
-                xs += [row["from_x"], row["to_x"], None]
-                ys += [-row["from_y"], -row["to_y"], None]
-            traces.append(go.Scattergl(
-                x=xs, y=ys, mode="lines",
-                line={"color": edge_col, "width": edge_width}, opacity=0.4,
-                name=f"cellnest_lines_{pair}",
-                hovertemplate=f"{pair}<extra></extra>"))
+            if "edge_weight" in opts:
+                scores = sub["attention_score"].values
+                w_min_s, w_max_s = scores.min(), scores.max()
+                w_range_s = w_max_s - w_min_s if w_max_s > w_min_s else 1.0
+                for i, (_, row) in enumerate(sub.iterrows()):
+                    ew = edge_width * (0.5 + 1.5 * (row["attention_score"] - w_min_s) / w_range_s)
+                    ah = max(3, int(ew * 3))
+                    traces.append(go.Scattergl(
+                        x=[row["from_x"], row["to_x"], None],
+                        y=[-row["from_y"], -row["to_y"], None],
+                        mode="lines",
+                        line={"color": edge_col, "width": ew}, opacity=0.4,
+                        name=f"cellnest_lines_{pair}", hoverinfo="skip"))
+                    traces.append(go.Scattergl(
+                        x=[row["to_x"]], y=[-row["to_y"]], mode="markers",
+                        marker={"symbol": "arrow", "size": ah,
+                                "angle": arrow_angles[i], "color": edge_col,
+                                "line": {"width": 0}},
+                        opacity=0.7, name=f"cellnest_heads_{pair}", hoverinfo="skip"))
+            else:
+                xs, ys = [], []
+                for _, row in sub.iterrows():
+                    xs += [row["from_x"], row["to_x"], None]
+                    ys += [-row["from_y"], -row["to_y"], None]
+                traces.append(go.Scattergl(
+                    x=xs, y=ys, mode="lines",
+                    line={"color": edge_col, "width": edge_width}, opacity=0.4,
+                    name=f"cellnest_lines_{pair}",
+                    hoverinfo="skip"))
+                # Arrowheads at the target end, scaled with edge_width
+                traces.append(go.Scattergl(
+                    x=sub["to_x"].tolist(), y=(-sub["to_y"]).tolist(),
+                    mode="markers",
+                    marker={"symbol": "arrow", "size": head_size,
+                            "angle": arrow_angles.tolist(), "color": edge_col,
+                            "line": {"width": 0}},
+                    opacity=0.7, name=f"cellnest_heads_{pair}",
+                    hoverinfo="skip"))
 
-        traces += [
-            go.Scatter(x=sub["to_x"].tolist(), y=(-sub["to_y"]).tolist(),
-                       mode="markers",
-                       marker={"symbol": "arrow", "size": 8, "color": node_col,
-                               "angle": arrow_angles.tolist(), "line": {"width": 0}},
-                       name=f"cellnest_arrows_{pair}", hoverinfo="skip"),
-            go.Scattergl(x=sub["from_x"].tolist(), y=(-sub["from_y"]).tolist(),
-                         mode="markers", marker={"size": 5, "color": node_col},
-                         name=f"cellnest_senders_{pair}",
-                         hovertemplate=f"Sender {pair}<extra></extra>"),
-            go.Scattergl(x=sub["to_x"].tolist(), y=(-sub["to_y"]).tolist(),
-                         mode="markers", marker={"size": 5, "color": node_col, "symbol": "diamond"},
-                         name=f"cellnest_receivers_{pair}",
-                         hovertemplate=f"Receiver {pair}<extra></extra>"),
-        ]
+        # Invisible midpoint markers for reliable hover hit area
+        traces.append(go.Scattergl(
+            x=mid_x, y=mid_y, mode="markers",
+            marker={"size": hover_size, "opacity": 0, "color": node_col, "line": {"width": 0}},
+            name=f"cellnest_hover_{pair}",
+            hovertemplate=f"{pair}<extra></extra>",
+        ))
+
+    # Gray-out: add dark overlay for non-participating cells (prepend so it's beneath edges)
+    if "gray_bg" in opts and coords is not None and participating_ids:
+        all_idx = np.arange(len(coords))
+        mask = ~np.isin(all_idx, list(participating_ids))
+        gray_x = coords["x"].values[mask].tolist()
+        gray_y = (-coords["y"].values[mask]).tolist()
+        traces.insert(0, go.Scattergl(
+            x=gray_x, y=gray_y, mode="markers",
+            marker={"size": 5, "color": "rgba(28,28,36,0.92)",
+                    "line": {"width": 1, "color": "rgba(28,28,36,0.92)"}},
+            name="cellnest_gray_bg", hoverinfo="skip",
+        ))
+
     return traces
 
 
@@ -9092,6 +9359,7 @@ app.layout = html.Div([
     dcc.Store(id="counts-mode-store", data="original"),
     dcc.Store(id="roi-done",          data=0),
     dcc.Store(id="roi-pending",       data=None),
+    dcc.Store(id="measure-store",     data={"active": False, "points": []}),
     dcc.Interval(id="subset-poll",   interval=500,  n_intervals=0),
     dcc.Interval(id="morph-hires-poll", interval=400, n_intervals=0, disabled=True),
     # Fires once after 500 ms to guarantee initial plot render in Dash 4
@@ -10108,7 +10376,22 @@ dbc.Modal([
                         },
                         style={"height": "100%"},
                     )
-                ], id="spatial-panel", style={"flex": "2", "minWidth": "200px"}),
+                    html.Div([
+                        html.Button("📏", id="measure-btn", n_clicks=0, title="Measure distance",
+                                    style={"padding": "4px 7px", "fontSize": "14px",
+                                           "backgroundColor": CARD_BG, "color": TEXT,
+                                           "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                           "cursor": "pointer", "lineHeight": "1"}),
+                        html.Span(id="measure-dist-display",
+                                  style={"fontSize": "11px", "color": TEXT,
+                                         "backgroundColor": "rgba(13,17,23,0.85)",
+                                         "padding": "3px 6px", "borderRadius": "4px",
+                                         "marginLeft": "4px", "display": "none"}),
+                    ], style={"position": "absolute", "bottom": "10px", "right": "10px",
+                              "zIndex": "10", "display": "flex", "alignItems": "center",
+                              "pointerEvents": "auto"}),
+                ], id="spatial-panel", style={"flex": "2", "minWidth": "200px",
+                                              "position": "relative"}),
 
                 html.Div(id="panel-resize-handle", style={
                     "width": "6px", "cursor": "col-resize", "flexShrink": "0",
@@ -10129,67 +10412,67 @@ dbc.Modal([
                                                       "toImageButtonOptions": {"format": "svg", "filename": "xenium_umap"}},
                                               style={"flex": "1", "minHeight": "0"}),
                                     _plot_dim_controls("umap"),
-                                ], style={"display": "flex", "flexDirection": "column", "height": "calc(100% - 36px)"})]),
+                                ], style={"display": "flex", "flexDirection": "column", "flex": "1", "minHeight": "0"})]),
                         dbc.Tab(label="Cell Type Abundance", tab_id="tab-abundance",
                                 label_style={"fontSize": "12px", "padding": "4px 12px"},
                                 children=[html.Div([
                                     html.Div(dcc.Graph(id="cell-type-abundance-plot", responsive=True,
-                                              config={"displayModeBar": False},
+                                              config={"displayModeBar": "hover", "toImageButtonOptions": {"format": "svg", "filename": "xenium_abundance"}},
                                               style={"width": "100%", "height": "100%"}),
                                              id="abundance-plot-container",
                                              style={"flex": "1", "minHeight": "0"}),
                                     _plot_dim_controls("abundance"),
-                                ], style={"display": "flex", "flexDirection": "column", "height": "calc(100% - 36px)"})]),
+                                ], style={"display": "flex", "flexDirection": "column", "flex": "1", "minHeight": "0"})]),
                         dbc.Tab(label="Co-occurrence", tab_id="tab-cooccurrence",
                                 label_style={"fontSize": "12px", "padding": "4px 12px"},
                                 children=[html.Div([
                                     html.Div(dcc.Graph(id="cooccurrence-plot", responsive=True,
-                                              config={"displayModeBar": False},
+                                              config={"displayModeBar": "hover", "toImageButtonOptions": {"format": "svg", "filename": "xenium_cooccurrence"}},
                                               style={"width": "100%", "height": "100%"}),
                                              id="cooccurrence-plot-container",
                                              style={"flex": "1", "minHeight": "0"}),
                                     _plot_range_and_dim_controls("cooccurrence"),
-                                ], style={"display": "flex", "flexDirection": "column", "height": "calc(100% - 36px)"})]),
+                                ], style={"display": "flex", "flexDirection": "column", "flex": "1", "minHeight": "0"})]),
                         dbc.Tab(label="Neighborhood Enrichment", tab_id="tab-enrichment",
                                 label_style={"fontSize": "12px", "padding": "4px 12px"},
                                 children=[html.Div([
                                     html.Div(dcc.Graph(id="enrichment-plot", responsive=True,
-                                              config={"displayModeBar": False},
+                                              config={"displayModeBar": "hover", "toImageButtonOptions": {"format": "svg", "filename": "xenium_enrichment"}},
                                               style={"width": "100%", "height": "100%"}),
                                              id="enrichment-plot-container",
                                              style={"flex": "1", "minHeight": "0"}),
                                     _plot_range_and_dim_controls("enrichment"),
-                                ], style={"display": "flex", "flexDirection": "column", "height": "calc(100% - 36px)"})]),
+                                ], style={"display": "flex", "flexDirection": "column", "flex": "1", "minHeight": "0"})]),
                         dbc.Tab(label="Interaction Graph", tab_id="tab-interaction",
                                 label_style={"fontSize": "12px", "padding": "4px 12px"},
                                 children=[html.Div([
                                     html.Div(dcc.Graph(id="interaction-plot", responsive=True,
-                                              config={"displayModeBar": False},
+                                              config={"displayModeBar": "hover", "toImageButtonOptions": {"format": "svg", "filename": "xenium_interaction"}},
                                               style={"width": "100%", "height": "100%"}),
                                              id="interaction-plot-container",
                                              style={"flex": "1", "minHeight": "0"}),
                                     _plot_normalize_and_dim_controls("interaction"),
-                                ], style={"display": "flex", "flexDirection": "column", "height": "calc(100% - 36px)"})]),
+                                ], style={"display": "flex", "flexDirection": "column", "flex": "1", "minHeight": "0"})]),
                         dbc.Tab(label="Chord Diagram", tab_id="tab-chord",
                                 label_style={"fontSize": "12px", "padding": "4px 12px"},
                                 children=[html.Div([
                                     html.Div(dcc.Graph(id="chord-plot", responsive=True,
-                                              config={"displayModeBar": False},
+                                              config={"displayModeBar": "hover", "toImageButtonOptions": {"format": "svg", "filename": "xenium_chord"}},
                                               style={"width": "100%", "height": "100%"}),
                                              id="chord-plot-container",
                                              style={"flex": "1", "minHeight": "0"}),
                                     _plot_normalize_and_dim_controls("chord"),
-                                ], style={"display": "flex", "flexDirection": "column", "height": "calc(100% - 36px)"})]),
+                                ], style={"display": "flex", "flexDirection": "column", "flex": "1", "minHeight": "0"})]),
                         dbc.Tab(label="Niche UMAP", tab_id="tab-niche-umap",
                                 label_style={"fontSize": "12px", "padding": "4px 12px"},
                                 children=[html.Div([
                                     html.Div(dcc.Graph(id="niche-umap-plot", responsive=True,
-                                              config={"displayModeBar": False},
+                                              config={"displayModeBar": "hover", "toImageButtonOptions": {"format": "svg", "filename": "xenium_niche_umap"}},
                                               style={"width": "100%", "height": "100%"}),
                                              id="niche-umap-plot-container",
                                              style={"flex": "1", "minHeight": "0"}),
                                     _plot_dim_controls("niche-umap"),
-                                ], style={"display": "flex", "flexDirection": "column", "height": "calc(100% - 36px)"})]),
+                                ], style={"display": "flex", "flexDirection": "column", "flex": "1", "minHeight": "0"})]),
                         dbc.Tab(label="CellNEST CCC", tab_id="tab-cellnest",
                                 label_style={"fontSize": "12px", "padding": "4px 12px"},
                                 children=[html.Div([
@@ -10223,6 +10506,7 @@ dbc.Modal([
                                                 {"label": "Ligand",          "value": "ligand"},
                                                 {"label": "Receptor",        "value": "receptor"},
                                                 {"label": "Attention Score", "value": "attention"},
+                                                {"label": "Sender Cell Type", "value": "sender_type"},
                                             ],
                                             value="lr_pair", clearable=False,
                                             style={"width": "160px", "fontSize": "11px"},
@@ -10275,14 +10559,43 @@ dbc.Modal([
                                               "borderBottom": f"1px solid {BORDER}", "flexShrink": "0"}),
                                     html.Div([
                                         dcc.Graph(id="cellnest-bar-plot", responsive=True,
-                                                  config={"displayModeBar": False},
+                                                  config={"displayModeBar": "hover", "modeBarButtons": [["toImage"]], "toImageButtonOptions": {"format": "svg", "filename": "xenium_cellnest_bar"}},
                                                   style={"flex": "1", "minWidth": "200px"}),
                                         dcc.Graph(id="cellnest-spatial-plot", responsive=True,
-                                                  config={"displayModeBar": False},
+                                                  config={"displayModeBar": "hover", "modeBarButtons": [["toImage"]], "toImageButtonOptions": {"format": "svg", "filename": "xenium_cellnest_chord"}},
                                                   style={"flex": "2", "minWidth": "200px"}),
                                     ], id="cellnest-plots-container",
                                        style={"display": "flex", "flex": "1", "minHeight": "0", "gap": "6px"}),
                                     _plot_dim_controls("cellnest"),
+                                    # ── NicheNet-style analysis panel ────────
+                                    html.Details([
+                                        html.Summary("▶ NicheNet-style Analysis",
+                                                     style={"fontSize": "11px", "color": MUTED,
+                                                            "cursor": "pointer", "padding": "4px 8px",
+                                                            "borderTop": f"1px solid {BORDER}"}),
+                                        html.Div([
+                                            html.Div([
+                                                html.Span("Top N ligands:", style={"fontSize": "11px", "color": MUTED, "marginRight": "6px"}),
+                                                dcc.Input(id="cellnest-nichenest-top-n", type="number", value=20, min=5, max=100,
+                                                          debounce=True,
+                                                          style={"width": "60px", "backgroundColor": CARD_BG, "color": TEXT,
+                                                                 "border": f"1px solid {BORDER}", "borderRadius": "4px",
+                                                                 "padding": "3px 6px", "fontSize": "11px"}),
+                                                html.Span("(Annotation column controls heatmap & dotplot)", style={"fontSize": "10px", "color": MUTED, "marginLeft": "10px"}),
+                                            ], style={"display": "flex", "alignItems": "center", "padding": "4px 8px", "flexShrink": "0"}),
+                                            html.Div([
+                                                dcc.Graph(id="cellnest-lr-heatmap", responsive=True,
+                                                          config={"displayModeBar": "hover", "modeBarButtons": [["toImage"]], "toImageButtonOptions": {"format": "svg", "filename": "xenium_cellnest_lr_heatmap"}},
+                                                          style={"flex": "1", "minWidth": "200px", "height": "320px"}),
+                                                dcc.Graph(id="cellnest-ligtarget-heatmap", responsive=True,
+                                                          config={"displayModeBar": "hover", "modeBarButtons": [["toImage"]], "toImageButtonOptions": {"format": "svg", "filename": "xenium_cellnest_ligtarget_heatmap"}},
+                                                          style={"flex": "1", "minWidth": "200px", "height": "320px"}),
+                                                dcc.Graph(id="cellnest-dotplot", responsive=True,
+                                                          config={"displayModeBar": "hover", "modeBarButtons": [["toImage"]], "toImageButtonOptions": {"format": "svg", "filename": "xenium_cellnest_dotplot"}},
+                                                          style={"flex": "1", "minWidth": "200px", "height": "320px"}),
+                                            ], style={"display": "flex", "gap": "6px", "padding": "0 8px 8px"}),
+                                        ], style={"backgroundColor": CARD_BG}),
+                                    ], style={"flexShrink": "0"}),
                                     # ── Downstream TF panel ─────────────────
                                     html.Details([
                                         html.Summary("▶ Downstream TF Analysis",
@@ -10319,24 +10632,24 @@ dbc.Modal([
                                                                  style={"flex": "1", "fontSize": "11px"}),
                                                 ], style={"display": "flex", "alignItems": "center", "padding": "4px 8px"}),
                                                 dcc.Graph(id="cellnest-downstream-plot", responsive=True,
-                                                          config={"displayModeBar": False},
+                                                          config={"displayModeBar": "hover", "modeBarButtons": [["toImage"]], "toImageButtonOptions": {"format": "svg", "filename": "xenium_cellnest_downstream"}},
                                                           style={"height": "220px"}),
                                             ], id="cellnest-downstream-results",
                                                style={"display": "none"}),
                                         ], style={"backgroundColor": CARD_BG}),
                                     ], style={"flexShrink": "0", "overflowY": "auto", "maxHeight": "260px"}),
                                 ], style={"display": "flex", "flexDirection": "column",
-                                          "height": "calc(100% - 36px)", "overflow": "hidden"})]),
+                                          "flex": "1", "minHeight": "0", "overflow": "hidden"})]),
                         dbc.Tab(label="ROI Area", tab_id="tab-roi-area",
                                 label_style={"fontSize": "12px", "padding": "4px 12px"},
                                 children=[html.Div([
                                     html.Div(dcc.Graph(id="roi-area-plot", responsive=True,
-                                              config={"displayModeBar": False},
+                                              config={"displayModeBar": "hover", "toImageButtonOptions": {"format": "svg", "filename": "xenium_roi_area"}},
                                               style={"width": "100%", "height": "100%"}),
                                              id="roi-area-plot-container",
                                              style={"flex": "1", "minHeight": "0"}),
                                     _plot_dim_controls("roi-area"),
-                                ], style={"display": "flex", "flexDirection": "column", "height": "calc(100% - 36px)"})]),
+                                ], style={"display": "flex", "flexDirection": "column", "flex": "1", "minHeight": "0"})]),
                     ]),
                 ], id="umap-panel", style={"display": "none"}),
             ], id="plots-row", style={"display": "flex", "flex": "1", "gap": "10px", "minHeight": "0"}),
@@ -10557,6 +10870,11 @@ def store_relayout(relayout_data, current):
     State("cellnest-overlay-enable", "value"),
     State("cellnest-options",        "value"),
     State("cellnest-color-by",       "value"),
+    State("cellnest-filter-ligand",   "value"),
+    State("cellnest-filter-receptor", "value"),
+    State("cellnest-filter-sender",   "value"),
+    State("cellnest-filter-receiver", "value"),
+    State("cellnest-annot-col",       "value"),
 )
 def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
                  _annot_done, morph_enable, morph_zlevel, morph_channels,
@@ -10566,7 +10884,8 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
                  _split_done, _roi_done, counts_mode, _niche_done,
                  cbar_min, cbar_max,
                  cn_lr_pair, cn_top_n, cn_edge_width, cn_overlay_enable, cn_options,
-                 cn_color_by):
+                 cn_color_by, cn_f_ligand, cn_f_receptor, cn_f_sender, cn_f_receiver,
+                 cn_annot_col):
     # If only the viewport changed, avoid full figure rebuild
     triggered = callback_context.triggered_id
     boundaries_active = bool(boundary_toggles)
@@ -10666,18 +10985,13 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
         _cn_status = _cellnest_state.get("status")
     if _cn_status == "done" and cn_lr_pair and "on" in (cn_overlay_enable or []):
         _cn_opts = cn_options or []
-        if "gray_bg" in _cn_opts:
-            with _cellnest_lock:
-                _cn_coords = (_cellnest_state.get("data") or {}).get("coords")
-            if _cn_coords is not None:
-                spatial_fig.add_trace(go.Scattergl(
-                    x=_cn_coords["x"].tolist(), y=(-_cn_coords["y"]).tolist(),
-                    mode="markers", marker={"size": 3, "color": "rgba(30,30,40,0.82)"},
-                    name="cellnest_gray_bg", hoverinfo="skip",
-                ))
         for _t in _cellnest_overlay_traces(cn_lr_pair, cn_top_n or 100,
                                            edge_width=cn_edge_width or 1,
-                                           color_by=cn_color_by or "lr_pair"):
+                                           color_by=cn_color_by or "lr_pair",
+                                           options=_cn_opts,
+                                           f_ligand=cn_f_ligand, f_receptor=cn_f_receptor,
+                                           f_sender=cn_f_sender, f_receiver=cn_f_receiver,
+                                           annot_col=cn_annot_col):
             spatial_fig.add_trace(_t)
     return spatial_fig, umap_fig
 
@@ -10686,15 +11000,123 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
     Output("selected-cell", "data"),
     Input("spatial-plot", "clickData"),
     Input("umap-plot",    "clickData"),
+    State("measure-store", "data"),
     prevent_initial_call=True,
 )
-def capture_click(spatial_click, umap_click):
+def capture_click(spatial_click, umap_click, measure_state):
+    # Don't select cells when the ruler is active
+    if measure_state and measure_state.get("active"):
+        return no_update
     triggered = callback_context.triggered_id
     click = spatial_click if triggered == "spatial-plot" else umap_click
     if not click or not click.get("points"):
         return None
     pt = click["points"][0]
     return pt.get("customdata") or pt.get("text")
+
+
+# ─── Distance measurement ────────────────────────────────────────────────────
+
+@app.callback(
+    Output("measure-store", "data"),
+    Output("measure-btn",   "style"),
+    Input("measure-btn", "n_clicks"),
+    State("measure-store", "data"),
+    prevent_initial_call=True,
+)
+def toggle_measure(n_clicks, store):
+    active = not store.get("active", False)
+    btn_style = {
+        "padding": "4px 7px", "fontSize": "14px",
+        "border": "1px solid #58a6ff" if active else f"1px solid {BORDER}",
+        "borderRadius": "4px", "cursor": "pointer", "lineHeight": "1",
+        "backgroundColor": "#1f3b5a" if active else CARD_BG,
+        "color": "#58a6ff" if active else TEXT,
+    }
+    return {"active": active, "points": []}, btn_style
+
+
+@app.callback(
+    Output("measure-store", "data", allow_duplicate=True),
+    Input("spatial-plot", "clickData"),
+    State("measure-store", "data"),
+    prevent_initial_call=True,
+)
+def measure_capture_click(click_data, store):
+    if not store or not store.get("active"):
+        return no_update
+    if not click_data or not click_data.get("points"):
+        return no_update
+    pt = click_data["points"][0]
+    x, y = pt.get("x"), pt.get("y")
+    if x is None or y is None:
+        return no_update
+    points = store.get("points", [])
+    if len(points) >= 2:
+        # Start new measurement from this click
+        points = [[x, y]]
+    else:
+        points = points + [[x, y]]
+    return {**store, "points": points}
+
+
+@app.callback(
+    Output("spatial-plot", "figure", allow_duplicate=True),
+    Output("measure-dist-display", "children"),
+    Output("measure-dist-display", "style"),
+    Input("measure-store", "data"),
+    State("spatial-plot", "figure"),
+    prevent_initial_call=True,
+)
+def draw_measurement(store, fig):
+    _dist_hidden = {"fontSize": "11px", "color": TEXT,
+                    "backgroundColor": "rgba(13,17,23,0.85)",
+                    "padding": "3px 6px", "borderRadius": "4px",
+                    "marginLeft": "4px", "display": "none"}
+    _dist_visible = {**_dist_hidden, "display": "inline"}
+
+    if fig is None:
+        return no_update, "", _dist_hidden
+
+    # Remove previous measure traces
+    fig["data"] = [t for t in fig.get("data", [])
+                   if not str(t.get("name", "")).startswith("measure_")]
+
+    if not store or not store.get("active"):
+        return fig, "", _dist_hidden
+
+    points = store.get("points", [])
+    if not points:
+        return fig, "", _dist_hidden
+
+    marker_trace = {
+        "type": "scattergl", "mode": "markers",
+        "x": [p[0] for p in points],
+        "y": [p[1] for p in points],
+        "marker": {"size": 10, "color": "#f0c040",
+                   "symbol": "cross", "line": {"width": 2, "color": "#f0c040"}},
+        "name": "measure_points", "hoverinfo": "skip", "showlegend": False,
+    }
+    fig["data"].append(marker_trace)
+
+    if len(points) == 2:
+        x1, y1 = points[0]
+        x2, y2 = points[1]
+        # y coordinates in plot space are negated µm; distance is same either way
+        dist_um = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+        line_trace = {
+            "type": "scattergl", "mode": "lines",
+            "x": [x1, x2], "y": [y1, y2],
+            "line": {"color": "#f0c040", "width": 2, "dash": "dot"},
+            "name": "measure_line", "hoverinfo": "skip", "showlegend": False,
+        }
+        fig["data"].append(line_trace)
+        label = f"{dist_um:.1f} µm"
+        if dist_um >= 1000:
+            label += f"  ({dist_um / 1000:.2f} mm)"
+        return fig, label, _dist_visible
+
+    return fig, "click second point…", _dist_visible
 
 
 @app.callback(
@@ -11008,6 +11430,37 @@ def update_cellnest_tab(ccc_version, lr_pair, top_n, color_by, annot_col,
 
 
 @app.callback(
+    Output("cellnest-lr-heatmap",       "figure"),
+    Output("cellnest-ligtarget-heatmap","figure"),
+    Output("cellnest-dotplot",          "figure"),
+    Input("cellnest-version",           "data"),
+    Input("cellnest-nichenest-top-n",   "value"),
+    Input("cellnest-annot-col",         "value"),
+    Input("cellnest-filter-ligand",     "value"),
+    Input("cellnest-filter-receptor",   "value"),
+    Input("cellnest-filter-sender",     "value"),
+    Input("cellnest-filter-receiver",   "value"),
+    prevent_initial_call=True,
+)
+def update_cellnest_nichenest(ccc_version, top_n, annot_col,
+                               f_ligand, f_receptor, f_sender, f_receiver):
+    with _cellnest_lock:
+        status = _cellnest_state.get("status")
+    if status != "done":
+        empty = go.Figure(layout=go.Layout(paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG))
+        return empty, empty, empty
+    n = top_n or 20
+    kw = dict(f_ligand=f_ligand, f_receptor=f_receptor,
+              f_sender=f_sender, f_receiver=f_receiver,
+              annot_col=annot_col, top_n=n)
+    return (
+        _cellnest_make_lr_heatmap(**kw),
+        _cellnest_make_ligtarget_heatmap(**kw),
+        _cellnest_make_dotplot(**kw),
+    )
+
+
+@app.callback(
     Output("spatial-plot", "figure", allow_duplicate=True),
     Input("cellnest-lr-pair", "value"),
     Input("cellnest-top-n", "value"),
@@ -11016,11 +11469,18 @@ def update_cellnest_tab(ccc_version, lr_pair, top_n, color_by, annot_col,
     Input("cellnest-overlay-enable", "value"),
     Input("cellnest-options", "value"),
     Input("cellnest-color-by", "value"),
+    Input("cellnest-filter-ligand",   "value"),
+    Input("cellnest-filter-receptor", "value"),
+    Input("cellnest-filter-sender",   "value"),
+    Input("cellnest-filter-receiver", "value"),
+    Input("cellnest-annot-col",       "value"),
     State("spatial-plot", "figure"),
     prevent_initial_call=True,
 )
 def update_cellnest_main_overlay(lr_pair, top_n, ccc_version, edge_width,
-                                 overlay_enable, options, color_by, current_fig):
+                                 overlay_enable, options, color_by,
+                                 f_ligand, f_receptor, f_sender, f_receiver, annot_col,
+                                 current_fig):
     if current_fig is None:
         raise dash.exceptions.PreventUpdate
     # Remove existing CellNEST traces
@@ -11028,21 +11488,16 @@ def update_cellnest_main_overlay(lr_pair, top_n, ccc_version, edge_width,
                    if not str(t.get("name", "")).startswith("cellnest_")]
     with _cellnest_lock:
         status = _cellnest_state.get("status")
-        cn_data = _cellnest_state.get("data")
     overlay_on = "on" in (overlay_enable or [])
     opts = options or []
     if status == "done" and lr_pair and overlay_on:
-        # Optional: gray out non-participating cells
-        if "gray_bg" in opts and cn_data is not None:
-            coords = cn_data["coords"]
-            data_traces = data_traces + [go.Scattergl(
-                x=coords["x"].tolist(), y=(-coords["y"]).tolist(),
-                mode="markers", marker={"size": 3, "color": "rgba(30,30,40,0.82)"},
-                name="cellnest_gray_bg", hoverinfo="skip",
-            ).to_plotly_json()]
         new_traces = _cellnest_overlay_traces(lr_pair, top_n or 100,
                                               edge_width=edge_width or 1,
-                                              color_by=color_by or "lr_pair")
+                                              color_by=color_by or "lr_pair",
+                                              options=opts,
+                                              f_ligand=f_ligand, f_receptor=f_receptor,
+                                              f_sender=f_sender, f_receiver=f_receiver,
+                                              annot_col=annot_col)
         data_traces = data_traces + [t.to_plotly_json() for t in new_traces]
     current_fig["data"] = data_traces
     return current_fig
@@ -11332,7 +11787,7 @@ app.clientside_callback(
             }
         }, 50);
         if (hiding) return [{"display": "none"}, "Show Plots"];
-        return [{"flex": "1", "minWidth": "0"}, "Hide Plots"];
+        return [{"flex": "1", "minWidth": "0", "display": "flex", "flexDirection": "column", "overflow": "hidden"}, "Hide Plots"];
     }""",
     Output("umap-panel",  "style"),
     Output("umap-toggle", "children"),
@@ -13110,9 +13565,11 @@ def update_spatial_plots(_spatial_done, _ds_version,
     Input("niche-done", "data"),
     Input("spatial-done", "data"),
     Input("dataset-version", "data"),
+    Input("niche-umap-plot-w", "value"),
+    Input("niche-umap-plot-h", "value"),
 )
-def update_niche_umap(_niche_done, _spatial_done, _ds_version):
-    return make_niche_umap_fig()
+def update_niche_umap(_niche_done, _spatial_done, _ds_version, w, h):
+    return make_niche_umap_fig(width=w, height=h)
 
 
 @app.callback(

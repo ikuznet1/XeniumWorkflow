@@ -145,7 +145,7 @@ A gold **⬡ SUBSET ACTIVE** banner appears below the tissue info when a cell su
 - **Cell Type** — Categorical coloring by annotation result (enabled after running annotation)
 - **Transcript Counts** — log1p(transcript count), Viridis colorscale
 - **Cell Area / Nucleus Area** — Cell size QC metrics, Plasma/Cividis colorscales
-- **Spatial Niche** — Categorical coloring by spatial niche assignment (enabled after running spatial niche analysis in the Plot tab)
+- **Spatial Niche** — Categorical coloring by spatial niche assignment (enabled after running "Run" in the Spatial Analysis Tools modal, accessible from the Plot tab)
 
 All color modes work on Xenium, Baysor, and Proseg cells after switching the segmentation source.
 
@@ -158,6 +158,10 @@ All color modes work on Xenium, Baysor, and Proseg cells after switching the seg
 **Point rendering:**
 - Point size: 1–8 px (default 2)
 - Opacity: 0.1–1.0 (default 0.85)
+
+**Distance measurement tool:**
+
+Click the **📏** button in the bottom-right corner of the spatial map to activate measure mode. Click any two cells to display the Euclidean distance between them in µm. The result appears next to the button. Click the button again to exit measure mode. Cell-click-to-select is suppressed while the tool is active.
 
 **Layout:**
 - The plots row and the bottom info bar are separated by a **vertical drag handle** — drag it to resize the panels.
@@ -191,13 +195,59 @@ The right-side panel contains additional analysis plots, each in its own tab:
 
 | Tab | Content | Controls |
 |-----|---------|---------|
-| **Cell Type Abundance** | Bar chart of cell type proportions | W × H dimension inputs |
-| **Co-occurrence** | Spatial co-occurrence score heatmap | Colorbar min/max, W × H |
-| **Neighborhood Enrichment** | Neighborhood enrichment Z-score heatmap | Colorbar min/max, W × H |
-| **Interaction Graph** | Node-edge graph of cell type contacts | O/E normalize toggle, W × H |
-| **Chord Diagram** | Chord diagram of cell type contacts | O/E normalize toggle, W × H |
-| **Niche UMAP** | UMAP colored by spatial niche | W × H |
-| **UMAP** | UMAP plot (alternative to sidebar toggle) | W × H |
+| **Cell Type Abundance** | Bar chart of cell type proportions | W × H dimension inputs; download button (SVG) |
+| **Co-occurrence** | Spatial co-occurrence score heatmap | Colorbar min/max, W × H; download |
+| **Neighborhood Enrichment** | Neighborhood enrichment Z-score heatmap | Colorbar min/max, W × H; download |
+| **Interaction Graph** | Node-edge graph of cell type contacts | O/E normalize toggle, W × H; download |
+| **Chord Diagram** | Chord diagram of cell type contacts | O/E normalize toggle, W × H; download |
+| **Niche UMAP** | UMAP (or spatial map) colored by spatial niche | W × H; download |
+| **UMAP** | UMAP plot (alternative to sidebar toggle) | W × H; download |
+| **CellNEST CCC** | Cell-cell communication from CellNEST output | See below |
+
+A **download button** (camera icon) appears on hover over each plot; exports as SVG at the current display size.
+
+### CellNEST Cell-Cell Communication
+
+Visualize cell-cell communication interactions inferred by [CellNEST](https://github.com/schwartzlab-methods/CellNEST). Requires running CellNEST externally first; use `functions/export_to_cellnest.py` to export the SpatialData zarr to a CellNEST-ready `.h5ad`.
+
+**Loading results:**
+
+Click **"Load CellNEST Results"** in the sidebar to open the modal:
+1. Enter the CellNEST output folder path (the root containing `output/`, `metadata/`, `embedding_data/` subdirs)
+2. Click **Detect Datasets** to auto-discover available datasets
+3. Select a dataset and set the **Strip suffix** field (default `_4` — strip the `_4` appended to Proseg cell IDs by CellNEST)
+4. Click **Load** — progress appears in the sidebar status
+
+**CellNEST CCC tab:**
+
+| Panel | Content |
+|-------|---------|
+| Left | Filtered LR-pair frequency bar chart (top 30 by count) |
+| Right | Circos/chord diagram — cell-type → cell-type interaction weights, colored by selected scheme |
+
+**Controls:**
+
+| Control | Description |
+|---------|-------------|
+| LR Pair | Multi-select dropdown; select one or more ligand-receptor pairs to visualize |
+| Top N | Maximum number of interactions to display per pair (ranked by attention score) |
+| Edge W | Base edge line width (applies to spatial map overlay) |
+| Color By | Edge color scheme: **LR Pair**, **Ligand**, **Receptor**, **Attention Score** (Viridis), or **Sender Cell Type** |
+| Annotation | Cell-type annotation column to use for sender/receiver coloring and filtering |
+| Ligand / Receptor / Sender / Receiver filters | Multi-select dropdowns to subset interactions |
+| Options | **Scale edge width by attention score** — scales each edge's line width proportionally to its attention score (0.5×–2×); **Highlight autocrine** — rings around self-loop cells; **Color background by degree** — background cells colored by total interaction count; **Gray out non-participating cells on map** — adds dark overlay on main map |
+
+Edges on the spatial map overlay are drawn as **directed arrows** (arrowhead at the receiver end), scaled with Edge W. Chord ribbon thickness in the circos diagram is automatically proportional to the aggregated attention weight (√-scaled for perceptual uniformity).
+
+**Main map overlay:**
+
+Check **"Show edges on map"** in the sidebar to overlay CellNEST interaction edges on the central spatial scatter. The overlay respects the selected LR pairs, Top N, Edge W, Color By, and gray-out option. The overlay persists through pan/zoom.
+
+**Downstream TF analysis:**
+
+Expand the **▶ Downstream TF Analysis** panel at the bottom of the CellNEST tab. Enter a receptor gene (e.g. `CCR7`), set the number of hops through the PPI network (default 2), and click **Find TFs**. The panel shows transcription factors downstream of the receptor that are either in the Xenium panel or have panel-gene targets. Select one or more TFs to plot their expression spatially.
+
+Databases (`human_signaling_ppi.csv`, `human_tf_target.csv`) are downloaded from the CellNEST GitHub on first use and cached at `~/.xenium_explorer_cache/cellnest_db/`.
 
 **O/E normalization** (Interaction Graph + Chord Diagram) — When enabled, each edge weight is divided by the expected number of contacts under a random mixing model (`observed / (freq_A × freq_B × total_edges)`). This removes bias from abundant cell types and highlights interactions that exceed random expectation.
 
@@ -497,7 +547,7 @@ Converts a SpatialData zarr to a Seurat RDS equivalent to `LoadXenium()` output.
 |---|---|
 | `@assays$Xenium` | Panel gene raw counts (dgCMatrix, genes × cells) |
 | `@assays$Imputed` | SpaGE-imputed genes, if present |
-| `@meta.data` | All obs columns + `nCount_Xenium`, `nFeature_Xenium` + cell type annotation columns (Seurat kNN, RCTD, CellTypist — if present in cache) |
+| `@meta.data` | All obs columns + `nCount_Xenium`, `nFeature_Xenium`, `cell_area`, `nucleus_area` + cell type annotation columns (Seurat kNN, RCTD, CellTypist — if present in cache) |
 | `@reductions$umap` | UMAP coordinates (`split_umap_1/2` when `--use_corrected`, else `umap_1/2`) |
 | `@images$fov` | Centroids + cell segmentation + nucleus segmentation |
 
@@ -530,13 +580,14 @@ spatialdata2seurat(
 CLI:
 ```bash
 python functions/spatialdata2seurat.py /data/xenium.zarr /data/xenium.rds
+
 python functions/spatialdata2seurat.py /data/xenium.zarr /data/xenium.rds \
-    --use_corrected --no_imputed --no_nucleus
+    --use_corrected --no_imputed --no_nucleus \
+    --cache_dir ~/.xenium_explorer_cache --assay Xenium --fov 1467
+
 python functions/spatialdata2seurat.py /data/xenium.zarr /data/xenium_roi.rds \
     --roi ~/.xenium_explorer_cache/rois_XXXXXXXX.json \
-    --roi_name "Infarct zone"
-python functions/spatialdata2seurat.py /data/xenium.zarr /data/xenium_roi.rds \
-    --roi rois.json --roi_cls "lesion"
+    --roi_cls Sample --roi_name Top --fov 1697
 ```
 
 **Flags:**
@@ -546,12 +597,16 @@ python functions/spatialdata2seurat.py /data/xenium.zarr /data/xenium_roi.rds \
 | `--use_corrected` | Use `X_corrected` (SPLIT-corrected) counts; drops cells without correction |
 | `--no_imputed` | Skip the `Imputed` assay |
 | `--no_nucleus` | Skip nucleus segmentation from `@images$fov` |
-| `--roi PATH` | Path to ROI JSON (exported from the app's cache) |
-| `--roi_cls CLS` | Filter ROIs to those with `cls == CLS` |
+| `--roi PATH` | Path to ROI JSON file or ROI directory. JSON files use the app's polygon format (`[{cls, name, polygon_xy}]`); cells are filtered by point-in-polygon (requires `shapely`) |
+| `--roi_cls CLS` | Filter ROIs to those with `cls == CLS` (default: all classes) |
 | `--roi_name NAME` | Filter ROIs to the named ROI only |
+| `--cache_dir DIR` | Cache directory to search for annotation parquets (default: `~/.xenium_explorer_cache`) |
+| `--assay NAME` | Name of the Seurat assay (default: `Xenium`) |
+| `--fov FOV` | FOV identifier for `@images$fov` (default: `fov`; use the numeric FOV count, e.g., `1467`) |
 
 **Notes:**
-- Cell type annotations (Seurat kNN, RCTD, CellTypist) are automatically discovered from `~/.xenium_explorer_cache/` and written to `@meta.data`. Run annotation in the app first.
+- Cell type annotations (Seurat kNN, RCTD, CellTypist) are automatically discovered from `~/.xenium_explorer_cache/` (or `--cache_dir`) and written to `@meta.data`. Annotations are matched to the current dataset via `dataset_hash` in `params.json`; for older runs without a hash, the script falls back to cell-ID overlap matching. Run annotation in the app first.
+- `cell_area` and `nucleus_area` are included in `@meta.data` when available in the zarr obs. For Proseg runs, `cell_area` is derived from the `volume` column in `cell-metadata.csv.gz`.
 - `@reductions$umap` is written from the pre-computed UMAP stored in zarr. If `--use_corrected`, the SPLIT-corrected UMAP (`split_umap_1/2`) is used. Load the run in the app at least once to ensure UMAP is cached; re-run this script if the warning `split_umap_1/2 not found` appears after the UMAP has been recomputed.
 - The ROI JSON path is printed to the server log when ROIs are saved; it is also at `~/.xenium_explorer_cache/rois_<hash>.json`.
 
