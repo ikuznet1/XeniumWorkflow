@@ -10375,7 +10375,7 @@ dbc.Modal([
                             "toImageButtonOptions": {"format": "svg", "filename": "xenium_spatial"},
                         },
                         style={"height": "100%"},
-                    )
+                    ),
                     html.Div([
                         html.Button("📏", id="measure-btn", n_clicks=0, title="Measure distance",
                                     style={"padding": "4px 7px", "fontSize": "14px",
