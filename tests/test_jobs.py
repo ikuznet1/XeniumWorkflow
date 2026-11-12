@@ -599,7 +599,8 @@ def test_no_job_is_started_outside_the_registry():
                  "_run_reseg_umap", "_run_spatial_analysis", "_run_spatial_niches",
                  "_load_cellnest_data", "_save_sdata_to_disk", "_load_cached_baysor",
                  "_load_cached_proseg", "_run_de", "_run_geneset_score", "_run_density",
-                 "_run_pseudobulk_de", "_run_moran", "_run_lr"}
+                 "_run_pseudobulk_de", "_run_moran", "_run_lr", "_run_compartments",
+                 "_run_spillover", "_run_segqc", "_run_coloc"}
     started = set()
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):

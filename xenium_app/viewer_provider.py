@@ -154,6 +154,11 @@ class _ViewerProvider:
             gs = analysis._geneset_color(mode, source, corrected)
             n_all = len(df) + sum(len(e["df"]) for e in extras)
             if gs is not None and len(gs[0]) >= n_all:
+                seq = analysis._view_color_seq.get(gs[2])
+                if seq is not None:        # a sequential per-cell value (distance, density, score)
+                    meta, arr = self._continuous(gs[0][:n_all], gs[2], "viridis")
+                    meta["min"], meta["max"] = seq
+                    return meta, arr
                 meta, arr = self._continuous(gs[0][:n_all], gs[2], "rdbu")
                 meta["min"], meta["max"] = -gs[1], gs[1]
                 return meta, arr

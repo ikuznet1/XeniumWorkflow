@@ -704,6 +704,7 @@ def _refresh_colorby_options(current_options) -> list:
         options.append({"label": f"ROI: {cls}", "value": f"roi_{cls}"})
     for name in analysis._geneset_names():
         options.append({"label": f"Gene set: {name}", "value": f"geneset:{name}"})
+    options += analysis._view_color_extra_options()
     return options
 
 

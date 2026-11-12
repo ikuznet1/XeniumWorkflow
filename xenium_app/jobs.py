@@ -95,6 +95,8 @@ _JOB_KIND_NAMES = {
     "cellnest": "CellNEST load", "de": "differential expression",
     "geneset": "gene-set scoring", "density": "transcript density",
     "moran": "spatially variable genes", "lr": "ligand-receptor scoring",
+    "compartments": "tissue compartments", "spillover": "spillover score",
+    "segqc": "segmentation QC", "coloc": "stratified co-localisation",
 }
 
 _jobs: dict = {}                       # job id → _Job, in start order

@@ -59,6 +59,33 @@ def _sdata_summary(sdata) -> str:
     return f"{n_tx:,} transcripts | images: {', '.join(images) or 'none'}"
 
 
+# functions(cells_df, seg_source) -> DataFrame (aligned to cells_df) or None: per-cell
+# columns of other modules to write with Save as SpatialData (the controls module registers)
+_extra_obs_providers: list = []
+
+
+def _with_extra_obs(cells_df, seg_source):
+    """(cells_df with the registered extra columns joined - a copy when there are any -,
+    their names)."""
+    names = []
+    if cells_df is None:
+        return cells_df, names
+    for fn in list(_extra_obs_providers):
+        try:
+            extra = fn(cells_df, seg_source)
+        except Exception as exc:
+            print(f"  save_spatialdata: extra columns skipped ({exc})", flush=True)
+            continue
+        if extra is None or not len(extra.columns):
+            continue
+        if not names:
+            cells_df = cells_df.copy()
+        for c in extra.columns:
+            cells_df[c] = extra[c].to_numpy()
+            names.append(c)
+    return cells_df, names
+
+
 def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bool = False) -> None:
     """Background thread: write current SpatialData + analysis results to disk."""
     _gen = jobs._dataset_gen
@@ -112,6 +139,11 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
             cluster_methods = [] if cells_df is None else [
                 c for c in cells_df.columns
                 if c.startswith("cluster") or c == "niche" or c.startswith("roi_")]
+
+        cells_df, _extra_cols = _with_extra_obs(cells_df, seg_source)
+        # text columns go through the label path below, numeric ones through the numeric path
+        cluster_methods = list(cluster_methods) + [c for c in _extra_cols if c not in cluster_methods
+                                                   and cells_df[c].dtype == object]
 
         _set("running", f"Writing to {save_path}…")
         print(f"  save_spatialdata: writing to {save_path} (seg={seg_source}, roi_only={roi_only})…", flush=True)

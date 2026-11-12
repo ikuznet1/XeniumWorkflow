@@ -358,10 +358,15 @@ def test_pseudobulk_job_fills_the_de_tab(xe, D, six, tmp_path):
     ref = pd.read_csv(tmp_path / "ref.csv")
     _same(res["table"]["log2fc"], ref["log2fc"])
     _same(res["table"]["padj"], ref["padj"])
-    # volcano: the shrunken fold change, named; genes without an adjusted p are not drawn
+    # volcano: the unshrunken (MLE) fold change by default, the shrunken one on request, each
+    # named; genes without an adjusted p are not drawn
     fig, rows = xe.update_de_results(1, 0, None, None)
     assert "Pseudobulk, all cells: A treated (3 samples) vs B control (3 samples)" in fig.layout.title.text
-    assert "~ condition" in fig.layout.title.text and res["shrink"] in fig.layout.xaxis.title.text
+    assert "~ condition" in fig.layout.title.text and "n = 6 samples" in fig.layout.title.text
+    assert "unshrunken (MLE)" in fig.layout.xaxis.title.text
+    fig_s, _rows = xe.update_de_results(1, 0, None, None, "shrunk")
+    assert f"{res['shrink']}-shrunken" in fig_s.layout.xaxis.title.text
+    assert "Unit of the p-values: n = 6 samples" in xe._de_state["message"]
     n_drawn = sum(int(np.isfinite(np.asarray(t.y, dtype=float)).sum()) for t in fig.data)
     assert n_drawn == int(res["table"]["padj"].notna().sum())
     cols, sample_view = xe.update_de_table_columns(1, 0)
@@ -854,7 +859,8 @@ def test_morans_i_tab_runs_per_sample_as_a_job(xe, D, expressed_gene):
         xe.moran_pick_gene_from_table({"row": 40, "column": 1}, rows[:15], opts)
     out = xe.download_moran_table(1)
     head = [l for l in out["content"].splitlines() if l.startswith("#")]
-    assert "k = 6" in head[0] and "row-standardised" in head[0] and len(head) == 3
+    assert "k = 6" in head[0] and "row-standardised" in head[0] and len(head) == 4
+    assert "unit of the p-values" in head[1] and "count >= 1" in head[1]
     body = pd.read_csv(io.StringIO(out["content"]), comment="#")
     assert len(body) == len(t) and list(body.columns[:3]) == ["sample", "gene", "moran_i"]
     # corrected counts are another matrix: asked for, absent in S1 → original, and said

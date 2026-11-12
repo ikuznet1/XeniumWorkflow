@@ -3,6 +3,9 @@ differential expression (DESeq2 / edgeR through rpy2), composition tests, Moran'
 ligand-receptor scores (compute + layouts)."""
 
 import re
+import os
+import json
+import hashlib
 import threading
 import numpy as np
 import pandas as pd
@@ -17,14 +20,18 @@ from . import core, jobs, dataview, ui, figures, analysis, spatial
 
 
 # ─── Samples and their conditions ─────────────────────────────────────────────
-# One assignment for every test that compares samples (pseudobulk DE, composition):
-# each loaded sample is in condition A, in condition B, or excluded, with an optional
-# pairing / batch label. Kept per sample identity (its directory / .zarr path), so it
-# survives removing and re-adding a sample; cleared when another dataset is loaded.
+# One assignment for every test that compares samples (pseudobulk DE, composition,
+# stratified co-localisation): each loaded sample is in condition A, in condition B, or
+# excluded, with an optional donor (the pairing unit: samples of one donor are not
+# independent) and an optional batch label. Kept per sample identity (its directory /
+# .zarr path), so it survives removing and re-adding a sample, and written to the cache
+# directory per set of loaded samples, so it comes back when the same samples are loaded
+# again (also after Load Sample, which clears the in-memory copy).
 
-_design_state: dict = {"assign": {},                    # sample key -> {"cond": "A"|"B"|"", "batch": str}
+_design_state: dict = {"assign": {},                    # sample key -> {"cond": "A"|"B"|"", "batch": str, "donor": str}
                        "names": {"A": "A", "B": "B"},   # display names of the two conditions
-                       "version": 0}
+                       "version": 0,
+                       "synced": None}                  # sample set the saved design was last looked up for
 _design_lock = threading.Lock()
 
 _PB_MIN_CELLS = 10         # a sample contributing fewer cells is dropped
@@ -50,7 +57,7 @@ _LR_MAX_PERM = 10_000
 def _stats_reset() -> None:
     """Forget the design and every result (another dataset was loaded; tests)."""
     with _design_lock:
-        _design_state.update({"assign": {}, "names": {"A": "A", "B": "B"}})
+        _design_state.update({"assign": {}, "names": {"A": "A", "B": "B"}, "synced": None})
         _design_state["version"] += 1
     with _comp_lock:
         _comp_state.update({"result": None, "message": ""})
@@ -61,9 +68,79 @@ def _stats_reset() -> None:
         _lr_state.update({"status": "idle", "message": "", "result": None})
 
 
+def _design_keys() -> list:
+    """Identity of every loaded sample (the primary one first)."""
+    return [dataview._ds_key(ds) for ds in [core.DATA] + list(dataview.EXTRA_DATASETS)]
+
+
+def _design_path(keys=None) -> "str | None":
+    """Cache file of the design of a set of samples; None when a sample has no identity on
+    disk (a dataset built in memory), so nothing is written for it."""
+    keys = sorted(set(_design_keys() if keys is None else keys))
+    if not keys or any(str(k).startswith("mem:") for k in keys):
+        return None
+    tag = hashlib.md5("\n".join(keys).encode()).hexdigest()[:10]
+    return os.path.join(core.CACHE_BASE_DIR, f"design_{tag}.json")
+
+
+def _design_save() -> None:
+    """Write the assignment of the loaded samples. Call inside _design_lock."""
+    keys = _design_keys()
+    path = _design_path(keys)
+    if path is None:
+        return
+    try:
+        os.makedirs(core.CACHE_BASE_DIR, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"version": 1, "samples": sorted(set(keys)), "names": _design_state["names"],
+                       "assign": {k: _design_state["assign"][k] for k in keys
+                                  if k in _design_state["assign"]}}, f, indent=1)
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f"  Sample design cache write error: {e}", flush=True)
+
+
+def _design_sync() -> bool:
+    """Restore the saved design when the set of loaded samples changed since the last
+    look: True when a saved design was read. Entries set in this session for samples
+    that have no saved design are kept."""
+    keys = _design_keys()
+    cur = tuple(sorted(set(keys)))
+    with _design_lock:
+        if _design_state.get("synced") == cur:
+            return False
+        _design_state["synced"] = cur
+        path = _design_path(keys)
+        if path is None or not os.path.isfile(path):
+            return False
+        try:
+            with open(path) as f:
+                saved = json.load(f)
+            assign = saved.get("assign") or {}
+            for k in keys:
+                a = assign.get(k)
+                if isinstance(a, dict):
+                    _design_state["assign"][k] = {
+                        "cond": a.get("cond") if a.get("cond") in ("A", "B") else "",
+                        "batch": str(a.get("batch") or ""), "donor": str(a.get("donor") or "")}
+            nm = saved.get("names") or {}
+            for c in ("A", "B"):
+                if nm.get(c):
+                    _design_state["names"][c] = str(nm[c])
+            _design_state["version"] += 1
+            print(f"  Sample design restored for {len(cur)} sample(s) from {os.path.basename(path)}",
+                  flush=True)
+            return True
+        except Exception as e:
+            print(f"  Sample design cache read error: {e}", flush=True)
+            return False
+
+
 def _design_samples() -> list:
     """The loaded samples (the primary one and the extra ones) with their assignment:
-    [{index, label (S0…), key, name, n_cells, cond ("A" / "B" / ""), batch}]."""
+    [{index, label (S0…), key, name, n_cells, cond ("A" / "B" / ""), batch, donor}]."""
+    _design_sync()
     dsets = [core.DATA] + list(dataview.EXTRA_DATASETS)
     with _design_lock:
         assign = {k: dict(v) for k, v in _design_state["assign"].items()}
@@ -73,22 +150,28 @@ def _design_samples() -> list:
         a = assign.get(key, {})
         out.append({"index": i, "label": f"S{i}", "key": key, "name": dataview._ds_name(ds),
                     "n_cells": int(len(ds["df"])), "cond": a.get("cond") or "",
-                    "batch": a.get("batch") or ""})
+                    "batch": a.get("batch") or "", "donor": a.get("donor") or ""})
     return out
 
 
 def _design_set(rows, names=None) -> None:
-    """Store the assignment: rows = [{key, cond, batch}], names = {"A": …, "B": …}."""
+    """Store the assignment: rows = [{key, cond, batch, donor}], names = {"A": …, "B": …}.
+    A row without "donor" keeps the donor the sample had."""
+    _design_sync()
+    _clean = lambda v: re.sub(r"\s+", " ", str(v or "").strip())
     with _design_lock:
         for r in rows:
             cond = r.get("cond") if r.get("cond") in ("A", "B") else ""
-            batch = re.sub(r"\s+", " ", str(r.get("batch") or "").strip())
-            _design_state["assign"][str(r["key"])] = {"cond": cond, "batch": batch}
+            prev = _design_state["assign"].get(str(r["key"]), {})
+            donor = _clean(r["donor"]) if "donor" in r else (prev.get("donor") or "")
+            _design_state["assign"][str(r["key"])] = {"cond": cond, "batch": _clean(r.get("batch")),
+                                                      "donor": donor}
         if names:
             for c in ("A", "B"):
-                nm = re.sub(r"\s+", " ", str(names.get(c) or "").strip())
+                nm = _clean(names.get(c))
                 _design_state["names"][c] = nm or c
         _design_state["version"] += 1
+        _design_save()
 
 
 def _design_names() -> dict:
@@ -98,11 +181,20 @@ def _design_names() -> dict:
 
 def _design_of(samples) -> tuple:
     """(conds, batches) of analysis samples / view tables, by their key."""
+    _design_sync()
     with _design_lock:
         assign = {k: dict(v) for k, v in _design_state["assign"].items()}
     conds = [(assign.get(s["key"], {}).get("cond") or "") for s in samples]
     batches = [(assign.get(s["key"], {}).get("batch") or "") for s in samples]
     return conds, batches
+
+
+def _design_donors(samples) -> list:
+    """Donor label of analysis samples / view tables, by their key ("" = none given)."""
+    _design_sync()
+    with _design_lock:
+        assign = {k: dict(v) for k, v in _design_state["assign"].items()}
+    return [(assign.get(s["key"], {}).get("donor") or "") for s in samples]
 
 
 def _design_summary() -> str:
@@ -120,9 +212,12 @@ def _design_summary() -> str:
     ex = [r["label"] for r in rows if not r["cond"]]
     if ex:
         parts.append(f"excluded: {', '.join(ex)}")
+    if any(r["donor"] for r in rows if r["cond"]):
+        parts.append("donor: " + ", ".join(f"{r['label']}={r['donor'] or '?'}"
+                                           for r in rows if r["cond"]))
     if any(r["batch"] for r in rows if r["cond"]):
-        parts.append("pairing / batch: " + ", ".join(f"{r['label']}={r['batch'] or '?'}"
-                                                      for r in rows if r["cond"]))
+        parts.append("batch: " + ", ".join(f"{r['label']}={r['batch'] or '?'}"
+                                           for r in rows if r["cond"]))
     return " · ".join(parts)
 
 
@@ -190,12 +285,219 @@ def _bh(p) -> np.ndarray:
     return out
 
 
+# ─── Sample-level inference: exact sign-flip and label-permutation tests ──────
+# The observations of a test between conditions are the independent units (donors, or
+# samples when no donor is given), never cells. With a handful of units the reference
+# distribution is small enough to enumerate, so it is enumerated: a random sample of a
+# 128-element null hides its tail. Monte Carlo (fixed seed) is used only above the
+# limits below.
+
+_SL_ENUM_UNITS = 16            # paired: all 2^n sign vectors are enumerated up to this many pairs
+_SL_ENUM_ASSIGN = 200_000      # unpaired: all C(n, n_A) relabellings are enumerated up to this many
+_SL_MC = 20_000                # Monte Carlo draws above the limits
+_SL_SEED = 0
+_SL_MIN_UNITS = 3              # units per condition (pairs, when paired) below which no sample-level test is run
+_sl_sign_cache: dict = {}
+
+
+def _sl_signs(n: int) -> np.ndarray:
+    """All 2^n sign vectors (rows of ±1), the identity (all +1) first."""
+    m = _sl_sign_cache.get(n)
+    if m is None:
+        bits = (np.arange(2 ** n, dtype=np.int64)[:, None] >> np.arange(n)[None, :]) & 1
+        m = (1.0 - 2.0 * bits).astype(np.float64)
+        _sl_sign_cache.clear()
+        _sl_sign_cache[n] = m
+    return m
+
+
+def _sl_signflip(d, n_mc: int = _SL_MC, seed: int = _SL_SEED, enum_max: int = _SL_ENUM_UNITS) -> dict:
+    """Paired sign-flip test of the mean of the per-unit differences *d*.
+
+    Under the null each unit's difference is as likely to have either sign. With n ≤
+    *enum_max* units all 2^n sign vectors are enumerated and the p-values are exact: p =
+    share of sign vectors whose |mean| is at least the observed one (two-sided), p_greater
+    / p_less the one-sided shares. Above that, *n_mc* random sign vectors (fixed *seed*)
+    and p = (1 + hits) / (1 + n_mc). min_p is the smallest two-sided p these n units can
+    give (2 / 2^n when no difference is 0)."""
+    d = np.asarray(d, dtype=np.float64)
+    d = d[np.isfinite(d)]
+    n = int(len(d))
+    out = {"test": "paired sign-flip", "n": n, "mean": float(d.mean()) if n else np.nan,
+           "n_pos": int((d > 0).sum()), "n_neg": int((d < 0).sum()), "exact": True,
+           "n_assignments": int(2 ** n) if n <= 62 else float("inf"),
+           "p": np.nan, "p_greater": np.nan, "p_less": np.nan, "min_p": np.nan}
+    if n < 1:
+        return out
+    obs = float(d.sum())
+    tol = 1e-12 * max(1.0, abs(obs))
+    if n <= enum_max:
+        sums = _sl_signs(n) @ d
+        out["p"] = float((np.abs(sums) >= abs(obs) - tol).mean())
+        out["p_greater"] = float((sums >= obs - tol).mean())
+        out["p_less"] = float((sums <= obs + tol).mean())
+        top = float(np.abs(d).sum())
+        out["min_p"] = float((np.abs(sums) >= top - 1e-12 * max(1.0, top)).mean())
+    else:
+        rng = np.random.default_rng(seed)
+        hits = np.zeros(3)
+        left = int(n_mc)
+        while left > 0:
+            b = min(left, max(1, 4_000_000 // n))
+            sums = (rng.integers(0, 2, size=(b, n), dtype=np.int8) * 2.0 - 1.0) @ d
+            hits += [(np.abs(sums) >= abs(obs) - tol).sum(), (sums >= obs - tol).sum(),
+                     (sums <= obs + tol).sum()]
+            left -= b
+        out["p"], out["p_greater"], out["p_less"] = ((hits + 1.0) / (n_mc + 1.0)).tolist()
+        out.update({"exact": False, "n_assignments": int(n_mc), "min_p": 1.0 / (n_mc + 1.0)})
+    return out
+
+
+def _sl_permutation(a, b, n_mc: int = _SL_MC, seed: int = _SL_SEED,
+                    enum_max: int = _SL_ENUM_ASSIGN) -> dict:
+    """Unpaired label-permutation test of mean(a) − mean(b).
+
+    The n_a + n_b units are exchangeable under the null. When the C(n, n_a) ways to pick
+    which units are "A" number at most *enum_max*, all are enumerated (exact p-values);
+    otherwise *n_mc* random relabellings (fixed *seed*), p = (1 + hits) / (1 + n_mc)."""
+    from itertools import combinations
+    from math import comb
+    a = np.asarray(a, dtype=np.float64); a = a[np.isfinite(a)]
+    b = np.asarray(b, dtype=np.float64); b = b[np.isfinite(b)]
+    na, nb = int(len(a)), int(len(b))
+    n = na + nb
+    out = {"test": "unpaired label permutation", "n": n, "n_a": na, "n_b": nb,
+           "mean": float(a.mean() - b.mean()) if na and nb else np.nan, "exact": True,
+           "n_assignments": comb(n, na) if na and nb else 0,
+           "p": np.nan, "p_greater": np.nan, "p_less": np.nan, "min_p": np.nan}
+    if not na or not nb:
+        return out
+    v = np.concatenate([a, b])
+    tot = float(v.sum())
+    stat = lambda sa: sa / na - (tot - sa) / nb          # difference of means from the sum of "A"
+    obs = float(stat(a.sum()))
+    tol = 1e-12 * max(1.0, abs(obs))
+    if out["n_assignments"] <= enum_max:
+        idx = np.fromiter((i for c in combinations(range(n), na) for i in c), dtype=np.int64,
+                          count=out["n_assignments"] * na).reshape(-1, na)
+        st = stat(v[idx].sum(axis=1))
+        out["p"] = float((np.abs(st) >= abs(obs) - tol).mean())
+        out["p_greater"] = float((st >= obs - tol).mean())
+        out["p_less"] = float((st <= obs + tol).mean())
+        top = float(np.abs(st).max())
+        out["min_p"] = float((np.abs(st) >= top - 1e-12 * max(1.0, top)).mean())
+    else:
+        rng = np.random.default_rng(seed)
+        hits = np.zeros(3)
+        for _ in range(int(n_mc)):
+            st = stat(v[rng.permutation(n)[:na]].sum())
+            hits += [abs(st) >= abs(obs) - tol, st >= obs - tol, st <= obs + tol]
+        out["p"], out["p_greater"], out["p_less"] = ((hits + 1.0) / (n_mc + 1.0)).tolist()
+        out.update({"exact": False, "n_assignments": int(n_mc), "min_p": 1.0 / (n_mc + 1.0)})
+    return out
+
+
+def _sl_units(conds, donors=None) -> dict:
+    """The independent units of a comparison of samples.
+
+    conds: "A" / "B" / "" per sample; donors: label per sample ("" / None: the sample is
+    its own unit). Samples of one donor within a condition are one unit (they are
+    averaged before any test). The comparison is *paired* when every included sample has
+    a donor and at least 2 donors have samples in both conditions; donors seen in one
+    condition only are then left out (listed in "dropped"). Returns {paired, units:
+    [(name, cond, [sample indices])], pairs: [(donor, [A indices], [B indices])],
+    dropped, n_samples, n_donors, note}."""
+    donors = [str(d or "").strip() for d in (donors if donors is not None else [""] * len(conds))]
+    inc = [i for i, c in enumerate(conds) if c in ("A", "B")]
+    groups: dict = {}
+    for i in inc:
+        name = donors[i] if donors[i] else f"\x00sample{i}"
+        groups.setdefault((name, conds[i]), []).append(i)
+    named = {d for (d, _c) in groups if not d.startswith("\x00")}
+    both = sorted(d for d in named if (d, "A") in groups and (d, "B") in groups)
+    all_named = bool(inc) and all(donors[i] for i in inc)
+    paired = all_named and len(both) >= 2
+    out = {"paired": paired, "pairs": [], "dropped": [], "n_donors": len(named)}
+    if paired:
+        out["pairs"] = [(d, groups[(d, "A")], groups[(d, "B")]) for d in both]
+        out["dropped"] = sorted(named - set(both))
+        used = [i for _d, ia, ib in out["pairs"] for i in ia + ib]
+        out["units"] = [(d, c, groups[(d, c)]) for d in both for c in ("A", "B")]
+        out["n_samples"] = len(used)
+        out["n_units"] = len(both)
+        out["note"] = f"n = {len(used)} samples ({len(both)} donors, paired)"
+    else:
+        out["units"] = [(d if not d.startswith("\x00") else "", c, ix) for (d, c), ix in groups.items()]
+        out["n_samples"] = len(inc)
+        out["n_units"] = len(groups)
+        n_d = len({d for (d, _c) in groups})
+        out["note"] = (f"n = {len(inc)} samples" + (f" ({n_d} donors)" if named else "")
+                       + (f", {len(groups)} independent units after averaging samples of one donor"
+                          if len(groups) != len(inc) else ""))
+        if both:
+            out["note"] += ("; a donor occurs in both conditions but the design is not paired "
+                            "(give every included sample a donor, with at least 2 donors in both "
+                            "conditions): its two units are treated as independent")
+    return out
+
+
+def _sl_test(values, conds, donors=None, units=None) -> dict:
+    """Sample-level test of A − B for one value per sample.
+
+    Samples sharing a donor within a condition are averaged to the donor first. Paired
+    design (see _sl_units): exact sign-flip test of the per-donor differences A − B;
+    otherwise the label-permutation test over the units. Adds effect (mean difference A −
+    B over the units), units_note ("n = 6 samples (3 donors, paired)"), paired, n_units
+    and per_unit (the values that were tested)."""
+    values = np.asarray(values, dtype=np.float64)
+    u = units or _sl_units(conds, donors)
+    _avg = lambda ix: float(np.nanmean(values[ix])) if np.isfinite(values[ix]).any() else np.nan
+    if u["paired"]:
+        d = np.array([_avg(ia) - _avg(ib) for _d, ia, ib in u["pairs"]])
+        res = _sl_signflip(d)
+        res["per_unit"] = d
+    else:
+        a = np.array([_avg(ix) for _n, c, ix in u["units"] if c == "A"])
+        b = np.array([_avg(ix) for _n, c, ix in u["units"] if c == "B"])
+        res = _sl_permutation(a, b)
+        res["per_unit"] = (a, b)
+    res.update({"effect": res["mean"], "paired": u["paired"], "n_units": u["n_units"],
+                "units_note": u["note"], "dropped": u["dropped"]})
+    return res
+
+
+def _sl_reach(min_p, n_tests: int, alpha: float = 0.05) -> "str | None":
+    """Warning text when no test of a family of *n_tests* can reach *alpha* after
+    Benjamini-Hochberg: a single test at the smallest achievable p gets q = min_p ×
+    n_tests. None when one test at the floor would pass."""
+    if min_p is None or not np.isfinite(min_p) or n_tests < 1:
+        return None
+    if min_p * n_tests < alpha:
+        return None
+    need = int(np.ceil(min_p * n_tests / alpha))
+    if min_p >= alpha:
+        return (f"the smallest achievable p with these units is {min_p:.3g}, which is not below "
+                f"{alpha:g}: no test can be significant, whatever the data")
+    return (f"the smallest achievable p is {min_p:.3g}; with {n_tests} tests a single one at that "
+            f"floor gets FDR {min(1.0, min_p * n_tests):.2g}: Benjamini-Hochberg can reach {alpha:g} "
+            f"only if at least {need} tests sit at the floor. Test fewer hypotheses or add units")
+
+
+def _units_cells(n: int, what: str = "cells") -> str:
+    """Statement of the unit of a cell-level p-value."""
+    return f"Unit of the p-values: n = {int(n):,} {what}, treated as independent"
+
+
 # ─── Pseudobulk differential expression ───────────────────────────────────────
 _PB_CAVEAT = ("Pseudobulk: the raw integer counts of the chosen cells are summed per sample and "
               "the samples (not the cells) are the observations. DESeq2 (Wald test, design "
-              "~ condition, or ~ batch + condition with pairing / batch labels; independent "
-              "filtering at alpha 0.05; log2 fold change A / B, shrunken with apeglm when that "
-              "package is installed, else DESeq2's normal prior, else unshrunken and labelled so); "
+              "~ condition; ~ donor + condition when every included sample has a donor - the "
+              "paired design, with the samples of one donor within a condition summed first; "
+              "else ~ batch + condition with batch labels; independent filtering at alpha 0.05; "
+              "log2 fold change A / B as the unshrunken maximum-likelihood estimate, with the "
+              "apeglm-shrunken estimate beside it when that package is installed, else DESeq2's "
+              "normal prior; the volcano colours by FDR alone and plots the estimate chosen "
+              "under 'Volcano x axis'); "
               "edgeR's quasi-likelihood F-test is used, and named, when DESeq2 is not installed. "
               "Always the original counts: SPLIT-corrected counts are modified, non-integer values "
               "and imputed genes are not counts. A condition needs at least 2 samples; with fewer "
@@ -335,16 +637,21 @@ def _design_check(conds, batches, min_per_cond=2) -> tuple:
 
 
 def _pb_prepare(samples, masks, conds, batches, min_cells=_PB_MIN_CELLS,
-                min_count=_PB_MIN_COUNT) -> dict:
+                min_count=_PB_MIN_COUNT, donors=None) -> dict:
     """The pseudobulk matrix and its design.
 
     samples / masks: the analysis samples (original counts) and the cells of the
     population in each; conds / batches: the assignment of each sample. Samples that
     are excluded, have no usable matrix rows or contribute fewer than *min_cells* cells
     are left out (and listed); genes whose total count over the used samples is below
-    *min_count* are not tested. Returns counts (genes × used samples, int64), genes,
-    cond, batch (None: no batch term), design, labels, sample_rows (every sample with
-    cells, library size and whether / why not it was used), warnings, n_filtered."""
+    *min_count* are not tested. donors: donor label per sample; when the used samples all
+    have one, the samples of a donor within a condition are summed into one column (they
+    are not independent replicates) and the donor is the blocking factor (~ donor +
+    condition), which takes the place of the batch labels. Returns counts (genes × model
+    columns, int64), genes, cond, batch (the blocking labels; None: no such term),
+    design, labels, col_of_sample (sample label → model column), sample_rows (every
+    sample with cells, library size and whether / why not it was used), warnings,
+    n_filtered, units_note."""
     min_cells = max(1, int(min_cells if min_cells is not None else _PB_MIN_CELLS))
     min_count = max(0, int(min_count if min_count is not None else _PB_MIN_COUNT))
     genes = analysis._an_common_genes(samples)
@@ -355,6 +662,7 @@ def _pb_prepare(samples, masks, conds, batches, min_cells=_PB_MIN_CELLS,
         tot, n = _pb_sum_counts(s, masks[i])
         v = tot[np.array([s["gni"][g] for g in genes], dtype=np.int64)]
         row = {"label": s["label"], "name": s["name"], "cond": conds[i], "batch": batches[i],
+               "donor": (donors[i] if donors is not None else "") or "",
                "n_cells": n, "lib_size": int(v.sum()), "used": False, "note": ""}
         if conds[i] not in ("A", "B"):
             row["note"] = "excluded"
@@ -368,8 +676,35 @@ def _pb_prepare(samples, masks, conds, batches, min_cells=_PB_MIN_CELLS,
             cols.append(v)
         rows.append(row)
     u_cond = [conds[i] for i in used]
+    u_block = [batches[i] for i in used]
+    u_donor = [(donors[i] or "") if donors is not None else "" for i in used]
+    labels = [samples[i]["label"] for i in used]
+    col_of = {lab: j for j, lab in enumerate(labels)}
+    block_name, pre_warn = "batch", []
+    if any(u_donor):
+        if not all(u_donor):
+            raise ValueError("Donor labels are set for some samples only: give every included "
+                             "sample a donor, or none.")
+        groups: dict = {}
+        for j, key in enumerate(zip(u_donor, u_cond)):
+            groups.setdefault(key, []).append(j)
+        if len(groups) < len(used):
+            merged = [g for g in groups.values() if len(g) > 1]
+            pre_warn.append("samples of one donor within a condition are not independent and "
+                            "were summed into one pseudobulk column: "
+                            + "; ".join("+".join(labels[j] for j in g) for g in merged))
+        if any(u_block):
+            pre_warn.append("batch labels are not used when donors are given: the donor is the "
+                            "blocking factor")
+        col_of = {labels[j]: gi for gi, g in enumerate(groups.values()) for j in g}
+        cols = [np.sum([cols[j] for j in g], axis=0) for g in groups.values()]
+        labels = ["+".join(labels[j] for j in g) for g in groups.values()]
+        u_cond = [c for (_d, c) in groups]
+        u_block = [d for (d, _c) in groups]
+        block_name = "donor"
     try:
-        u_batch, warn = _design_check(u_cond, [batches[i] for i in used])
+        u_batch, warn = _design_check(u_cond, u_block)
+        warn = pre_warn + warn
     except ValueError as exc:
         dropped = [r for r in rows if r["note"].startswith("dropped")]
         extra = (" Dropped: " + "; ".join(f"{r['label']} ({r['n_cells']} cells)" for r in dropped) + "."
@@ -384,8 +719,11 @@ def _pb_prepare(samples, masks, conds, batches, min_cells=_PB_MIN_CELLS,
         raise ValueError("A pseudobulk count exceeds the 32-bit integer range R works with.")
     return {"counts": counts[keep], "genes": [g for g, k in zip(genes, keep) if k],
             "cond": u_cond, "batch": u_batch,
-            "design": "~ batch + condition" if u_batch else "~ condition",
-            "labels": [samples[i]["label"] for i in used], "sample_rows": rows,
+            "design": f"~ {block_name} + condition" if u_batch else "~ condition",
+            "labels": labels, "col_of_sample": col_of, "sample_rows": rows,
+            "units_note": _sl_units([r["cond"] if r["used"] else "" for r in rows],
+                                    [r["donor"] for r in rows])["note"] if any(u_donor) else
+                          f"n = {len(used)} samples",
             "warnings": warn, "n_filtered": int((~keep).sum()), "n_genes_all": len(genes),
             "min_cells": min_cells, "min_count": min_count}
 
@@ -517,7 +855,7 @@ def _pb_fit(prep: dict, shrink: bool = True, engine: str = "auto") -> dict:
 
 def _run_pseudobulk_de(population, seg_source, method, color_by, counts_corrected=False,
                        min_cells=_PB_MIN_CELLS, min_count=_PB_MIN_COUNT, shrink=True,
-                       engine="auto") -> None:
+                       engine="auto", options=None) -> None:
     """Background job: pseudobulk differential expression between the two conditions of
     the sample design, for one cell population. Publishes into the DE state, so the
     volcano, the table and the CSV of the Differential Expression tab show it."""
@@ -554,7 +892,8 @@ def _run_pseudobulk_de(population, seg_source, method, color_by, counts_correcte
             return
         masks, pop_label = _pb_population_masks(population, samples, seg_source, method, color_by)
         conds, batches = _design_of(samples)
-        prep = _pb_prepare(samples, masks, conds, batches, min_cells, min_count)
+        prep = _pb_prepare(samples, masks, conds, batches, min_cells, min_count,
+                           donors=_design_donors(samples))
         jobs._job_check()
         _set("running", f"Fitting {prep['design']} on {len(prep['labels'])} samples × "
                         f"{len(prep['genes']):,} genes in R…")
@@ -565,12 +904,27 @@ def _run_pseudobulk_de(population, seg_source, method, color_by, counts_correcte
         names = _design_names()
         table = fit["table"]
         for r, lab in ((r, r["label"]) for r in prep["sample_rows"]):
-            r["size_factor"] = (float(fit["size_factors"][prep["labels"].index(lab)])
+            r["size_factor"] = (float(fit["size_factors"][prep["col_of_sample"][lab]])
                                 if r["used"] else None)
         n_a, n_b = prep["cond"].count("A"), prep["cond"].count("B")
         shrunk = "log2fc_shrunk" in table.columns
-        lfc_col = "log2fc_shrunk" if shrunk else "log2fc"
-        lfc_note = (f"{fit['shrink']}-shrunken" if shrunk else "unshrunken (MLE)")
+        # the volcano plots the unshrunken estimate unless the user picks the shrunken one;
+        # significance colouring is by FDR alone (see analysis.make_de_volcano_fig)
+        lfc_col = "log2fc"
+        lfc_note = ("unshrunken (MLE)" + (f"; {fit['shrink']}-shrunken estimate in column "
+                                           f"log2fc_shrunk" if shrunk else ""))
+        # depth of the cells behind each condition (median counts per cell of the population)
+        _libs = {"A": [], "B": []}
+        for i, (smp, r) in enumerate(zip(samples, prep["sample_rows"])):
+            if not r["used"]:
+                continue
+            _sf, _iv = analysis._an_size_factors(smp)
+            _rows = np.asarray(smp["rows"])
+            _sel = _rows[np.asarray(masks[i], dtype=bool) & (_rows >= 0)]
+            _sfs = _sf[_sel]
+            _libs[r["cond"]].append(analysis._AN_SCALE / _sfs[_sfs > 0])
+        med_a = float(np.median(np.concatenate(_libs["A"]))) if _libs["A"] else float("nan")
+        med_b = float(np.median(np.concatenate(_libs["B"]))) if _libs["B"] else float("nan")
         n_na = int(table["padj"].isna().sum())
         n_sig = int((table["padj"] < 0.05).sum())
         notes = list(fit["notes"])
@@ -579,11 +933,15 @@ def _run_pseudobulk_de(population, seg_source, method, color_by, counts_correcte
                          "integer counts")
         if bool(shrink) and not shrunk and fit["engine"] == "deseq2":
             notes.append("no shrinkage estimator ran: log2 fold changes are unshrunken")
+        _unit_word = "donors" if prep["design"].startswith("~ donor") else "samples"
         res = {"kind": "pseudobulk", "table": table, "population": pop_label,
                "label_a": names["A"], "label_b": names["B"], "n_a": n_a, "n_b": n_b,
-               "title": (f"Pseudobulk, {pop_label}: A {names['A']} ({n_a} samples) vs "
-                         f"B {names['B']} ({n_b} samples) — {fit['method_label']}, {prep['design']}"),
-               "lfc_col": lfc_col, "lfc_title": f"log2 fold change (A / B), {lfc_note}",
+               "title": (f"Pseudobulk, {pop_label}: A {names['A']} ({n_a} {_unit_word}) vs "
+                         f"B {names['B']} ({n_b} {_unit_word}) — {fit['method_label']}, {prep['design']}; "
+                         f"{prep['units_note']}"),
+               "lfc_col": lfc_col, "lfc_title": "log2 fold change (A / B), unshrunken (MLE)",
+               "units_note": prep["units_note"], "median_counts_a": med_a, "median_counts_b": med_b,
+               "depth_ratio": analysis._depth_ratio(med_a, med_b),
                "stat_name": fit["stat_name"], "shrink": fit["shrink"], "engine": fit["engine"],
                "method_label": fit["method_label"], "mean_unit": fit["mean_unit"],
                "design": prep["design"], "samples": prep["sample_rows"],
@@ -593,6 +951,17 @@ def _run_pseudobulk_de(population, seg_source, method, color_by, counts_correcte
                "seg_source": seg_source or "xenium", "corrected": False,
                "n_overlap": 0, "n_samples": len(prep["labels"]), "seconds": _time.time() - _t0}
         used = [r for r in prep["sample_rows"] if r["used"]]
+        _set("running", "Gene ownership and leak gate…")
+        _cA = [np.asarray(m, dtype=bool) & (r["used"] and r["cond"] == "A")
+               for m, r in zip(masks, prep["sample_rows"])]
+        _cB = [np.asarray(m, dtype=bool) & (r["used"] and r["cond"] == "B")
+               for m, r in zip(masks, prep["sample_rows"])]
+        analysis._de_annotate(res, {"samples": samples, "masks_a": _cA, "masks_b": _cB,
+                                    "seg_source": seg_source, "method": method, "color_by": color_by,
+                                    "use_corrected": False, "per_sample": True,
+                                    "options": dict(options or {})})
+        notes = res["notes"]
+        res["seconds"] = _time.time() - _t0
         dropped = [r for r in prep["sample_rows"] if r["note"].startswith("dropped")]
         msg = (f"Pseudobulk ({pop_label}): A {names['A']} [{', '.join(r['label'] for r in used if r['cond'] == 'A')}] "
                f"vs B {names['B']} [{', '.join(r['label'] for r in used if r['cond'] == 'B')}]; "
@@ -601,7 +970,10 @@ def _run_pseudobulk_de(population, seg_source, method, color_by, counts_correcte
                f"{prep['min_count']} not tested"
                + (f"; {n_na:,} without an adjusted p-value after independent filtering / outlier "
                   f"flagging" if n_na else "")
-               + f"), {n_sig:,} with FDR < 0.05 ({res['seconds']:.1f} s). Original counts.")
+               + f"), {n_sig:,} with FDR < 0.05 ({res['seconds']:.1f} s). Original counts."
+               + f"\nUnit of the p-values: {prep['units_note']} (the samples, not the cells)."
+               + "\n" + analysis._depth_note(med_a, med_b)
+               + ("\n" + res["leak_summary"] if res.get("leak_summary") else ""))
         if dropped:
             msg += (" Dropped (fewer than " + str(prep["min_cells"]) + " cells or no counts): "
                     + ", ".join(f"{r['label']} ({r['n_cells']} cells)" for r in dropped) + ".")
@@ -633,10 +1005,16 @@ def _pb_csv_header(res: dict) -> str:
              f"# counts: original integer counts summed per sample; segmentation: {res['seg_source']}; "
              f"means: {res['mean_unit']}",
              f"# genes: {res['n_genes']} tested, {res['n_filtered']} with total count < {res['min_count']} "
-             f"not tested, {res['n_padj_na']} without adjusted p-value"]
+             f"not tested, {res['n_padj_na']} without adjusted p-value",
+             f"# unit of the p-values: {res.get('units_note', '')}",
+             f"# median counts per cell of the population: A {res.get('median_counts_a', float('nan')):.0f}, "
+             f"B {res.get('median_counts_b', float('nan')):.0f}"]
+    if res.get("leak_summary"):
+        lines += ["# " + ln for ln in str(res["leak_summary"]).splitlines()]
     for r in res["samples"]:
         sf = "" if r.get("size_factor") is None else f"; size factor {r['size_factor']:.4g}"
         lines.append(f"# sample {r['label']} ({r['name']}): condition {r['cond'] or '-'}"
+                     + (f"; donor {r['donor']}" if r.get("donor") else "")
                      + (f"; batch {r['batch']}" if r["batch"] else "")
                      + f"; {r['n_cells']} cells; library size {r['lib_size']}{sf}"
                      + (f"; {r['note']}" if r["note"] else ""))
@@ -669,7 +1047,8 @@ def _pb_samples_view(res):
     if not res or res.get("kind") != "pseudobulk":
         return []
     cols = [("label", "Sample", None), ("name", "Name", lambda v: str(v)[:38]),
-            ("cond", "Condition", lambda v: v or "–"), ("batch", "Batch", lambda v: v or "–"),
+            ("cond", "Condition", lambda v: v or "–"), ("donor", "Donor", lambda v: v or "–"),
+            ("batch", "Batch", lambda v: v or "–"),
             ("n_cells", "Cells summed", lambda v: f"{v:,}"),
             ("lib_size", "Library size", lambda v: f"{v:,}"),
             ("size_factor", "Size factor", lambda v: f"{v:.3g}"), ("note", "", None)]
@@ -714,10 +1093,15 @@ def _design_modal():
                         close_button=False),
         dbc.ModalBody([
             html.Div("Assign each loaded sample to condition A, to condition B, or leave it out. "
-                     "The optional pairing / batch label (a patient, a slide, a run) adds a "
-                     "batch term to the model; give it to every included sample or to none. "
-                     "The assignment is shared by pseudobulk differential expression and the "
-                     "composition test.",
+                     "Donor: the individual a sample comes from - the pairing unit. Samples of "
+                     "one donor are not independent: within a condition they are combined into "
+                     "one unit, and when every included sample has a donor and at least 2 donors "
+                     "occur in both conditions the tests are paired (~ donor + condition; exact "
+                     "sign-flip test). Batch (a slide, a run): an optional blocking term for the "
+                     "model-based tests when no donors are given. Give a label to every included "
+                     "sample or to none. The assignment is shared by pseudobulk differential "
+                     "expression, the composition test and stratified co-localisation, and is "
+                     "saved in the cache directory for this set of samples.",
                      style={"fontSize": "11px", "color": core.MUTED, "marginBottom": "8px"}),
             html.Div([
                 html.Span("Name of A:", style=analysis._AN_LABEL_STYLE),
@@ -744,8 +1128,9 @@ def _design_rows_children() -> list:
     head = html.Div([html.Span("Sample", style={**L, "width": "44px"}),
                      html.Span("Name", style={**L, "flex": "1"}),
                      html.Span("Cells", style={**L, "width": "70px", "textAlign": "right"}),
-                     html.Span("Condition", style={**L, "width": "130px"}),
-                     html.Span("Pairing / batch", style={**L, "width": "130px"})],
+                     html.Span("Condition", style={**L, "width": "110px"}),
+                     html.Span("Donor (pairing)", style={**L, "width": "110px"}),
+                     html.Span("Batch", style={**L, "width": "100px"})],
                     style={"display": "flex", "gap": "8px", "alignItems": "center",
                            "borderBottom": f"1px solid {core.BORDER}", "paddingBottom": "3px"})
     out = [head]
@@ -760,10 +1145,13 @@ def _design_rows_children() -> list:
             dcc.Dropdown(id={"type": "design-cond", "index": r["index"]}, clearable=False,
                          options=[{"label": "A", "value": "A"}, {"label": "B", "value": "B"},
                                   {"label": "excluded", "value": ""}],
-                         value=r["cond"], style={"width": "130px", "fontSize": "11px"}),
+                         value=r["cond"], style={"width": "110px", "fontSize": "11px"}),
+            dcc.Input(id={"type": "design-donor", "index": r["index"]}, type="text",
+                      value=r["donor"], placeholder="(none)",
+                      style={**analysis._AN_INPUT_STYLE, "width": "110px"}),
             dcc.Input(id={"type": "design-batch", "index": r["index"]}, type="text",
                       value=r["batch"], placeholder="(none)",
-                      style={**analysis._AN_INPUT_STYLE, "width": "130px"}),
+                      style={**analysis._AN_INPUT_STYLE, "width": "100px"}),
         ], style={"display": "flex", "gap": "8px", "alignItems": "center", "padding": "3px 0"}))
     return out
 
@@ -779,7 +1167,13 @@ _COMP_NOTE = ("Proportions are compositional: they sum to 1 within a sample, so 
               "(ignores batch labels) is given beside it; Benjamini–Hochberg FDR over the "
               f"categories. With fewer than {_COMP_MIN_SAMPLES} samples in a condition no test is "
               "run: only the proportions are shown. Cluster and niche ids are comparable across "
-              "samples only when the samples were clustered together.")
+              "samples only when the samples were clustered together. Test 'exact (sample-level)': "
+              "the same transformed proportions, tested without a variance model - the paired "
+              "sign-flip test over donors when every included sample has a donor and at least 2 "
+              "donors occur in both conditions (samples of a donor within a condition are averaged "
+              "first), otherwise the label-permutation test over the independent units; every "
+              "assignment is enumerated when feasible. The status line gives the unit, the "
+              "smallest p these units can produce, and whether any FDR below 0.05 is reachable.")
 
 
 def _comp_category_options(seg_source, color_by) -> list:
@@ -909,7 +1303,55 @@ def _comp_test(counts, conds, batches=None, transform: str = "logit") -> pd.Data
     })
 
 
-def _comp_compute(kind, seg_source="xenium", method=None, transform="logit") -> dict:
+def _comp_exact(sub, t_idx, n_tables, conds, donors, transform, names, cat_name) -> tuple:
+    """Exact sample-level test of every category's transformed proportion: (tests frame or
+    None, note). Paired sign-flip over donors when the design is paired, else the label-
+    permutation test over the independent units (see _sl_test)."""
+    c_use = [conds[i] if i in set(t_idx) else "" for i in range(n_tables)]
+    u = _sl_units(c_use, donors)
+    if u["paired"]:
+        n_min = len(u["pairs"])
+        short = f"{n_min} donors with samples in both conditions"
+    else:
+        n_min = min(sum(1 for _n, c, _ix in u["units"] if c == k) for k in ("A", "B"))
+        short = (f"{sum(1 for _n, c, _ix in u['units'] if c == 'A')} independent units in A and "
+                 f"{sum(1 for _n, c, _ix in u['units'] if c == 'B')} in B")
+    if n_min < _SL_MIN_UNITS:
+        return None, (f"No test was run: {short}; at least {_SL_MIN_UNITS} are needed "
+                      f"({u['note']}). The proportions are shown.")
+    y = _comp_transform(sub.to_numpy(), transform)
+    props = sub.to_numpy() / sub.to_numpy().sum(axis=0, keepdims=True)
+    rows, first = [], None
+    for ci in range(len(sub)):
+        full = np.full(n_tables, np.nan)
+        full[t_idx] = y[ci]
+        pfull = np.full(n_tables, np.nan)
+        pfull[t_idx] = props[ci]
+        r = _sl_test(full, c_use, donors, units=u)
+        first = first or r
+        used_a = [i for _n, c, ix in u["units"] if c == "A" for i in ix]
+        used_b = [i for _n, c, ix in u["units"] if c == "B" for i in ix]
+        ma, mb = float(np.nanmean(pfull[used_a])), float(np.nanmean(pfull[used_b]))
+        rows.append({"mean_prop_a": ma, "mean_prop_b": mb, "prop_ratio": ma / mb if mb > 0 else np.nan,
+                     "effect": r["effect"], "p_exact": r["p"], "n_units": r["n_units"]})
+    tests = pd.DataFrame(rows)
+    tests["fdr_exact"] = _bh(tests["p_exact"].to_numpy())
+    reach = _sl_reach(first["min_p"], len(tests))
+    how = (f"all {first['n_assignments']:,} assignments enumerated: exact" if first["exact"]
+           else f"{first['n_assignments']:,} random assignments, seed {_SL_SEED}")
+    note = (f"{len(tests)} categories tested between A {names['A']} and B {names['B']}: "
+            f"{'logit' if transform != 'asin' else 'arcsine-square-root'}-transformed proportions, "
+            f"{first['test']} test ({how}), "
+            f"BH FDR. Unit of the p-values: {u['note']}. Smallest achievable p: {first['min_p']:.3g}. "
+            f"{int((tests['fdr_exact'] < 0.05).sum())} with FDR < 0.05.")
+    if u["dropped"]:
+        note += f" Donors with samples in one condition only were left out: {', '.join(u['dropped'])}."
+    if reach:
+        note += f"\n⚠ {reach[0].upper() + reach[1:]}."
+    return tests, note
+
+
+def _comp_compute(kind, seg_source="xenium", method=None, transform="logit", test="moderated") -> dict:
     """Per-sample proportions of the categories of *kind* and, when the design allows
     it, the test of each category between the two conditions. Raises ValueError with a
     message when nothing can be shown."""
@@ -950,6 +1392,26 @@ def _comp_compute(kind, seg_source="xenium", method=None, transform="logit") -> 
     t_cond = [conds[i] for i in t_idx]
     n_a, n_b = t_cond.count("A"), t_cond.count("B")
     res["n_a"], res["n_b"] = n_a, n_b
+    donors = _design_donors(tables)
+    for r, d in zip(rows, donors):
+        r["donor"] = d
+    res["test"] = "exact" if test == "exact" else "moderated"
+    res["p_col"], res["fdr_col"] = (("p_exact", "fdr_exact") if test == "exact" else ("p_mod", "fdr_mod"))
+    if len(tables) >= 2 and test == "exact":
+        sub = counts[[tables[i]["label"] for i in t_idx]]
+        sub = sub.loc[sub.sum(axis=1) > 0]
+        if len(t_idx) < 2 or len(sub) < 2:
+            res["test_note"] = ("No test was run: fewer than 2 assigned samples or fewer than 2 "
+                                "categories with cells.")
+            return res
+        tests, note = _comp_exact(sub, t_idx, len(tables), conds, donors, transform, names, cat_name)
+        res["test_note"] = note
+        if tests is not None:
+            tests.insert(0, "category", list(sub.index))
+            tests.insert(1, "n_cells", sub.sum(axis=1).to_numpy())
+            res["tests"] = tests
+            res["design"] = "exact sample-level test"
+        return res
     if len(tables) < 2:
         res["test_note"] = ("One sample: its proportions are shown; a test between conditions "
                             "needs several samples.")
@@ -982,7 +1444,11 @@ def _comp_compute(kind, seg_source="xenium", method=None, transform="logit") -> 
         f"{'∞' if not np.isfinite(df0) else f'{df0:.1f}'}"
         f"{'; fewer than 2 usable variances: ordinary t-test' if df0 == 0 else ''}), BH FDR. "
         f"{int((tests['fdr_mod'] < 0.05).sum())} with FDR < 0.05."
-        + (" Welch's t-test ignores the batch labels." if t_batch else ""))
+        + (" Welch's t-test ignores the batch labels." if t_batch else "")
+        + f" Unit of the p-values: n = {n_a + n_b} samples."
+        + (" Donor labels are set but this test does not use them (samples of one donor are "
+           "treated as independent): choose 'exact (sample-level)' for the paired test."
+           if any(donors[i] for i in t_idx) else ""))
     return res
 
 
@@ -1027,7 +1493,7 @@ def make_composition_fig(width=None, height=None):
     if tests is not None:
         top = (100.0 * props.max(axis=1)).reindex(tests["category"]).to_numpy()
         pos = {c: i for i, c in enumerate(cats)}
-        for c, q, yv in zip(tests["category"], tests["fdr_mod"], top):
+        for c, q, yv in zip(tests["category"], tests[res.get("fdr_col", "fdr_mod")], top):
             if np.isfinite(q) and q < 0.05:
                 fig.add_annotation(x=pos[str(c)], y=yv, text="*", showarrow=False, yshift=10,
                                    font=dict(size=16, color=core.TEXT))
@@ -1062,11 +1528,14 @@ def _comp_table(res) -> tuple:
     if tests is not None:
         t = tests.set_index(tests["category"].astype(str)).reindex(out["category"])
         _g3 = lambda v: None if not np.isfinite(v) else float(f"{v:.3g}")
-        for cid, name, f in (("mean_prop_a", "% A", lambda v: None if not np.isfinite(v) else round(100 * v, 2)),
-                             ("mean_prop_b", "% B", lambda v: None if not np.isfinite(v) else round(100 * v, 2)),
-                             ("prop_ratio", "Ratio A/B", _g3), ("t_mod", "t (mod.)", _g3),
-                             ("p_mod", "p", _g3), ("fdr_mod", "FDR", _g3),
-                             ("p_welch", "p (Welch)", _g3), ("fdr_welch", "FDR (Welch)", _g3)):
+        _pct = lambda v: None if not np.isfinite(v) else round(100 * v, 2)
+        spec = ((("effect", "Effect (A − B)", _g3), ("p_exact", "p (exact)", _g3),
+                 ("fdr_exact", "FDR", _g3), ("n_units", "Units", _g3))
+                if "p_exact" in t.columns else
+                (("t_mod", "t (mod.)", _g3), ("p_mod", "p", _g3), ("fdr_mod", "FDR", _g3),
+                 ("p_welch", "p (Welch)", _g3), ("fdr_welch", "FDR (Welch)", _g3)))
+        for cid, name, f in (("mean_prop_a", "% A", _pct), ("mean_prop_b", "% B", _pct),
+                             ("prop_ratio", "Ratio A/B", _g3)) + spec:
             out[cid] = [f(float(v)) for v in t[cid].to_numpy(dtype=float)]
             cols.append(_col(cid, name))
     for r in res["samples"]:
@@ -1086,6 +1555,7 @@ def _comp_csv(res) -> str:
              f"# A: {names['A']}; B: {names['B']}; {res.get('test_note', '')}"]
     for r in res["samples"]:
         lines.append(f"# sample {r['label']} ({r['name']}): condition {r['cond'] or '-'}"
+                     + (f"; donor {r['donor']}" if r.get("donor") else "")
                      + (f"; batch {r['batch']}" if r["batch"] else "")
                      + f"; {r['n_cells']} labelled cells; {r['n_unlabelled']} unlabelled"
                      + (f"; {r['note']}" if r["note"] else ""))
@@ -1134,6 +1604,12 @@ def _composition_section():
                          options=[{"label": "logit", "value": "logit"},
                                   {"label": "arcsine √", "value": "asin"}],
                          style={"width": "110px", "fontSize": "11px"}),
+            html.Span("Test:", style=L),
+            dcc.Dropdown(id="comp-test", clearable=False, value="moderated",
+                         options=[{"label": "moderated t (propeller-style)", "value": "moderated"},
+                                  {"label": "exact (sample-level: paired sign-flip / permutation)",
+                                   "value": "exact"}],
+                         style={"width": "250px", "fontSize": "11px"}),
             dbc.Button("Compute", id="comp-run-btn", color="primary", size="sm", n_clicks=0,
                        style={"fontSize": "11px", "padding": "2px 12px"}),
         ], style=S),
@@ -1174,7 +1650,9 @@ _MORAN_NOTE = ("Moran's I per gene on log1p(count / library size × 10,000), wit
                "expressed gene is significant: rank by I, not by the p-value. I measures spatial "
                "autocorrelation at the scale of the k neighbours; a gene restricted to a cell "
                "type that clusters in space scores high whatever the reason. Imputed genes are "
-               "not tested.")
+               "not tested. The unit of the p-values is the cell (n = the cells of a sample, "
+               "treated as independent); '% cells' counts cells with at least one transcript "
+               "of the gene (≥ 1: a fractional SPLIT-corrected residue is not a detection).")
 
 
 def _xy_of(df) -> np.ndarray:
@@ -1258,7 +1736,7 @@ def _moran_sample(s: dict, k: int = _MORAN_K, progress=None, chunk_bytes: float 
         block = csc[:, cc].toarray().astype(np.float64, copy=False)
         if not identity:
             block = block[sel]
-        pct[c0:c0 + step] = 100.0 * (block > 0).sum(axis=0) / n
+        pct[c0:c0 + step] = 100.0 * (block >= analysis._DETECT_MIN).sum(axis=0) / n
         block *= sf_sel[:, None]
         np.log1p(block, out=block)
         mu = block.mean(axis=0)
@@ -1331,6 +1809,10 @@ def _run_moran(seg_source, use_corrected, k=_MORAN_K) -> None:
                + "; ".join(f"{i['label']}: {i['n_cells']:,} cells, {i['n_tested']:,} genes, "
                            f"{i['n_sig']:,} with FDR < 0.05" for i in infos)
                + f" ({'SPLIT-corrected' if corrected else 'original'} counts, {res['seconds']:.1f} s).")
+        msg += ("\nUnit of the p-values: the cells of each sample ("
+                + "; ".join(f"{i['label']}: n = {i['n_cells']:,} cells" for i in infos)
+                + "), treated as independent; the graph is built within each sample. "
+                  "% cells: count ≥ 1 transcript.")
         if use_corrected and not corrected:
             msg += " Original counts were used: not every sample has SPLIT-corrected counts."
         if skipped:
@@ -1408,7 +1890,10 @@ _LR_NOTE = ("Score of a ligand–receptor pair for sender type S and receiver ty
             "pairs with both genes measured on the panel are scored; complexes are not modelled. "
             "A significant score means both genes are expressed specifically in neighbouring "
             "cell types - expression-based inference, not evidence of signalling; segmentation "
-            "spill-over between adjacent cells inflates it.")
+            "spill-over between adjacent cells inflates it."
+            " Detected = a count of at least one transcript (≥ 1) in the cell, also for SPLIT-"
+            "corrected counts. The unit of the p-values is the cell (labels exchangeable within a "
+            "sample); it is not a test across samples or donors.")
 
 
 def _lr_parse_pairs(text) -> tuple:
@@ -1504,7 +1989,7 @@ def _lr_compute(samples, labels, pairs, k: int = _MORAN_K, n_perm: int = 200, se
     L = np.array([gpos[a] for a, _ in kept], dtype=np.int64)
     R = np.array([gpos[b] for _, b in kept], dtype=np.int64)
     # pooled cells: expression of the genes of the pairs, labels, neighbour graph
-    xs, labs, blocks, adj = [], [], [], []
+    xs, labs, blocks, adj, dets = [], [], [], [], []
     n0 = 0
     for s, lab in zip(samples, labels):
         if lab is None:
@@ -1518,6 +2003,9 @@ def _lr_compute(samples, labels, pairs, k: int = _MORAN_K, n_perm: int = 200, se
         sf, _in_view = analysis._an_size_factors(s)
         sub = s["csc"][:, np.array([s["gni"][g] for g in G], dtype=np.int64)].tocsr()[rows[ok]]
         sub = sub.astype(np.float64)
+        det = sub.copy()                    # detection is decided on the counts: ≥ 1 transcript
+        det.data = (det.data >= analysis._DETECT_MIN).astype(np.float64)
+        dets.append(det)
         sub.data = np.log1p(sub.data * np.repeat(sf[rows[ok]].astype(np.float64), np.diff(sub.indptr)))
         xs.append(sub)
         labs.append(lab[ok].astype(str))
@@ -1561,8 +2049,10 @@ def _lr_compute(samples, labels, pairs, k: int = _MORAN_K, n_perm: int = 200, se
 
     inv_n = (1.0 / n_t[:T])[:, None]                       # label counts do not change under permutation
     means = _sums(code)[:T] * inv_n
-    frac = (np.bincount(code[xi] * n_g + col_of_nnz, minlength=(T + 1) * n_g)
-            .reshape(T + 1, n_g)[:T] * inv_n)
+    Dm = sp.vstack(dets).tocsc()
+    Dm.eliminate_zeros()
+    frac = (np.bincount(code[Dm.indices] * n_g + np.repeat(np.arange(n_g, dtype=np.int64), np.diff(Dm.indptr)),
+                        minlength=(T + 1) * n_g).reshape(T + 1, n_g)[:T] * inv_n)
     mL, mR = means[:, L], means[:, R]                      # T × P
     score = 0.5 * (mL[:, None, :] + mR[None, :, :])        # sender × receiver × pair
     tested = (neigh[:, :, None] & (frac[:, L] >= min_frac)[:, None, :]
@@ -1651,6 +2141,9 @@ def _run_lr(pairs_text, label_kind, seg_source, method, use_corrected, k, n_perm
             msg += " Original counts were used: not every sample has SPLIT-corrected counts."
         if len(samples) > 1:
             msg += f" Cells of {len(samples)} samples were pooled (graph and permutations within each sample)."
+        msg += (f"\nUnit of the p-values: n = {info['n_cells']:,} cells, treated as exchangeable within "
+                f"their sample (label permutation); not a test across samples. Detected = count ≥ 1 "
+                f"transcript.")
         if info["types_dropped"]:
             msg += (f" Not scored (fewer than {_LR_MIN_CELLS} cells): "
                     f"{', '.join(map(str, info['types_dropped'][:12]))}"

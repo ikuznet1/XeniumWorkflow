@@ -151,7 +151,10 @@ const [dl] = await Promise.all([page.waitForEvent('download', {timeout: 30000}),
 const csvPath = `${out}/an_de_table.csv`;
 await dl.saveAs(csvPath);
 const csv = (await import('node:fs')).readFileSync(csvPath, 'utf8').split('\n');
-check('CSV download', /^# A: /.test(csv[0]) && /^gene,log2fc,pct_a,pct_b/.test(csv[1]) && csv.length > 100, `${dl.suggestedFilename()}, ${csv.length - 3} genes`);
+// comment lines (groups, unit of the p-values, depth, ownership / leak gate), then the table
+const csvHead = csv.findIndex((l) => !l.startsWith('#'));
+check('CSV download', /^# A: /.test(csv[0]) && csv.slice(0, csvHead).some((l) => /unit of the p-values/.test(l))
+  && /^gene,log2fc,pct_a,pct_b/.test(csv[csvHead]) && csv.length > 100, `${dl.suggestedFilename()}, ${csv.length - csvHead - 2} genes, ${csvHead} header lines`);
 
 // a group that is too small is refused
 await page.evaluate(([x, y]) => window.XeniumViewer.instance.setViewport({x0: x - 20, x1: x + 20, y0: y - 13, y1: y + 13}), at(0.72, 0.45));

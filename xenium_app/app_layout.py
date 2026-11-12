@@ -5,7 +5,7 @@ import dash
 from dash import dcc, html
 import dash_bootstrap_components as dbc
 
-from . import compat, core, ui, dataview, morph, analysis, stats, sdata_store, startup
+from . import compat, core, ui, dataview, morph, analysis, stats, controls, sdata_store, startup
 
 
 with core._spage_lock:
@@ -96,6 +96,7 @@ sidebar = html.Div([
               for c in dict.fromkeys(r["cls"] for r in core._roi_state["rois"])],
             # gene sets saved for this dataset (later changes: update_color_by_for_genesets)
             *[{"label": f"Gene set: {n}", "value": f"geneset:{n}"} for n in analysis._geneset_names()],
+            *analysis._view_color_extra_options(),
         ],
         value="cluster",
         clearable=False,
@@ -503,6 +504,12 @@ app.layout = html.Div([
     dcc.Store(id="lr-done", data=0),
     dcc.Interval(id="lr-poll", interval=700, disabled=True),
     stats._design_modal(),
+    # confound controls: compartments / spillover / segmentation QC / stratified co-localisation
+    dcc.Store(id="ctl-comp-done", data=0),
+    dcc.Store(id="spill-done", data=0),
+    dcc.Store(id="segqc-done", data=0),
+    dcc.Store(id="coloc-done", data=0),
+    dcc.Interval(id="ctl-poll", interval=700, disabled=True),
     dcc.Store(id="counts-mode-store", data="original"),
     dcc.Store(id="roi-done",          data=0),
     dcc.Store(id="roi-pending",       data=None),
@@ -1049,6 +1056,8 @@ app.layout = html.Div([
                     },
                 ),
             ]),
+            html.Div(id="annot-label-report",
+                     style={"borderTop": f"1px solid {core.BORDER}", "marginTop": "8px", "paddingTop": "4px"}),
         ]),
         dbc.ModalFooter([
             html.Div(id="annot-modal-status", style={"fontSize": "11px", "color": core.MUTED, "flex": "1"}),
@@ -1855,6 +1864,9 @@ dbc.Modal([
                         analysis._density_tab(),
                         stats._moran_tab(),
                         stats._lr_tab(),
+                        controls._controls_tab(),
+                        controls._segqc_tab(),
+                        controls._coloc_tab(),
                     ]),
                 ], id="umap-panel", style={"display": "none"}),
             ], id="plots-row", style={"display": "flex", "flex": "1", "gap": "10px", "minHeight": "0"}),

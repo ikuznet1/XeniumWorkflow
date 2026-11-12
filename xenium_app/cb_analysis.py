@@ -184,12 +184,15 @@ def de_delete_group(n_clicks, group_a, version):
     State("de-pb-min-cells",   "value"),
     State("de-pb-min-count",   "value"),
     State("de-pb-shrink",      "value"),
+    State("de-leak-gate",      "value"),
     prevent_initial_call=True,
 )
 def run_de(n_clicks, group_a, group_b, seg_source, method, color_by, counts_mode,
-           mode="cells", population=None, min_cells=None, min_count=None, shrink=None):
+           mode="cells", population=None, min_cells=None, min_count=None, shrink=None,
+           leak_gate=None):
     if not n_clicks:
         raise dash.exceptions.PreventUpdate
+    options = {"leak_gate": "on" in (leak_gate if leak_gate is not None else ["on"])}
     if mode == "pseudobulk":
         if not population:
             return False, True, "Pick the cell population to sum the counts over."
@@ -207,7 +210,7 @@ def run_de(n_clicks, group_a, group_b, seg_source, method, color_by, counts_mode
                          counts_mode == "corrected",
                          stats._PB_MIN_CELLS if min_cells is None else min_cells,
                          stats._PB_MIN_COUNT if min_count is None else min_count,
-                         "on" in (shrink if shrink is not None else ["on"])),
+                         "on" in (shrink if shrink is not None else ["on"]), "auto", options),
                    state=analysis._de_state, lock=analysis._de_lock, copy_context=True)
         return True, False, "Running…"
     if not group_a or not group_b:
@@ -218,7 +221,7 @@ def run_de(n_clicks, group_a, group_b, seg_source, method, color_by, counts_mode
         return True, False, "A differential expression run is already in progress."
     jobs._job_start("de", "Differential expression", analysis._run_de,
                args=(group_a, group_b, seg_source or "xenium", method, color_by,
-                     counts_mode == "corrected"),
+                     counts_mode == "corrected", options),
                state=analysis._de_state, lock=analysis._de_lock)
     return True, False, "Running…"
 
@@ -249,11 +252,13 @@ def poll_de(_, done_ver):
     Input("dataset-version",  "data"),
     Input("de-plot-w",        "value"),
     Input("de-plot-h",        "value"),
+    Input("de-lfc-axis",      "value"),
 )
-def update_de_results(_done, _ds_version, w, h):
+def update_de_results(_done, _ds_version, w, h, lfc_axis="mle"):
     with analysis._de_lock:
         res = analysis._de_state.get("result")
-    return analysis.make_de_volcano_fig(width=w, height=h), analysis._de_table_records(res)
+    return (analysis.make_de_volcano_fig(width=w, height=h, lfc_axis=lfc_axis),
+            analysis._de_table_records(res))
 
 
 def _de_pick(gene, gene_options):
@@ -272,7 +277,10 @@ def _de_pick(gene, gene_options):
 def de_pick_gene_from_volcano(click, gene_options):
     """A click on a volcano point selects that gene in the sidebar."""
     pt = (click or {}).get("points") or [{}]
-    return _de_pick(pt[0].get("customdata") or pt[0].get("text"), gene_options)
+    cd = pt[0].get("customdata")
+    if isinstance(cd, (list, tuple)):
+        cd = cd[0] if cd else None
+    return _de_pick(cd or pt[0].get("text"), gene_options)
 
 
 @app_layout.app.callback(
@@ -311,7 +319,14 @@ def download_de_table(n_clicks):
     header = (f"# A: {res['label_a']} (n={res['n_a']}); B: {res['label_b']} (n={res['n_b']}); "
               f"counts: {'SPLIT-corrected' if res['corrected'] else 'original'}; "
               f"segmentation: {res['seg_source']}; Wilcoxon rank-sum on log1p(CP10K), cells as "
-              f"observations; BH FDR\n")
+              f"observations; BH FDR\n"
+              f"# unit of the p-values: {res.get('units_note', '')}\n"
+              f"# median counts per cell: A {res.get('median_counts_a', float('nan')):.0f}, "
+              f"B {res.get('median_counts_b', float('nan')):.0f}; pct_a / pct_b: cells with count >= 1 "
+              f"transcript; rate_a / rate_b: sum of counts / sum of total counts of the group x 10,000; "
+              f"low_count: fewer than {analysis._DE_RATE_MIN_COUNT} transcripts of the gene over both groups\n")
+    if res.get("leak_summary"):
+        header += "".join(f"# {ln}\n" for ln in str(res["leak_summary"]).splitlines())
     return dict(content=header + t.to_csv(index=False),
                 filename=f"de_{_safe(res['label_a'])}_vs_{_safe(res['label_b'])}.csv")
 

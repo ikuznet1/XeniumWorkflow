@@ -307,7 +307,11 @@ A **download button** (camera icon) appears on hover over each plot; exports as 
 
 Tests that compare **samples** (pseudobulk differential expression, composition) share one assignment: every loaded sample (the primary one, `S0`, and those added with **+ Add sample**, `S1`, `S2`, …) is in **condition A**, in **condition B**, or **excluded**, optionally with a **pairing / batch** label (a patient, a slide, a run). **Samples & conditions…** in either tab opens the editor; the two conditions can be named. The assignment is kept per sample for the session (it is not written to disk) and is cleared when another dataset is loaded.
 
-A batch label adds a batch term to the model (`~ batch + condition`). It must be given to every included sample or to none, and it must not be confounded with the condition (each label in one condition only, or one label per sample): such a design is refused with the reason.
+- **Donor (pairing)**: the individual a sample comes from. Samples of one donor are not independent: within a condition they are combined into one unit (averaged; summed for pseudobulk). When every included sample has a donor and at least 2 donors occur in both conditions, the tests are **paired** (`~ donor + condition`; exact sign-flip test).
+- **Batch** (a slide, a run): an optional blocking term of the model-based tests when no donors are given (`~ batch + condition`). A label must be given to every included sample or to none and must not be confounded with the condition; such a design is refused with the reason.
+- The design is **saved in the cache directory** (`design_<hash>.json`, keyed by the set of loaded samples) and restored when the same samples are loaded again, also after Load Sample.
+
+**Exact sample-level tests** (used by the composition test's *exact* option and by stratified co-localisation). Paired: the sign-flip test of the per-donor differences — all 2^n sign vectors are enumerated up to 16 donors, 20,000 random vectors with a fixed seed above. Unpaired: the label-permutation test of the difference of means — all C(n, n_A) relabellings up to 200,000, Monte Carlo above. A null that can be enumerated is never sampled. Every result states the **unit and the number of independent units** ("n = 6 samples (3 donors, paired)"), the **smallest achievable p** (2 / 2^n for n pairs: 0.25 with 3, 0.031 with 6), and a warning when that floor × the number of tests cannot reach 0.05 after Benjamini–Hochberg. Every p-value in the Differential Expression, composition, Spatial Genes, Ligand–Receptor and co-localisation tabs and CSVs now names its unit, e.g. "n = 112,551 cells, treated as independent".
 
 **Cell types of added samples.** Annotation runs on the primary sample only. An added sample gets cell types from (1) the annotation cache, if that sample was annotated earlier as the primary dataset with the same cache directory (per method, the most recent Xenium-segmentation run), or (2) the `cell_type_<method>` columns of a store written by **Save as SpatialData**. A sample without labels for the chosen method is left out of cell-type populations and composition tests, and named. *Behaviour change:* added samples that have such labels are now coloured by cell type in both renderers (they were always "Unknown").
 
@@ -320,6 +324,8 @@ A batch label adds a batch term to the model (`~ batch + condition`). It must be
 3. **Run**. The result uses the same volcano plot, table and **Download CSV** as the cell-level test; title, status line and CSV header name the method, the design and the samples. A table under the status line lists, per sample, the cells summed, the library size and the size factor.
 
 - **Counts**: the raw integer counts of the chosen cells are summed per sample over the measured panel genes. Imputed genes are never used. **The original counts are always used, also when Active Counts is "SPLIT Corrected"** (the status line says so): SPLIT-corrected counts are modified, non-integer values, which a count model must not be given.
+- **Paired design**: with donors on every included sample the design is `~ donor + condition` and the samples of one donor within a condition are summed into one pseudobulk column first (named in the status line).
+- **Volcano**: points are coloured by **FDR < 0.05 alone**, and the x axis is the unshrunken (MLE) log2FC by default; **Volcano x axis** switches to the shrunken estimate. (Before, the shrunken estimate was plotted and a significant gene shrunk to ~0 was drawn as not significant.)
 - **Model**: **DESeq2** through rpy2 — design `~ condition`, or `~ batch + condition` with batch labels; Wald test; independent filtering at alpha 0.05; log2 fold change **A / B**. The table gives the unshrunken (MLE) log2FC and, with **Shrink log2FC** ticked, the **apeglm**-shrunken one (DESeq2's `normal` prior when apeglm is not installed; the column and the volcano axis name the estimator, or say "unshrunken"). If DESeq2's dispersion trend cannot be fitted the gene-wise estimates are used and the status line says so.
 - **Without DESeq2**: **edgeR**'s quasi-likelihood F-test is used when edgeR is installed, and the result is labelled as such. With neither package the run is refused with the install hint (`BiocManager::install(c("DESeq2", "apeglm"))`). There is no fallback to a t-test.
 - **Refusals and warnings**: a condition with **fewer than 2 samples is refused**; with fewer than 3 the status line warns that the variance estimates are unreliable. A sample contributing fewer than **Min. cells / sample** (default 10) is dropped and named. Genes with a total count below **Min. total count / gene** (default 10) are not tested and counted in the status line, as are genes DESeq2 leaves without an adjusted p-value (they are not drawn in the volcano).
@@ -340,6 +346,7 @@ A batch label adds a batch term to the model (`~ batch + condition`). It must be
 - **Compute** shows, for every sample that has the labels, the proportion of each category: a plot with **one point per sample**, grouped and coloured by condition (bars: condition means; `*`: FDR < 0.05), a table (test results and each sample's proportion) and **Download CSV** (adds the cell counts).
 - **Method (propeller-style, Phipson et al. 2022)**: per-sample proportions are **logit**-transformed (0.5 pseudocount per category, as `speckle`) or **arcsine-square-root**-transformed; a linear model (`~ condition`, or `~ batch + condition`) is fitted per category and tested with a **moderated t-test** — limma-style empirical Bayes shrinkage of the category variances towards a common prior (non-robust, no trend), implemented in Python. **Welch's t-test** on the same transformed values is given beside it (it ignores batch labels). Benjamini–Hochberg FDR over the categories.
 - **With fewer than 3 samples in a condition no test is run** — the tab says so and shows the proportions only. With one sample its proportions are shown.
+- **Test: exact (sample-level)** tests the same transformed proportions without a variance model: paired sign-flip over donors when the design is paired, otherwise label permutation over the independent units (see *Samples and conditions*). The moderated t-test does not use donor labels and says so when they are set.
 - **Validation**: Welch's t, its degrees of freedom and p-value equal `scipy.stats.ttest_ind(equal_var=False)`; the moderated t, its p-value, the prior variance and the prior and total degrees of freedom equal `limma::lmFit` + `eBayes(robust = FALSE)` on the same transformed proportions (relative difference < 10⁻⁵), with and without a batch term. `speckle::propeller` itself was not installed: its default uses `robust = TRUE`, which can differ when one category's variance is an outlier. A quasi-binomial / beta-binomial GLM is not implemented.
 
 **Caveats**
@@ -412,6 +419,61 @@ A batch label adds a batch term to the model (`~ batch + condition`). It must be
 - Segmentation spill-over between touching cells of two types inflates both means.
 - A targeted panel holds a fraction of any ligand–receptor resource; absence of a pair from the result means "not measured" as often as "not expressed".
 
+
+### Confound controls
+
+The features of this and the next three sections (and the exact sample-level tests of **Samples and conditions**) are general versions of controls developed in an earlier spatial study by the author, where each was written after a specific false result: depth producing correlations, neighbour transcripts read as a cell type's programme, a shared niche read as an interaction, cells counted as replicates. They are reimplemented here without any study-specific gene list, cell-type name or threshold: every such value is a parameter with a default. All of them work on the active segmentation (Xenium, Baysor, Proseg), the current subset and every loaded sample; all neighbour searches are made **within one sample**.
+
+**Plots panel → Confound Controls.** Pick where the cell types come from (an annotation or the cluster set) at the top.
+
+#### Tissue compartments
+
+Per sample: **edge distance** (the cell positions are rasterised into bins, default 50 µm; occupied bins are tissue; optional morphological closing; interior holes of at most 4 bins are filled; a Euclidean distance transform gives each bin its distance to the nearest empty bin, and a cell inherits its bin's value), **local density** (other cells within R, default 100 µm) and a **dense core** of a dominant cell type (default: the most abundant; ≥ 10 neighbours within R, ≥ 30 % of them of that type, > 200 µm from the edge). Compartment = `core` / `edge` (not core, within the edge threshold) / `other`. Every threshold is an input.
+
+- The columns appear under **Color By** as *Control: Edge distance / Local density / Dominant-type fraction / Dense core* (Plotly and WebGL views, sequential colour scale), are the strata of the co-localisation test, and are written by **Save as SpatialData** as `ctl_edge_distance_um`, `ctl_local_density`, `ctl_dominant_fraction`, `ctl_core`, `ctl_compartment`.
+- They are stored per sample and segmentation by cell id and are not recomputed automatically: **recompute after changing the subset or the segmentation**. They are dropped on Load Sample.
+- Resolution is one bin: cells in an edge bin all get one bin size. A gap in the tissue wider than the hole limit is an edge.
+- Why: section margins are where sectioning damage and segmentation noise concentrate and where some cell types are simply rare. A cell type that prefers the margin looks depleted of everything that is rare there.
+
+#### Spillover score and gene ownership
+
+**Spillover score** of a cell for a *source* cell type (default: the type contributing the most transcripts) = the share of the cell's counts in the source's marker genes ÷ the median of that share inside source cells. 1 means "as much source-marker signal as a real source cell"; flags at ≥ 0.10 (low), ≥ 0.25 (moderate), ≥ 0.50 (high). Markers are derived from the annotation (genes at ≥ 50 counts per million in the source and ≥ 10× every other type; when fewer than 3 pass, the top genes by ratio, labelled **FALLBACK** — the score is then an upper bound) or typed in.
+
+- **Built-in validity check**, shown in the status line and the plot title: if the score measures transcripts crossing segment boundaries, the marker share of non-source cells must **fall with distance** to the nearest source cell (mean within 30 µm ≥ 2× the mean beyond 100 µm) and **rise with the fraction of source cells within 50 µm** (Spearman ρ > 0 and top third above bottom third). When a check fails the status says the score must not be used as a contamination mask: it is then measuring shared biology or an annotation that splits one population.
+- When the markers are so sparse that the median share inside source cells is 0, the mean is the reference, the status says so and gives the share of source cells carrying a marker transcript; the per-cell score is then coarse.
+- The status also gives the flag rate per **depth quintile**. A strong trend with depth means the score follows cell size or depth as well.
+- **Color By → Control: Spillover score**; the columns `ctl_spillover`, `ctl_spillover_flag`, `ctl_source_distance_um` are exported.
+- **Gene ownership** (table + CSV): per gene the cell type with the highest rate (Σ counts ÷ Σ depth of the type's cells) and every type at ≥ 20 % of it; genes with fewer than 100 transcripts get no owner. A "programme" read in a cell type that owns few of its genes is largely a readout of its neighbours.
+
+#### Leak gate in Differential Expression
+
+With **Gene ownership + leak gate** ticked (default) and a cell-type annotation present, both DE modes add `owner`, `leak_fraction` and `leak_flag` to the table and CSV (the CSV also has `owners`, `leak_share_a`, `leak_share_b`, `leak_change_frac`, `top_leak_type`); flagged genes are open orange diamonds on the volcano and the status line says how many genes, and how many of the significant ones, were flagged.
+
+- **Model**: leakage adds leak(L) × (profile of neighbouring type L) to the focal cells. Predicted leaked signal of a gene = Σ_L leak(L) × its counts per million in L. **Flag** when the predicted leak is more than half of the observed signal in either group, or when the leak alone predicts at least half of the observed log fold change. In the pseudobulk mode every sample is a section with its own leak and neighbour profiles and the groups are averaged over sections; in the cell-level mode each group is one pooled section.
+- **Measuring leak(L)** differs from the original, which chose marker genes the focal type does not express in a paired single-nucleus reference. Without a reference: a gene's focal ÷ L ratio is the leak plus the focal type's own expression, so the leak cannot exceed the lowest ratios; it is the median of the 25 lowest ratios among L's own genes (≥ 50 CPM in L, ≥ 10× every third type). A neighbour with fewer than 10 such genes, or whose own genes the focal type carries at ≥ 50 % of their level, is **not modelled and named** — its contribution is missing from the prediction.
+- It needs group A to be one cell type (≥ 80 % of its labelled cells). When B is the same type both groups are modelled; otherwise only A (e.g. "type vs all other cells").
+- **Limits**: the estimate leans low (the lowest ratios are selected in the same data), so the gate errs towards not flagging; with an annotation that does not separate the types (sub-types of one lineage, a classifier that calls most cells one label) few neighbours are modelled and the gate says little. A flag means "check the owner and the neighbours", not "wrong".
+
+### Segmentation QC
+
+**Plots panel → Segmentation QC.** One row per segmentation source of the primary sample (Xenium and every cached Baysor / Proseg run, loaded or not) and counts mode (original, SPLIT-corrected), as a registered, cancellable job; table, four small bar plots, CSV.
+
+- **Identity marker sets**: the 5 most specific genes of every type, derived once from the Xenium segmentation's original counts and annotation, or typed in (`Type: gene, gene, …` per line; a line `geneA, geneB` adds a pair of mutually exclusive markers).
+- **Exclusion-rule failure**: share of labelled cells whose own identity set is not the largest share of their transcripts. **Co-expression**: over pairs of top markers of different types, cells with both ÷ cells with either (count ≥ 1). **Spillover slope**: in cells not of the source type, source-identity transcripts per 100 regressed on the number of source-type neighbours within 15 µm (reference-free; 0 = no dependence), and the reverse. **Own-identity retention** (corrected counts): own identity transcripts after ÷ before correction; below 1 with a lower failure rate is over-correction, not improvement. Plus cells, median transcripts / genes (count ≥ 1) / area per cell, and the share of transcripts assigned when the all-transcripts density grid exists.
+- A corrected row covers the cells the correction touched (non-empty corrected row; "Corrected share") and its retention compares those same cells before and after.
+- A run without its own annotation — or whose annotation uses other type names — gets the Xenium label of the nearest Xenium centroid within 10 µm (the Labels column says so). This favours segmentations that resemble Xenium's.
+- No p-values: these are descriptive. Runs on a small ROI give noisy slopes. The original benchmark's criteria that need a paired dissociated reference (patient-specific signal, arm balance) are not implemented.
+
+### Stratified co-localisation with matched nulls
+
+**Plots panel → Stratified Co-localisation**, beside the kNN-based Neighborhood Enrichment. For every ordered pair (focal A, target B) and radius R (default 50 µm):
+
+- **O** = B cells within R of each A cell. **E** = the mean of that count around the *pool* cells (labelled cells that are neither A nor B) of the same **stratum**: sample × compartment × edge-distance bin (50, 100, 150, 200, 300, 500, 1000 µm) × local-density quintile; a coarser stratum when fewer than 3 pool cells share it. **Effect** per sample = log2((ΣO + 0.5) / (ΣE + 0.5)). The unstratified value (`effect_naive`, pool = the whole sample) is given beside it: the difference is what "both types live in the same region" contributed.
+- **Bias and within-sample p**: the A label is permuted among A and pool cells within each finest stratum (B fixed, default 200 permutations, fixed seed); the mean permuted effect is subtracted (`effect_corrected`), p = (1 + permutations at least as far from that mean) / (1 + permutations).
+- **Across samples**: with ≥ 3 independent units (donors when given, else samples) the bias-corrected effect is tested with the exact sign-flip test, and between conditions A and B with the paired sign-flip or label-permutation test of the design. With fewer units the tab says **SINGLE-SAMPLE / PER-SAMPLE RESULT**: the within-sample p treats the cells of one section as exchangeable and says nothing about other sections or donors.
+- **Placebo anchors** (optional focal type): the same statistic for count-matched random anchor cells drawn within each sample × compartment (mean, 95 % range, p), and for the other types within 3× the focal type's abundance that share its most common compartment. The verdict is "specific" only when the focal type lies beyond both. Without a placebo, "X sits near Y" cannot be told from "X is a cell of that compartment".
+- Heatmap (focal × target, `*` FDR < 0.05 of the test named in the title), table, CSV (per sample and pair, with the pair-level tests). Only types with ≥ 20 cells; a pair needs ≥ 20 focal and ≥ 10 target cells in a sample; the 40 most abundant types at most. Compartments come from the Confound Controls tab; when absent, edge distance and density are computed with the defaults and there is no core.
+- **Speed** (measured): 112,551 labelled cells, 11 types, R = 50 µm, 200 permutations, placebo: 5.4 s, about 60 MB above the loaded dataset.
 
 ### CellNEST Cell-Cell Communication
 
@@ -983,12 +1045,13 @@ or the command line, builds the Dash app and registers the callbacks.
 | `morph` | morphology image overlay of the Plotly view |
 | `figures` | Plotly figure builders (spatial map, UMAP, analysis plots) |
 | `analysis` | differential expression, gene-set scores, transcript density |
-| `stats` | sample → condition design, pseudobulk differential expression (DESeq2 / edgeR), composition test, Moran's I, ligand–receptor scores |
+| `stats` | sample → condition / donor design (persisted), exact sample-level tests, pseudobulk differential expression (DESeq2 / edgeR), composition test, Moran's I, ligand–receptor scores |
+| `controls` | confound controls: tissue compartments, spillover score, gene ownership, leak gate, segmentation QC metrics, stratified co-localisation, annotation label report |
 | `cellnest` | CellNEST loading, filters and plots |
 | `sdata_store` | SpatialData / sopa backend: cache store, Save as SpatialData, tissue ROI and patches |
 | `startup` | the import-time work: locate and load the dataset, autoload cached results |
 | `app_layout` | the Dash `app` and its layout |
-| `cb_plots`, `cb_tools`, `cb_reseg`, `cb_spage`, `cb_data`, `cb_spatial`, `cb_analysis`, `cb_stats` | the callbacks, by feature |
+| `cb_plots`, `cb_tools`, `cb_reseg`, `cb_spage`, `cb_data`, `cb_spatial`, `cb_analysis`, `cb_stats`, `cb_controls` | the callbacks, by feature |
 | `viewer_provider` | data provider for `xenium_viewer_api.py` (WebGL view) and `/health` |
 | `compat` | the single namespace over all modules (below) |
 
@@ -1046,6 +1109,11 @@ The same routes are registered a second time under `/umap/viewer/*` for the UMAP
 
 A review of the code base fixed a number of defects. Most are invisible, but these change numbers or outputs relative to earlier versions:
 
+- **"% of cells expressing" on SPLIT-corrected counts** (DE `% A` / `% B`, the ligand–receptor detection threshold, Moran's `% cells`, genes per cell in Segmentation QC): a cell detects a gene when its count is **≥ 1 transcript**. For integer counts this is the former count > 0; for corrected (fractional) counts a residue below one transcript no longer counts, so these percentages are lower than before. The DE table also gives **Rate A / Rate B** (Σ counts ÷ Σ total counts of the group, per 10,000), which is defined for fractional counts and does not move with depth; `low_count` marks genes with fewer than 100 transcripts over both groups.
+- **DE status line and CSV** give the median counts per cell of both groups and warn when they differ by more than 1.5×; they state the unit of the p-values.
+- **Pseudobulk volcano**: coloured by FDR alone; x axis = unshrunken log2FC unless the shrunken one is chosen (see above). The cell-level volcano keeps its |log2FC| ≥ 0.5 rule.
+- **Sample design**: has a donor field, is saved per set of samples and restored (it used to be memory-only and lost on Load Sample).
+- **Annotation dialog**: shows the label counts of every annotation of the active segmentation, a caution that labels on a targeted panel can collapse a lineage into one label at high confidence, and a flag when one label takes more than 80 % of a coarse cluster that the finest cluster set splits into several sub-clusters.
 - **Baysor input** is restricted to gene transcripts with Q ≥ 20. Control and unassigned codewords and low-quality transcripts were previously passed through, so new Baysor segmentations and their counts differ.
 - **SPLIT-corrected counts** are aligned to genes by name. `SPLIT::purify()` returns only the genes shared by the panel and the reference; these columns were previously written as the first *n* panel genes, so whenever the reference lacked a panel gene every later gene was mislabelled and the last columns were zero. Any `X_corrected` layer, corrected export or RDS produced with such a reference (in the app or with `functions/run_split.py`) must be regenerated. A quick test: the alphabetically last panel genes are all zero in an affected matrix.
 - **Proseg input** is restricted to gene transcripts with Q ≥ 20, like Baysor. Low-quality transcripts are dropped with `--min-qv 20` (the `--xenium` preset of Proseg 1.1.9 applies no quality filter), and control, unassigned and deprecated codewords are removed from the input before Proseg reads it (Proseg has no option to exclude features; they were previously used for the segmentation and only left out of the count matrix). A whole-slide run therefore writes a filtered temporary copy of `transcripts.parquet` into the run's cache directory and deletes it afterwards. Cached Proseg runs made earlier still contain these transcripts. Proseg's own default of ignoring transcripts more than 60 µm from any nucleus (`--max-transcript-nucleus-distance`) is unchanged.

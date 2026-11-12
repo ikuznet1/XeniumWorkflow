@@ -31,6 +31,37 @@ _de_state: dict = {"status": "idle", "message": "", "result": None,
                    "selection": None}     # last lasso / box outline: {polygon_xy, n, t}
 _de_lock = threading.Lock()
 _DE_MIN_CELLS = 10         # smallest group a test is run for
+# Detection rule used wherever "expressed" / "% of cells" is computed: a cell detects a
+# gene when its count is at least one whole transcript. For integer counts this is the
+# usual count > 0; for SPLIT-corrected (fractional) counts a residue below one transcript
+# is not a detection. The depth-robust companion is the rate Σ counts / Σ depth.
+_DETECT_MIN = 1.0
+_DETECT_RULE = ("detected = count ≥ 1 transcript (the same as > 0 for integer counts; a fractional "
+                "SPLIT-corrected residue below 1 is not a detection); rate = Σ counts / Σ total "
+                "counts of the group, per 10,000")
+_DE_DEPTH_RATIO = 1.5      # median counts per cell of the two groups differing by more is flagged
+_DE_RATE_MIN_COUNT = 100   # Σ counts of a gene over both groups below which its rate is unstable
+# functions(res, ctx) that add columns / notes to a finished DE result before it is shown
+# (the leak gate of the controls module registers here); ctx: samples, masks_a, masks_b,
+# seg_source, method, color_by, use_corrected, options
+_de_annotators: list = []
+# other per-cell values offered under Color By through the gene-set path: name prefix ->
+# function(name, seg_source, use_corrected) -> (values over the cells of the view, (lo, hi)
+# or None for a diverging scale centred at 0, label) or None
+_view_color_providers: dict = {}
+_view_color_seq: dict = {}  # label -> (lo, hi) of a sequential (not diverging) colour value
+_view_color_options: list = []   # functions() -> [{"label", "value"}] of such Color By entries
+
+
+def _view_color_extra_options() -> list:
+    """Color By options of the registered per-cell values (after the gene sets)."""
+    out = []
+    for fn in list(_view_color_options):
+        try:
+            out += list(fn())
+        except Exception as exc:
+            print(f"  Color By options error: {exc}", flush=True)
+    return out
 
 _geneset_state: dict = {"status": "idle", "message": "",
                         "sets": {},       # name -> [genes as entered]
@@ -387,8 +418,9 @@ def _de_rank_sums(parts, n_genes: int, progress=None, chunk_nnz: int = 6_000_000
     Per chunk of genes one uint64 key per entry (gene | float32 bits of the value |
     is-A) is sorted, which orders the values within each gene and keeps ties adjacent.
     Returns per gene: rank_sum_a (average ranks for ties), tie_term (Σ t³ − t over the
-    tie groups, zeros included), nnz_a / nnz_b (cells with a count) and sum_a / sum_b
-    (Σ of the normalised, not log-transformed values), plus n_a and n_b."""
+    tie groups, zeros included), nnz_a / nnz_b (cells with a non-zero count), det_a /
+    det_b (cells with a count ≥ _DETECT_MIN), sum_a / sum_b (Σ of the normalised, not
+    log-transformed values) and raw_a / raw_b (Σ of the counts), plus n_a and n_b."""
     n_a = int(sum(int((p["grp"] == 1).sum()) for p in parts))
     n_b = int(sum(int((p["grp"] == 2).sum()) for p in parts))
     n = n_a + n_b
@@ -408,6 +440,8 @@ def _de_rank_sums(parts, n_genes: int, progress=None, chunk_nnz: int = 6_000_000
     rank_a = np.zeros(n_genes); tie = np.zeros(n_genes)
     nnz_a = np.zeros(n_genes); nnz_b = np.zeros(n_genes)
     sum_a = np.zeros(n_genes); sum_b = np.zeros(n_genes)
+    det_a = np.zeros(n_genes); det_b = np.zeros(n_genes)
+    raw_a = np.zeros(n_genes); raw_b = np.zeros(n_genes)
     _1, _33 = np.uint64(1), np.uint64(33)
     for g0, g1 in zip(edges[:-1], edges[1:]):
         if progress is not None:
@@ -415,6 +449,7 @@ def _de_rank_sums(parts, n_genes: int, progress=None, chunk_nnz: int = 6_000_000
         ng = g1 - g0
         keys = []
         sums = np.zeros(2 * ng); cnts = np.zeros(2 * ng)
+        dets = np.zeros(2 * ng); raws = np.zeros(2 * ng)
         for p in parts:
             csc, ip = p["csc"], p["csc"].indptr
             c = p["cols"][g0:g1]
@@ -442,12 +477,17 @@ def _de_rank_sums(parts, n_genes: int, progress=None, chunk_nnz: int = 6_000_000
             idx2 = col_local * 2 + isa
             sums += np.bincount(idx2, weights=norm.astype(np.float64), minlength=2 * ng)
             cnts += np.bincount(idx2, minlength=2 * ng)
+            dets += np.bincount(idx2, weights=(dat[keep] >= _DETECT_MIN).astype(np.float64),
+                                minlength=2 * ng)
+            raws += np.bincount(idx2, weights=dat[keep].astype(np.float64), minlength=2 * ng)
             v = np.ascontiguousarray(np.log1p(norm), dtype=np.float32)
             keys.append((col_local.astype(np.uint64) << _33)
                         | (v.view(np.uint32).astype(np.uint64) << _1)
                         | isa.astype(np.uint64))
         sum_b[g0:g1], sum_a[g0:g1] = sums[0::2], sums[1::2]
         nnz_b[g0:g1], nnz_a[g0:g1] = cnts[0::2], cnts[1::2]
+        det_b[g0:g1], det_a[g0:g1] = dets[0::2], dets[1::2]
+        raw_b[g0:g1], raw_a[g0:g1] = raws[0::2], raws[1::2]
         if not keys:
             continue
         key = keys[0] if len(keys) == 1 else np.concatenate(keys)
@@ -476,7 +516,8 @@ def _de_rank_sums(parts, n_genes: int, progress=None, chunk_nnz: int = 6_000_000
     if progress is not None:
         progress(1.0)
     return {"n_a": n_a, "n_b": n_b, "rank_sum_a": rank_a, "tie_term": tie,
-            "nnz_a": nnz_a, "nnz_b": nnz_b, "sum_a": sum_a, "sum_b": sum_b}
+            "nnz_a": nnz_a, "nnz_b": nnz_b, "sum_a": sum_a, "sum_b": sum_b,
+            "det_a": det_a, "det_b": det_b, "raw_a": raw_a, "raw_b": raw_b}
 
 
 def _de_test_stats(rank_sum_a, tie_term, n_a: int, n_b: int):
@@ -525,6 +566,7 @@ def _de_compute(samples, masks_a, masks_b, progress=None) -> dict:
     if not genes:
         raise ValueError("The samples of this view share no measured genes.")
     parts, n_overlap, n_nomat = [], 0, 0
+    lib_a, lib_b = [], []
     for i, s in enumerate(samples):
         nrow = len(s["df"])
         a = None if masks_a is None else np.asarray(masks_a[i], dtype=bool)
@@ -544,6 +586,10 @@ def _de_compute(samples, masks_a, masks_b, progress=None) -> dict:
         grp = np.zeros(s["csc"].shape[0], dtype=np.int8)
         grp[rows[ok & b]] = 2
         grp[rows[ok & a]] = 1
+        with np.errstate(divide="ignore"):
+            lib = np.where(sf > 0, _AN_SCALE / np.where(sf > 0, sf, 1.0), 0.0)
+        lib_a.append(lib[grp == 1])
+        lib_b.append(lib[grp == 2])
         parts.append({"csc": s["csc"], "grp": grp, "sf": sf,
                       "cols": np.array([s["gni"][g] for g in genes], dtype=np.int64)})
     n_a = int(sum(int((p["grp"] == 1).sum()) for p in parts))
@@ -558,11 +604,19 @@ def _de_compute(samples, masks_a, masks_b, progress=None) -> dict:
     u, z, log10p = _de_test_stats(r["rank_sum_a"], r["tie_term"], n_a, n_b)
     log10padj = _bh_log10(log10p)
     mean_a, mean_b = r["sum_a"] / n_a, r["sum_b"] / n_b
+    lib_a, lib_b = np.concatenate(lib_a), np.concatenate(lib_b)
+    dep_a, dep_b = float(lib_a.sum()), float(lib_b.sum())
+    rate_a = _AN_SCALE * r["raw_a"] / max(dep_a, 1e-12)
+    rate_b = _AN_SCALE * r["raw_b"] / max(dep_b, 1e-12)
+    med_a = float(np.median(lib_a)) if len(lib_a) else float("nan")
+    med_b = float(np.median(lib_b)) if len(lib_b) else float("nan")
     table = pd.DataFrame({
         "gene": genes,
         "log2fc": np.log2((mean_a + 1.0) / (mean_b + 1.0)),
-        "pct_a": 100.0 * r["nnz_a"] / n_a,
-        "pct_b": 100.0 * r["nnz_b"] / n_b,
+        "pct_a": 100.0 * r["det_a"] / n_a,
+        "pct_b": 100.0 * r["det_b"] / n_b,
+        "rate_a": rate_a, "rate_b": rate_b,
+        "low_count": (r["raw_a"] + r["raw_b"]) < _DE_RATE_MIN_COUNT,
         "mean_a": mean_a, "mean_b": mean_b,
         "U": u, "z": z,
         "pval": 10.0 ** log10p, "padj": 10.0 ** log10padj,
@@ -570,7 +624,47 @@ def _de_compute(samples, masks_a, masks_b, progress=None) -> dict:
     })
     return {"table": table, "n_a": n_a, "n_b": n_b, "n_overlap": n_overlap,
             "n_no_matrix": n_nomat, "n_genes": len(genes), "n_samples": len(samples),
-            "corrected": bool(samples[0]["corrected"])}
+            "corrected": bool(samples[0]["corrected"]),
+            "median_counts_a": med_a, "median_counts_b": med_b,
+            "depth_ratio": _depth_ratio(med_a, med_b)}
+
+
+def _depth_ratio(med_a, med_b) -> float:
+    """max / min of the two groups' median counts per cell (NaN when one is 0 or unknown)."""
+    if not (np.isfinite(med_a) and np.isfinite(med_b)) or min(med_a, med_b) <= 0:
+        return float("nan")
+    return float(max(med_a, med_b) / min(med_a, med_b))
+
+
+def _depth_note(med_a, med_b, ratio=None) -> str:
+    """Sentence on the depth of the two groups of a DE result, with the warning when the
+    medians differ by more than _DE_DEPTH_RATIO."""
+    ratio = _depth_ratio(med_a, med_b) if ratio is None else ratio
+    txt = f"Median counts per cell: A {med_a:,.0f}, B {med_b:,.0f}"
+    if np.isfinite(ratio):
+        txt += f" (ratio {ratio:.2f})."
+        if ratio > _DE_DEPTH_RATIO:
+            txt += (f"\n⚠ The groups differ in depth by more than {_DE_DEPTH_RATIO:g}×: detection "
+                    f"(% of cells) rises with depth for every gene, and library-size normalisation "
+                    f"does not remove that for sparse counts. Read the rate columns (Σ counts / "
+                    f"Σ depth) and the log2 fold change, not the percentages.")
+    else:
+        txt += "."
+    return txt
+
+
+def _de_annotate(res: dict, ctx: dict) -> None:
+    """Run the registered annotators on a finished DE result; one that fails leaves a
+    note instead of stopping the result from being shown."""
+    for fn in list(_de_annotators):
+        try:
+            fn(res, ctx)
+        except jobs._DatasetChanged:
+            raise
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            res.setdefault("notes", []).append(f"{getattr(fn, '__name__', 'annotator')} failed: {str(exc)[:200]}")
 
 
 def _de_groups_path() -> str:
@@ -587,7 +681,7 @@ def _de_groups_save() -> None:
         print(f"  DE groups cache write error: {e}", flush=True)
 
 
-def _run_de(spec_a, spec_b, seg_source, method, color_by, use_corrected) -> None:
+def _run_de(spec_a, spec_b, seg_source, method, color_by, use_corrected, options=None) -> None:
     """Background job: differential expression between the two picked groups."""
     _gen = jobs._dataset_gen
 
@@ -617,7 +711,13 @@ def _run_de(spec_a, spec_b, seg_source, method, color_by, use_corrected) -> None
 
         res = _de_compute(samples, ma, mb, progress=_prog)
         res.update({"label_a": la, "label_b": lb, "seg_source": seg_source or "xenium",
-                    "seconds": _time.time() - _t0})
+                    "units_note": f"n = {res['n_a'] + res['n_b']:,} cells, treated as independent",
+                    "detect_rule": _DETECT_RULE, "notes": []})
+        _set("running", "Gene ownership and leak gate…")
+        _de_annotate(res, {"samples": samples, "masks_a": ma, "masks_b": mb, "seg_source": seg_source,
+                           "method": method, "color_by": color_by, "use_corrected": use_corrected,
+                           "options": dict(options or {})})
+        res["seconds"] = _time.time() - _t0
         jobs._check_dataset_gen(_gen)
         _msg = (f"{la} (A, {res['n_a']:,} cells) vs {lb} (B, {res['n_b']:,} cells): "
                 f"{res['n_genes']:,} genes, "
@@ -628,6 +728,14 @@ def _run_de(spec_a, spec_b, seg_source, method, color_by, use_corrected) -> None
             _msg += (f" {res['n_overlap']:,} cells were in both groups and were removed from B.")
         if res["n_samples"] > 1:
             _msg += f" Cells of {res['n_samples']} samples were pooled."
+        _msg += (f"\nUnit of the p-values: {res['units_note']} (they are not, when the groups come "
+                 f"from few samples: the p-values are then far too small).")
+        _msg += "\n" + _depth_note(res["median_counts_a"], res["median_counts_b"], res["depth_ratio"])
+        _msg += f"\n% A / % B: {_DETECT_RULE}."
+        if res.get("leak_summary"):
+            _msg += "\n" + res["leak_summary"]
+        for nt in res.get("notes") or []:
+            _msg += f"\nNote: {nt}."
         _set("done", _msg, result=res)
         print(f"  DE: {_msg}", flush=True)
     except jobs._JobCancelled:
@@ -642,31 +750,62 @@ def _run_de(spec_a, spec_b, seg_source, method, color_by, use_corrected) -> None
         _set("error", str(exc)[:300])
 
 
-def make_de_volcano_fig(width=None, height=None):
-    """Volcano plot of the last differential-expression result."""
+def make_de_volcano_fig(width=None, height=None, lfc_axis=None):
+    """Volcano plot of the last differential-expression result.
+
+    lfc_axis ("mle" / "shrunk"): the fold change on the x axis of a pseudobulk result -
+    the unshrunken maximum-likelihood estimate (default) or the shrunken one. A point's
+    colour never depends on that choice: for a pseudobulk result it is FDR < 0.05 alone
+    (a shrunken estimate near 0 can belong to a significant gene), for the cell-level
+    test FDR < 0.05 and |log2FC| ≥ 0.5. Genes the leak gate flagged are drawn as open
+    orange diamonds whatever their significance."""
     with _de_lock:
         res = _de_state.get("result")
     if not res:
         return figures._make_placeholder_fig("No differential expression computed yet.")
     t = res["table"]
-    # a pseudobulk result names the fold-change column it plots (shrunken when available);
+    pb = res.get("kind") == "pseudobulk"
+    lfc, x_title = "log2fc", res.get("lfc_title") or "log2 fold change (A / B)"
+    if pb:
+        if lfc_axis == "shrunk" and "log2fc_shrunk" in t.columns:
+            lfc = "log2fc_shrunk"
+            x_title = f"log2 fold change (A / B), {res.get('shrink')}-shrunken"
+        else:
+            x_title = "log2 fold change (A / B), unshrunken (MLE)"
+            if lfc_axis == "shrunk":
+                x_title += " — no shrunken estimate in this result"
     # genes without an adjusted p-value (DESeq2 independent filtering) are not drawn
-    lfc = res.get("lfc_col", "log2fc")
     y = np.minimum(t["neg_log10_padj"].to_numpy(dtype=float), 300.0)
     x = t[lfc].to_numpy(dtype=float)
-    sig = (t["padj"].to_numpy(dtype=float) < 0.05) & (np.abs(x) >= 0.5)
-    up = sig & (x > 0)
-    dn = sig & ~up
+    direction = t["log2fc"].to_numpy(dtype=float)       # the side never depends on shrinkage
+    fdr_ok = t["padj"].to_numpy(dtype=float) < 0.05
+    sig = fdr_ok if pb else (fdr_ok & (np.abs(x) >= 0.5))
+    flagged = (t["leak_flag"].fillna(False).to_numpy(dtype=bool) if "leak_flag" in t.columns
+               else np.zeros(len(t), dtype=bool))
+    up = sig & (direction > 0) & ~flagged
+    dn = sig & ~(direction > 0) & ~flagged
+    rule = "FDR < 0.05" if pb else "FDR < 0.05, |log2FC| ≥ 0.5"
     traces = []
-    for mask, name, color in ((~sig, "not significant", "#6e7681"),
-                              (up, f"higher in A ({int(up.sum()):,})", "#f85149"),
-                              (dn, f"higher in B ({int(dn.sum()):,})", "#58a6ff")):
+    groups = [(~sig & ~flagged, "not significant", "#6e7681", "circle", 0.8),
+              (up, f"higher in A ({int(up.sum()):,}; {rule})", "#f85149", "circle", 0.8),
+              (dn, f"higher in B ({int(dn.sum()):,})", "#58a6ff", "circle", 0.8)]
+    if flagged.any():
+        groups.append((flagged, f"leak-gate flagged ({int(flagged.sum()):,}; {int((flagged & sig).sum()):,} "
+                                f"significant)", "#d29922", "diamond-open", 0.95))
+    for mask, name, color, symbol, op in groups:
         sub = t[mask]
+        extra = ""
+        cd = sub["gene"]
+        if "leak_fraction" in sub.columns:
+            cd = np.column_stack([sub["gene"], sub["owner"].fillna("").astype(str),
+                                  sub["leak_fraction"].round(2).astype(object).where(sub["leak_fraction"].notna(), "–")])
+            extra = "<br>owner %{customdata[1]}<br>leak fraction %{customdata[2]}"
         traces.append(go.Scattergl(
             x=x[mask], y=y[mask], mode="markers", name=name,
-            marker=dict(size=5, color=color, opacity=0.8),
-            text=sub["gene"], customdata=sub["gene"],
-            hovertemplate="<b>%{text}</b><br>log2FC %{x:.2f}<br>−log10 FDR %{y:.1f}<extra></extra>"))
+            marker=dict(size=7 if symbol != "circle" else 5, color=color, opacity=op, symbol=symbol,
+                        line=dict(width=1.2, color=color) if symbol != "circle" else None),
+            text=sub["gene"], customdata=cd,
+            hovertemplate="<b>%{text}</b><br>log2FC %{x:.2f}<br>−log10 FDR %{y:.1f}" + extra + "<extra></extra>"))
     # label the strongest genes of each side
     lab = pd.concat([t[up].nlargest(8, "neg_log10_padj"), t[dn].nlargest(8, "neg_log10_padj")])
     fig = go.Figure(traces)
@@ -674,25 +813,34 @@ def make_de_volcano_fig(width=None, height=None):
         fig.add_annotation(x=r[lfc], y=min(r["neg_log10_padj"], 300.0), text=r["gene"],
                            showarrow=False, yshift=9, font=dict(size=10, color=core.TEXT))
     fig.add_hline(y=-np.log10(0.05), line=dict(color=core.MUTED, width=1, dash="dot"))
-    for xv in (-0.5, 0.5):
-        fig.add_vline(x=xv, line=dict(color=core.MUTED, width=1, dash="dot"))
+    if not pb:
+        for xv in (-0.5, 0.5):
+            fig.add_vline(x=xv, line=dict(color=core.MUTED, width=1, dash="dot"))
     fig.update_layout(
         paper_bgcolor=core.CARD_BG, plot_bgcolor=core.CARD_BG, font=dict(color=core.TEXT, size=11),
         margin=dict(l=50, r=10, t=30, b=40),
         title=dict(text=res.get("title") or
                    f"A: {res['label_a']} ({res['n_a']:,})  vs  B: {res['label_b']} ({res['n_b']:,})",
                    font=dict(size=12), x=0.01),
-        xaxis=dict(title=res.get("lfc_title") or "log2 fold change (A / B)",
-                   gridcolor=core.BORDER, zerolinecolor=core.BORDER),
+        xaxis=dict(title=x_title, gridcolor=core.BORDER, zerolinecolor=core.BORDER),
         yaxis=dict(title="−log10 FDR", gridcolor=core.BORDER, zerolinecolor=core.BORDER),
         legend=dict(orientation="h", y=-0.2, font=dict(size=10)),
-        uirevision=f"de-{res.get('seconds')}",
+        uirevision=f"de-{res.get('seconds')}-{lfc}",
     )
     if width:
         fig.update_layout(width=width)
     if height:
         fig.update_layout(height=height)
     return fig
+
+
+def _de_leak_columns(t, out) -> None:
+    """Copy the ownership / leak-gate columns of a DE table into its display frame."""
+    if "owner" in t.columns:
+        out["owner"] = t["owner"].fillna("").astype(str).to_numpy()
+    if "leak_fraction" in t.columns:
+        out["leak_fraction"] = t["leak_fraction"].round(3).to_numpy()
+        out["leak_flag"] = np.where(t["leak_flag"].isna(), "", np.where(t["leak_flag"] == True, "FLAG", "ok"))  # noqa: E712
 
 
 def _de_table_records(res) -> list:
@@ -702,39 +850,53 @@ def _de_table_records(res) -> list:
     t = res["table"].sort_values(["padj", "pval"], kind="stable")
     _g3 = lambda v: None if not np.isfinite(v) else float(f"{v:.3g}")
     if res.get("kind") == "pseudobulk":
-        out = pd.DataFrame({"gene": t["gene"], "log2fc": t["log2fc"].round(3)})
+        out = pd.DataFrame({"gene": t["gene"].to_numpy(), "log2fc": t["log2fc"].round(3).to_numpy()})
         if "log2fc_shrunk" in t.columns:
-            out["log2fc_shrunk"] = t["log2fc_shrunk"].round(3)
-        out["base_mean"] = t["base_mean"].round(1)
-        out["mean_a"], out["mean_b"] = t["mean_a"].round(1), t["mean_b"].round(1)
-        out["stat"] = t["stat"].round(2)
-        out["pval"], out["padj"] = t["pval"].map(_g3), t["padj"].map(_g3)
+            out["log2fc_shrunk"] = t["log2fc_shrunk"].round(3).to_numpy()
+        out["base_mean"] = t["base_mean"].round(1).to_numpy()
+        out["mean_a"], out["mean_b"] = t["mean_a"].round(1).to_numpy(), t["mean_b"].round(1).to_numpy()
+        out["stat"] = t["stat"].round(2).to_numpy()
+        out["pval"], out["padj"] = t["pval"].map(_g3).to_numpy(), t["padj"].map(_g3).to_numpy()
+        _de_leak_columns(t, out)
         return out.astype(object).where(out.notna(), None).to_dict("records")
     out = pd.DataFrame({
-        "gene": t["gene"],
-        "log2fc": t["log2fc"].round(3),
-        "pct_a": t["pct_a"].round(1), "pct_b": t["pct_b"].round(1),
-        "mean_a": t["mean_a"].round(2), "mean_b": t["mean_b"].round(2),
-        "z": t["z"].round(2),
-        "pval": t["pval"].map(lambda v: float(f"{v:.3g}")),
-        "padj": t["padj"].map(lambda v: float(f"{v:.3g}")),
+        "gene": t["gene"].to_numpy(),
+        "log2fc": t["log2fc"].round(3).to_numpy(),
+        "pct_a": t["pct_a"].round(1).to_numpy(), "pct_b": t["pct_b"].round(1).to_numpy(),
+        "mean_a": t["mean_a"].round(2).to_numpy(), "mean_b": t["mean_b"].round(2).to_numpy(),
+        "z": t["z"].round(2).to_numpy(),
+        "pval": t["pval"].map(lambda v: float(f"{v:.3g}")).to_numpy(),
+        "padj": t["padj"].map(lambda v: float(f"{v:.3g}")).to_numpy(),
     })
-    return out.to_dict("records")
+    if "rate_a" in t.columns:
+        out.insert(4, "rate_a", t["rate_a"].map(_g3).to_numpy())
+        out.insert(5, "rate_b", t["rate_b"].map(_g3).to_numpy())
+    _de_leak_columns(t, out)
+    return out.astype(object).where(out.notna(), None).to_dict("records")
 
 
 def _de_table_columns(res=None) -> list:
     """Columns of the result table: of the cell-level Wilcoxon test, or of a pseudobulk
-    result (which names its test statistic and its fold-change columns)."""
-    _col = lambda cid, name: {"id": cid, "name": name, "type": "text" if cid == "gene" else "numeric"}
+    result (which names its test statistic and its fold-change columns); the gene
+    ownership / leak-gate columns when the result has them."""
+    _text = ("gene", "owner", "leak_flag")
+    _col = lambda cid, name: {"id": cid, "name": name, "type": "text" if cid in _text else "numeric"}
+    leak = []
+    if res is not None and "owner" in res["table"].columns:
+        leak.append(_col("owner", "Owner"))
+    if res is not None and "leak_fraction" in res["table"].columns:
+        leak += [_col("leak_fraction", "Leak fraction"), _col("leak_flag", "Leak gate")]
     if res and res.get("kind") == "pseudobulk":
-        cols = [_col("gene", "Gene"), _col("log2fc", "log2FC")]
+        cols = [_col("gene", "Gene"), _col("log2fc", "log2FC (MLE)")]
         if "log2fc_shrunk" in res["table"].columns:
             cols.append(_col("log2fc_shrunk", f"log2FC ({res.get('shrink') or 'shrunk'})"))
         return cols + [_col("base_mean", "Base mean"), _col("mean_a", "Mean A"), _col("mean_b", "Mean B"),
-                       _col("stat", res.get("stat_name") or "stat"), _col("pval", "p"), _col("padj", "FDR")]
-    return [_col("gene", "Gene"), _col("log2fc", "log2FC"), _col("pct_a", "% A"),
-            _col("pct_b", "% B"), _col("mean_a", "Mean A"), _col("mean_b", "Mean B"),
-            _col("z", "z"), _col("pval", "p"), _col("padj", "FDR")]
+                       _col("stat", res.get("stat_name") or "stat"), _col("pval", "p"), _col("padj", "FDR")] + leak
+    rate = ([_col("rate_a", "Rate A /10k"), _col("rate_b", "Rate B /10k")]
+            if res is None or "rate_a" in res["table"].columns else [])
+    return [_col("gene", "Gene"), _col("log2fc", "log2FC"), _col("pct_a", "% A (≥1)"),
+            _col("pct_b", "% B (≥1)")] + rate + [_col("mean_a", "Mean A"), _col("mean_b", "Mean B"),
+            _col("z", "z"), _col("pval", "p"), _col("padj", "FDR")] + leak
 
 
 # ── gene-set scores ───────────────────────────────────────────────────────────
@@ -953,6 +1115,19 @@ def _geneset_color(color_by, seg_source="xenium", use_corrected: bool = False):
     samples one after the other; symmetric colour limit; label), or None when the set
     cannot be scored (the views then draw transcript counts)."""
     name = str(color_by or "")[len("geneset:"):]
+    for prefix, fn in list(_view_color_providers.items()):
+        if name.startswith(prefix):
+            got = fn(name, seg_source, use_corrected)
+            if got is None:
+                return None
+            vals, rng, label = got
+            if rng is None:
+                _view_color_seq.pop(label, None)
+                fin = np.asarray(vals)[np.isfinite(vals)]
+                lim = float(np.abs(fin).max()) if len(fin) else 1.0
+                return vals, (lim if lim > 0 else 1.0), label
+            _view_color_seq[label] = (float(rng[0]), float(rng[1]))
+            return vals, float(rng[1]), label
     arrays, _info = _geneset_values(name, seg_source, use_corrected)
     if arrays is None:
         return None
@@ -966,10 +1141,14 @@ def _geneset_marker(vals, lim, label, cbar_range=None, **marker) -> dict:
     """Plotly marker of a gene-set score: diverging scale centred at 0 (the range inputs
     override either end)."""
     lo, hi = -lim, lim
+    seq = _view_color_seq.get(label)
+    if seq is not None:                    # a sequential value (distance, density, score ≥ 0)
+        lo, hi = seq
     if cbar_range:
         lo = cbar_range[0] if cbar_range[0] is not None else lo
         hi = cbar_range[1] if cbar_range[1] is not None else hi
-    return dict(color=vals, colorscale="RdBu_r", cmin=lo, cmax=hi, showscale=True,
+    return dict(color=vals, colorscale="Viridis" if seq is not None else "RdBu_r",
+                cmin=lo, cmax=hi, showscale=True,
                 colorbar=dict(title=label.replace(": ", ":<br>"), thickness=12, len=0.5, x=1.02),
                 **marker)
 
@@ -1457,7 +1636,12 @@ _DE_CAVEAT = ("Wilcoxon rank-sum test per gene on log1p(count / library size × 
               "independent observation, so p-values are anticonservative when the groups come "
               "from different samples or replicates (pseudobulk per sample is the proper test "
               "there) and when the groups were defined from the same expression data (clusters). "
-              "Imputed genes are not tested.")
+              "Imputed genes are not tested. % A / % B count a cell when the gene has at least "
+              "one transcript in it (≥ 1; a fractional SPLIT-corrected residue is not a "
+              "detection); Rate = Σ counts / Σ total counts of the group per 10,000, which does "
+              "not move with depth the way a percentage does. Owner / Leak fraction / Leak gate: "
+              "see the Confound Controls tab; a flagged gene's signal or change is predicted to "
+              "be more than half explained by transcripts of neighbouring cell types.")
 _GS_NOTE = ("Score per cell = mean of the z-scored log-normalised expression of the set minus the "
             "mean of a control set drawn from the same expression bins (as Seurat AddModuleScore / "
             "scanpy score_genes; 25 bins, 50 control genes per bin, fixed seed). Computed for the "
@@ -1512,6 +1696,20 @@ def _de_tab(pseudobulk_controls=None):
         ], id="de-cells-controls", style={"flexShrink": "0"}),
         html.Div(pseudobulk_controls or [], id="de-pb-controls",
                  style={"display": "none", "flexShrink": "0"}),
+        html.Div([
+            dcc.Checklist(id="de-leak-gate",
+                          options=[{"label": html.Span(" Gene ownership + leak gate (needs a cell-type "
+                                                       "annotation)", style={"fontSize": "11px", "color": core.TEXT}),
+                                    "value": "on"}],
+                          value=["on"], inputStyle={"marginRight": "3px"}, style={"display": "inline-flex"}),
+            html.Span("Volcano x axis:", style={**_AN_LABEL_STYLE, "marginLeft": "10px"}),
+            dcc.RadioItems(id="de-lfc-axis", value="mle", inline=True,
+                           options=[{"label": " log2FC (MLE)", "value": "mle"},
+                                    {"label": " shrunken log2FC (pseudobulk)", "value": "shrunk"}],
+                           inputStyle={"marginRight": "3px"},
+                           labelStyle={"marginRight": "10px", "cursor": "pointer", "fontSize": "11px",
+                                       "color": core.TEXT}),
+        ], style=_AN_ROW_STYLE),
         html.Div(id="de-status", style={**_AN_STATUS_STYLE, "whiteSpace": "pre-wrap"}),
         html.Div(id="de-pb-samples", style={"padding": "0 8px", "flexShrink": "0"}),
         html.Div(_DE_CAVEAT, id="de-caveat", style=_AN_NOTE_STYLE),
@@ -1533,6 +1731,8 @@ def _de_tab(pseudobulk_controls=None):
                                 "border": f"1px solid {core.BORDER}", "padding": "2px 5px",
                                 "fontFamily": "inherit", "minWidth": "38px", "maxWidth": "90px"},
                     style_filter={"backgroundColor": core.CARD_BG, "color": core.TEXT},
+                    style_data_conditional=[{"if": {"filter_query": '{leak_flag} = "FLAG"'},
+                                             "color": "#d29922"}],
                 ),
                 html.Div([
                     dbc.Button("Download CSV", id="de-download-btn", color="secondary", size="sm",

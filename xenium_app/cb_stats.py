@@ -19,11 +19,12 @@ from . import core, jobs, dataview, analysis, stats, app_layout, cb_analysis
     Output("design-status", "children"),
     Input("de-design-open-btn",   "n_clicks"),
     Input("comp-design-open-btn", "n_clicks"),
+    Input("coloc-design-open-btn", "n_clicks"),
     prevent_initial_call=True,
 )
-def open_design_modal(de_clicks, comp_clicks):
+def open_design_modal(de_clicks, comp_clicks, coloc_clicks=None):
     """Open the editor with one row per loaded sample."""
-    if not de_clicks and not comp_clicks:
+    if not de_clicks and not comp_clicks and not coloc_clicks:
         raise dash.exceptions.PreventUpdate
     names = stats._design_names()
     return True, stats._design_rows_children(), names["A"], names["B"], ""
@@ -50,27 +51,34 @@ def close_design_modal(n_clicks):
     State("design-name-a",  "value"),
     State("design-name-b",  "value"),
     State("design-version", "data"),
+    State({"type": "design-donor", "index": ALL}, "value"),
     prevent_initial_call=True,
 )
-def apply_design(n_clicks, conds, batches, ids, name_a, name_b, version):
+def apply_design(n_clicks, conds, batches, ids, name_a, name_b, version, donors=None):
     """Store the assignment of the samples listed in the editor."""
     if not n_clicks:
         raise dash.exceptions.PreventUpdate
     samples = {s["index"]: s for s in stats._design_samples()}
     rows = []
-    for cid, cond, batch in zip(ids or [], conds or [], batches or []):
+    donors = list(donors or []) + [""] * len(ids or [])
+    for cid, cond, batch, donor in zip(ids or [], conds or [], batches or [], donors):
         s = samples.get((cid or {}).get("index"))
         if s is None:
             return no_update, ("The loaded samples changed while the editor was open: close it "
                                "and open it again.")
-        rows.append({"key": s["key"], "cond": cond or "", "batch": batch or ""})
+        rows.append({"key": s["key"], "cond": cond or "", "batch": batch or "", "donor": donor or ""})
     if (name_a or "A").strip() == (name_b or "B").strip():
         return no_update, "Give the two conditions different names."
     stats._design_set(rows, {"A": name_a, "B": name_b})
     n_a = sum(1 for r in rows if r["cond"] == "A")
     n_b = sum(1 for r in rows if r["cond"] == "B")
+    u = stats._sl_units([r["cond"] for r in rows], [r["donor"] for r in rows])
+    saved = "saved in the cache directory" if stats._design_path() else "kept for this session"
     return (version or 0) + 1, (f"Saved: {n_a} sample{'s' if n_a != 1 else ''} in A, {n_b} in B, "
-                                f"{len(rows) - n_a - n_b} excluded.")
+                                f"{len(rows) - n_a - n_b} excluded ({saved}). Units of the "
+                                f"sample-level tests: {u['note']}."
+                                + (f" Donors in one condition only (left out of paired tests): "
+                                   f"{', '.join(u['dropped'])}." if u["dropped"] else ""))
 
 
 @app_layout.app.callback(
@@ -174,9 +182,10 @@ def update_comp_category_options(active_tab, _annot, _niche, _ds, seg_source, _e
     State("seg-source",     "value"),
     State("cluster-method", "value"),
     State("comp-version",   "data"),
+    State("comp-test",      "value"),
     prevent_initial_call=True,
 )
-def run_composition(n_clicks, kind, transform, seg_source, method, version):
+def run_composition(n_clicks, kind, transform, seg_source, method, version, test="moderated"):
     """Per-sample proportions and, with at least 3 samples per condition, the test of
     every category (a few thousand numbers: computed in the callback, no job)."""
     if not n_clicks:
@@ -185,7 +194,8 @@ def run_composition(n_clicks, kind, transform, seg_source, method, version):
         return no_update, "Pick what the proportions are computed of."
     try:
         res = stats._comp_compute(kind, seg_source or "xenium", method,
-                                  "asin" if transform == "asin" else "logit")
+                                  "asin" if transform == "asin" else "logit",
+                                  "exact" if test == "exact" else "moderated")
     except ValueError as exc:
         with stats._comp_lock:
             stats._comp_state.update({"result": None, "message": str(exc)})
@@ -332,7 +342,9 @@ def download_moran_table(n_clicks):
     header = (f"# Moran's I per gene; kNN graph of the cell centroids, k = {res['k']}, "
               f"row-standardised weights; log1p(CP10K) of the "
               f"{'SPLIT-corrected' if res['corrected'] else 'original'} counts; segmentation: "
-              f"{res['seg_source']}; z and two-sided p under the normality assumption; BH FDR per sample\n")
+              f"{res['seg_source']}; z and two-sided p under the normality assumption; BH FDR per sample\n"
+              f"# unit of the p-values: the cells of a sample, treated as independent; pct_cells: "
+              f"count >= 1 transcript\n")
     for i in res["samples"]:
         header += (f"# sample {i['label']} ({i['name']}): {i['n_cells']} cells; E[I] = "
                    f"{i['expected']:.6g}; Var[I] = {i['variance']:.6g}\n")
@@ -492,7 +504,9 @@ def download_lr_table(n_clicks):
               f"are spatial neighbours (kNN k = {info['k']}, >= {stats._LR_MIN_EDGES} adjacent cell pairs)\n"
               f"# p: label permutation within sample, {info['n_perm']} permutations, seed {info['seed']}; "
               f"padj: BH over the {len(t)} tested combinations; expression-based inference, not "
-              f"evidence of signalling\n")
+              f"evidence of signalling\n"
+              f"# unit of the p-values: n = {info['n_cells']} cells, exchangeable within their sample; "
+              f"frac_ligand / frac_receptor: cells with count >= 1 transcript\n")
     return dict(content=header + t.to_csv(index=False), filename="ligand_receptor_scores.csv")
 
 
