@@ -97,18 +97,33 @@ def _find_annotation_parquet(reference_zarr: str, identity_column: str) -> tuple
     # The column inside annotation parquets is always "label"
     label_col = "label"
 
-    pattern = os.path.join(cache_dir, f"*{key}*{run_tag}*.parquet")
-    matches = [m for m in _glob.glob(pattern)
-               if not m.endswith("_rctd_obj.rds")]  # exclude RDS side-cars
+    import re as _re
+    cands = [m for m in _glob.glob(os.path.join(_glob.escape(cache_dir), f"*_{run_tag}_*.parquet"))
+             if not m.endswith("_weights.parquet")]  # exclude RCTD weights side-cars
+    # RCTD mode sits before the tool/tag (SPLIT cache) or after it (annotation modal)
+    if key.startswith("rctd_"):
+        mode = _re.escape(key[len("rctd_"):])
+        rx = _re.compile(rf"labels_rctd_{mode}_(baysor|proseg)_{run_tag}_"
+                         rf"|labels_rctd_(baysor|proseg)_{run_tag}_{mode}_")
+    else:
+        rx = _re.compile(rf"labels_{_re.escape(key)}_(baysor|proseg)_{run_tag}_")
+    matches = [m for m in cands if rx.search(os.path.basename(m))]
+    if not matches:   # other key forms (e.g. "rctd" without a mode): key must start the
+        # part after "_labels_" — the text before it holds the reference RDS name and
+        # its label column, which must not be matched
+        for m in cands:
+            _pre, _sep, _tail = os.path.basename(m).split(f"_{run_tag}_")[0].rpartition("_labels_")
+            if _sep and _tail.startswith(key):
+                matches.append(m)
+    matches.sort(key=os.path.getmtime)
 
-    if len(matches) == 1:
-        return matches[0], label_col
     if len(matches) > 1:
         print(f"  Multiple annotation parquets found for run_tag={run_tag}, key={key}:")
         for m in matches:
             print(f"    {m}")
-        print(f"  Using: {matches[0]}")
-        return matches[0], label_col
+        print(f"  Using (newest): {matches[-1]}")
+    if matches:
+        return matches[-1], label_col
     return None, label_col
 
 
@@ -162,7 +177,10 @@ def transfer_seg_idents(
 
     # Auto-detect labels_file from xenium explorer cache if not provided
     _auto_label_col = None
-    if labels_file is None:
+    # (only when the reference table does not already carry the requested column)
+    _ref_tbl = ref_sdata.tables.get("table")
+    if labels_file is None and not (_ref_tbl is not None
+                                    and identity_column in _ref_tbl.obs.columns):
         auto_path, auto_col = _find_annotation_parquet(reference_zarr, identity_column)
         if auto_path:
             print(f"  Auto-detected annotation parquet: {auto_path}")
@@ -208,13 +226,9 @@ def transfer_seg_idents(
         ref_obs_index = ref_table.obs.index.tolist()
 
     # Build mapping: boundary index → identity label
-    ref_id_to_label = {}
-    for cid in ref_cell_ids:
-        cid_str = str(cid)
-        if cid_str in ref_obs_index:
-            ref_id_to_label[cid] = ref_labels_series.loc[cid_str]
-        elif cid in ref_obs_index:
-            ref_id_to_label[cid] = ref_labels_series.loc[cid]
+    # (dict lookup by str ID; list membership here was O(n_cells × n_labels))
+    _lab = dict(zip(map(str, ref_obs_index), ref_labels_series.values))
+    ref_id_to_label = {cid: _lab[str(cid)] for cid in ref_cell_ids if str(cid) in _lab}
 
     print(f"  Reference: {len(ref_boundaries)} cells, {len(ref_id_to_label)} with labels")
 

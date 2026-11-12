@@ -222,7 +222,11 @@ def _extract_spatial_coords(ro, rds, meta_df):
             all_coords = []
             for img in image_names:
                 try:
-                    ro.r(f'._s2c_coords <- GetTissueCoordinates(._s2c_obj, image="{img}")')
+                    # Ask for centroids: the default boundary may be a segmentation
+                    # (one row per polygon vertex)
+                    ro.r(f'._s2c_coords <- tryCatch('
+                         f'GetTissueCoordinates(._s2c_obj[["{img}"]], which="centroids"), '
+                         f'error=function(e) GetTissueCoordinates(._s2c_obj, image="{img}"))')
                     coords_r = ro.r("._s2c_coords")
                     from rpy2.robjects import pandas2ri
                     coords_df = pandas2ri.rpy2py(coords_r)
@@ -231,6 +235,13 @@ def _extract_spatial_coords(ro, rds, meta_df):
                     print(f"  Warning: GetTissueCoordinates failed for '{img}': {e}")
             if all_coords:
                 coords_all = pd.concat(all_coords)
+                # FOV coordinates carry cell IDs in a "cell" column (row names are 1..n)
+                if "cell" in coords_all.columns:
+                    # per-cell mean: identity for centroids, vertex mean for segmentations
+                    _num = [c for c in coords_all.columns
+                            if c != "cell" and pd.api.types.is_numeric_dtype(coords_all[c])]
+                    coords_all = coords_all.groupby("cell", sort=False)[_num].mean()
+                coords_all.index = coords_all.index.astype(str)
                 # Identify x/y columns (Seurat uses various names)
                 xcol = ycol = None
                 for xc in ["x", "imagerow", "x_centroid", "centroid_x"]:
@@ -243,7 +254,7 @@ def _extract_spatial_coords(ro, rds, meta_df):
                         break
                 if xcol and ycol:
                     # Align to meta_df index
-                    matched = coords_all.reindex(meta_df.index)
+                    matched = coords_all.reindex(meta_df.index.astype(str))
                     valid = matched[xcol].notna()
                     if valid.sum() > 0:
                         x[valid.values] = matched.loc[valid, xcol].values.astype(np.float64)
@@ -593,8 +604,12 @@ def _write_annotation_csv(meta_df, cell_type_col, cell_ids, output_dir, name_pre
         print(f"  Warning: column '{cell_type_col}' not found — skipping annotation CSV")
         return
     labels = meta_df[cell_type_col].values
-    if np.issubdtype(np.array(labels).dtype, np.integer) or \
-       np.issubdtype(np.array(labels).dtype, np.floating):
+    if np.issubdtype(np.array(labels).dtype, np.floating):
+        # NaN (R NA) cannot be cast to int — write "Unknown" as export_to_cellnest does
+        _arr = np.array(labels)
+        _nan = np.isnan(_arr)
+        labels = np.where(_nan, "Unknown", np.where(_nan, 0, _arr).astype(int).astype(str))
+    elif np.issubdtype(np.array(labels).dtype, np.integer):
         labels = np.array(labels).astype(int).astype(str)
     else:
         labels = np.array(labels).astype(str)

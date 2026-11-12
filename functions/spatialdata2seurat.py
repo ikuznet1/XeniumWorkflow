@@ -57,21 +57,25 @@ def _shapes_to_longdf(gdf, cell_ids_set=None) -> pd.DataFrame:
     with columns: cell (str), x (float), y (float).
     Optionally filtered to cell_ids_set for alignment.
     """
-    rows = []
-    for cid, geom in zip(gdf.index, gdf.geometry):
-        cid_str = str(cid)
-        if cell_ids_set is not None and cid_str not in cell_ids_set:
-            continue
-        try:
-            if geom.geom_type == "MultiPolygon":
-                coords = list(geom.geoms[0].exterior.coords)
-            else:
-                coords = list(geom.exterior.coords)
-            for x, y in coords:
-                rows.append((cid_str, float(x), float(y)))
-        except Exception:
-            pass
-    return pd.DataFrame(rows, columns=["cell", "x", "y"])
+    import shapely
+    ids   = np.asarray(gdf.index.astype(str), dtype=object)
+    geoms = np.asarray(gdf.geometry.values, dtype=object)
+    if cell_ids_set is not None:
+        keep  = np.fromiter((c in cell_ids_set for c in ids), dtype=bool, count=len(ids))
+        ids, geoms = ids[keep], geoms[keep]
+    # Vectorised (no per-vertex Python loop): Polygon → exterior; MultiPolygon → first part
+    tid   = shapely.get_type_id(geoms)          # 3 = Polygon, 6 = MultiPolygon, -1 = missing
+    multi = tid == 6
+    if multi.any():
+        geoms = geoms.copy()
+        geoms[multi] = shapely.get_geometry(geoms[multi], 0)
+    ok    = (tid == 3) | multi
+    ids, geoms = ids[ok], geoms[ok]
+    if len(geoms) == 0:
+        return pd.DataFrame({"cell": pd.Series(dtype=object),
+                             "x": pd.Series(dtype=float), "y": pd.Series(dtype=float)})
+    coords, idx = shapely.get_coordinates(shapely.get_exterior_ring(geoms), return_index=True)
+    return pd.DataFrame({"cell": ids[idx], "x": coords[:, 0], "y": coords[:, 1]})
 
 
 # ── Main conversion function ───────────────────────────────────────────────────
@@ -127,8 +131,6 @@ def spatialdata2seurat(
     pandas2ri.activate()
     _rconv.set_conversion(ro.default_converter + pandas2ri.converter)
 
-    # Increase R's vector memory limit (default can be too low for large matrices)
-    os.environ.setdefault("R_MAX_VSIZE", "32Gb")
     importr("Seurat")
     importr("SeuratObject")
     importr("Matrix")
@@ -146,6 +148,8 @@ def spatialdata2seurat(
     print(f"Reading SpatialData from {sdata_path} …", flush=True)
     sdata = sd.read_zarr(sdata_path)
     adata = sdata.tables["table"]
+    # SpaGE zarr rows follow the full table order — capture before any filtering
+    _spage_obs_idx = [str(c) for c in adata.obs_names]
 
     print(f"  {len(adata)} cells, {len(adata.var)} genes", flush=True)
 
@@ -245,7 +249,6 @@ def spatialdata2seurat(
     # Rows correspond to the full adata (before ROI / corrected filtering).
     _spage_genes  = []
     _spage_zarr   = None
-    _spage_obs_idx = list(adata.obs_names)  # capture before any filtering
     _spage_ref = os.path.join(run_dir, "spage_result.json")
     if include_imputed and os.path.exists(_spage_ref):
         try:
@@ -255,19 +258,60 @@ def spatialdata2seurat(
             _zpath = _sref.get("path", "")
             if os.path.isdir(_zpath):
                 _spage_zarr  = _szarr.open_array(_zpath, mode="r")
-                _spage_genes = list(_spage_zarr.attrs.get("genes", _sref.get("genes", [])))
-                print(f"  SpaGE: found {len(_spage_genes)} imputed genes in {os.path.basename(_zpath)}",
-                      flush=True)
+                if _spage_zarr.shape[0] != len(_spage_obs_idx):
+                    print(f"  SpaGE: {os.path.basename(_zpath)} has {_spage_zarr.shape[0]} rows but the "
+                          f"table has {len(_spage_obs_idx)} cells; skipping imputed genes", flush=True)
+                    _spage_zarr = None
+                else:
+                    _spage_genes = list(_spage_zarr.attrs.get("genes", _sref.get("genes", [])))
+                    print(f"  SpaGE: found {len(_spage_genes)} imputed genes in {os.path.basename(_zpath)}",
+                          flush=True)
         except Exception as _se:
             print(f"  SpaGE: could not load spage_result.json: {_se}", flush=True)
+    elif include_imputed and not os.path.exists(os.path.join(run_dir, "params.json")):
+        # Xenium (non-reseg) store: the app records a streamed SpaGE result only in
+        # {cache_dir}/spage_index.json, keyed by the data dir (or the .zarr path).
+        try:
+            import json as _sj
+            import zarr as _szarr
+            _sidx_path = os.path.join(_cache_dir_early, "spage_index.json")
+            _sidx = _sj.load(open(_sidx_path)) if os.path.exists(_sidx_path) else {}
+            _zpath = _sidx.get(run_dir) or _sidx.get(os.path.abspath(sdata_path.rstrip("/\\"))) or ""
+            if _zpath.endswith(".parquet"):
+                _zpath = _zpath[:-len(".parquet")] + ".zarr"
+            if _zpath and os.path.isdir(_zpath):
+                _sz = _szarr.open_array(_zpath, mode="r")
+                _sg = list(_sz.attrs.get("genes", []))
+                if _sz.shape[0] == len(_spage_obs_idx) and _sg:
+                    _spage_zarr, _spage_genes = _sz, _sg
+                    print(f"  SpaGE: found {len(_spage_genes)} imputed genes in "
+                          f"{os.path.basename(_zpath)} (via spage_index.json)", flush=True)
+                else:
+                    print(f"  SpaGE: {os.path.basename(_zpath)} has {_sz.shape[0]} rows but the "
+                          f"table has {len(_spage_obs_idx)} cells; skipping imputed genes", flush=True)
+        except Exception as _se:
+            print(f"  SpaGE: could not load spage_index.json: {_se}", flush=True)
 
     # ── Split panel vs imputed genes ───────────────────────────────────────────
-    # Imputed genes come from the spage zarr; all genes in adata are panel genes.
-    panel_genes   = list(adata.var_names)
+    # Imputed genes come from the spage zarr, or from table columns flagged as imputed
+    # (non-streaming SpaGE in the app, functions/impute.py).
+    if "is_imputed" in adata.var.columns:
+        imp_mask = adata.var["is_imputed"].fillna(False).astype(bool).values
+    else:
+        _imp = set(adata.uns.get("imputed_genes", [])) | \
+               set(adata.uns.get("split_corrected_imputed_genes", []))
+        imp_mask = np.array([g in _imp for g in adata.var_names], dtype=bool)
+    panel_genes     = list(adata.var_names[~imp_mask])
+    table_imp_genes = list(adata.var_names[imp_mask])
     imputed_genes = _spage_genes
     print(f"  Panel genes: {len(panel_genes)}, imputed: {len(imputed_genes)}", flush=True)
 
     # ── Choose expression matrix ───────────────────────────────────────────────
+    if use_corrected and "X_corrected" not in adata.layers:
+        raise ValueError(
+            "use_corrected=True but no 'X_corrected' layer in the SpatialData table. "
+            "Run SPLIT first (app or functions/run_split.py)."
+        )
     if use_corrected and "X_corrected" in adata.layers:
         print("  Using X_corrected layer (SPLIT)", flush=True)
         X_full = adata.layers["X_corrected"]
@@ -285,7 +329,9 @@ def spatialdata2seurat(
     if not sp.issparse(X_full):
         X_full = sp.csr_matrix(X_full)
 
-    X_panel = X_full  # all columns are panel genes
+    X_panel = X_full
+    if imp_mask.any():
+        X_panel = X_full.tocsr()[:, ~imp_mask]   # keep imputed columns out of the counts assay
 
     # ── Build imputed matrix aligned to final cell set ─────────────────────────
     # Reads the zarr in chunks to avoid loading the full dense array into memory.
@@ -315,6 +361,12 @@ def spatialdata2seurat(
         except Exception as _ie:
             print(f"  SpaGE: could not build imputed matrix: {_ie}", flush=True)
             X_imputed = None
+
+    # Imputed genes stored in the table itself (used when no streaming result was loaded)
+    if X_imputed is None and include_imputed and table_imp_genes:
+        X_imputed     = sp.csr_matrix(adata.X)[:, imp_mask].astype(np.float32)
+        imputed_genes = table_imp_genes
+        print(f"  SpaGE: using {len(imputed_genes)} imputed genes stored in the table", flush=True)
 
     if X_imputed is None:
         imputed_genes = []
@@ -393,17 +445,26 @@ def spatialdata2seurat(
             print(f"  Cache: param_tag={param_tag}, dataset_hash={dataset_hash}", flush=True)
 
         # Mapping: fragment to look for in filename → target column name
+        # (regex: RCTD doublet is "labels_rctd_doublet[_{tool}_{tag}]" from SPLIT / Xenium,
+        #  or "labels_rctd_{tool}_{tag}_doublet" from the annotation modal on a reseg run)
         _annot_targets = {
-            "labels_seurat":        "cell_type_seurat",
-            "labels_rctd_doublet":  "cell_type_rctd_doublet",
+            r"labels_seurat":        "cell_type_seurat",
+            r"labels_rctd_doublet(_|$)|labels_rctd_(baysor|proseg)_[0-9a-f]{8}_doublet":
+                                     "cell_type_rctd_doublet",
         }
+        # Annotation caches of reseg runs are tagged with md5(out_dir)[:8], not param_tag
+        import hashlib as _hashlib
+        import re as _re
+        _run_tag  = _hashlib.md5(os.path.abspath(run_dir).encode()).hexdigest()[:8]
+        _is_reseg = os.path.exists(params_json)
         for _fragment, _col in _annot_targets.items():
             if _col in meta.columns:
                 continue  # already present in obs
             # All parquets containing this annotation type
             candidates = [
                 f for f in os.listdir(_cache_dir)
-                if f.endswith(".parquet") and _fragment in f
+                if f.endswith(".parquet") and not f.endswith("_weights.parquet")
+                and _re.search(_fragment, f)
             ]
             # Narrow to same dataset (by hash suffix before .parquet)
             if dataset_hash:
@@ -414,11 +475,16 @@ def spatialdata2seurat(
                     print(f"  Warning: {_col} — no parquets found for dataset_hash={dataset_hash}; "
                           f"run annotation in the app for this run first", flush=True)
                     continue
-            # Within same-dataset candidates, prefer the exact param_tag run
-            if param_tag:
-                specific = [f for f in candidates if param_tag in f]
-                if specific:
-                    candidates = specific
+            # Only accept parquets of this exact run (cell IDs are reused across runs)
+            if _is_reseg:
+                _had = bool(candidates)
+                candidates = [f for f in candidates if f"_{_run_tag}_" in f]
+                if _had and not candidates:
+                    print(f"  {_col}: no annotation parquet for this run (tag {_run_tag}); "
+                          f"skipping", flush=True)
+            else:
+                candidates = [f for f in candidates
+                              if not _re.search(r"_(baysor|proseg)_[0-9a-f]{8}_", f)]
             if not candidates:
                 continue
 
@@ -469,7 +535,8 @@ def spatialdata2seurat(
             if _n_matched == 0:
                 print(f"  Warning: {_col} — 0/{len(_meta_idx)} cells matched. "
                       f"Parquet index sample: {list(_ann.index[:5])}, "
-                      f"meta index sample: {list(_meta_idx[:5])}", flush=True)
+                      f"meta index sample: {list(_meta_idx[:5])} — column not added", flush=True)
+                continue   # labels of other cells: an all-'Unknown' column would be misleading
             elif _n_matched < len(_meta_idx):
                 print(f"  Warning: {_col} — only {_n_matched}/{len(_meta_idx)} cells matched; "
                       f"rest set to 'Unknown'", flush=True)

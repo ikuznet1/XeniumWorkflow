@@ -64,8 +64,10 @@ def read_obs_column(obs_grp, col):
     # Could be a categorical group (anndata encoding)
     if isinstance(item, zarr.Group):
         codes = item["codes"][:]
-        categories = item["categories"][:]
-        return categories[codes]
+        categories = np.asarray(item["categories"][:], dtype=object)
+        out = categories[codes]
+        out[codes < 0] = "Unknown"   # anndata encodes missing as code -1
+        return out
     raise ValueError(f"Unexpected zarr type for obs column '{col}': {type(item)}")
 
 
@@ -141,7 +143,7 @@ def export_sdata_to_cellnest(
     # Step 1 — Open zarr
     # ------------------------------------------------------------------
     print("[1/8] Opening zarr store …")
-    zroot     = zarr.open_group(sdata_path, mode="r")
+    zroot     = zarr.open_group(sdata_path, mode="r", use_consolidated=False)
     table_grp = zroot["tables"]["table"]
     obs_grp   = table_grp["obs"]
     var_grp   = table_grp["var"]
@@ -198,7 +200,19 @@ def export_sdata_to_cellnest(
             panel_corrected_csr = read_zarr_sparse(table_grp, "layers/X_corrected")
             print(f"       X_corrected shape {panel_corrected_csr.shape}")
         except KeyError:
-            print("       WARNING: X_corrected not found — falling back to raw counts")
+            raise ValueError(
+                "use_corrected=True but 'X_corrected' layer not found in the SpatialData zarr. "
+                "Run SPLIT ambient RNA correction first (via the app or functions/run_split.py)."
+            )
+        # Writers pad X_corrected to full var width (zero columns for imputed genes)
+        n_var_total = len(panel_mask)
+        if panel_corrected_csr.shape[1] == n_var_total:
+            panel_corrected_csr = panel_corrected_csr[:, panel_mask]
+        elif panel_corrected_csr.shape[1] != int(panel_mask.sum()):
+            raise ValueError(
+                f"X_corrected has {panel_corrected_csr.shape[1]} columns; "
+                f"expected {n_var_total} or {int(panel_mask.sum())}"
+            )
 
     # ------------------------------------------------------------------
     # Step 3c — Assemble final X and X_raw based on flag combination
@@ -298,7 +312,11 @@ def export_sdata_to_cellnest(
         else:
             labels = read_obs_column(obs_grp, cell_type_col)
             # Convert numeric cluster IDs to strings
-            if np.issubdtype(labels.dtype, np.integer) or np.issubdtype(labels.dtype, np.floating):
+            if np.issubdtype(labels.dtype, np.floating):
+                _nan = np.isnan(labels)
+                labels = np.where(_nan, "Unknown",
+                                  np.where(_nan, 0, labels).astype(int).astype(str))
+            elif np.issubdtype(labels.dtype, np.integer):
                 labels = labels.astype(int).astype(str)
             else:
                 labels = labels.astype(str)
@@ -347,7 +365,7 @@ def export_sdata_to_cellnest(
 
 def list_obs_cols(sdata_path):
     """Print all obs columns available in the zarr store and exit."""
-    zroot    = zarr.open_group(sdata_path, mode="r")
+    zroot    = zarr.open_group(sdata_path, mode="r", use_consolidated=False)
     obs_grp  = zroot["tables"]["table"]["obs"]
     cols     = sorted(obs_grp.keys())
     print(f"obs columns in {sdata_path}:")

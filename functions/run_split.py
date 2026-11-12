@@ -111,6 +111,40 @@ def _r_dgcmatrix_to_scipy(r_mat):
 
 
 # ---------------------------------------------------------------------------
+# scipy sparse → R dgCMatrix (no dense intermediate)
+# ---------------------------------------------------------------------------
+
+def _assign_r_dgcmatrix(r_name, mat_cells_x_genes, gene_names, cell_names):
+    """Assign a cells × genes matrix to R variable `r_name` as a genes × cells dgCMatrix."""
+    import rpy2.robjects as ro
+    from rpy2.robjects import numpy2ri
+    from rpy2.robjects.conversion import localconverter
+
+    csc = sp.csc_matrix(sp.csr_matrix(mat_cells_x_genes).T)   # genes × cells
+    csc.sum_duplicates()
+    csc.eliminate_zeros()
+    csc.sort_indices()
+    if csc.nnz >= 2**31:
+        raise ValueError(f"Matrix has {csc.nnz:,} non-zeros; R dgCMatrix supports < 2^31.")
+    with localconverter(ro.default_converter + numpy2ri.converter) as cv:
+        r_i = cv.py2rpy(np.ascontiguousarray(csc.indices, dtype=np.int32))
+        r_p = cv.py2rpy(np.ascontiguousarray(csc.indptr,  dtype=np.int32))
+        r_x = cv.py2rpy(np.ascontiguousarray(csc.data,    dtype=np.float64))
+    ro.r.assign("._dgc_i", r_i)
+    ro.r.assign("._dgc_p", r_p)
+    ro.r.assign("._dgc_x", r_x)
+    ro.r.assign("._dgc_dims", ro.IntVector([int(csc.shape[0]), int(csc.shape[1])]))
+    ro.r.assign("._dgc_rn", ro.StrVector(list(gene_names)))
+    ro.r.assign("._dgc_cn", ro.StrVector(list(cell_names)))
+    ro.r(f"""
+{r_name} <- Matrix::sparseMatrix(i=as.integer(._dgc_i), p=as.integer(._dgc_p),
+    x=as.numeric(._dgc_x), dims=as.integer(._dgc_dims), index1=FALSE,
+    dimnames=list(._dgc_rn, ._dgc_cn))
+rm(._dgc_i, ._dgc_p, ._dgc_x, ._dgc_dims, ._dgc_rn, ._dgc_cn)
+""")
+
+
+# ---------------------------------------------------------------------------
 # KMeans + UMAP on corrected counts
 # ---------------------------------------------------------------------------
 
@@ -123,6 +157,11 @@ def _compute_split_clusters_umap(cells_df, corrected_mat, corrected_cell_ids=Non
     from sklearn.cluster import KMeans
 
     try:
+        # Stub tensorflow so umap/__init__.py can load parametric_umap without crashing
+        # on a NumPy ABI mismatch in the installed TF (same as xenium_explorer.py)
+        import sys as _sys_umap, types as _types_umap
+        if "tensorflow" not in _sys_umap.modules:
+            _sys_umap.modules["tensorflow"] = _types_umap.ModuleType("tensorflow")
         import umap as _umap_mod
         _have_umap = True
     except Exception:
@@ -231,7 +270,7 @@ def _write_split_to_zarr(sdata_path, corrected_mat, cells_df, panel_genes,
     # Pad to match zarr var width (imputed gene cols → 0)
     var_grp = table_grp["var"]
     var_key = var_grp.attrs.get("_index", "_index")
-    n_var   = len(var_grp[var_key])
+    n_var   = var_grp[var_key].shape[0]   # zarr v3 Arrays have no len()
     if mat_aligned.shape[1] < n_var:
         n_pad       = n_var - mat_aligned.shape[1]
         mat_aligned = sp.hstack(
@@ -402,8 +441,8 @@ def run_split_from_zarr(
     # ── Step 4: Find shared genes ────────────────────────────────────────────
     print("  SPLIT [4/8]: finding shared genes…", flush=True)
     ro.r.assign("._split_rds", rds)
-    mat_r     = ro.r("slot(slot(._split_rds, 'assays')[['RNA']], 'counts')")
-    ref_genes = list(ro.r['rownames'](mat_r))
+    # LayerData works for both Assay (v3/v4) and Assay5 (v5) objects
+    ref_genes = list(ro.r("rownames(SeuratObject::LayerData(._split_rds[['RNA']], layer='counts'))"))
     shared_genes = sorted(set(panel_genes) & set(ref_genes))
     if len(shared_genes) < 10:
         raise ValueError(
@@ -416,8 +455,9 @@ def run_split_from_zarr(
     print("  SPLIT [5/8]: building RCTD Reference…", flush=True)
     ro.r.assign("._split_genes", ro.StrVector(shared_genes))
     ro.r("""
-._split_ref_mat <- slot(slot(._split_rds, 'assays')[['RNA']], 'counts')[._split_genes, , drop=FALSE]
+._split_ref_mat <- SeuratObject::LayerData(._split_rds[['RNA']], layer='counts')[._split_genes, , drop=FALSE]
 ._split_ref_mat <- as(._split_ref_mat, 'dgCMatrix')
+._split_ref_mat@x <- as.numeric(round(._split_ref_mat@x))
 """)
     ref_labels_r       = ro.StrVector(meta_df[label_col].astype(str).tolist())
     ref_labels_r.names = ro.StrVector(list(meta_df.index.astype(str)))
@@ -437,21 +477,7 @@ def run_split_from_zarr(
     shared_idx           = [gni[g] for g in shared_genes if g in gni and gni[g] < n_panel]
     shared_genes_present = [g for g in shared_genes if g in gni and gni[g] < n_panel]
     expr_shared = expr_panel[:, shared_idx]   # cells × shared_genes
-    expr_t      = expr_shared.T.toarray() if hasattr(expr_shared, "toarray") else expr_shared.T
-
-    counts_r_mat = ro.r.matrix(
-        ro.FloatVector(expr_t.flatten(order="F").tolist()),
-        nrow=len(shared_genes_present),
-        ncol=n_cells,
-    )
-    ro.r.assign("._split_counts_mat", counts_r_mat)
-    ro.r.assign("._split_rownames",   ro.StrVector(shared_genes_present))
-    ro.r.assign("._split_colnames",   ro.StrVector(cell_ids))
-    ro.r("""
-rownames(._split_counts_mat) <- ._split_rownames
-colnames(._split_counts_mat) <- ._split_colnames
-._split_counts_mat <- as(._split_counts_mat, 'dgCMatrix')
-""")
+    _assign_r_dgcmatrix("._split_counts_mat", expr_shared, shared_genes_present, cell_ids)
 
     coords_df = cells_df[["x_centroid", "y_centroid"]].copy()
     coords_df.columns = ["x", "y"]
@@ -483,18 +509,8 @@ rownames(._split_coords) <- colnames(._split_counts_mat)
     print("  SPLIT: RCTD done, running purify()…", flush=True)
 
     # Full panel matrix (genes × cells) for purify
-    expr_full_t = expr_panel.T.toarray() if hasattr(expr_panel, "toarray") else expr_panel.T
-    full_r_mat  = ro.r.matrix(
-        ro.FloatVector(expr_full_t.flatten(order="F").tolist()),
-        nrow=n_panel,
-        ncol=n_cells,
-    )
-    ro.r.assign("._split_full_counts", full_r_mat)
-    ro.r.assign("._split_panel_genes", ro.StrVector(list(panel_genes)))
+    _assign_r_dgcmatrix("._split_full_counts", expr_panel, panel_genes, cell_ids)
     ro.r("""
-rownames(._split_full_counts) <- ._split_panel_genes
-colnames(._split_full_counts) <- ._split_colnames
-._split_full_counts <- as(._split_full_counts, 'dgCMatrix')
 ._split_res      <- SPLIT::purify(
     counts              = ._split_full_counts,
     rctd               = ._split_rctd,
@@ -511,9 +527,30 @@ colnames(._split_full_counts) <- ._split_colnames
     except Exception:
         corrected_cell_ids = None
 
+    # purify() returns only the genes RCTD used (panel ∩ reference), not the panel
+    try:
+        corrected_gene_ids = list(ro.r["rownames"](purified_r))
+    except Exception:
+        corrected_gene_ids = None
+
     purified_csc = _r_dgcmatrix_to_scipy(purified_r)   # genes × cells (CSC)
     corrected_mat = purified_csc.T.tocsr()               # cells × genes (CSR)
     corrected_mat.data = np.clip(corrected_mat.data, 0, None)
+    if corrected_gene_ids is not None and corrected_gene_ids != list(panel_genes):
+        # Put every column back at its panel-gene position (one column per panel
+        # gene, as the zarr layer expects); genes purify() dropped stay zero.
+        _pg_pos = {g: i for i, g in enumerate(panel_genes)}
+        _gcols  = np.array([_pg_pos.get(str(g), -1) for g in corrected_gene_ids], dtype=np.int64)
+        _coo    = corrected_mat.tocoo()
+        _gok    = _gcols[_coo.col] >= 0
+        corrected_mat = sp.csr_matrix(
+            (_coo.data[_gok], (_coo.row[_gok], _gcols[_coo.col[_gok]])),
+            shape=(corrected_mat.shape[0], len(panel_genes)))
+        print(f"  SPLIT: purify() returned {len(corrected_gene_ids)} of {len(panel_genes)} panel genes "
+              f"— columns re-aligned to the panel", flush=True)
+    elif corrected_gene_ids is None and corrected_mat.shape[1] != len(panel_genes):
+        raise RuntimeError(f"SPLIT::purify returned {corrected_mat.shape[1]} genes without names "
+                           f"for a {len(panel_genes)}-gene panel — cannot align the corrected counts")
     n_corr = corrected_mat.shape[0]
     print(f"  SPLIT: corrected matrix shape {corrected_mat.shape} "
           f"({n_corr}/{n_cells} cells)", flush=True)

@@ -61,12 +61,23 @@ def _vectorized_spage(spatial_df: pd.DataFrame,
     if len(shared) == 0:
         raise ValueError("No shared genes between spatial and reference data.")
 
-    n_pv = min(n_pv, len(shared))
-
-    rna_scaled  = pd.DataFrame(st.zscore(rna_df[shared],    axis=0),
+    # float32 z-scores (as in the app) to halve memory
+    rna_scaled  = pd.DataFrame(st.zscore(rna_df[shared],    axis=0).astype(np.float32),
                                 index=rna_df.index,    columns=shared)
-    spat_scaled = pd.DataFrame(st.zscore(spatial_df[shared], axis=0),
+    spat_scaled = pd.DataFrame(st.zscore(spatial_df[shared], axis=0).astype(np.float32),
                                 index=spatial_df.index, columns=shared)
+    # Genes with zero variance in either dataset z-score to NaN and break the PCA (as in the app)
+    _ok = (np.isfinite(rna_scaled.values.sum(axis=0))
+           & np.isfinite(spat_scaled.values.sum(axis=0)))
+    if not _ok.all():
+        print(f"  SpaGE: dropping {int((~_ok).sum())} shared genes with zero variance", flush=True)
+        shared = shared[_ok]
+        if len(shared) == 0:
+            raise ValueError("No shared genes with non-zero variance in both datasets.")
+        rna_scaled  = rna_scaled.loc[:, shared]
+        spat_scaled = spat_scaled.loc[:, shared]
+
+    n_pv = min(n_pv, len(shared))
 
     pv = PVComputation(n_factors=n_pv, n_pv=n_pv,
                        dim_reduction="pca", dim_reduction_target="pca")
@@ -77,24 +88,33 @@ def _vectorized_spage(spatial_df: pd.DataFrame,
     S     = S[:, :eff]
     print(f"  SpaGE: {eff} effective principal vectors", flush=True)
 
-    rna_proj  = rna_scaled.values  @ S   # (n_ref,  eff)
-    spat_proj = spat_scaled.values @ S   # (n_spat, eff)
+    rna_proj  = (rna_scaled.values  @ S).astype(np.float32)   # (n_ref,  eff)
+    spat_proj = (spat_scaled.values @ S).astype(np.float32)   # (n_spat, eff)
+    del rna_scaled, spat_scaled
 
     nbrs = NearestNeighbors(n_neighbors=50, algorithm="auto", metric="cosine")
     nbrs.fit(rna_proj)
     distances, indices = nbrs.kneighbors(spat_proj)   # (n_spat, 50)
-
-    Y      = rna_df[genes_to_predict].values.astype(np.float32)  # (n_ref, n_genes)
-    Y_nbrs = Y[indices]                                           # (n_spat, 50, n_genes)
+    del rna_proj, spat_proj
 
     valid  = distances < 1
-    d_v    = np.where(valid, distances, 0.0)
+    d_v    = np.where(valid, distances, 0.0).astype(np.float32)
+    del distances
     d_sum  = d_v.sum(axis=1, keepdims=True)
     d_sum[d_sum == 0] = 1.0
-    w      = np.where(valid, 1.0 - d_v / d_sum, 0.0)
-    n_v    = np.maximum(valid.sum(axis=1, keepdims=True) - 1, 1)
+    w      = np.where(valid, 1.0 - d_v / d_sum, 0.0).astype(np.float32)
+    n_v    = np.maximum(valid.sum(axis=1, keepdims=True) - 1, 1).astype(np.float32)
     w      = w / n_v
-    imp    = np.einsum("ij,ijk->ik", w, Y_nbrs)                  # (n_spat, n_genes)
+    del d_v, d_sum, valid, n_v
+
+    # Impute in gene chunks: Y_nbrs is (n_spat, 50, chunk) instead of (n_spat, 50, n_genes)
+    GENE_CHUNK = 10
+    imp = np.empty((len(spatial_df), len(genes_to_predict)), dtype=np.float32)
+    for i in range(0, len(genes_to_predict), GENE_CHUNK):
+        chunk_genes = genes_to_predict[i:i + GENE_CHUNK]
+        Y = rna_df[chunk_genes].values.astype(np.float32)        # (n_ref, chunk)
+        imp[:, i:i + len(chunk_genes)] = np.einsum("ij,ijk->ik", w, Y[indices])
+        del Y
 
     return pd.DataFrame(imp, index=spatial_df.index, columns=genes_to_predict)
 
@@ -117,7 +137,9 @@ def _load_reference(rds_path: str, genes_needed: list) -> tuple[pd.DataFrame, li
     rds_path_r = rds_path.replace("\\", "/")
     ro.r(f'seurat_ref <- readRDS("{rds_path_r}")')
     ro.r('rna_ref   <- seurat_ref[["RNA"]]')
-    ro.r('rna_genes <- rownames(rna_ref@data)')
+    # LayerData works for both Assay (v3/v4) and Assay5 (v5) objects
+    ro.r('rna_mat_data <- SeuratObject::LayerData(rna_ref, layer="data")')
+    ro.r('rna_genes <- rownames(rna_mat_data)')
     all_rna_genes = list(ro.r("rna_genes"))
 
     # Filter to genes that exist in the reference
@@ -134,7 +156,7 @@ def _load_reference(rds_path: str, genes_needed: list) -> tuple[pd.DataFrame, li
         ro.r(f"""
 genes_sub  <- {genes_r}
 genes_sub  <- genes_sub[genes_sub %in% rna_genes]
-mat_sub    <- rna_ref@data[genes_sub, ]
+mat_sub    <- rna_mat_data[genes_sub, , drop=FALSE]
 Matrix::writeMM(mat_sub, "{mat_file}")
 writeLines(rownames(mat_sub), "{genes_file}")
 writeLines(colnames(mat_sub), "{cells_file}")
@@ -145,7 +167,7 @@ writeLines(colnames(mat_sub), "{cells_file}")
         with open(cells_file) as f:
             ref_cells = [l.strip() for l in f]
 
-    ro.r("rm(seurat_ref, rna_ref, mat_sub); gc()")
+    ro.r("rm(seurat_ref, rna_ref, rna_mat_data, mat_sub); gc()")
 
     rna_df = pd.DataFrame(
         mat_sp.toarray().astype(np.float32),
@@ -206,9 +228,12 @@ def impute(sdata_path: str,
         spage_repo = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   "..", "SpaGE_repo")
     spage_repo = os.path.abspath(spage_repo)
-    if not os.path.isdir(spage_repo):
-        raise FileNotFoundError(f"SpaGE_repo not found at {spage_repo}. "
-                                f"Pass --spage_repo or set spage_repo=.")
+    if not os.path.isfile(os.path.join(spage_repo, "SpaGE", "principal_vectors.py")):
+        raise FileNotFoundError(
+            f"SpaGE not found at {spage_repo} (the directory is a git submodule and is empty "
+            f"until fetched). Run `git submodule update --init SpaGE_repo` in the repository, "
+            f"or pass --spage_repo / spage_repo= pointing at a clone of "
+            f"https://github.com/tabdelaal/SpaGE.")
 
     if output is None:
         stem   = sdata_path.rstrip("/\\")
@@ -225,6 +250,20 @@ def impute(sdata_path: str,
     print(f"Loading SpatialData from {sdata_path} …", flush=True)
     sdata = sd.read_zarr(sdata_path)
     adata = sdata.tables["table"]
+
+    # SPLIT writes these obs columns as bare arrays (not in column-order), so
+    # sd.read_zarr does not return them — recover them so the output keeps them.
+    try:
+        import zarr as _zarr_mod
+        _obs_grp = _zarr_mod.open_group(
+            os.path.join(sdata_path, "tables", "table", "obs"), mode="r")
+        for _ec in ["cluster_split_10", "split_umap_1", "split_umap_2"]:
+            if _ec not in adata.obs.columns and _ec in _obs_grp:
+                _ev = _obs_grp[_ec][:]
+                if len(_ev) == len(adata):
+                    adata.obs[_ec] = _ev
+    except Exception:
+        pass
 
     # Identify panel (non-imputed) genes
     if "is_imputed" in adata.var.columns:
@@ -255,10 +294,11 @@ def impute(sdata_path: str,
     from rpy2.robjects.packages import importr
     _rconv.set_conversion(ro.default_converter)
     importr("SeuratObject")
-    ro.r(f'_tmp_ref <- readRDS("{rds_path.replace(chr(92), "/")}")')
-    ro.r('_tmp_genes <- rownames(_tmp_ref[["RNA"]]@data)')
-    all_rna_genes = list(ro.r("_tmp_genes"))
-    ro.r("rm(_tmp_ref); gc()")
+    # R identifiers cannot start with "_" — use dot-prefixed temporaries
+    ro.r(f'.tmp_ref <- readRDS("{rds_path.replace(chr(92), "/")}")')
+    ro.r('.tmp_genes <- rownames(SeuratObject::LayerData(.tmp_ref[["RNA"]], layer="data"))')
+    all_rna_genes = list(ro.r(".tmp_genes"))
+    ro.r("rm(.tmp_ref, .tmp_genes); gc()")
 
     # ── Determine shared genes and genes_to_predict ────────────────────────────
     shared_genes = sorted(panel_gene_set & set(all_rna_genes))
@@ -300,6 +340,15 @@ def impute(sdata_path: str,
     else:
         genes_to_predict = [g for g in genes_to_predict if g in rna_df.columns]
 
+    # Skip genes already imputed into this table (re-run on own output would duplicate var names)
+    gene_suffix = " [corr+imp]" if use_corrected else " [imp]"
+    _existing   = set(adata.var_names)
+    _dup = [g for g in genes_to_predict if g + gene_suffix in _existing]
+    if _dup:
+        print(f"  Warning: {len(_dup)} genes already imputed in this table (skipped): "
+              f"{_dup[:10]}", flush=True)
+        genes_to_predict = [g for g in genes_to_predict if g + gene_suffix not in _existing]
+
     if not genes_to_predict:
         raise ValueError("No valid genes to predict after filtering against loaded reference.")
 
@@ -317,6 +366,7 @@ def impute(sdata_path: str,
     rs = xen_raw.sum(axis=1, keepdims=True)
     rs[rs == 0] = 1.0
     xen_norm   = np.log1p(xen_raw / rs * 10_000)
+    del xen_raw, rs
     spatial_df = pd.DataFrame(xen_norm, index=adata.obs_names, columns=shared_in_rna)
 
     # ── Run SpaGE ─────────────────────────────────────────────────────────────
@@ -329,7 +379,6 @@ def impute(sdata_path: str,
     print("Building output AnnData …", flush=True)
 
     # Tag gene names with [corr+imp] when imputing on corrected counts
-    gene_suffix   = " [corr+imp]" if use_corrected else " [imp]"
     tagged_genes  = [g + gene_suffix for g in genes_to_predict]
 
     imp_X   = sp.csr_matrix(imp_df.values.astype(np.float32))
