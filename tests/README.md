@@ -1,7 +1,7 @@
 # Tests
 
-A pytest suite for `xenium_explorer.py`, `xenium_viewer_api.py`, `functions/` and the
-WebGL viewer. It replaces the one-off check scripts that used to live in a scratch
+A pytest suite for the app (`xenium_explorer.py` and the `xenium_app/` package behind
+it), `xenium_viewer_api.py`, `functions/` and the WebGL viewer. It replaces the one-off check scripts that used to live in a scratch
 folder.
 
 ```
@@ -21,7 +21,8 @@ environment as the app. Nothing else is installed or downloaded by the tests.
 
 ## Why one process per bundle
 
-`xenium_explorer.py` loads its dataset **while it is imported** (from `DATA_DIR`) and
+The app loads its dataset **while it is imported** (`import xenium_explorer` imports the
+`xenium_app` package, which reads `DATA_DIR`) and
 fixes its cache root (`XENIUM_CACHE_DIR`), REPL mode (`XENIUM_ENABLE_REPL`) and
 default renderer (`XENIUM_RENDERER`) at the same moment. A Python process can
 therefore hold exactly one dataset in one configuration. The suite is built around
@@ -119,6 +120,7 @@ Unset or missing paths are skipped, never an error.
 | `test_tools_reseg.py` | `tools` | real Baysor and Proseg runs (single region; Proseg also on patches): each tool is first cancelled mid-run (processes gone, nothing left in the cache, state released), then the same request runs to completion; input equals an independent read of the region, matrix equals a recount of the tool's output, zarr / params / cache reload consistency |
 | `test_tools_r.py` | `tools` | sparse matrices to R and back through rpy2, verified on the R side, also from a worker thread |
 | `test_browser.py` | `browser` | wrappers around `viewer_src/test/{app_smoke,glue_checks,run}.mjs` (`viewer_src/test/analysis_checks.mjs`, which drives the three analysis tabs in both renderers on a real bundle, is run by hand like `jobs_panel.mjs`) |
+| `test_package_layout.py` | default | the split into `xenium_app/`: every global is defined in one module, no module copies another's globals, every `module.NAME` and every global a function reads exists, library modules do not import the start-up modules; rebinding a constant, a state dict, a counter and a function through `xe` (assignment, `monkeypatch`, `mock.patch.object`) and through the REPL namespace reaches the code that uses them |
 | `test_slow_bundles.py` | `slow` | the bundle-dependent default modules on each larger bundle |
 
 ## Tiers
@@ -150,6 +152,12 @@ minute and exercises all the "this bundle has no ..." paths; the 5K skin bundle
 GB of memory.
 
 ## Writing tests
+
+* `xe` is one namespace over all modules of `xenium_app`: read any global as `xe.<name>`
+  and rebind it with `monkeypatch.setattr(xe, "<name>", value)` or `xe.<name> = value`;
+  the module that defines the name is rebound, so the app's own code sees the change.
+  Tests that read the source use `tl.app_tree()` (all source files as one module),
+  `tl.app_sources()` or `tl.app_source_of("function_name")`, not a single file.
 
 * Assert a property, not the absence of an exception: recompute the expected value
   from the raw files (`raw` fixture) or with a second implementation, and compare by

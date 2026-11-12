@@ -224,7 +224,7 @@ def test_static_layout_ids_cover_callback_inputs(xe, audit):
 
 
 # ── every Python source at least parses ──────────────────────────────────────
-@pytest.mark.parametrize("path", sorted([tl.REPO / "xenium_explorer.py", tl.REPO / "xenium_viewer_api.py",
+@pytest.mark.parametrize("path", sorted([*tl.app_sources(), tl.REPO / "xenium_viewer_api.py",
                                          *(tl.REPO / "functions").glob("*.py"),
                                          tl.REPO / "viewer_src" / "dev_server.py"]),
                          ids=lambda p: p.name)

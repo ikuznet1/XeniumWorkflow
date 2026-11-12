@@ -2,7 +2,8 @@
 // chromium, wire-format parsing in node, and screenshot pixel statistics.
 import {chromium} from 'playwright';
 import {spawn} from 'node:child_process';
-import {mkdirSync} from 'node:fs';
+import {existsSync, mkdirSync} from 'node:fs';
+import {homedir} from 'node:os';
 import {dirname, resolve} from 'node:path';
 import {fileURLToPath} from 'node:url';
 
@@ -11,10 +12,17 @@ export const ROOT = resolve(HERE, '..', '..');
 export const SHOTS = resolve(HERE, 'screenshots');
 mkdirSync(SHOTS, {recursive: true});
 
+// Test bundles. XV_SKIN / XV_TINY name one bundle each; XV_TEST_DATA names the folder that
+// holds them (default ~/Documents/XeniumTestData). Without either, the tiny bundle falls
+// back to the fixture in the repository; tests that need a bundle that is absent skip.
+export const TEST_DATA = process.env.XV_TEST_DATA || resolve(homedir(), 'Documents', 'XeniumTestData');
+const firstExisting = (...paths) => paths.find((p) => existsSync(p)) || paths[0];
 export const DATA = {
-  skin: process.env.XV_SKIN || '/Users/ikuz/Documents/XeniumTestData/prime_human_skin_ffpe',
-  tiny: process.env.XV_TINY || '/Users/ikuz/Documents/XeniumTestData/prime_mouse_ileum_tiny',
+  skin: process.env.XV_SKIN || resolve(TEST_DATA, 'prime_human_skin_ffpe'),
+  tiny: process.env.XV_TINY || firstExisting(resolve(TEST_DATA, 'prime_mouse_ileum_tiny'),
+                                             resolve(ROOT, 'tests', 'data', 'prime_mouse_ileum_tiny')),
 };
+export const hasBundle = (dir) => existsSync(resolve(dir, 'experiment.xenium'));
 
 // XV_GL=metal (default on macOS): the real GPU through ANGLE-Metal in headless chromium.
 // XV_GL=swiftshader (default elsewhere): software WebGL2. Usable for small data only: in this

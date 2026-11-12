@@ -5,10 +5,11 @@
 // launch_fab.py is the app plus /_fab/* routes that put the fabricated state in place.
 import {chromium} from 'playwright';
 import {readFileSync} from 'node:fs';
+import {DATA} from './lib.mjs';
 
 const base = process.argv[2] || 'http://127.0.0.1:8098';
 const out = process.argv[3] || '.';
-const extraDir = process.argv[4] || '/Users/ikuz/Documents/XeniumTestData/prime_mouse_ileum_tiny';
+const extraDir = process.argv[4] || DATA.tiny;   // XV_TINY, or see lib.mjs
 const gl = process.env.XV_GL || (process.platform === 'darwin' ? 'metal' : 'swiftshader');
 const args = gl === 'metal' ? ['--use-angle=metal', '--ignore-gpu-blocklist']
   : ['--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'];

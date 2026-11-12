@@ -28,7 +28,8 @@ import scipy.sparse as sp
 REPO = pathlib.Path(__file__).resolve().parents[1]
 TESTS = REPO / "tests"
 TINY_BUNDLE = TESTS / "data" / "prime_mouse_ileum_tiny"
-APP_SOURCE = REPO / "xenium_explorer.py"
+APP_SOURCE = REPO / "xenium_explorer.py"          # the entry point (and `import xenium_explorer`)
+APP_PACKAGE = REPO / "xenium_app"                 # where the code lives
 
 # Bundles larger than this are linked into the working directory instead of copied.
 COPY_LIMIT_BYTES = 200 * 1024 * 1024
@@ -429,8 +430,33 @@ class new_threads:
 
 
 # ── source-level access to code that is not importable on its own ────────────
+def app_sources() -> list:
+    """Every source file of the app: the modules of xenium_app in import order (as listed
+    in its MODULES), any other file of the package, then the entry point."""
+    init = ast.parse((APP_PACKAGE / "__init__.py").read_text())
+    order = next(ast.literal_eval(n.value) for n in init.body if isinstance(n, ast.Assign)
+                 and any(isinstance(t, ast.Name) and t.id == "MODULES" for t in n.targets))
+    files = [APP_PACKAGE / f"{name}.py" for name in order]
+    files += sorted(p for p in APP_PACKAGE.glob("*.py") if p not in files)
+    return files + [APP_SOURCE]
+
+
+def app_source_of(name) -> pathlib.Path:
+    """The source file that defines the top-level function or class *name*."""
+    hits = [p for p in app_sources() for n in ast.parse(p.read_text()).body
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == name]
+    if len(hits) != 1:
+        raise LookupError(f"{name}: defined in {len(hits)} files")
+    return hits[0]
+
+
 def app_tree():
-    return ast.parse(APP_SOURCE.read_text())
+    """The whole app as one module: the statements of every source file, in import order.
+    (Line numbers are those of the file a statement comes from.)"""
+    body = []
+    for path in app_sources():
+        body.extend(ast.parse(path.read_text(), filename=str(path)).body)
+    return ast.Module(body=body, type_ignores=[])
 
 
 def function_node(tree, name):
@@ -440,7 +466,7 @@ def function_node(tree, name):
     raise LookupError(name)
 
 
-def compile_block(nodes, filename="<extracted from xenium_explorer.py>"):
+def compile_block(nodes, filename="<extracted from the app source>"):
     """Compile a list of statement nodes taken from the app source into a code object."""
     mod = ast.Module(body=list(nodes), type_ignores=[])
     ast.fix_missing_locations(mod)

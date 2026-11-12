@@ -5,7 +5,7 @@ import {pathToFileURL} from 'node:url';
 import {resolve} from 'node:path';
 import {writeFileSync} from 'node:fs';
 import {
-  Checks, DATA, GL_MODE, HERE, ROOT, diffFraction, fetchBin, launch, newPage, parseBin, pointInPolygon, shot, startServer,
+  Checks, DATA, GL_MODE, HERE, ROOT, diffFraction, fetchBin, launch, newPage, parseBin, pointInPolygon, shot, startServer, hasBundle,
 } from './lib.mjs';
 
 const T = new Checks();
@@ -51,6 +51,12 @@ async function drawPath(page, pts) {
   await page.mouse.up();
 }
 
+for (const dir of [DATA.skin, DATA.tiny]) {
+  if (!hasBundle(dir)) {
+    console.log(`SKIP  viewer tests: no Xenium bundle at ${dir} (set XV_SKIN / XV_TINY or XV_TEST_DATA)`);
+    process.exit(0);
+  }
+}
 const skin = await startServer(DATA.skin, 8072);
 const tiny = await startServer(DATA.tiny, 8073);
 const browser = await launch();

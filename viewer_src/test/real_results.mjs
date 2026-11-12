@@ -4,6 +4,8 @@
 // runs, annotation label caches (Seurat / CellTypist / RCTD with weights), SPLIT-corrected
 // counts, SpaGE-imputed genes and the sopa store with a tissue ROI and patches.
 //
+//   XV_TEST_DATA   folder of the test data (default ~/Documents/XeniumTestData); the
+//                  defaults below are inside it
 //   XV_REAL_DATA   bundle             (default …/XeniumTestData/skin_pipeline_copy)
 //   XV_REAL_CACHE  XENIUM_CACHE_DIR   (default …/XeniumTestData/cache_pipelines)
 //   XV_REAL_EXTRA  second sample(s) for the multi-sample checks, comma-separated
@@ -38,9 +40,8 @@ import {spawn} from 'node:child_process';
 import {existsSync, mkdirSync, readFileSync, readdirSync} from 'node:fs';
 import {createServer} from 'node:net';
 import {resolve} from 'node:path';
-import {GL_ARGS, GL_MODE, ROOT, SHOTS} from './lib.mjs';
+import {GL_ARGS, GL_MODE, ROOT, SHOTS, TEST_DATA as TD} from './lib.mjs';
 
-const TD = '/Users/ikuz/Documents/XeniumTestData';
 const DATA_DIR = process.env.XV_REAL_DATA || `${TD}/skin_pipeline_copy`;
 const CACHE_DIR = process.env.XV_REAL_CACHE || `${TD}/cache_pipelines`;
 const EXTRA_DIR = process.env.XV_REAL_EXTRA || `${TD}/prime_mouse_ileum_tiny,${TD}/geo_rv_0038290_R2/bundle`;   // comma-separated

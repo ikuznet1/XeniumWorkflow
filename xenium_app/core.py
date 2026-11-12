@@ -1,0 +1,209 @@
+"""Configuration, constants and the shared state of the app (state dicts and their locks,
+server log capture). Imported first; imports no other module of the package.
+The import block below is the single-file app's, kept whole so that third-party libraries
+are still imported in the same order.
+
+DATA, the loaded dataset, lives here as ``core.DATA``; it is assigned by startup.py."""
+
+
+import os
+import re
+import sys
+import warnings
+warnings.filterwarnings("ignore", message=".*not recognized as a component of a Zarr hierarchy.*")
+warnings.filterwarnings("ignore", message=".*R is not initialized by the main thread.*")
+warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*invalid value encountered in divide.*")
+import json
+import io
+import base64
+import threading
+import subprocess
+import hashlib
+import contextvars
+
+# ─── Configurable paths (override via env vars for cloud deployment) ─────────
+CACHE_BASE_DIR = os.environ.get("XENIUM_CACHE_DIR",
+                                os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache"))
+from concurrent.futures import ThreadPoolExecutor
+from dash import no_update, Patch
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp
+import h5py
+from PIL import Image
+
+import dash
+from dash import dcc, html, Input, Output, State, callback_context, ALL, ClientsideFunction
+from dash import dash_table
+import dash_bootstrap_components as dbc
+import plotly.graph_objects as go
+from plotly.colors import qualitative
+
+_ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]|\x1b\[[?][0-9;]*[A-Za-z]|\x1b[()][0-9A-Za-z]|[\x00-\x08\x0b\x0e-\x1f\x7f]')
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_ESCAPE.sub('', text)
+
+
+# ─── Constants ────────────────────────────────────────────────────────────────
+PIXEL_SIZE_UM = 0.2125
+
+# Max cells for which to render boundaries (performance guard)
+BOUNDARY_CELL_LIMIT = 3000
+
+# RCTD pie chart settings
+PIE_THRESHOLD      = 1500   # max cells in view to render RCTD weight pie charts
+RCTD_PIE_RADIUS_UM = 8.0    # pie chart radius in µm
+
+CLUSTER_COLORS = (
+    qualitative.Plotly + qualitative.D3 + qualitative.G10
+    + qualitative.T10 + qualitative.Pastel
+)
+
+DARK_BG  = "#0d1117"
+PANEL_BG = "#161b22"
+CARD_BG  = "#21262d"
+BORDER   = "#30363d"
+TEXT     = "#c9d1d9"
+MUTED    = "#8b949e"
+ACCENT   = "#58a6ff"
+PLOT_BG  = "#0d1117"
+GRID     = "#21262d"
+
+QC_METRICS = {
+    "transcript_counts": "Transcript Counts",
+    "cell_area":         "Cell Area (µm²)",
+    "nucleus_area":      "Nucleus Area (µm²)",
+    "total_counts":      "Total Counts",
+}
+COLORSCALES = {
+    "transcript_counts": "Viridis",
+    "cell_area":         "Plasma",
+    "nucleus_area":      "Cividis",
+    "total_counts":      "Magma",
+}
+
+
+# ─── Annotation state (shared across callbacks via background thread) ─────────
+_annot_state: dict = {"status": "idle", "message": ""}
+_annot_lock   = threading.Lock()
+
+_ANNOT_METHODS = {"celltypist": "CellTypist", "seurat": "Seurat", "rctd": "RCTD"}
+
+# ─── Baysor segmentation state ────────────────────────────────────────────────
+_baysor_state: dict = {"status": "idle", "message": "", "result": None}
+_baysor_lock  = threading.Lock()
+
+# ─── Proseg segmentation state ────────────────────────────────────────────────
+_proseg_state: dict = {"status": "idle", "message": "", "result": None}
+_proseg_lock  = threading.Lock()
+
+# ─── SpaGE imputation state ───────────────────────────────────────────────────
+_spage_state: dict = {"status": "idle", "message": "", "result": None,
+                      "result_path": None, "result_genes": None}
+_spage_lock   = threading.Lock()
+SPAGE_STREAM_THRESHOLD = 500_000_000  # ~2 GB at float32; above this stream to zarr on disk
+_spage_repl_pending = False   # set by run_spage(); cleared once poll_spage_repl fires
+_spage_last_logged  = ""      # last message printed by poll_spage_repl (dedup)
+_active_counts_mode = "original"  # mirrors counts-mode-store; updated by sync_counts_mode
+
+# ─── CellNEST CCC state ───────────────────────────────────────────────────────
+_cellnest_state: dict = {"status": "idle", "message": "", "data": None}
+_cellnest_lock  = threading.Lock()
+
+# ─── Reseg UMAP state ─────────────────────────────────────────────────────────
+_umap_reseg_state: dict = {"status": "idle", "message": "", "result": None}
+_umap_reseg_lock  = threading.Lock()
+
+# ─── Subset state ─────────────────────────────────────────────────────────────
+_subset_version = 0   # incremented by subset()/unsubset() to trigger re-render
+
+# ─── SpatialData / Sopa state ─────────────────────────────────────────────────
+_sdata_state: dict = {"status": "idle", "message": "", "sdata": None, "roi": None, "patches": None}
+_sdata_lock   = threading.Lock()
+_save_sdata_state: dict = {"status": "idle", "message": ""}
+_save_sdata_lock  = threading.Lock()
+_sdata_version = 0  # incremented when ROI/patches change, to trigger overlay refresh
+
+# ─── SPLIT ambient RNA correction state ───────────────────────────────────────
+_split_state: dict = {"status": "idle", "message": "", "result": None}
+_split_lock   = threading.Lock()
+
+# ─── Spatial niches state ─────────────────────────────────────────────────────
+_niche_state: dict = {"status": "idle", "message": ""}
+_niche_lock   = threading.Lock()
+
+# ─── Spatial analysis state ───────────────────────────────────────────────────
+_spatial_state: dict = {"status": "idle", "message": "", "result": None}
+_spatial_lock   = threading.Lock()
+
+# ─── ROI Annotation state ─────────────────────────────────────────────────────
+_roi_state: dict = {
+    "rois": [],           # [{name, cls, polygon_xy:[[x,y],...], color}]
+    "show": True,         # overlay visibility
+    "pending_hull": None, # [[x,y],...] awaiting save
+}
+_roi_lock = threading.Lock()
+
+# ─── Server log capture ────────────────────────────────────────────────────────
+import collections
+_log_buffer: collections.deque = collections.deque(maxlen=200)
+_log_lock = threading.Lock()
+
+class _LogCapture:
+    """Tee writes to the original stream and to _log_buffer."""
+    def __init__(self, original):
+        self._orig = original
+
+    def write(self, s):
+        self._orig.write(s)
+        if s.strip():
+            with _log_lock:
+                _log_buffer.append(s.rstrip())
+        return len(s)
+
+    def flush(self):
+        self._orig.flush()
+
+    def fileno(self):
+        return self._orig.fileno()
+
+    def isatty(self):
+        return self._orig.isatty()
+
+    # Forward all other attribute lookups to the original stream
+    def __getattr__(self, name):
+        return getattr(self._orig, name)
+
+sys.stdout = _LogCapture(sys.stdout)
+sys.stderr = _LogCapture(sys.stderr)
+
+
+def _redirect_rpy2_console():
+    """Call once inside any thread that uses rpy2 to capture R console output."""
+    import warnings
+    warnings.filterwarnings("ignore", message="R is not initialized by the main thread")
+    try:
+        import rpy2.rinterface_lib.callbacks as rpy2_cb
+        def _r_write(x):
+            x = x.rstrip()
+            if x:
+                with _log_lock:
+                    _log_buffer.append(f"[R] {x}")
+        rpy2_cb.consolewrite_print     = _r_write
+        rpy2_cb.consolewrite_warnerror = _r_write
+    except Exception:
+        pass
+
+CELLTYPIST_MODELS = {
+    "Healthy_Adult_Heart.pkl": "Healthy Adult Heart (Azimuth/CellTypist)",
+    "Immune_All_Low.pkl":      "Immune All – Low (CellTypist)",
+    "Immune_All_High.pkl":     "Immune All – High (CellTypist)",
+}
+
+
+# ─── Callbacks ────────────────────────────────────────────────────────────────
+
+def _seg_tool(seg_source: str) -> str:
+    """Extract tool name from seg-source value: 'xenium', 'baysor', or 'proseg'."""
+    return (seg_source or "xenium").split(":")[0]

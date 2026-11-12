@@ -605,8 +605,10 @@ def test_no_job_is_started_outside_the_registry():
             continue
         fn = node.func
         name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
-        names = {n.id for a in list(node.args) + [k.value for k in node.keywords]
-                 for n in ast.walk(a) if isinstance(n, ast.Name)}
+        # a job function is named bare in its own module and as module.function elsewhere
+        names = {n.id if isinstance(n, ast.Name) else n.attr
+                 for a in list(node.args) + [k.value for k in node.keywords]
+                 for n in ast.walk(a) if isinstance(n, (ast.Name, ast.Attribute))}
         if name == "Thread":
             assert not (names & job_funcs), f"line {node.lineno}: job started with a bare Thread"
         if name == "_job_start":

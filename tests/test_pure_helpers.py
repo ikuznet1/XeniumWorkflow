@@ -1,6 +1,6 @@
 """Unit tests of the data-independent helpers, on synthetic input.
 
-The functions live in xenium_explorer.py, which cannot be imported without loading a
+The functions live in the xenium_app package, which cannot be imported without loading a
 dataset, so they are reached through the session's ``xe`` import; nothing here depends
 on which bundle that import loaded. The SPLIT gene re-alignment is not a function at
 all (it is a block inside _run_split_correction / run_split_from_zarr), so that block
@@ -448,7 +448,7 @@ def _split_realign_block(path, function):
     return tl.compile_block(hits)
 
 
-SPLIT_SOURCES = [(tl.APP_SOURCE, "_run_split_correction"),
+SPLIT_SOURCES = [(tl.app_source_of("_run_split_correction"), "_run_split_correction"),
                  (tl.REPO / "functions" / "run_split.py", "run_split_from_zarr")]
 
 

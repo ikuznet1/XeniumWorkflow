@@ -45,6 +45,7 @@ def test_cache_helpers_resolve_under_the_cache_root(xe, cache_dir):
 
 def test_no_module_constant_points_into_the_home_cache(xe):
     home_cache = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache")
+    assert {"CACHE_BASE_DIR", "_CELLNEST_DB_CACHE", "SPAGE_REPO"} <= set(vars(xe))   # all modules
     leaks = {k: v for k, v in vars(xe).items()
              if isinstance(v, str) and v.startswith(home_cache)}
     assert not leaks, leaks

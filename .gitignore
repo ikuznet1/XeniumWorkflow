@@ -19,3 +19,6 @@ __pycache__/
 viewer_src/image_test/out/
 viewer_src/image_test/dist/
 viewer_src/**/*.png
+
+# written by the app when launched directly on the fixture bundle
+tests/data/**/spatialdata_xenium.zarr/

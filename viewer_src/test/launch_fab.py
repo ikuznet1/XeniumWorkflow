@@ -1,7 +1,7 @@
 """The real app plus test-only routes that fabricate state the parity features consume.
    DATA_DIR=... XENIUM_RENDERER=webgl PORT=8098 python launch_fab.py"""
 import os, sys
-sys.path.insert(0, "/Users/ikuz/Documents/XeniumWorkflow")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))   # the repo
 import numpy as np, pandas as pd
 import xenium_explorer as xe
 from flask import jsonify, request

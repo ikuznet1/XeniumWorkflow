@@ -6,7 +6,7 @@ Works with standard Xenium panels (a few hundred genes) and with **Xenium Prime 
 
 ## Cloud Run Deployment
 
-The app can be deployed to **Google Cloud Run** for remote access. The container files (`Dockerfile`, `requirements-cloud.txt`, `.dockerignore`) are **not currently in this repository**; the commands below assume you supply a `Dockerfile` that installs the Python dependencies, copies `xenium_explorer.py`, `xenium_viewer_api.py`, `assets/` and `functions/`, and starts `python xenium_explorer.py`.
+The app can be deployed to **Google Cloud Run** for remote access. The container files (`Dockerfile`, `requirements-cloud.txt`, `.dockerignore`) are **not currently in this repository**; the commands below assume you supply a `Dockerfile` that installs the Python dependencies, copies `xenium_explorer.py`, the `xenium_app/` package, `xenium_viewer_api.py`, `assets/` and `functions/`, and starts `python xenium_explorer.py`.
 
 **Quick summary:**
 
@@ -858,6 +858,51 @@ See `environment.yml` (conda) or `requirements.txt` (pip) for the full pinned de
 
 ---
 
+## Code layout
+
+`xenium_explorer.py` is the entry point; the code is in the `xenium_app/` package.
+Importing the package starts the app as before: it loads the dataset named by `DATA_DIR`
+or the command line, builds the Dash app and registers the callbacks.
+
+| Module | Contents |
+|--------|----------|
+| `core` | configuration (`CACHE_BASE_DIR`), constants, the shared state dicts and their locks, server log capture; holds `DATA` |
+| `jobs` | dataset generation counter and the job registry (progress, Cancel, tool processes) |
+| `caching` | cache locations: dataset keys, segmentation run directories, cache size and clean-up |
+| `ui` | small Dash building blocks: labels, plot-tab controls, jobs panel rows |
+| `loading` | readers: Xenium bundle → SpatialData store → the `DATA` dict |
+| `dataview` | derived data and accessors on `DATA`: gene expression, clusters, viewport cells, extra samples |
+| `annotation` | CellTypist, Seurat kNN and RCTD |
+| `reseg`, `clustering` | Baysor / Proseg runs and cached-run loading; clustering and UMAP of a run |
+| `split`, `spage` | SPLIT ambient RNA correction; SpaGE imputation |
+| `subsetting` | the REPL helpers `subset()`, `unsubset()`, `get_genes()`, `retry_split_zarr_write()` |
+| `spatial`, `regions` | spatial analysis and niches; ROI helpers |
+| `morph` | morphology image overlay of the Plotly view |
+| `figures` | Plotly figure builders (spatial map, UMAP, analysis plots) |
+| `analysis` | differential expression, gene-set scores, transcript density |
+| `cellnest` | CellNEST loading, filters and plots |
+| `sdata_store` | SpatialData / sopa backend: cache store, Save as SpatialData, tissue ROI and patches |
+| `startup` | the import-time work: locate and load the dataset, autoload cached results |
+| `app_layout` | the Dash `app` and its layout |
+| `cb_plots`, `cb_tools`, `cb_reseg`, `cb_spage`, `cb_data`, `cb_spatial`, `cb_analysis` | the callbacks, by feature |
+| `viewer_provider` | data provider for `xenium_viewer_api.py` (WebGL view) and `/health` |
+| `compat` | the single namespace over all modules (below) |
+
+Two rules keep this equivalent to the former single file:
+
+- **A global is defined in one module and looked up there.** Code in another module writes
+  `core.CACHE_BASE_DIR`, `figures.make_spatial_fig(...)`, never `from .core import ...`.
+  `import xenium_explorer as xe` therefore still gives one namespace: `xe.<name>` reads any
+  global of any module, and `xe.<name> = value` (or `monkeypatch.setattr(xe, ...)`) rebinds
+  it in the module that defines it, where all code picks it up. The REPL uses the same
+  namespace. `tests/test_package_layout.py` checks the rule and the rebinding.
+- **Import order is the order of the side effects.** `xenium_app/__init__.py` imports the
+  library modules first (they only define things), then `startup`, `app_layout`, the
+  `cb_*` modules and `viewer_provider`, which do the work in the order the single file did.
+  A library module must not import one of those.
+
+---
+
 ## Developing the WebGL viewer
 
 The viewer source lives in `viewer_src/` and is bundled with esbuild. Node.js is needed only for this.
@@ -871,7 +916,7 @@ npm run build          # writes ../assets/xenium_viewer.js
 python viewer_src/dev_server.py /path/to/xenium_bundle 8070     # http://127.0.0.1:8070/
 
 # tests (headless Chromium via Playwright)
-node test/run.mjs                                  # viewer core against dev_server.py
+node test/run.mjs                                  # viewer core against dev_server.py (bundles: XV_SKIN, XV_TINY or XV_TEST_DATA, see test/lib.mjs)
 node image_test/verify.mjs                         # image layer: decode and placement
 node test/app_smoke.mjs http://127.0.0.1:8050 out/ # the real app, started with XENIUM_RENDERER=webgl
 node test/glue_checks.mjs http://127.0.0.1:8050    # renderer switching, selection and image handling in the real app
