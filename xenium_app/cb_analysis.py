@@ -6,7 +6,7 @@ import dash
 from dash import Input, Output, State, ClientsideFunction
 import time as _time
 
-from . import core, jobs, dataview, analysis, stats, regions, app_layout, cb_spatial
+from . import core, jobs, dataview, analysis, stats, regions, proximity, app_layout, cb_spatial
 
 
 # ─── Analysis callbacks: differential expression ──────────────────────────────
@@ -185,14 +185,61 @@ def de_delete_group(n_clicks, group_a, version):
     State("de-pb-min-count",   "value"),
     State("de-pb-shrink",      "value"),
     State("de-leak-gate",      "value"),
+    State("prox-labels",       "value"),
+    State("prox-target",       "value"),
+    State("prox-anchor",       "value"),
+    State("prox-near",         "value"),
+    State("prox-far",          "value"),
+    State("prox-nrand",        "value"),
+    State("prox-source",       "value"),
+    State("prox-length",       "value"),
+    State("contact-radius",    "value"),
+    State("contact-min-cells", "value"),
+    State("contact-nshuffle",  "value"),
     prevent_initial_call=True,
 )
 def run_de(n_clicks, group_a, group_b, seg_source, method, color_by, counts_mode,
            mode="cells", population=None, min_cells=None, min_count=None, shrink=None,
-           leak_gate=None):
+           leak_gate=None, prox_labels=None, prox_target=None, prox_anchor=None, prox_near=None,
+           prox_far=None, prox_nrand=None, prox_source=None, prox_length=None,
+           contact_radius=None, contact_min_cells=None, contact_nshuffle=None):
     if not n_clicks:
         raise dash.exceptions.PreventUpdate
     options = {"leak_gate": "on" in (leak_gate if leak_gate is not None else ["on"])}
+    if mode in ("proximity", "contact"):
+        if not prox_labels:
+            return False, True, "Pick where the cell types come from (an annotation, or clusters)."
+        if not prox_target or not prox_anchor:
+            return False, True, "Pick the cells to test (T) and the cell type they are near (X)."
+        if prox_target == prox_anchor:
+            return False, True, "T and X are the same cell type."
+        if mode == "proximity":
+            if not prox_near or not prox_far or prox_near <= 0 or prox_far <= prox_near:
+                return False, True, "The near distance must be positive and smaller than the far distance."
+            if not _an_job_claim(analysis._de_state, analysis._de_lock):
+                return True, False, "A differential expression run is already in progress."
+            jobs._job_start("proximity", "Proximity differential expression", proximity._run_proximity_de,
+                            args=(prox_target, prox_anchor, prox_labels, seg_source or "xenium", method,
+                                  counts_mode == "corrected",
+                                  {"near": prox_near, "far": prox_far, "n_random": prox_nrand,
+                                   "fit_length": "on" in (prox_length or [])},
+                                  prox_source or "auto"),
+                            state=analysis._de_state, lock=analysis._de_lock)
+            return True, False, "Running…"
+        try:
+            import rpy2.robjects.conversion as _rconv
+            import rpy2.robjects as _ro_mod
+            _rconv.set_conversion(_ro_mod.default_converter)
+        except Exception as exc:
+            return False, True, f"rpy2 / R is not available ({exc}). " + stats._PB_INSTALL_HINT
+        if not _an_job_claim(analysis._de_state, analysis._de_lock):
+            return True, False, "A differential expression run is already in progress."
+        jobs._job_start("contact", "Contact-group differential expression", proximity._run_contact_de,
+                        args=(prox_target, prox_anchor, prox_labels, seg_source or "xenium", method,
+                              counts_mode == "corrected", contact_radius, contact_min_cells,
+                              contact_nshuffle),
+                        state=analysis._de_state, lock=analysis._de_lock, copy_context=True)
+        return True, False, "Running…"
     if mode == "pseudobulk":
         if not population:
             return False, True, "Pick the cell population to sum the counts over."
@@ -312,6 +359,12 @@ def download_de_table(n_clicks):
         raise dash.exceptions.PreventUpdate
     t = res["table"].sort_values(["padj", "pval"], kind="stable").drop(columns=["neg_log10_padj"])
     _safe = lambda v: re.sub(r"[^A-Za-z0-9_.-]+", "_", str(v))[:40]
+    if res.get("kind") == "proximity":
+        return dict(content=proximity._prox_csv_header(res) + t.to_csv(index=False),
+                    filename=f"proximity_{_safe(res['target'])}_near_{_safe(res['anchor'])}.csv")
+    if res.get("kind") == "contact":
+        return dict(content=proximity._contact_csv_header(res) + t.to_csv(index=False),
+                    filename=f"contact_{_safe(res['target'])}_with_{_safe(res['anchor'])}.csv")
     if res.get("kind") == "pseudobulk":
         return dict(content=stats._pb_csv_header(res) + t.to_csv(index=False),
                     filename=f"pseudobulk_{_safe(res['population'])}_{_safe(res['label_a'])}_vs_"

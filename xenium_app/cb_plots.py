@@ -177,8 +177,8 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
                 return no_update, no_update   # no pies before, none now
             figures._spatial_base_shapes[:] = _pies
             patched = Patch()
-            patched["layout"]["shapes"] = _pies + figures._spatial_overlay_shapes(sdata_roi_on,
-                                                                           sdata_patches_on)
+            patched["layout"]["shapes"] = _pies + figures._spatial_overlay_shapes(
+                sdata_roi_on, sdata_patches_on, seg_source)
             return patched, no_update
         if not boundaries_active and not morph_active and not density_active:
             # Nothing overlay-related → skip entirely
@@ -198,7 +198,7 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
                     figures._spatial_base_shapes[:] = _pies
                     patched = Patch()
                     patched["layout"]["shapes"] = _pies + figures._spatial_overlay_shapes(
-                        sdata_roi_on, sdata_patches_on)
+                        sdata_roi_on, sdata_patches_on, seg_source)
                     return patched, no_update
                 return no_update, no_update
             patched = Patch()
@@ -206,7 +206,7 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
             if _pies is not None and (_pies or figures._spatial_base_shapes):
                 figures._spatial_base_shapes[:] = _pies
                 patched["layout"]["shapes"] = _pies + figures._spatial_overlay_shapes(
-                    sdata_roi_on, sdata_patches_on)
+                    sdata_roi_on, sdata_patches_on, seg_source)
             return patched, no_update
 
     if triggered in ("morph-brightness", "morph-opacity", "morph-channels",

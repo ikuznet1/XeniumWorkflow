@@ -257,7 +257,7 @@ The right-side panel contains additional analysis plots, each in its own tab:
 
 | Tab | Content | Controls |
 |-----|---------|---------|
-| **Cell Type Abundance** | Bar chart of cell type proportions; below it, per-sample proportions and a test between conditions | W × H; see [Composition between conditions](#composition-between-conditions) |
+| **Cell Type Abundance** | Bar chart of cell type proportions; below it, per-sample proportions and a test between conditions; below that, marker transcripts per mm² counted from the transcript file | W × H; see [Composition between conditions](#composition-between-conditions) and [Segmentation-free abundance](#segmentation-free-abundance) |
 | **Co-occurrence** | Spatial co-occurrence score heatmap | Colorbar min/max, W × H; download |
 | **Neighborhood Enrichment** | Neighborhood enrichment heatmap: log2 of the fraction of a cell type's neighbours that are of each type over that type's overall frequency (0 = random mixing) | Colorbar min/max, W × H; download |
 | **Interaction Graph** | Node-edge graph of cell type contacts | O/E normalize toggle, W × H; download |
@@ -339,6 +339,37 @@ Tests that compare **samples** (pseudobulk differential expression, composition)
 - **Cluster ids** are per sample: "cluster 3 in every sample" is the same population only if the samples were clustered together. Prefer cell types.
 - Fold changes of a population defined by a ROI also reflect its cell-type composition.
 
+### Proximity differential expression
+
+**Plots panel → Differential Expression → Test: Proximity to a cell type.** "Which genes of the cells **T** change near cells of the anchor type **X**?" Pick where the cell types come from (an annotation, or the clusters), T and X, then **Run**. It works on one sample; with several it tests across them.
+
+- **Per sample**: log1p(count / library size × 10,000) of every T cell is residualised (ordinary least squares) on log1p(library size) and on decile bins of the local fraction of the **density-covariate** type (cells within 50 µm; default: the type that contributes the most transcripts; "none" drops the term). d is the distance to the nearest X cell of the same sample.
+- **Effect** (table column *Near − far*, the volcano's x axis, in log2 units): mean residual of the T cells with d ≤ **Near** (default 25 µm) minus that of the T cells with d ≥ **Far** (default 100 µm). **Slope**: OLS slope of the residual on −log(d + 1). A sample needs ≥ 100 T cells, ≥ 5 X cells, ≥ 5 near and ≥ 50 far cells; genes detected (≥ 1 transcript) in fewer than 2 % of the T cells are not tested.
+- **Matched random anchors** (default 99 sets): as many non-X cells as there are X cells, drawn within the same compartment × edge-distance stratum (the columns of the Confound Controls tab; the defaults are computed when they are missing, and the status line says so), put through the same computation. They answer "what does any set of cells sitting where X sits produce?".
+- **p-values**: with ≥ 3 independent units (donors when every included sample has one, else samples; *Samples & conditions…*) the **exact sign-flip test** of the per-unit effects — the status line gives n and the smallest achievable p. With fewer units (a **single sample**) p is the share of random anchor sets at least as far from their mean as the observed effect; the status line marks this as a single-sample result that does not generalise.
+- **Empirical FDR** (column *Emp. FDR*, the volcano's y axis): the number of genes the random sets yield at a gene's threshold divided by the number observed (never 0, made monotone). In the cohort mode the random sets' sign-flip p-values are used, in the single-sample mode |z| against the random sets with every random set scored against the others.
+- When fewer than half of the random sets leave enough near and far cells in every unit (anchors as numerous as an abundant type cover the tissue), p and FDR are taken from the **slope** instead and the status line says so; if that fails too, the cohort mode falls back to Benjamini–Hochberg and the single-sample mode refuses.
+- **Specific**: not reproduced by up to 3 other anchor types of similar abundance (within 3×): in the cohort mode same sign in ≥ 5/7 of the units, in the single-sample mode same direction and beyond the random sets at p ≤ 0.05.
+- **Leak gate**: the gate of the other tests is run for T near X against T far from X, and genes that X owns and T does not (Confound Controls → gene ownership) are flagged as well: next to X, T cells pick up X transcripts. Flagged genes are open orange diamonds in the volcano; *X ÷ T rate* shows how much more X expresses a gene. Genes with X as top owner that T also carries are counted in the status line.
+- **Between conditions**: with a design that gives ≥ 3 units per condition the per-sample effects are also tested A − B (columns *A − B*, *p (A vs B)*, BH FDR).
+- **Fit exp(−d / L)** (optional): per gene and sample the length L (grid 2–600 µm) for which residual ~ a + b·exp(−d / L) fits best; the table gives the median L and R². R² is small for most genes.
+- Honours the segmentation, the subset and Active Counts. **Timing**: 112,551-cell Prime 5K skin section, 99 random sets: 10,816 fibroblasts near 263 mast cells 4.8 s; 62,817 T cells near 3,427 macrophages 10.5 s headless, 7.8 s in the app.
+- **What it is not**: a gradient with distance is an association with position. The residualisation and the random anchors remove depth, a dominant neighbour's density and generic location; they do not remove everything that co-varies with being near X.
+- Reimplemented from an earlier spatial study by the author (checked against that code on fabricated data: residuals, near − far and slope to 10⁻⁸, sign-flip p-values and random draws identical). Changed here: sufficient statistics on sparse matrices instead of dense residuals; strata of the random anchors are compartment × edge bin instead of deciles of one cell type's local fraction; per-sample effects are averaged per unit; the FDR is evaluated at every gene's own threshold instead of on a fixed grid; a single-sample mode exists.
+
+### Contact-group pseudobulk differential expression
+
+**Plots panel → Differential Expression → Test: Contact groups (pseudobulk).** "Do T cells in contact with X differ from T cells that are not?" Needs several samples.
+
+- **Groups**: within each sample, T cells with an X cell within the **contact radius** (default 50 µm, centroid to centroid) against T cells without.
+- **Matching**: the comparator cells are weighted so that their mix of compartment × edge-distance bin × density quintile equals that of the contact cells; contact cells in a stratum without comparator are left out (counted in the status line).
+- **Model**: pseudobulk = Σ weight × counts per sample × group, rounded to whole counts, fitted with `~ sample + group` through the same R bridge as the pseudobulk mode (DESeq2, else edgeR, else refused with the install hint). With donors on every used sample, samples of one donor are summed into one block. The unit of the p-values is the sample (block); the status line states n.
+- **Refusal**: fewer than 2 samples with at least **Min. cells / sample / group** (default 20) in both groups → no test, with the counts per sample and a pointer to the proximity mode. A Baysor / Proseg run is one sample.
+- **Label shuffle** (default 199, 0 to skip): contact / comparator labels are permuted within sample × stratum, weights and fit are redone, and the number of genes passing (FDR < 0.05, |log2FC| > 0.5, not flagged) is compared with the observed number: P = (1 + shuffles with at least as many) / (1 + shuffles). Every shuffle is a model fit (about 4–6 s for 4,200 genes × 12 pseudobulks), so 199 take a quarter of an hour; the job shows progress and can be cancelled.
+- **Leak gate** per sample (contact = arm A); genes X owns and T does not are flagged too and never count as passing.
+- Uses the active counts mode (SPLIT-corrected counts are summed and rounded as well).
+- Reimplemented from an earlier spatial study by the author (the matching weights equal that code's on fabricated data). Changed here: one generic comparison instead of fixed cell states; weighted sums are rounded because DESeq2 needs integers (the original fitted fractional sums with edgeR); the shuffle null counts passing genes as there.
+
 ### Composition between conditions
 
 **Plots panel → Cell Type Abundance → Composition between conditions.** Tests whether the **proportion** of each cell type (or cluster, or spatial niche) differs between conditions A and B, with the same sample assignment.
@@ -355,6 +386,70 @@ Tests that compare **samples** (pseudobulk differential expression, composition)
 - With 3–5 samples per condition only large shifts are detectable, and the empirical Bayes prior is estimated from as many variances as there are categories (a dozen): treat the moderated p-values as approximate and compare with Welch's.
 - Proportions depend on the tissue area sampled and on the segmentation; cells without a label are left out of the denominator.
 - Cluster and niche ids are comparable across samples only when the samples were clustered together (niches are computed for the primary sample only).
+
+### Segmentation-free abundance
+
+**Plots panel → Cell Type Abundance → Segmentation-free abundance.** Answers "is there more of
+this cell type's signal per area of tissue?" without asking the segmentation: the **marker
+transcripts of a cell type per mm² of tissue**, counted straight from the transcript file
+(quality Q ≥ 20, gene features only - the filter of the cell-feature matrix), next to the
+density of the **segmented** cells of the same type on the same area. A cell that the
+segmentation merged into a neighbour, split, or left unlabelled still contributes its
+transcripts here.
+
+| Control | What it does |
+|---------|--------------|
+| **Cell types from / Type** | The annotation (or the active cluster set) and the type whose markers are counted. The segmented cell density is computed for this type. |
+| **Markers to derive** | Number of marker genes taken from the annotation (default 5): the type's most specific genes, by the rule of the spillover score (≥ 50 counts per million in the type and ≥ 10× every other type; the top genes by ratio when fewer than 3 pass - the status then says the markers are **not exclusive**). |
+| **Marker genes (text box)** | Optional: your own markers; then no annotation is needed (and without a type there is no cell density). Names not on the panel are reported. |
+| **Tile sizes (µm)** | The area-bin sweep, default 25, 50, 100, 200 (multiples of 5 µm). |
+| **Tissue area from** | *cells*: a tile with a cell centroid of the active segmentation and subset is tissue (default). *all transcripts*: a tile with at least one gene transcript is tissue - neither numerator nor denominator then uses the segmentation; needs one pass over all transcripts (cached; the same grid as Transcript Density → all genes), and a cell subset is not applied. |
+| **Fill holes ≤ (tiles)** | Interior holes of the mask of at most this many tiles count as tissue (the rule of the tissue compartments; default 0: none). |
+| **Redistributions** | Size of the null of the concentration statistics (default 200; 0: none). |
+
+**What is computed**, per sample and tile size:
+
+- **Area** = tissue tiles × tile size². The area of the same tissue **grows with the tile
+  size** (coarse tiles cover gaps and the margin), so every density is given along the sweep.
+  A difference between samples that shrinks, vanishes or changes sign along the sweep is a
+  property of the area estimate, not of the tissue; the status line says so when the sign of a
+  difference between conditions changes.
+- **Tx / mm²** = marker transcripts on the tissue tiles ÷ area. **Tx / 10k tx** = per 10,000
+  gene transcripts on the same tiles (shown when the all-transcripts grid is in the cache).
+- **Cells / mm²** = segmented cells of the type on the same tiles ÷ the same area; **Tx / cell**
+  = marker transcripts per segmented cell of the type; **In type's cells / In any cell** = the
+  share of the marker transcripts on the tissue that the count matrix (active counts mode)
+  assigns to cells of the type / to any cell. A low first share with a high second one means
+  the type's markers sit in cells called something else.
+- **Concentration**: Gini coefficient of the marker count over the tissue tiles, and the share
+  of the count in the top 10 % of tiles, each reported as **observed minus the mean of a null**
+  that redistributes the same number of transcripts over the same tiles with equal
+  probability. A sparse count has a high Gini by itself; only the excess is clustering.
+  p = (1 + redistributions with a Gini ≥ observed) / (1 + redistributions), one-sided.
+  **Unit of this p-value: the tiles of one sample** (n = number of tissue tiles, stated in the
+  status line); it describes that section and does not generalise.
+- **Between conditions**: with a [sample design](#samples-and-conditions) of at least 3
+  independent units per condition (3 pairs, when paired), the exact sample-level test (paired
+  sign-flip or label permutation) of A − B for transcripts per mm², cells per mm², transcripts
+  per 10k and the Gini excess, at every tile size. **Unit: samples / donors**, with n and the
+  smallest achievable p stated. With fewer units, or one sample, the rows are descriptive and
+  the status line says so.
+
+The plot shows the three quantities against the tile size, one line per sample; the table and
+the CSV hold every row, the CSV also the transcripts of each marker gene (one gene can carry
+the whole set - the status line names it when one gene gives more than 60 %).
+
+The per-gene transcript grids are read in **one pass** over `transcripts.parquet` for all
+markers and cached with the Transcript Density grids (`density_<dataset>/`), per sample.
+Every sample is binned on its own grid against its own tissue mask. A sample loaded from a
+`.zarr` has no transcript file: it is left out and named.
+
+**Limits.** Transcript density does not tell cell number from expression per cell: a rise can
+be more cells or more transcripts per cell. Markers that are not exclusive to the type count
+other cells too. The null of the concentration statistics gives every tissue tile the same
+probability, so a tissue that is unevenly dense in everything shows some excess for every
+gene; compare with a gene that should be uniform. With the area from cells, the denominator
+still depends on where the segmentation found cells (but not on what it called them).
 
 ### Gene-set scores
 
@@ -419,6 +514,36 @@ Tests that compare **samples** (pseudobulk differential expression, composition)
 - Segmentation spill-over between touching cells of two types inflates both means.
 - A targeted panel holds a fraction of any ligand–receptor resource; absence of a pair from the result means "not measured" as often as "not expressed".
 
+### Ligand–receptor exposure decomposition
+
+The second mode of the **Ligand–Receptor** tab (**Mode → Exposure decomposition**; it uses the same pair list and cell grouping). It answers a different question from the scores: not "is this pair expressed in neighbouring types" but **why the exposure of a receiver type to a ligand differs** between two conditions (or how it is made up in one): expression, contact or geometry. It is a general version of an analysis from an earlier spatial study by the author; the core sums are ported unchanged together with their brute-force unit test.
+
+For sender type S, receiver type T, ligand L and receptor R, with the contact set C = (receiver *i*, sender *j*) pairs whose centroids lie within the contact radius **in the same sample**, and *s* = a cell's total count over the panel:
+
+| Term | Definition | Reads as |
+|------|-----------|----------|
+| K, contacts per receiver | \|C\| / N_T | contact: how many S cells a T cell touches |
+| R, receptor rate | Σ_T x_R / Σ_T s | expression in the receiver type |
+| L, ligand rate | Σ_S x_L / Σ_S s | expression in the sender type |
+| γ, tile co-location | P_exp / (R · L), with P_exp = Σ_C s_i s_j R̃_i L̃_j / Σ_C s_i s_j and R̃, L̃ the rate of the cell's type in its tile | geometry at the scale of the tile: do ligand-rich senders sit where receptor-rich receivers sit |
+| π, contact preference | P / P_exp, with P = Σ_C x_iR x_jL / Σ_C s_i s_j | geometry below the tile: are the cells in contact the ones carrying the two genes |
+
+**Exposure E = K · P = K · R · L · γ · π, exactly** (the log2 form is asserted on every run with two conditions). Rates are Σ counts / Σ depth, the rule used elsewhere in the app, so fractional SPLIT-corrected counts need no rounding and a section-wide capture factor cancels in γ and π; the **Rates: detection** option replaces the counts by 1[count ≥ 1] and the depth by 1.
+
+- **Controls**: contact radius (default 30 µm), tile side (250 µm; 0 = the whole sample, which moves all geometry into π), ownership share (0.2), transcript floor (100), minimum cells per type (50), rates. An interaction is kept when the sender owns the ligand and the receiver owns the receptor (pooled rate ≥ the share of the highest type's rate), both genes reach the floor in their type **in every unit**, and both types have the minimum number of cells and are in contact in every unit. The status line counts what each filter removed. At most the 40 most abundant groups are used.
+- **Two conditions** (*Samples & conditions…*, the editor of the pseudobulk test): the sums of a donor's samples within a condition are pooled (ratios of pooled sums are exact), then per unit the log2 ratio A / B of each term; **log2 E ratio = Σ of the five log2 term ratios**. Paired design (every sample has a donor, ≥ 3 donors in both conditions): exact sign-flip test of the per-donor log2 ratios. Otherwise, with ≥ 3 units per condition: exact label permutation of mean(log2 term in A) − mean(log2 term in B) (all relabellings up to 20,000, else 5,000 random ones with a fixed seed, and said so). Benjamini–Hochberg FDR over the interactions; the status line states the unit and n, the smallest achievable p, and warns when no test can reach 0.05. Per sender → receiver pair the interactions are averaged per unit and tested the same way (with the exact sign-flip 95 % interval when there are enough donors for one), and per term an **omnibus** over the between-type pairs: Σ t² against every sign (or label) assignment of the units, plus the shift shared by all pairs.
+- **One condition, one sample, or fewer than 3 units per condition**: no p-values, and the status says why. One condition shows the terms themselves (pooled over the samples); two conditions with too few units show the log2 ratios of the pooled conditions.
+- **Observed / expected variant** (columns Obs., Exp., O/E): observed = share of receivers that detect the receptor and have at least one ligand-positive sender in contact; expected = the same with ligand positivity assigned at random among the senders, 1 − (1 − p_L)^k for a receiver with k sender contacts; O/E = (obs + 0.001) / (exp + 0.001). With a design, its log2 ratio A / B is tested like the terms.
+- **Plot**: stacked diverging bars, one row per ligand → receptor | sender → receiver (or per type pair: **Show**). With two conditions the five bars are the term contributions and the diamond their sum, the exposure change (* p < 0.05); with one condition the bars are log2 γ and log2 π. **Table** and **Download CSV** (all terms, per-unit statistics, the type-pair table, the omnibus and the sample list in the header).
+- A registered job with progress and Cancel; honours the segmentation source, the subset, the counts mode and several samples (a contact never joins cells of two samples).
+
+Caveats:
+
+- The decomposition says **why an exposure differs** (expression vs contact vs geometry). Like every expression-based score it is **not evidence of signalling**.
+- π rises when transcripts spill between touching cells: a ligand transcript assigned to the receiver's neighbour is exactly a "preferential contact". The ownership filter removes the pairs where that is the whole signal; read π beside the leak gate and the spillover score.
+- γ depends on the tile size; rerun with another tile (or 0) to see how much of the geometry is regional.
+- The floor applies to the shallowest unit, so a small sample removes interactions for all.
+
 
 ### Confound controls
 
@@ -459,7 +584,8 @@ With **Gene ownership + leak gate** ticked (default) and a cell-type annotation 
 **Plots panel → Segmentation QC.** One row per segmentation source of the primary sample (Xenium and every cached Baysor / Proseg run, loaded or not) and counts mode (original, SPLIT-corrected), as a registered, cancellable job; table, four small bar plots, CSV.
 
 - **Identity marker sets**: the 5 most specific genes of every type, derived once from the Xenium segmentation's original counts and annotation, or typed in (`Type: gene, gene, …` per line; a line `geneA, geneB` adds a pair of mutually exclusive markers).
-- **Exclusion-rule failure**: share of labelled cells whose own identity set is not the largest share of their transcripts. **Co-expression**: over pairs of top markers of different types, cells with both ÷ cells with either (count ≥ 1). **Spillover slope**: in cells not of the source type, source-identity transcripts per 100 regressed on the number of source-type neighbours within 15 µm (reference-free; 0 = no dependence), and the reverse. **Own-identity retention** (corrected counts): own identity transcripts after ÷ before correction; below 1 with a lower failure rate is over-correction, not improvement. Plus cells, median transcripts / genes (count ≥ 1) / area per cell, and the share of transcripts assigned when the all-transcripts density grid exists.
+- **Exclusion-rule failure**: share of labelled cells whose own identity set is not the largest share of their transcripts. **Co-expression**: over pairs of top markers of different types, cells with both ÷ cells with either (count ≥ 1). **Spillover slope**: in cells not of the source type, source-identity transcripts per 100 regressed on the number of source-type neighbours within 15 µm (reference-free; 0 = no dependence), and the reverse. **Own-identity retention** (corrected counts): own identity transcripts after ÷ before correction; below 1 with a lower failure rate is over-correction, not improvement. Plus cells, median transcripts / genes (count ≥ 1) / area per cell.
+- **Assigned** (original counts only): Σ counts of the source's cells ÷ gene transcripts (Q ≥ 20) inside the bounding box of its cell centroids, grown by one median cell radius. The transcripts of the section are counted by the job itself the first time (the same scan and cache file as the *All transcripts* grid of the Transcript Density tab; cancellable, nothing is written when cancelled) and read from the cache afterwards. For the Xenium segmentation of a whole section this equals the share of Q ≥ 20 gene transcripts with a cell id in `transcripts.parquet`; for a run on a region the box is at least as large as the region, which lowers the value. A dataset loaded from a `.zarr` has no transcript file: the column is empty and the status says so.
 - A corrected row covers the cells the correction touched (non-empty corrected row; "Corrected share") and its retention compares those same cells before and after.
 - A run without its own annotation — or whose annotation uses other type names — gets the Xenium label of the nearest Xenium centroid within 10 µm (the Labels column says so). This favours segmentations that resemble Xenium's.
 - No p-values: these are descriptive. Runs on a small ROI give noisy slopes. The original benchmark's criteria that need a paired dissociated reference (patient-specific signal, arm balance) are not implemented.
@@ -474,6 +600,51 @@ With **Gene ownership + leak gate** ticked (default) and a cell-type annotation 
 - **Placebo anchors** (optional focal type): the same statistic for count-matched random anchor cells drawn within each sample × compartment (mean, 95 % range, p), and for the other types within 3× the focal type's abundance that share its most common compartment. The verdict is "specific" only when the focal type lies beyond both. Without a placebo, "X sits near Y" cannot be told from "X is a cell of that compartment".
 - Heatmap (focal × target, `*` FDR < 0.05 of the test named in the title), table, CSV (per sample and pair, with the pair-level tests). Only types with ≥ 20 cells; a pair needs ≥ 20 focal and ≥ 10 target cells in a sample; the 40 most abundant types at most. Compartments come from the Confound Controls tab; when absent, edge distance and density are computed with the defaults and there is no core.
 - **Speed** (measured): 112,551 labelled cells, 11 types, R = 50 µm, 200 permutations, placebo: 5.4 s, about 60 MB above the loaded dataset.
+
+### Aggregates
+
+**Aggregates** tab: finds connected groups of cells of a chosen *class* — a set of cell types
+you pick, e.g. the immune types — that are locally denser than chance, and reports each one.
+Ported from an earlier spatial study by the author; the detection (local count, within-stratum
+null, hotspot rule, Delaunay components, tile area, permuted-label control) reproduces the
+original's numbers exactly on fabricated data, and every value of that study is a parameter here.
+
+- **Detection, per sample.** For every cell the class cells within *R* (default 50 µm, the cell
+  itself included) are counted. The class label is permuted among the cells of the same stratum —
+  compartment × edge-distance bin × local-density quintile, taken from the Confound Controls tab
+  (or computed with its defaults, and said so) — 200 times by default. A cell is a *hotspot* when
+  p = (k + 1) / (permutations + 1) ≤ α (default 0.01; k = permuted counts ≥ the observed one) and
+  at least 3 class cells lie within *R*. Hotspot cells of any type that are joined by Delaunay
+  edges of at most 30 µm form a component; components with at least *N* class cells (default 10)
+  are the aggregates. Neighbour searches, triangulations and permutations never cross samples.
+- **Per aggregate** (table and CSV): id (1 = most class cells), sample, cells, class cells, class
+  fraction, area (the tissue its cells are nearest to, 5 µm grid, at most 20 µm from a cell),
+  centroid, composition, and for every cell type the inside-vs-matched-outside log2 O/E: cells
+  of the type inside ÷ the number expected from the labelled cells of the same stratum that lie
+  outside every aggregate and its 25 µm rim. The class types are enriched by construction; the
+  other types are the informative ones.
+- **Per sample**: aggregates, aggregates per mm² of tissue, area fraction, share of the class
+  cells inside, and the **control**: the same detection on 20 permuted labellings gives the
+  number of aggregates chance alone produces (false-aggregate rate = control mean ÷ observed).
+- **On the map, both renderers**: outline polygons (convex hull, or an alpha hull that follows
+  the shape: Delaunay triangles with all edges ≤ 30 µm) labelled A1, A2, … in the WebGL view,
+  with a "Show outlines" toggle; **Color By → "Aggregates: Aggregate id"** colours the member
+  cells by id (cells outside are grey; the scale starts below 1 so that aggregate 1 is visible).
+  The outlines are shown for the segmentation they were computed on.
+- **Save as SpatialData** writes `ctl_aggregate_id` (empty outside), `ctl_aggregate_hotspot` and
+  `ctl_aggregate_p` for the primary sample.
+- **What the p-values mean.** The hotspot p-values have the cells of one section as their unit
+  (exchangeable within strata): they are a detection threshold and say nothing about other
+  sections or donors; a single sample is labelled as a single-sample result. Between conditions
+  the unit is the sample or donor: aggregates per mm² and area fraction are compared with the
+  exact sample-level test (paired sign-flip or label permutation, as in *Samples and conditions*)
+  when there are at least 3 independent units per condition, with n and the smallest achievable
+  p stated; otherwise no test is run and the reason is given.
+- **Limits.** The result depends on the annotation: a class that is most of the tissue gives
+  large "aggregates" and a high control rate (read the control column). Recompute after changing
+  the subset, the segmentation or the annotation. The cells × cells neighbour matrix is held in
+  memory (about 100 neighbours per cell at 50 µm in dense tissue). Registered job with progress
+  and Cancel.
 
 ### CellNEST Cell-Cell Communication
 
@@ -1047,11 +1218,15 @@ or the command line, builds the Dash app and registers the callbacks.
 | `analysis` | differential expression, gene-set scores, transcript density |
 | `stats` | sample → condition / donor design (persisted), exact sample-level tests, pseudobulk differential expression (DESeq2 / edgeR), composition test, Moran's I, ligand–receptor scores |
 | `controls` | confound controls: tissue compartments, spillover score, gene ownership, leak gate, segmentation QC metrics, stratified co-localisation, annotation label report |
+| `proximity` | proximity differential expression (near vs far from an anchor cell type, matched random anchors) and contact-group pseudobulk differential expression |
+| `lrdecomp` | ligand–receptor exposure decomposition into five factors, per-term sample-level tests |
+| `aggregates` | aggregates: connected groups of cells of a chosen class, outlines, composition, per-sample density |
+| `segfree` | segmentation-free abundance: marker transcripts per mm² of tissue from the transcript file, area-bin sweep, concentration against a redistribution null |
 | `cellnest` | CellNEST loading, filters and plots |
 | `sdata_store` | SpatialData / sopa backend: cache store, Save as SpatialData, tissue ROI and patches |
 | `startup` | the import-time work: locate and load the dataset, autoload cached results |
 | `app_layout` | the Dash `app` and its layout |
-| `cb_plots`, `cb_tools`, `cb_reseg`, `cb_spage`, `cb_data`, `cb_spatial`, `cb_analysis`, `cb_stats`, `cb_controls` | the callbacks, by feature |
+| `cb_plots`, `cb_tools`, `cb_reseg`, `cb_spage`, `cb_data`, `cb_spatial`, `cb_analysis`, `cb_stats`, `cb_controls`, `cb_proximity`, `cb_lrdecomp`, `cb_aggregates`, `cb_segfree` | the callbacks, by feature |
 | `viewer_provider` | data provider for `xenium_viewer_api.py` (WebGL view) and `/health` |
 | `compat` | the single namespace over all modules (below) |
 
@@ -1090,7 +1265,9 @@ node test/glue_checks.mjs http://127.0.0.1:8050    # renderer switching, selecti
 node test/jobs_panel.mjs http://127.0.0.1:8050 out/ # jobs panel: starts Proseg on cached patches, checks progress, clicks Cancel
 node test/analysis_checks.mjs http://127.0.0.1:8050 out/ # Differential Expression / Gene Sets / Transcript Density tabs in both renderers (lasso → groups → test → gene set → density)
 XS_SAMPLES=/bundle2,/bundle3,/bundle4 node test/stats_checks.mjs http://127.0.0.1:8050 out/ # several samples: design editor, pseudobulk DE, composition, density of added samples in both renderers, Moran's I, ligand-receptor (see the top of the file)
+node test/proximity_checks.mjs http://127.0.0.1:8050 out/ # Differential Expression: "Proximity to a cell type" and "Contact groups" (with XS_SAMPLES=… the contact test runs in R; without, its single-sample refusal is checked)
 node test/webgl_fallback.mjs http://127.0.0.1:8050 # automatic fallback to Plotly without WebGL2 (browsers started with WebGL disabled)
+XA_CLASS="B cells|Plasma cells" node test/aggregates_checks.mjs http://127.0.0.1:8050 out/ # Aggregates tab in both renderers: run, table, Color By, outlines, toggle, alpha hulls, CSV (needs a cell-type annotation in the cache)
 node test/real_results.mjs                         # WebGL against Plotly on real Baysor/Proseg/RCTD/SPLIT/SpaGE results; starts its own app (paths: see the top of the file)
 ```
 

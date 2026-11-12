@@ -72,11 +72,25 @@ def six(xe, D):
     return extras
 
 
-def _rscript(code: str, tmp_path, name="ref.R") -> None:
+def _rscript_start(code: str, tmp_path, name="ref.R"):
+    """Start the reference R script; _rscript_wait() checks it. Started before the in-process
+    fit so that the two R sessions (each loads its packages for several seconds) overlap."""
     path = tmp_path / name
     path.write_text(code)
-    out = subprocess.run(["Rscript", str(path)], capture_output=True, text=True, timeout=900)
-    assert out.returncode == 0, out.stderr[-3000:]
+    return subprocess.Popen(["Rscript", str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+def _rscript_wait(proc) -> None:
+    try:
+        _out, err = proc.communicate(timeout=900)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        raise
+    assert proc.returncode == 0, err[-3000:]
+
+
+def _rscript(code: str, tmp_path, name="ref.R") -> None:
+    _rscript_wait(_rscript_start(code, tmp_path, name))
 
 
 def _need_r(*pkgs):
@@ -290,9 +304,13 @@ def test_pseudobulk_deseq2_equals_deseq2_run_directly_in_r(xe, D, six, tmp_path,
     masks, _ = xe._pb_population_masks("all", samples, "xenium", None, "cluster")
     prep = xe._pb_prepare(samples, masks, *xe._design_of(samples))
     assert prep["design"] == ("~ batch + condition" if batch else "~ condition")
-    fit = xe._pb_fit(prep, shrink=True)
     _write_matrix(prep, tmp_path)
-    _rscript(_DESEQ_REF % {"dir": tmp_path, "batch": "TRUE" if batch else "FALSE"}, tmp_path)
+    ref_run = _rscript_start(_DESEQ_REF % {"dir": tmp_path, "batch": "TRUE" if batch else "FALSE"}, tmp_path)
+    try:
+        fit = xe._pb_fit(prep, shrink=True)
+        plain = xe._pb_fit(prep, shrink=False)
+    finally:
+        _rscript_wait(ref_run)
     ref = pd.read_csv(tmp_path / "ref.csv")
     t = fit["table"]
     assert fit["engine"] == "deseq2" and "DESeq2" in fit["method_label"] and "Wald" in fit["method_label"]
@@ -308,7 +326,6 @@ def test_pseudobulk_deseq2_equals_deseq2_run_directly_in_r(xe, D, six, tmp_path,
     assert (hit["padj"] < 0.05).mean() > 0.8 and (hit["log2fc"] > 0.8).mean() > 0.8
     assert (t["padj"].iloc[40:] < 0.05).mean() < 0.1
     # unshrunken on request: no shrunken column, same test
-    plain = xe._pb_fit(prep, shrink=False)
     assert plain["shrink"] == "none" and "log2fc_shrunk" not in plain["table"].columns
     _same(plain["table"]["padj"], ref["padj"])
 
@@ -319,9 +336,12 @@ def test_pseudobulk_edger_fallback_equals_edger_run_directly_in_r(xe, D, six, tm
     samples = xe._an_samples("xenium", False)
     masks, _ = xe._pb_population_masks("all", samples, "xenium", None, "cluster")
     prep = xe._pb_prepare(samples, masks, *xe._design_of(samples))
-    fit = xe._pb_fit(prep, engine="edger")
     _write_matrix(prep, tmp_path)
-    _rscript(_EDGER_REF % {"dir": tmp_path}, tmp_path)
+    ref_run = _rscript_start(_EDGER_REF % {"dir": tmp_path}, tmp_path)
+    try:
+        fit = xe._pb_fit(prep, engine="edger")
+    finally:
+        _rscript_wait(ref_run)
     ref = pd.read_csv(tmp_path / "ref.csv")
     assert fit["engine"] == "edger" and "edgeR" in fit["method_label"] and "quasi-likelihood" in fit["method_label"]
     assert "DESeq2 is not installed" in fit["method_label"] and fit["shrink"] == "none"

@@ -5,7 +5,10 @@ import dash
 from dash import dcc, html
 import dash_bootstrap_components as dbc
 
-from . import compat, core, ui, dataview, morph, analysis, stats, controls, sdata_store, startup
+from . import compat, core, ui, dataview, morph, analysis, stats, controls, proximity, sdata_store, startup
+from . import aggregates
+from . import segfree
+from . import lrdecomp
 
 
 with core._spage_lock:
@@ -510,6 +513,12 @@ app.layout = html.Div([
     dcc.Store(id="segqc-done", data=0),
     dcc.Store(id="coloc-done", data=0),
     dcc.Interval(id="ctl-poll", interval=700, disabled=True),
+    dcc.Store(id="lrd-done", data=0),
+    dcc.Interval(id="lrd-poll", interval=700, disabled=True),
+    dcc.Store(id="agg-done", data=0),
+    dcc.Interval(id="agg-poll", interval=700, disabled=True),
+    dcc.Store(id="sfree-done", data=0),
+    dcc.Interval(id="sfree-poll", interval=700, disabled=True),
     dcc.Store(id="counts-mode-store", data="original"),
     dcc.Store(id="roi-done",          data=0),
     dcc.Store(id="roi-pending",       data=None),
@@ -1630,6 +1639,7 @@ dbc.Modal([
                                              style={"flex": "1", "minHeight": "240px"}),
                                     ui._plot_dim_controls("abundance"),
                                     stats._composition_section(),
+                                    segfree._sfree_section(),
                                 ], style={"display": "flex", "flexDirection": "column", "flex": "1", "minHeight": "0",
                                           "overflowY": "auto"})]),
                         dbc.Tab(label="Co-occurrence", tab_id="tab-cooccurrence",
@@ -1859,14 +1869,16 @@ dbc.Modal([
                                              style={"flex": "1", "minHeight": "0"}),
                                     ui._plot_dim_controls("roi-area"),
                                 ], style={"display": "flex", "flexDirection": "column", "flex": "1", "minHeight": "0"})]),
-                        analysis._de_tab(stats._pb_controls()),
+                        analysis._de_tab(stats._pb_controls(), proximity._PROX_DE_MODES,
+                                         proximity._prox_controls()),
                         analysis._geneset_tab(),
                         analysis._density_tab(),
                         stats._moran_tab(),
-                        stats._lr_tab(),
+                        stats._lr_tab(lrdecomp._lrd_controls(), lrdecomp._lrd_results()),
                         controls._controls_tab(),
                         controls._segqc_tab(),
                         controls._coloc_tab(),
+                        aggregates._agg_tab(),
                     ]),
                 ], id="umap-panel", style={"display": "none"}),
             ], id="plots-row", style={"display": "flex", "flex": "1", "gap": "10px", "minHeight": "0"}),

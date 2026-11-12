@@ -443,7 +443,7 @@ class _ViewerProvider:
         args = args or {}
         with core._roi_lock:
             rois = list(core._roi_state["rois"]) if core._roi_state.get("show", True) else []
-        polys, lines = [], []
+        polys, lines = figures._provided_overlays(figures._overlay_polygon_providers, source), []
         for r in rois:
             pts = [[float(x), -float(y)] for x, y in r.get("polygon_xy") or []]
             if len(pts) >= 3:

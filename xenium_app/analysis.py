@@ -41,6 +41,8 @@ _DETECT_RULE = ("detected = count ≥ 1 transcript (the same as > 0 for integer 
                 "counts of the group, per 10,000")
 _DE_DEPTH_RATIO = 1.5      # median counts per cell of the two groups differing by more is flagged
 _DE_RATE_MIN_COUNT = 100   # Σ counts of a gene over both groups below which its rate is unstable
+_DE_PB_KINDS = ("pseudobulk", "contact")     # results fitted on pseudobulks: same table and volcano rules
+_DE_FDR_ONLY_KINDS = _DE_PB_KINDS + ("proximity",)   # volcano colour by FDR alone
 # functions(res, ctx) that add columns / notes to a finished DE result before it is shown
 # (the leak gate of the controls module registers here); ctx: samples, masks_a, masks_b,
 # seg_source, method, color_by, use_corrected, options
@@ -764,14 +766,15 @@ def make_de_volcano_fig(width=None, height=None, lfc_axis=None):
     if not res:
         return figures._make_placeholder_fig("No differential expression computed yet.")
     t = res["table"]
-    pb = res.get("kind") == "pseudobulk"
+    pb = res.get("kind") in _DE_PB_KINDS
+    fdr_only = res.get("kind") in _DE_FDR_ONLY_KINDS
     lfc, x_title = "log2fc", res.get("lfc_title") or "log2 fold change (A / B)"
     if pb:
         if lfc_axis == "shrunk" and "log2fc_shrunk" in t.columns:
             lfc = "log2fc_shrunk"
             x_title = f"log2 fold change (A / B), {res.get('shrink')}-shrunken"
         else:
-            x_title = "log2 fold change (A / B), unshrunken (MLE)"
+            x_title = res.get("lfc_title") or "log2 fold change (A / B), unshrunken (MLE)"
             if lfc_axis == "shrunk":
                 x_title += " — no shrunken estimate in this result"
     # genes without an adjusted p-value (DESeq2 independent filtering) are not drawn
@@ -779,16 +782,16 @@ def make_de_volcano_fig(width=None, height=None, lfc_axis=None):
     x = t[lfc].to_numpy(dtype=float)
     direction = t["log2fc"].to_numpy(dtype=float)       # the side never depends on shrinkage
     fdr_ok = t["padj"].to_numpy(dtype=float) < 0.05
-    sig = fdr_ok if pb else (fdr_ok & (np.abs(x) >= 0.5))
+    sig = fdr_ok if fdr_only else (fdr_ok & (np.abs(x) >= 0.5))
     flagged = (t["leak_flag"].fillna(False).to_numpy(dtype=bool) if "leak_flag" in t.columns
                else np.zeros(len(t), dtype=bool))
     up = sig & (direction > 0) & ~flagged
     dn = sig & ~(direction > 0) & ~flagged
-    rule = "FDR < 0.05" if pb else "FDR < 0.05, |log2FC| ≥ 0.5"
+    rule = ((res.get("fdr_name") or "FDR") + " < 0.05") if fdr_only else "FDR < 0.05, |log2FC| ≥ 0.5"
     traces = []
     groups = [(~sig & ~flagged, "not significant", "#6e7681", "circle", 0.8),
-              (up, f"higher in A ({int(up.sum()):,}; {rule})", "#f85149", "circle", 0.8),
-              (dn, f"higher in B ({int(dn.sum()):,})", "#58a6ff", "circle", 0.8)]
+              (up, f"{res.get('up_name') or 'higher in A'} ({int(up.sum()):,}; {rule})", "#f85149", "circle", 0.8),
+              (dn, f"{res.get('down_name') or 'higher in B'} ({int(dn.sum()):,})", "#58a6ff", "circle", 0.8)]
     if flagged.any():
         groups.append((flagged, f"leak-gate flagged ({int(flagged.sum()):,}; {int((flagged & sig).sum()):,} "
                                 f"significant)", "#d29922", "diamond-open", 0.95))
@@ -796,7 +799,7 @@ def make_de_volcano_fig(width=None, height=None, lfc_axis=None):
         sub = t[mask]
         extra = ""
         cd = sub["gene"]
-        if "leak_fraction" in sub.columns:
+        if "leak_fraction" in sub.columns and "owner" in sub.columns:
             cd = np.column_stack([sub["gene"], sub["owner"].fillna("").astype(str),
                                   sub["leak_fraction"].round(2).astype(object).where(sub["leak_fraction"].notna(), "–")])
             extra = "<br>owner %{customdata[1]}<br>leak fraction %{customdata[2]}"
@@ -813,7 +816,7 @@ def make_de_volcano_fig(width=None, height=None, lfc_axis=None):
         fig.add_annotation(x=r[lfc], y=min(r["neg_log10_padj"], 300.0), text=r["gene"],
                            showarrow=False, yshift=9, font=dict(size=10, color=core.TEXT))
     fig.add_hline(y=-np.log10(0.05), line=dict(color=core.MUTED, width=1, dash="dot"))
-    if not pb:
+    if not fdr_only:
         for xv in (-0.5, 0.5):
             fig.add_vline(x=xv, line=dict(color=core.MUTED, width=1, dash="dot"))
     fig.update_layout(
@@ -823,7 +826,7 @@ def make_de_volcano_fig(width=None, height=None, lfc_axis=None):
                    f"A: {res['label_a']} ({res['n_a']:,})  vs  B: {res['label_b']} ({res['n_b']:,})",
                    font=dict(size=12), x=0.01),
         xaxis=dict(title=x_title, gridcolor=core.BORDER, zerolinecolor=core.BORDER),
-        yaxis=dict(title="−log10 FDR", gridcolor=core.BORDER, zerolinecolor=core.BORDER),
+        yaxis=dict(title=f"−log10 {res.get('fdr_name') or 'FDR'}", gridcolor=core.BORDER, zerolinecolor=core.BORDER),
         legend=dict(orientation="h", y=-0.2, font=dict(size=10)),
         uirevision=f"de-{res.get('seconds')}-{lfc}",
     )
@@ -849,7 +852,23 @@ def _de_table_records(res) -> list:
         return []
     t = res["table"].sort_values(["padj", "pval"], kind="stable")
     _g3 = lambda v: None if not np.isfinite(v) else float(f"{v:.3g}")
-    if res.get("kind") == "pseudobulk":
+    if res.get("columns"):
+        # a result that names its own columns: [(column, header, "text" | "num")]
+        out = pd.DataFrame({"gene": t["gene"].to_numpy()})
+        for cid, _name, kind in res["columns"]:
+            if cid in ("gene", "leak_flag") or cid not in t.columns:
+                continue
+            v = t[cid]
+            if v.dtype == bool:
+                out[cid] = np.where(v.to_numpy(), "yes", "no")
+            elif kind == "num":
+                out[cid] = pd.to_numeric(v, errors="coerce").map(_g3).to_numpy()
+            else:
+                out[cid] = v.fillna("").astype(str).to_numpy()
+        if "leak_flag" in t.columns:
+            out["leak_flag"] = np.where(t["leak_flag"].isna(), "", np.where(t["leak_flag"] == True, "FLAG", "ok"))  # noqa: E712
+        return out.astype(object).where(out.notna(), None).to_dict("records")
+    if res.get("kind") in _DE_PB_KINDS:
         out = pd.DataFrame({"gene": t["gene"].to_numpy(), "log2fc": t["log2fc"].round(3).to_numpy()})
         if "log2fc_shrunk" in t.columns:
             out["log2fc_shrunk"] = t["log2fc_shrunk"].round(3).to_numpy()
@@ -886,7 +905,10 @@ def _de_table_columns(res=None) -> list:
         leak.append(_col("owner", "Owner"))
     if res is not None and "leak_fraction" in res["table"].columns:
         leak += [_col("leak_fraction", "Leak fraction"), _col("leak_flag", "Leak gate")]
-    if res and res.get("kind") == "pseudobulk":
+    if res and res.get("columns"):
+        return [{"id": cid, "name": name, "type": "text" if kind == "text" else "numeric"}
+                for cid, name, kind in res["columns"] if cid in res["table"].columns]
+    if res and res.get("kind") in _DE_PB_KINDS:
         cols = [_col("gene", "Gene"), _col("log2fc", "log2FC (MLE)")]
         if "log2fc_shrunk" in res["table"].columns:
             cols.append(_col("log2fc_shrunk", f"log2FC ({res.get('shrink') or 'shrunk'})"))
@@ -1657,9 +1679,11 @@ _DENSITY_NOTE = ("Transcripts (not cells) per bin over the whole tissue: quality
 _DE_REST_OPTION = {"label": "All other cells", "value": "rest"}
 
 
-def _de_tab(pseudobulk_controls=None):
+def _de_tab(pseudobulk_controls=None, extra_modes=None, extra_controls=None):
     """The Differential Expression tab. *pseudobulk_controls*: the rows shown instead of
-    the two group pickers in the "Pseudobulk across samples" mode (stats._pb_controls)."""
+    the two group pickers in the "Pseudobulk across samples" mode (stats._pb_controls).
+    *extra_modes* / *extra_controls*: further tests (radio options) and the rows shown for
+    them (proximity._PROX_DE_MODES, proximity._prox_controls)."""
     return dbc.Tab(label="Differential Expression", tab_id="tab-de",
                    label_style={"fontSize": "12px", "padding": "4px 12px"},
                    children=[html.Div([
@@ -1667,7 +1691,8 @@ def _de_tab(pseudobulk_controls=None):
             html.Span("Test:", style=_AN_LABEL_STYLE),
             dcc.RadioItems(id="de-mode", value="cells", inline=True,
                            options=[{"label": " Cells (Wilcoxon)", "value": "cells"},
-                                    {"label": " Pseudobulk across samples", "value": "pseudobulk"}],
+                                    {"label": " Pseudobulk across samples", "value": "pseudobulk"}]
+                                   + [dict(o) for o in (extra_modes or [])],
                            inputStyle={"marginRight": "3px"},
                            labelStyle={"marginRight": "12px", "cursor": "pointer", "fontSize": "11px",
                                        "color": core.TEXT},
@@ -1695,6 +1720,8 @@ def _de_tab(pseudobulk_controls=None):
             ], style=_AN_ROW_STYLE),
         ], id="de-cells-controls", style={"flexShrink": "0"}),
         html.Div(pseudobulk_controls or [], id="de-pb-controls",
+                 style={"display": "none", "flexShrink": "0"}),
+        html.Div(extra_controls or [], id="de-prox-controls",
                  style={"display": "none", "flexShrink": "0"}),
         html.Div([
             dcc.Checklist(id="de-leak-gate",
@@ -1742,7 +1769,7 @@ def _de_tab(pseudobulk_controls=None):
                     dcc.Download(id="de-download"),
                 ], style={"padding": "4px 0"}),
             ], style={"flex": "1.25", "minWidth": "0", "overflow": "auto", "padding": "0 6px"}),
-        ], style={"display": "flex", "flex": "1", "minHeight": "0", "gap": "6px"}),
+        ], style={"display": "flex", "flex": "1", "minHeight": "320px", "gap": "6px"}),
         ui._plot_dim_controls("de"),
     ], style={"display": "flex", "flexDirection": "column", "flex": "1", "minHeight": "0",
               "overflowY": "auto"})])

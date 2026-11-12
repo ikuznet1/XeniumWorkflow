@@ -1102,8 +1102,13 @@ _SEGQC_NOTE = (
     "'Corrected share') and its retention compares the same cells before and after. A run without "
     "its own annotation gets the Xenium labels of the nearest Xenium centroid (within 10 µm), "
     "which favours segmentations close to Xenium's: compare such rows with care. Lower "
-    "contamination with a retention well below 1 is over-correction, not improvement. The "
-    "metrics that need a paired dissociated reference are not computed.")
+    "contamination with a retention well below 1 is over-correction, not improvement. "
+    "Assigned (original counts only): Σ counts of the source's cells ÷ gene transcripts (Q ≥ 20) "
+    "inside the bounding box of its cells, grown by one median cell radius; the transcripts of "
+    "the section are counted once from the transcript file (the 'All transcripts' grid of the "
+    "Transcript Density tab, kept in the cache), which takes about as long as that tab's scan "
+    "the first time; a dataset loaded from a .zarr has no transcript file and no such column. "
+    "The metrics that need a paired dissociated reference are not computed.")
 
 
 def _identity_sets(prof: dict, n: int = _QC_SET_SIZE, min_cells: int = 10) -> dict:
@@ -1267,29 +1272,73 @@ def _qc_metrics(s: dict, labels, sets: dict, source_type=None, radius: float = _
     return {"row": row, "per_type": per, "ident_sums": ident_sums}
 
 
-def _frac_assigned(s: dict) -> float:
-    """Σ counts of the source's cells ÷ gene transcripts (Q ≥ 20) inside the bounding box
-    of its cells, from the all-transcripts density grid of the primary sample; NaN when
-    that grid has not been computed (Transcript Density tab)."""
+def _ensure_all_tx_grid(gen=None, progress=None) -> str:
+    """Make sure the all-transcripts density grid of the primary sample exists (the
+    denominator of the fraction of transcripts assigned): read once from the transcript
+    file with the Transcript Density scan and kept in the same cache file, so the
+    Transcript Density tab finds it too. Returns "" when the grid is available, else the
+    reason it is not. Cancellable (the scan checks the job flag per batch); nothing is
+    written when the job is cancelled or the dataset changed."""
+    if analysis._density_grid(analysis._DENSITY_ALL, analysis._DENSITY_BASE_UM) is not None:
+        return ""
+    data_dir = core.DATA.get("data_dir")
+    if not data_dir:
+        return "the dataset was loaded from a .zarr, which has no transcript file"
+    with analysis._density_lock:
+        busy = analysis._density_state.get("status") == "running"
+    if busy:
+        return "a Transcript Density job is running; run Segmentation QC again when it has finished"
     try:
-        g = analysis._density_grid(analysis._DENSITY_ALL, analysis._DENSITY_BASE_UM)
-        if g is None:
-            return np.nan
-        xy = stats._xy_of(s["df"])
-        b = float(g["bin"])
-        x0, x1 = int(np.floor(xy[:, 0].min() / b)) - g["ix0"], int(np.floor(xy[:, 0].max() / b)) - g["ix0"]
-        y0, y1 = int(np.floor(xy[:, 1].min() / b)) - g["iy0"], int(np.floor(xy[:, 1].max() / b)) - g["iy0"]
-        sub = g["grid"][max(y0, 0):max(y1 + 1, 0), max(x0, 0):max(x1 + 1, 0)]
-        den = float(sub.sum())
-        if den <= 0:
-            return np.nan
-        rows = np.asarray(s["rows"])
-        w = np.zeros(s["csc"].shape[0])
-        w[rows[rows >= 0]] = 1.0
-        panel = np.array([s["gni"][x] for x in s["genes"]], dtype=np.int64)
-        return float((s["csc"].T @ w)[panel].sum() / den)
-    except Exception:
+        scan = analysis._density_scan(data_dir, analysis._DENSITY_ALL, progress=progress)
+    except ValueError as exc:
+        return str(exc).rstrip(".")
+    if gen is not None:
+        jobs._check_dataset_gen(gen)
+    jobs._job_check()
+    analysis._density_write(analysis._density_cache_file(analysis._DENSITY_ALL), scan, analysis._DENSITY_ALL)
+    with analysis._density_lock:
+        analysis._density_state["version"] += 1
+    return ""
+
+
+def _frac_assigned(s: dict) -> float:
+    """Fraction of transcripts assigned to cells: Σ counts of the source's cells ÷ gene
+    transcripts (Q ≥ 20, the filter of the cell-feature matrix) inside the footprint of
+    its cells, from the all-transcripts density grid of the primary sample (5 µm bins).
+    The footprint is the bounding box of the centroids of the source's cells, grown by one
+    median cell radius (√(median cell area / π)) when the table has cell areas, so that
+    transcripts of the outermost cells are inside it. NaN when the grid does not exist
+    (see _ensure_all_tx_grid) or the box holds no transcripts. For a segmentation of the
+    whole section this is the share of the tissue's transcripts that ended up in a cell;
+    for a run on a region it is that share within the region's bounding box (a box is
+    larger than a non-rectangular region, which lowers the value)."""
+    g = analysis._density_grid(analysis._DENSITY_ALL, analysis._DENSITY_BASE_UM)
+    if g is None or not g["grid"].size:
         return np.nan
+    rows = np.asarray(s["rows"])
+    ok = rows >= 0
+    if not ok.any():
+        return np.nan
+    df = s["df"]
+    xy = stats._xy_of(df)[ok]
+    pad = 0.0
+    if "cell_area" in df.columns:
+        area = float(np.nanmedian(pd.to_numeric(df["cell_area"], errors="coerce").to_numpy(dtype=np.float64)[ok]))
+        if np.isfinite(area) and area > 0:
+            pad = float(np.sqrt(area / np.pi))
+    b = float(g["bin"])
+    x0 = int(np.floor((xy[:, 0].min() - pad) / b)) - g["ix0"]
+    x1 = int(np.floor((xy[:, 0].max() + pad) / b)) - g["ix0"]
+    y0 = int(np.floor((xy[:, 1].min() - pad) / b)) - g["iy0"]
+    y1 = int(np.floor((xy[:, 1].max() + pad) / b)) - g["iy0"]
+    sub = g["grid"][max(y0, 0):max(y1 + 1, 0), max(x0, 0):max(x1 + 1, 0)]
+    den = float(sub.sum())
+    if den <= 0:
+        return np.nan
+    w = np.zeros(s["csc"].shape[0])
+    w[rows[ok]] = 1.0
+    panel = np.array([s["gni"][x] for x in s["genes"]], dtype=np.int64)
+    return float(np.asarray(s["csc"].T @ w).ravel()[panel].sum() / den)
 
 
 def _segqc_sources(run_values=None) -> list:
@@ -1409,6 +1458,15 @@ def _run_segqc(method, sets_text, source_type, radius, run_values=None) -> None:
                 src["short"] = f"{src['tool'].capitalize()} {n_tool[src['tool']]}"
         n_steps = sum(1 + (s["corrected"] is not None) for s in srcs if s["sample"] is not None)
         step = 0
+        # the denominator of "fraction of transcripts assigned": all gene transcripts of the
+        # section, binned once (cached) - computed here when the grid does not exist yet
+        scan_needed = (analysis._density_grid(analysis._DENSITY_ALL, analysis._DENSITY_BASE_UM) is None
+                       and bool(core.DATA.get("data_dir")))
+        if scan_needed:
+            _set("running", "Segmentation QC: counting all transcripts of the section (once; kept in the cache)…")
+        no_grid = _ensure_all_tx_grid(_gen, progress=lambda f: jobs._job_progress(
+            "Counting all transcripts of the section (once)…", 0.5 * f))
+        f0 = 0.5 if scan_needed and not no_grid else 0.0
         for src in srcs:
             if src["sample"] is None:
                 notes.append(f"{src['label']}: {src.get('error', 'not available')}")
@@ -1440,7 +1498,7 @@ def _run_segqc(method, sets_text, source_type, radius, run_values=None) -> None:
                 jobs._job_check()
                 step += 1
                 _set("running", f"Segmentation QC: {src['label']} ({mode} counts)…")
-                jobs._job_progress(f"{src['label']} ({mode})", (step - 1) / max(1, n_steps))
+                jobs._job_progress(f"{src['label']} ({mode})", f0 + (1.0 - f0) * (step - 1) / max(1, n_steps))
                 ref_ident, coverage = None, np.nan
                 if mode != "original":
                     # a correction may cover part of the cells (those the deconvolution
@@ -1485,9 +1543,11 @@ def _run_segqc(method, sets_text, source_type, radius, run_values=None) -> None:
         if len(tr):
             msg += (f" Labels transferred from Xenium by nearest centroid for: {', '.join(tr[:6])}"
                     f"{'…' if len(tr) > 6 else ''}.")
-        if table["frac_assigned"].isna().all():
-            msg += (" Fraction of transcripts assigned: not available (compute the 'All transcripts' "
-                    "grid in the Transcript Density tab first).")
+        if no_grid:
+            msg += f" Fraction of transcripts assigned: not available ({no_grid})."
+        elif table["frac_assigned"].notna().any():
+            msg += (" Assigned = Σ counts of the cells ÷ gene transcripts (Q ≥ 20) in the bounding box of "
+                    "the cells (grown by one median cell radius), original counts only.")
         for nt in notes:
             msg += f"\nNote: {nt}."
         _set("done", msg, result=res)
@@ -2288,7 +2348,8 @@ def _segqc_csv(res) -> str:
              "# spill_slope: source identity transcripts per 100 in non-source cells regressed on the number of "
              "source neighbours within the radius; reverse_slope: foreign identity per 100 in source cells vs "
              "non-source neighbours; retention: own identity transcripts after / before correction",
-             "# frac_assigned: sum of counts of the cells / gene transcripts (Q >= 20) in the bounding box of the cells"]
+             "# frac_assigned: sum of counts of the cells / gene transcripts (Q >= 20) in the bounding box of the "
+             "cell centroids grown by one median cell radius (all-transcripts grid, 5 um bins; original counts only)"]
     for k, g in res["sets"].items():
         lines.append(f"# identity set {k}: {' '.join(g)}")
     for nt in res.get("notes") or []:

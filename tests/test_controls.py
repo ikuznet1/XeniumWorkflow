@@ -12,6 +12,7 @@ from __future__ import annotations
 import ast
 import itertools
 import os
+import time
 
 import numpy as np
 import pandas as pd
@@ -832,6 +833,9 @@ def test_every_neighbour_search_of_the_app_is_in_a_function_that_takes_one_sampl
     allowed = {
         "controls.py": {"_local_counts", "_source_geometry", "_coloc_counts", "_transfer_labels"},
         "stats.py": {"_knn_indices"},                    # Moran, LR: called per sample
+        "proximity.py": {"_prox_sample", "_contact_near"},              # one sample's coordinates each
+        "lrdecomp.py": {"_lrd_contacts"},                               # one KD-tree per sample
+        "aggregates.py": {"_agg_adjacency", "_agg_edges", "_agg_tile_area", "_agg_hull", "_agg_sample"},
         "spatial.py": {"_run_spatial_analysis", "_run_spatial_niches"},   # primary sample's table only
         "reseg.py": {"_patch_seam_dedup_mask"},          # duplicate cells across patch seams of one run
         "annotation.py": {"_run_seurat_annotation"},     # expression space (PCA), not tissue space
@@ -1169,3 +1173,218 @@ def test_new_tabs_jobs_and_notes_are_in_the_app(xe):
     # the poll releases the buttons and reports new results once
     out = xe.poll_controls(1, -1, -1, -1, -1)
     assert out[4:8] == (False, False, False, False) and out[-1] is True
+
+
+# ── 7. cancel, export, fraction of transcripts assigned ──────────────────────
+def _gate(xe, monkeypatch, name):
+    """Replace xe.<name> by a version that reports it was entered and then waits until the
+    test lets it go on: the job is held inside its computation while Cancel is pressed."""
+    import threading
+    real = getattr(xe, name)
+    entered, release = threading.Event(), threading.Event()
+
+    def held(*a, **k):
+        entered.set()
+        assert release.wait(20), "the test never released the job"
+        return real(*a, **k)
+
+    monkeypatch.setattr(xe, name, held)
+    return real, entered, release
+
+
+def _cancel_mid_run(xe, monkeypatch, kind, hold, start, state, published):
+    """Start a controls job with *start*, cancel it while it is inside xe.<hold>, and check
+    it ends cancelled with nothing published; then run it again to completion."""
+    names = ("compartments", "spillover", "segqc", "coloc")
+    real, entered, release = _gate(xe, monkeypatch, hold)
+    v0 = state["version"]
+    assert start()[:2] == (True, False)
+    job = [j for j in xe._jobs.values() if j.kind == kind][-1]
+    assert entered.wait(20), state["message"]
+    assert job.snapshot()["cancellable"] and xe._job_cancel(job.id)
+    assert job.state == "cancelling" and not xe._job_cancel(job.id)      # a second Cancel is refused
+    release.set()
+    job.thread.join(20)
+    assert job.state == "cancelled" and job.cancelled and job.error is None
+    assert state["status"] == "error" and state["message"] == "Cancelled"
+    assert state["result"] is None and state["version"] == v0, "a cancelled job published a result"
+    assert not published(), "a cancelled job left per-cell columns behind"
+    assert xe._JOB_KIND_NAMES[kind] not in xe._running_jobs()
+    # the tab shows "Cancelled" (not the last progress text) and the Run button is free again
+    seen = [s["version"] for s in (xe._comp_ctl_state, xe._spill_state, xe._segqc_state, xe._coloc_state)]
+    out = xe.poll_controls(1, *seen)
+    i = names.index(kind)
+    assert out[i] == "Cancelled" and out[4 + i] is False and out[12] is True
+    # again, not held: completes and publishes
+    monkeypatch.setattr(xe, hold, real)
+    assert start()[:2] == (True, False)
+    job2 = [j for j in xe._jobs.values() if j.kind == kind][-1]
+    assert job2 is not job
+    job2.thread.join(60)
+    assert job2.state == "done" and state["status"] == "done", state["message"]
+    assert state["result"] is not None and state["version"] == v0 + 1
+    return state["result"]
+
+
+def test_cancel_compartments_mid_run_publishes_nothing_and_a_rerun_completes(xe, D, labels, monkeypatch):
+    table = xe._view_tables("xenium")[0]
+    method = D["cluster_methods"][0] if D["cluster_methods"] else None
+    start = lambda: xe.run_compartments(1, "celltype:celltypist", "auto", 20, 0, 4, 30, 2, 0.2, 20, "xenium", method)
+    _cancel_mid_run(xe, monkeypatch, "compartments", "_compartments", start, xe._comp_ctl_state,
+                    lambda: xe._ctl_available("xenium"))
+    assert len(xe._ctl_get(table, "xenium", "edge_distance_um")) == len(D["df"])
+    assert {"edge_distance_um", "local_density", "compartment"} <= set(xe._ctl_available("xenium"))
+
+
+def test_cancel_spillover_mid_run_publishes_nothing_and_a_rerun_completes(xe, D, labels, monkeypatch, tmp_path):
+    xe.EXTRA_DATASETS.extend([_fab_ds(D, 200, i, str(tmp_path / f"sp{i}")) for i in range(2)])
+    gene = D["gene_names"][0]
+    start = lambda: xe.run_spillover(1, "celltype:celltypist", "auto", gene, 5, 0.2, "xenium", None, "original")
+    res = _cancel_mid_run(xe, monkeypatch, "spillover", "_source_geometry", start, xe._spill_state,
+                          lambda: xe._ctl_available("xenium"))
+    assert res["markers"] == [gene] and "spillover" in xe._ctl_available("xenium")
+
+
+def test_cancel_segmentation_qc_mid_run_publishes_nothing_and_a_rerun_completes(xe, D, labels, monkeypatch):
+    top = [D["gene_names"][i] for i in np.argsort(-np.asarray(D["expr"].sum(axis=0)).ravel())[:6]]
+    sets = f"Alpha: {top[0]}, {top[1]}\nBeta: {top[2]}, {top[3]}\nGamma: {top[4]}, {top[5]}"
+    start = lambda: xe.run_segqc(1, "celltypist", sets, "auto", 15.0)
+    res = _cancel_mid_run(xe, monkeypatch, "segqc", "_qc_metrics", start, xe._segqc_state, lambda: [])
+    assert len(res["table"]) >= 1 and res["table"].loc[0, "source"] == "Xenium"
+
+
+def test_cancel_segmentation_qc_during_the_transcript_scan_writes_no_grid(xe, D, labels, monkeypatch):
+    """The all-transcripts grid the QC job computes on demand is cancellable too, and a
+    cancelled scan leaves no cache file."""
+    path = xe._density_cache_file(xe._DENSITY_ALL)
+    had = os.path.exists(path)
+    keep = path + ".kept"
+    if had:
+        os.replace(path, keep)
+    xe._density_mem.clear()
+    seen = []
+
+    def slow_batches(p, gene, qv_min=20):
+        for i in range(400):
+            seen.append(i)
+            time.sleep(0.02)
+            yield np.array([1.0], np.float32), np.array([1.0], np.float32), i / 400
+
+    try:
+        monkeypatch.setattr(xe, "_density_tx_batches_parquet", slow_batches)
+        top = [D["gene_names"][i] for i in np.argsort(-np.asarray(D["expr"].sum(axis=0)).ravel())[:6]]
+        sets = f"Alpha: {top[0]}, {top[1]}\nBeta: {top[2]}, {top[3]}\nGamma: {top[4]}, {top[5]}"
+        assert xe.run_segqc(1, "celltypist", sets, "auto", 15.0)[:2] == (True, False)
+        job = [j for j in xe._jobs.values() if j.kind == "segqc"][-1]
+        while not seen and job.thread.is_alive():
+            time.sleep(0.01)
+        assert "counting all transcripts" in xe._segqc_state["message"]
+        assert xe._job_cancel(job.id)
+        job.thread.join(20)
+        assert job.state == "cancelled" and len(seen) < 400
+        assert xe._segqc_state["result"] is None and not os.path.exists(path)
+    finally:
+        xe._density_mem.clear()
+        if had:
+            os.replace(keep, path)
+
+
+def test_cancel_colocalisation_mid_run_publishes_nothing_and_a_rerun_completes(xe, monkeypatch):
+    _fake_view(xe, monkeypatch, 1, n=600)
+    start = lambda: xe.run_coloc(1, "celltype:celltypist", 20.0, 20, "A", "xenium", None)
+    res = _cancel_mid_run(xe, monkeypatch, "coloc", "_coloc_enrich", start, xe._coloc_state, lambda: [])
+    assert res["n_perm"] == 20 and res["placebo"] is not None and len(res["summary"]) == 12
+
+
+def test_fraction_of_transcripts_assigned_equals_a_hand_count(xe, raw, D, labels):
+    """Segmentation QC computes the all-transcripts grid it needs itself; the column is
+    Σ counts of the cells ÷ the Q ≥ 20 gene transcripts in the padded bounding box."""
+    if raw.n_transcripts > 20_000_000:
+        pytest.skip("all transcripts of a large bundle are not read into memory here")
+    path = xe._density_cache_file(xe._DENSITY_ALL)
+    if os.path.exists(path):
+        os.remove(path)
+    xe._density_mem.clear()
+    top = [D["gene_names"][i] for i in np.argsort(-np.asarray(D["expr"].sum(axis=0)).ravel())[:6]]
+    sets = f"Alpha: {top[0]}, {top[1]}\nBeta: {top[2]}, {top[3]}\nGamma: {top[4]}, {top[5]}"
+    xe._run_segqc("celltypist", sets, "auto", 15.0)
+    st = xe._segqc_state
+    assert st["status"] == "done", st["message"]
+    assert os.path.exists(path), "the QC job did not compute the all-transcripts grid"
+    assert "Assigned = Σ counts of the cells ÷ gene transcripts" in st["message"] and "not available" not in st["message"]
+    row = st["result"]["table"].iloc[0]
+    assert row["source"] == "Xenium" and row["counts"] == "original"
+    # by hand: the app's transcript filter, binned at 5 µm, summed over the bins the box touches
+    names = list(D["gene_names"])
+    tx = raw.transcripts(columns=["x_location", "y_location", "qv", "feature_name", "is_gene"])
+    ok = tx["qv"].to_numpy(float) >= 20
+    ok &= tx["is_gene"].to_numpy(bool) if "is_gene" in tx.columns else tx["feature_name"].isin(names).to_numpy()
+    tx = tx[ok]
+    df = D["df"]
+    pad = float(np.sqrt(np.nanmedian(df["cell_area"].to_numpy(float)) / np.pi)) if "cell_area" in df.columns else 0.0
+    bx = np.floor(tx["x_location"].to_numpy(np.float64) / 5.0)
+    by = np.floor(tx["y_location"].to_numpy(np.float64) / 5.0)
+    x, y = df["x_centroid"].to_numpy(float), df["y_centroid"].to_numpy(float)
+    inside = ((bx >= np.floor((x.min() - pad) / 5.0)) & (bx <= np.floor((x.max() + pad) / 5.0))
+              & (by >= np.floor((y.min() - pad) / 5.0)) & (by <= np.floor((y.max() + pad) / 5.0)))
+    assert inside.sum() > 0
+    want = float(D["expr"].sum()) / float(inside.sum())
+    assert row["frac_assigned"] == pytest.approx(want, rel=1e-9) and 0 < want <= 1.0
+    assert "frac_assigned" in xe._segqc_csv(st["result"]) and xe._segqc_records(st["result"])[0]["frac_assigned"] > 0
+    # a second run reads the cached grid (no scan) and gives the same number
+    def no_scan(*a, **k):
+        raise AssertionError("the transcripts were scanned again")
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setattr(xe, "_density_scan", no_scan)
+        xe._run_segqc("celltypist", sets, "auto", 15.0)
+    finally:
+        mp.undo()
+    assert xe._segqc_state["result"]["table"].iloc[0]["frac_assigned"] == pytest.approx(want, rel=1e-9)
+    # a dataset without a transcript file: said, column empty
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setitem(D, "data_dir", None)
+        os.remove(path)
+        xe._density_mem.clear()
+        xe._run_segqc("celltypist", sets, "auto", 15.0)
+    finally:
+        mp.undo()
+    assert "Fraction of transcripts assigned: not available (the dataset was loaded from a .zarr" in xe._segqc_state["message"]
+    assert np.isnan(xe._segqc_state["result"]["table"].iloc[0]["frac_assigned"])
+
+
+def test_save_as_spatialdata_writes_the_control_columns_and_they_read_back(xe, D, labels, expressed_gene, tmp_path):
+    """An actual export with compartment and spillover columns present, read back with
+    spatialdata: the ctl_* columns are in the table, per cell, with the values the app holds."""
+    import spatialdata
+    xe._run_compartments("xenium", None, "celltype:celltypist", "auto",
+                         {"bin_um": 20, "radius": 30, "min_nb": 2, "min_frac": 0.2, "min_edge": 20})
+    assert xe._comp_ctl_state["status"] == "done", xe._comp_ctl_state["message"]
+    top = D["gene_names"][int(np.argmax(np.asarray(D["expr"].sum(axis=0)).ravel()))]
+    xe._run_spillover("xenium", None, "celltype:celltypist", "auto", top, 5, False)
+    assert xe._spill_state["status"] == "done", xe._spill_state["message"]
+    table0 = xe._view_tables("xenium")[0]
+    want = {c: xe._ctl_get(table0, "xenium", c) for c in xe._ctl_available("xenium")}
+    assert {"edge_distance_um", "local_density", "dominant_fraction", "core", "compartment", "spillover",
+            "spillover_flag"} <= set(want)
+    n_cols_before = len(D["df"].columns)
+    msg, poll_disabled, btn_disabled = xe.start_save_sdata(1, str(tmp_path), "with_controls", [], "xenium")
+    assert (poll_disabled, btn_disabled) == (False, True), msg
+    tl.wait_state(xe._save_sdata_state, xe._save_sdata_lock, timeout=600)
+    assert xe._save_sdata_state["status"] == "done", xe._save_sdata_state["message"]
+    path = os.path.join(str(tmp_path), "with_controls.zarr")
+    obs = spatialdata.read_zarr(path).tables["table"].obs
+    ids = obs["cell_id"].astype(str).to_numpy() if "cell_id" in obs.columns else obs.index.astype(str).to_numpy()
+    assert list(ids) == list(D["df"].index.astype(str))
+    for c, v in want.items():
+        got = obs[f"ctl_{c}"]
+        if c in ("compartment", "spillover_flag"):
+            assert got.astype(str).tolist() == [str(x) for x in v], c
+        else:
+            np.testing.assert_allclose(got.to_numpy(float), np.asarray(v, float), rtol=1e-6, atol=1e-6, err_msg=c)
+    assert set(obs["ctl_compartment"].astype(str)) <= {"core", "edge", "other"}
+    assert len(D["df"].columns) == n_cols_before, "the export wrote the control columns into the app's cell table"
+    # the app reads the exported store again, and the extra columns do not break its loader
+    data = xe.load_from_sdata_zarr(path)
+    assert list(data["df"].index.astype(str)) == list(D["df"].index.astype(str))

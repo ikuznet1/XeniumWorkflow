@@ -9,6 +9,7 @@ from . import (
     core, jobs, caching, ui, loading, dataview, annotation, spage, morph, figures, analysis,
     stats, controls, sdata_store, regions, app_layout,
 )
+from . import segfree
 
 
 # ─── SpatialData / Sopa callbacks ─────────────────────────────────────────────
@@ -503,6 +504,7 @@ def load_sample(n_clicks, picked_path, custom_path, ds_version, roi_done,
         analysis._an_autoload()
         stats._stats_reset()
         controls._controls_reset()
+        segfree._sfree_reset()
         annotation._annot_autoload()
         sdata_store._sdata_autoload()
         spage._spage_autoload()

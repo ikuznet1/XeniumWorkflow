@@ -273,7 +273,8 @@
 
   // Outlines from the server: refetched only when what they are built from changes.
   function syncOverlays() {
-    var key = [cur.overlayBase, ex.sdataRoi, ex.sdataPatches, ex.sdataDone].join("|");
+    // (an.gsVersion: per-cell results drawn as outlines - aggregates - bump the same version)
+    var key = [cur.overlayBase, ex.sdataRoi, ex.sdataPatches, ex.sdataDone, an.gsVersion].join("|");
     if (!viewer || key === overlayKey) return;
     overlayKey = key;
     fetch(PREFIX + "/viewer/overlays?source=" + encodeURIComponent(cur.source) +
@@ -757,6 +758,7 @@
     an.gsVersion = gsVersion || 0;
     if (mode === "webgl" && viewer && lastMode === "webgl") {
       viewer.setState({ density: densityState() });
+      if (gsChanged) syncOverlays();
       if (gsChanged && cur.colorVersion) {
         var cv = cur.colorVersion.split("|").slice(0, -1).concat([an.gsVersion]).join("|");
         cur.colorVersion = cv;

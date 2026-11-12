@@ -97,6 +97,9 @@ _JOB_KIND_NAMES = {
     "moran": "spatially variable genes", "lr": "ligand-receptor scoring",
     "compartments": "tissue compartments", "spillover": "spillover score",
     "segqc": "segmentation QC", "coloc": "stratified co-localisation",
+    "proximity": "proximity differential expression", "contact": "contact-group differential expression",
+    "lrdecomp": "ligand-receptor exposure decomposition", "aggregates": "aggregates",
+    "segfree": "segmentation-free abundance",
 }
 
 _jobs: dict = {}                       # job id → _Job, in start order

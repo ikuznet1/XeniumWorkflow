@@ -2230,18 +2230,32 @@ def _lr_table_records(res) -> list:
     return out.head(5000).to_dict("records")
 
 
-def _lr_tab():
+def _lr_tab(decomp_controls=None, decomp_results=None):
+    """The Ligand–Receptor tab. *decomp_controls* / *decomp_results*: the rows shown in the
+    "Exposure decomposition" mode instead of the score controls and results
+    (lrdecomp._lrd_controls / _lrd_results)."""
     S, L = analysis._AN_ROW_STYLE, analysis._AN_LABEL_STYLE
+    _wrap = {"display": "flex", "flexDirection": "column", "flex": "1", "minHeight": "0"}
     _text = ("sender", "receiver", "ligand", "receptor")
     _col = lambda cid, name: {"id": cid, "name": name, "type": "text" if cid in _text else "numeric"}
     return dbc.Tab(label="Ligand–Receptor", tab_id="tab-lr",
                    label_style={"fontSize": "12px", "padding": "4px 12px"},
                    children=[html.Div([
         html.Div([
+            html.Span("Mode:", style=L),
+            dcc.RadioItems(id="lr-mode", value="scores", inline=True,
+                           options=[{"label": " Scores (label permutation)", "value": "scores"},
+                                    {"label": " Exposure decomposition", "value": "decomp"}],
+                           inputStyle={"marginRight": "3px"},
+                           labelStyle={"marginRight": "12px", "cursor": "pointer", "fontSize": "11px",
+                                       "color": core.TEXT}),
             html.Span("Between:", style=L),
             dcc.Dropdown(id="lr-labels", options=[{"label": "Cluster (active cluster set)", "value": "cluster"}],
                          value=None, placeholder="Cell type annotation / cluster…",
                          style={"flex": "1", "minWidth": "170px", "fontSize": "11px"}),
+        ], style=S),
+        html.Div(decomp_controls or [], id="lrd-controls", style={"display": "none", "flexShrink": "0"}),
+        html.Div([
             html.Span("k:", style=L),
             dcc.Input(id="lr-k", type="number", min=1, max=50, step=1, value=_MORAN_K, debounce=True,
                       style=ui._PLOT_CTRL_INPUT),
@@ -2250,7 +2264,7 @@ def _lr_tab():
                       debounce=True, style=ui._PLOT_CTRL_INPUT),
             dbc.Button("Run", id="lr-run-btn", color="primary", size="sm", n_clicks=0,
                        style={"fontSize": "11px", "padding": "2px 12px"}),
-        ], style=S),
+        ], id="lr-scores-controls", style=S),
         html.Div([
             dcc.Upload(dbc.Button("Upload CSV of ligand,receptor pairs", color="secondary", size="sm",
                                   style={"fontSize": "11px", "padding": "2px 8px"}),
@@ -2263,6 +2277,8 @@ def _lr_tab():
                      placeholder="ligand,receptor — one pair per line (a header line 'ligand,receptor' is allowed)…",
                      style={**analysis._AN_INPUT_STYLE, "margin": "2px 8px", "height": "64px",
                             "flexShrink": "0", "fontFamily": "monospace", "resize": "vertical"}),
+        html.Div(decomp_results or [], id="lrd-results", style={**_wrap, "display": "none"}),
+        html.Div([
         html.Div(id="lr-status", style={**analysis._AN_STATUS_STYLE, "whiteSpace": "pre-wrap"}),
         html.Div(_LR_NOTE, id="lr-note", style=analysis._AN_NOTE_STYLE),
         html.Div([
@@ -2290,5 +2306,6 @@ def _lr_tab():
             ], style={"flex": "1.25", "minWidth": "0", "overflow": "auto", "padding": "0 6px"}),
         ], style={"display": "flex", "flex": "1", "minHeight": "0", "gap": "6px"}),
         ui._plot_dim_controls("lr"),
+        ], id="lr-scores-results", style=_wrap),
     ], style={"display": "flex", "flexDirection": "column", "flex": "1", "minHeight": "0",
               "overflowY": "auto"})])

@@ -241,10 +241,38 @@ def _get_reseg_expr_values(gene: str, alt_res: dict) -> "np.ndarray | None":
 _spatial_base_shapes: list = []
 
 
-def _spatial_overlay_shapes(sdata_roi_on: bool = False, sdata_patches_on: bool = False) -> list:
+# Outlines other modules draw on the map (the aggregates module registers):
+# functions(seg_source) -> Plotly layout shapes (plot space, y = -µm) for the Plotly map,
+# functions(seg_source) -> polygon dicts of viewer_provider.overlays (µm, y down) for WebGL
+_overlay_shape_providers: list = []
+_overlay_polygon_providers: list = []
+
+
+_overlay_last_seg: dict = {"seg": "xenium"}   # segmentation of the last map that was built
+
+
+def _provided_overlays(providers, seg_source) -> list:
+    """Outlines of the registered providers; seg_source None: the segmentation of the
+    last map built (callers that patch the shapes of the existing figure)."""
+    if seg_source is None:
+        seg_source = _overlay_last_seg["seg"]
+    else:
+        _overlay_last_seg["seg"] = seg_source
+    out = []
+    for fn in list(providers):
+        try:
+            out += list(fn(seg_source or "xenium"))
+        except Exception as exc:
+            print(f"  overlay provider error: {exc}", flush=True)
+    return out
+
+
+def _spatial_overlay_shapes(sdata_roi_on: bool = False, sdata_patches_on: bool = False,
+                            seg_source=None) -> list:
     """Layout shapes that do not depend on the figure: saved ROI outlines, the
-    pending lasso hull and the sopa tissue-ROI / patch-grid overlays."""
-    shapes = []
+    pending lasso hull, the sopa tissue-ROI / patch-grid overlays and the outlines of
+    the registered providers for the active segmentation."""
+    shapes = _provided_overlays(_overlay_shape_providers, seg_source)
     with core._roi_lock:
         roi_visible = core._roi_state["show"]
         rois_snap   = list(core._roi_state["rois"])
@@ -874,7 +902,8 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
     )
     all_shapes = list(_separator_shapes) + list(_pie_shapes)
     _spatial_base_shapes[:] = all_shapes
-    all_shapes += _spatial_overlay_shapes(sdata_roi_on, sdata_patches_on)
+    all_shapes += _spatial_overlay_shapes(sdata_roi_on, sdata_patches_on,
+                                          "proseg" if pres else "baysor" if bres else "xenium")
     if all_shapes:
         layout_kwargs["shapes"] = all_shapes
     fig.update_layout(**layout_kwargs)

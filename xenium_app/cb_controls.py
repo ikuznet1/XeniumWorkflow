@@ -259,10 +259,10 @@ def poll_controls(_, comp_done=None, spill_done=None, segqc_done=None, coloc_don
             msgs.append(msg); btns.append(True); vers.append(no_update)
         else:
             btns.append(False)
-            if ver != seen:
-                msgs.append(msg); vers.append(ver)
-            else:
-                msgs.append(no_update); vers.append(no_update)
+            # a cancelled job ends as "error" / "Cancelled" without a new result version:
+            # its last "running" text must not stay in the tab
+            msgs.append(msg if (ver != seen or status == "error") else no_update)
+            vers.append(ver if ver != seen else no_update)
     return (*msgs, *btns, *vers, not running)
 
 

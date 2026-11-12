@@ -6,7 +6,7 @@ import dash
 from dash import no_update
 from dash import Input, Output, State, ALL
 
-from . import core, jobs, dataview, analysis, stats, app_layout, cb_analysis
+from . import core, jobs, dataview, analysis, stats, proximity, app_layout, cb_analysis
 
 
 # ─── Samples and conditions (one editor for pseudobulk DE and composition) ────
@@ -20,11 +20,12 @@ from . import core, jobs, dataview, analysis, stats, app_layout, cb_analysis
     Input("de-design-open-btn",   "n_clicks"),
     Input("comp-design-open-btn", "n_clicks"),
     Input("coloc-design-open-btn", "n_clicks"),
+    Input("prox-design-open-btn", "n_clicks"),
     prevent_initial_call=True,
 )
-def open_design_modal(de_clicks, comp_clicks, coloc_clicks=None):
+def open_design_modal(de_clicks, comp_clicks, coloc_clicks=None, prox_clicks=None):
     """Open the editor with one row per loaded sample."""
-    if not de_clicks and not comp_clicks and not coloc_clicks:
+    if not de_clicks and not comp_clicks and not coloc_clicks and not prox_clicks:
         raise dash.exceptions.PreventUpdate
     names = stats._design_names()
     return True, stats._design_rows_children(), names["A"], names["B"], ""
@@ -99,14 +100,23 @@ def update_design_summaries(_design, _extra, _ds):
     Output("de-cells-controls", "style"),
     Output("de-pb-controls",    "style"),
     Output("de-caveat",         "children"),
+    Output("de-prox-controls",  "style"),
+    Output("de-prox-params",    "style"),
+    Output("de-contact-params", "style"),
     Input("de-mode", "value"),
 )
 def toggle_de_mode(mode):
     """Show the controls and the caveat of the chosen test."""
     show, hide = {"flexShrink": "0"}, {"display": "none", "flexShrink": "0"}
+    row = dict(analysis._AN_ROW_STYLE)
+    row_hide = {**row, "display": "none"}
     if mode == "pseudobulk":
-        return hide, show, stats._PB_CAVEAT
-    return show, hide, analysis._DE_CAVEAT
+        return hide, show, stats._PB_CAVEAT, hide, row, row_hide
+    if mode == "proximity":
+        return hide, hide, proximity._PROX_NOTE, show, row, row_hide
+    if mode == "contact":
+        return hide, hide, proximity._CONTACT_NOTE, show, row_hide, row
+    return show, hide, analysis._DE_CAVEAT, hide, row, row_hide
 
 
 @app_layout.app.callback(
@@ -147,7 +157,8 @@ def update_de_table_columns(_done, _ds_version):
     pseudobulk result, the per-sample cells / library sizes / size factors."""
     with analysis._de_lock:
         res = analysis._de_state.get("result")
-    return analysis._de_table_columns(res), stats._pb_samples_view(res)
+    return (analysis._de_table_columns(res),
+            stats._pb_samples_view(res) or proximity._prox_samples_view(res))
 
 
 # ─── Composition between conditions ───────────────────────────────────────────
