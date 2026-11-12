@@ -35,7 +35,7 @@ import h5py
 from PIL import Image
 
 import dash
-from dash import dcc, html, Input, Output, State, callback_context, ALL
+from dash import dcc, html, Input, Output, State, callback_context, ALL, ClientsideFunction
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 from plotly.colors import qualitative
@@ -98,6 +98,23 @@ def _labels_key_for_method(method: str, alt_res=None) -> str:
     out_tag = hashlib.md5((alt_res.get("out_dir", "")).encode()).hexdigest()[:8]
     tool    = alt_res.get("source", "baysor")
     return f"labels_{method}_{tool}_{out_tag}"
+
+
+def _label_key_for_active_seg(label_key, alt_res=None):
+    """Check a chosen _annot_state labels key against the active segmentation.
+    Xenium keys ('labels_<method>[_<mode>]') hold Xenium cell ids, reseg keys carry
+    a '_<tool>_<run tag>' part. Returns the key itself when it belongs to the active
+    segmentation, else the same method's key for it when that has labels, else None."""
+    if not label_key or not label_key.startswith("labels_"):
+        return label_key
+    if alt_res is None:
+        if "_baysor_" not in label_key and "_proseg_" not in label_key:
+            return label_key
+    elif _labels_key_for_method("", alt_res)[len("labels_"):] in label_key:
+        return label_key
+    _alt_key = _labels_key_for_method(label_key.split("_")[1], alt_res)
+    with _annot_lock:
+        return _alt_key if _annot_state.get(_alt_key) is not None else None
 
 # ─── Baysor segmentation state ────────────────────────────────────────────────
 _baysor_state: dict = {"status": "idle", "message": "", "result": None}
@@ -211,32 +228,159 @@ CELLTYPIST_MODELS = {
 }
 
 
+# ─── Dataset generation ───────────────────────────────────────────────────────
+# Bumped by _install_dataset() (Load Sample). A background job captures the value
+# when it starts and stops publishing once it has changed, so results computed for
+# the previous dataset never reach the new dataset's state, DATA or cache files.
+_dataset_gen = 0
+
+
+class _DatasetChanged(Exception):
+    """Raised inside a background job whose dataset was replaced while it ran."""
+
+
+def _check_dataset_gen(gen: int) -> None:
+    """Raise _DatasetChanged when the dataset was replaced since *gen* was captured."""
+    if gen != _dataset_gen:
+        raise _DatasetChanged("dataset was replaced while this job was running — result discarded")
+
+
+def _stale_job(gen: int, status: str) -> bool:
+    """Guard for a job's _set(): False while the job's dataset is still loaded.
+    After a dataset swap an "error" report is dropped (returns True); any other
+    status raises _DatasetChanged so the job unwinds through its own error handler
+    instead of writing old-dataset results."""
+    if gen == _dataset_gen:
+        return False
+    if status == "error":
+        return True
+    _check_dataset_gen(gen)
+    return True
+
+
+def _dataset_key() -> str:
+    """Identity of the current dataset for cache tags: the Xenium output directory,
+    or the .zarr path when the app was started from an exported SpatialData store
+    (data_dir is None there)."""
+    return DATA.get("data_dir") or DATA.get("sdata_path") or ""
+
+
+def _dataset_name() -> str:
+    """Basename used in Baysor/Proseg cache directory names ('' for .zarr input)."""
+    return os.path.basename((DATA.get("data_dir") or "").rstrip("/"))
+
+
+def _dataset_hash_forms() -> set:
+    """The 8-char md5 tags the current dataset may be recorded under. params.json
+    'dataset_hash' hashes data_dir as it was passed at launch, so the relative,
+    absolute and trailing-slash spellings of the same directory all count."""
+    key = _dataset_key()
+    if not key:
+        return set()
+    forms = {key, key.rstrip("/"), os.path.abspath(key)}
+    try:
+        forms.add(os.path.relpath(os.path.abspath(key)))
+    except ValueError:
+        pass
+    forms |= {f + "/" for f in list(forms)}
+    return {hashlib.md5(f.encode()).hexdigest()[:8] for f in forms}
+
+
+def _seg_run_tag(entry: str, tool: str):
+    """Parameter tag of cache entry *entry* when it is a Baysor/Proseg run directory
+    of the current dataset, else None. Names are '<tool>_<dataset>_<dataset hash>_<tag>'
+    or, for older runs, '<tool>_<dataset>_<tag>'; the latter are told apart from a
+    same-named dataset in another folder by the 'dataset_hash' in params.json
+    (accepted when that file or field is missing)."""
+    dataset = _dataset_name()
+    prefix = f"{tool}_{dataset}_"
+    if not dataset or not entry.startswith(prefix):
+        return None
+    m = re.fullmatch(r"(?:([0-9a-f]{8})_)?([0-9a-f]{8})", entry[len(prefix):])
+    if not m:
+        return None   # e.g. a run of dataset '<dataset>_2'
+    hashes = _dataset_hash_forms()
+    if m.group(1):
+        return m.group(2) if m.group(1) in hashes else None
+    try:
+        with open(os.path.join(CACHE_BASE_DIR, entry, "params.json")) as f:
+            stored = json.load(f).get("dataset_hash")
+    except Exception:
+        stored = None
+    if stored and stored not in hashes:
+        return None
+    return m.group(2)
+
+
+def _seg_run_dir(tool: str, param_tag: str) -> str:
+    """Cache directory of the current dataset's Baysor/Proseg run with *param_tag*:
+    the existing directory when there is one (so older '<tool>_<dataset>_<tag>'
+    runs are reused), otherwise a new name that includes the dataset hash so two
+    datasets with the same folder name never share a run directory."""
+    if os.path.isdir(CACHE_BASE_DIR):
+        for entry in sorted(os.listdir(CACHE_BASE_DIR)):
+            if (entry.endswith(param_tag) and os.path.isdir(os.path.join(CACHE_BASE_DIR, entry))
+                    and _seg_run_tag(entry, tool) == param_tag):
+                return os.path.join(CACHE_BASE_DIR, entry)
+    ds_hash = hashlib.md5(_dataset_key().encode()).hexdigest()[:8]
+    return os.path.join(CACHE_BASE_DIR, f"{tool}_{_dataset_name()}_{ds_hash}_{param_tag}")
+
+
 def _cache_path(model_name: str) -> str:
     """Return path for the cached annotation parquet file."""
     safe = model_name.replace(".pkl", "").replace("/", "_")
     cache_dir = CACHE_BASE_DIR
     os.makedirs(cache_dir, exist_ok=True)
     # Include a hash of the data dir so caches from different datasets don't clash
-    tag = hashlib.md5(DATA["data_dir"].encode()).hexdigest()[:8]
+    tag = hashlib.md5(_dataset_key().encode()).hexdigest()[:8]
     return os.path.join(cache_dir, f"{safe}_{tag}.parquet")
 
 
+def _annot_cache_valid(cached, cell_ids_override, cache_sig, allow_subset=False) -> bool:
+    """Is a cached annotation parquet usable for the given resegmented cells?
+    Xenium caches (cell_ids_override None) are always accepted. Reseg caches carry
+    a '_sig' column (hash of the cell ids + matrix shape/nnz) which must match;
+    files written before that column existed must cover exactly the same ids."""
+    if cell_ids_override is None:
+        return True
+    if "_sig" in cached.columns:
+        return len(cached) > 0 and cache_sig is not None and str(cached["_sig"].iloc[0]) == str(cache_sig)
+    _ids = pd.Index([str(c) for c in cell_ids_override])
+    _idx = pd.Index(cached.index.astype(str))
+    if not _idx.isin(_ids).all():
+        return False
+    return len(_idx) <= len(_ids) if allow_subset else len(_idx) == len(_ids)
+
+
+def _annot_cache_frame(labels, cache_sig):
+    """DataFrame written to the annotation cache (adds '_sig' for reseg runs)."""
+    _df = pd.DataFrame({"label": labels})
+    if cache_sig is not None:
+        _df["_sig"] = str(cache_sig)
+    return _df
+
+
 def _run_celltypist(model_name: str, labels_key: str = "labels",
-                    expr_override=None, cell_ids_override=None) -> None:
+                    expr_override=None, cell_ids_override=None, cache_sig=None) -> None:
     """Background thread: annotate cells with CellTypist and store results."""
     _redirect_rpy2_console()
-    import anndata as ad
-    import celltypist
-    from celltypist import models as ct_models
+    _gen = _dataset_gen
 
     def _set(status, message, labels=None):
         with _annot_lock:
+            if _stale_job(_gen, status):
+                return
             _annot_state["status"]  = status
             _annot_state["message"] = message
             if labels is not None:
                 _annot_state[labels_key] = labels
 
     try:
+        # imports inside the try so a missing package reports an error instead of
+        # leaving the status at "running"
+        import anndata as ad
+        import celltypist
+        from celltypist import models as ct_models
         # ── Check disk cache first ───────────────────────────────────────
         _cache_key = model_name if labels_key == "labels" else f"{model_name}_{labels_key}"
         cache_file = _cache_path(_cache_key)
@@ -246,11 +390,9 @@ def _run_celltypist(model_name: str, labels_key: str = "labels",
             pred_labels = cached["label"].astype(str)
             pred_labels.index = pred_labels.index.astype(str)
             if cell_ids_override is not None:
-                _sample = set([str(c) for c in cell_ids_override[:200]])
-                _overlap = len(set(pred_labels.index[:200]) & _sample)
-                if _overlap < max(1, len(_sample) * 0.05):
-                    print(f"  Warning: cached annotation index mismatch "
-                          f"(overlap {_overlap}/{len(_sample)}) — re-running", flush=True)
+                if not _annot_cache_valid(cached, cell_ids_override, cache_sig):
+                    print(f"  Warning: cached annotation belongs to another segmentation "
+                          f"— re-running", flush=True)
                     try:
                         os.remove(cache_file)
                     except Exception:
@@ -274,6 +416,13 @@ def _run_celltypist(model_name: str, labels_key: str = "labels",
         # Build AnnData aligned to barcode order (expr rows = barcodes)
         expr     = expr_override if expr_override is not None else DATA["expr"]
         genes    = DATA["gene_names"]
+        if expr_override is not None:
+            # reseg matrix holds the measured panel columns only
+            genes = list(genes)[:expr.shape[1]]
+        elif len(_panel_gene_names()) != len(genes):
+            # Xenium: SpaGE-imputed columns in DATA["expr"] are not measured counts
+            genes = _panel_gene_names()
+            expr  = expr[:, [DATA["gene_name_to_idx"][g] for g in genes]]
         barcodes = cell_ids_override if cell_ids_override is not None else DATA["barcodes"]
 
         # Normalize to 10,000 counts per cell then log1p (CP10K + log1p)
@@ -292,6 +441,11 @@ def _run_celltypist(model_name: str, labels_key: str = "labels",
         )
 
         _set("running", f"Running CellTypist ({model_name})…")
+        # majority_voting builds a neighbour graph through scanpy, which imports umap:
+        # stub tensorflow as the UMAP code paths do (NumPy ABI mismatch in the installed TF)
+        import sys as _sys_ct, types as _types_ct
+        if "tensorflow" not in _sys_ct.modules:
+            _sys_ct.modules["tensorflow"] = _types_ct.ModuleType("tensorflow")
         predictions = celltypist.annotate(
             adata, model=model_name, majority_voting=True
         )
@@ -306,9 +460,10 @@ def _run_celltypist(model_name: str, labels_key: str = "labels",
         print(f"  Annotation done: {len(unique_types)} cell types — {unique_types[:8]}", flush=True)
 
         # ── Save to disk cache ───────────────────────────────────────────
+        # (cache_file was resolved at the start, for the dataset this job belongs to)
+        _check_dataset_gen(_gen)
         try:
-            cache_file = _cache_path(_cache_key)
-            pd.DataFrame({"label": pred_labels}).to_parquet(cache_file)
+            _annot_cache_frame(pred_labels, cache_sig).to_parquet(cache_file)
             print(f"  Annotation cached to {cache_file}", flush=True)
         except Exception as ce:
             print(f"  Warning: could not cache annotation: {ce}", flush=True)
@@ -323,7 +478,7 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
                           n_cores: int = 4, labels_key: str = "labels",
                           expr_override=None, cell_ids_override=None,
                           umi_min: int = 20, umi_min_sigma: int = 100,
-                          mode_labels_key: str = None) -> None:
+                          mode_labels_key: str = None, cache_sig=None) -> None:
     """
     Background thread: run RCTD (spacexr) for cell-type assignment.
     Requires the spacexr R package:
@@ -332,14 +487,14 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
     In 'doublet'/'multi' mode the first_type column is used.
     """
     _redirect_rpy2_console()
-    import rpy2.robjects.conversion as _rconv
-    import rpy2.robjects as _ro_mod
-    _rconv.set_conversion(_ro_mod.default_converter)
 
     _key_for_cache = mode_labels_key or labels_key
+    _gen = _dataset_gen
 
     def _set(status, message, labels=None):
         with _annot_lock:
+            if _stale_job(_gen, status):
+                return
             _annot_state["status"]  = status
             _annot_state["message"] = message
             if labels is not None:
@@ -347,20 +502,32 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
                 if mode_labels_key and mode_labels_key != labels_key:
                     _annot_state[mode_labels_key] = labels
 
+    ro = None       # set once R is used; the finally below cleans up after it
+    tmpdir = None
     try:
+        # inside the try so a missing rpy2 reports an error instead of a stuck "running"
+        import rpy2.robjects.conversion as _rconv
+        import rpy2.robjects as _ro_mod
+        _rconv.set_conversion(_ro_mod.default_converter)
         cache_key  = f"rctd_{os.path.basename(rds_path)}_{label_col}_{mode}_umi{umi_min}_sig{umi_min_sigma}_{_key_for_cache}"
         cache_file = _cache_path(cache_key)
+        if os.path.exists(cache_file):
+            # an empty label file (failed earlier run) is not a usable cache
+            try:
+                if len(pd.read_parquet(cache_file)) == 0:
+                    os.remove(cache_file)
+            except Exception:
+                pass
         if os.path.exists(cache_file):
             _set("running", "Loading cached RCTD annotation…")
             cached = pd.read_parquet(cache_file)
             labels = cached["label"].astype(str)
             labels.index = labels.index.astype(str)
             if cell_ids_override is not None:
-                _sample = set([str(c) for c in cell_ids_override[:200]])
-                _overlap = len(set(labels.index[:200]) & _sample)
-                if _overlap < max(1, len(_sample) * 0.05):
-                    print(f"  Warning: cached RCTD annotation index mismatch "
-                          f"(overlap {_overlap}/{len(_sample)}) — re-running", flush=True)
+                # RCTD drops low-UMI cells, so the cached ids may be a subset
+                if not _annot_cache_valid(cached, cell_ids_override, cache_sig, allow_subset=True):
+                    print(f"  Warning: cached RCTD annotation belongs to another segmentation "
+                          f"— re-running", flush=True)
                     try:
                         os.remove(cache_file)
                         weights_cache_del = cache_file.replace(".parquet", "_weights.parquet")
@@ -384,6 +551,7 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
                             print(f"  RCTD: weight cache load failed: {_we}", flush=True)
                     weights_key = f"rctd_weights_{labels_key}"
                     with _annot_lock:
+                        _check_dataset_gen(_gen)
                         _annot_state[weights_key] = weights_df
                     _set("done", f"Done (cached) — {len(unique_types)} cell types", labels=labels)
                     return
@@ -402,13 +570,11 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
                         print(f"  RCTD: weight cache load failed: {_we}", flush=True)
                 weights_key = f"rctd_weights_{labels_key}"
                 with _annot_lock:
+                    _check_dataset_gen(_gen)
                     _annot_state[weights_key] = weights_df
                 _set("done", f"Done (cached) — {len(unique_types)} cell types", labels=labels)
                 return
 
-        import tempfile
-        import scipy.io as sio
-        import scipy.sparse as sp_
         import rpy2.robjects as ro
         import rpy2.robjects.conversion as _rconv
         from rpy2.robjects import pandas2ri
@@ -447,7 +613,11 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
             ro.r.assign("._rctd_rds", rds)
             mat_r     = ro.r("SeuratObject::LayerData(._rctd_rds[['RNA']], layer='counts')")
             ref_genes = list(ro.r['rownames'](mat_r))
-            xenium_genes = list(DATA["gene_names"])
+            # Xenium: measured panel genes only (SpaGE-imputed columns are not counts)
+            xenium_genes = _panel_gene_names()
+            if expr_override is not None:
+                # reseg matrix holds the measured panel columns only
+                xenium_genes = list(DATA["gene_names"])[:expr_override.shape[1]]
             shared_genes = sorted(set(xenium_genes) & set(ref_genes))
             if len(shared_genes) < 10:
                 _set("error", f"Only {len(shared_genes)} shared genes between reference and panel.")
@@ -480,35 +650,34 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
             df = DATA["df"]
             if expr_override is not None:
                 xen_mat_full = expr_override.T        # genes × cells
-                cell_ids     = [str(c) for c in (cell_ids_override or range(expr_override.shape[0]))]
+                cell_ids     = [str(c) for c in (cell_ids_override if cell_ids_override is not None
+                                                 else range(expr_override.shape[0]))]
                 coords_df    = df[["x_centroid", "y_centroid"]].reindex(
                                    pd.Index(cell_ids)).fillna(0.0)
             else:
+                # All cells, in expression-row order (independent of an active
+                # subset(), like CellTypist/Seurat): matrix columns == barcodes.
+                df = DATA.get("_df_original", df)
                 xen_mat_full = DATA["expr"].T  # genes × cells
-                cell_ids     = [str(c) for c in df.index.tolist()]
+                cell_ids     = [str(b) for b in DATA["barcodes"]]
                 coords_df    = df[["x_centroid", "y_centroid"]].copy()
-                coords_df.index = cell_ids
+                coords_df.index = coords_df.index.astype(str)
+                if list(coords_df.index) != cell_ids:
+                    coords_df = coords_df.reindex(pd.Index(cell_ids)).fillna(0.0)
 
-            gene_idx   = {g: i for i, g in enumerate(xenium_genes)}
+            gene_idx   = ({g: i for i, g in enumerate(xenium_genes)} if expr_override is not None
+                          else DATA["gene_name_to_idx"])
             shared_idx = [gene_idx[g] for g in shared_genes]
-            xen_sub    = sp_.csc_matrix(xen_mat_full[shared_idx, :])   # shared_genes × cells
-
-            tmpdir = tempfile.mkdtemp(prefix="xenium_rctd_")
-            sio.mmwrite(os.path.join(tmpdir, "xenium.mtx"), xen_sub)
-            with open(os.path.join(tmpdir, "genes.txt"),    "w") as f: f.write("\n".join(shared_genes) + "\n")
-            with open(os.path.join(tmpdir, "barcodes.txt"), "w") as f: f.write("\n".join(cell_ids) + "\n")
-            coords_df.to_csv(os.path.join(tmpdir, "coords.csv"))
-
-            ro.r.assign("._rctd_tmpdir", tmpdir)
+            # shared_genes × cells dgCMatrix built from the sparse parts
+            # (no MatrixMarket text round trip)
+            _scipy_to_r_dgc(xen_mat_full.T[:, shared_idx], shared_genes, cell_ids, "._rctd_xen_mat")
+            del xen_mat_full
+            ro.r.assign("._rctd_cx", ro.FloatVector(
+                np.ascontiguousarray(coords_df["x_centroid"].to_numpy(dtype=np.float64))))
+            ro.r.assign("._rctd_cy", ro.FloatVector(
+                np.ascontiguousarray(coords_df["y_centroid"].to_numpy(dtype=np.float64))))
             ro.r("""
-._rctd_xen_mat  <- Matrix::readMM(file.path(._rctd_tmpdir, "xenium.mtx"))
-._rctd_xen_genes <- readLines(file.path(._rctd_tmpdir, "genes.txt"))
-._rctd_xen_bcs   <- readLines(file.path(._rctd_tmpdir, "barcodes.txt"))
-rownames(._rctd_xen_mat) <- ._rctd_xen_genes
-colnames(._rctd_xen_mat) <- ._rctd_xen_bcs
-._rctd_xen_mat  <- as(._rctd_xen_mat, 'dgCMatrix')
-._rctd_coords   <- read.csv(file.path(._rctd_tmpdir, "coords.csv"), row.names=1)
-colnames(._rctd_coords) <- c('x', 'y')
+._rctd_coords   <- data.frame(x=._rctd_cx, y=._rctd_cy, row.names=colnames(._rctd_xen_mat))
 ._rctd_numi_xen <- colSums(._rctd_xen_mat)
 ._rctd_puck     <- spacexr::SpatialRNA(
     coords = ._rctd_coords,
@@ -538,7 +707,18 @@ colnames(._rctd_coords) <- c('x', 'y')
 ._rctd_types   <- colnames(._rctd_weights)[apply(._rctd_weights, 1, which.max)]
 names(._rctd_types) <- rownames(._rctd_weights)
 """)
-            else:  # doublet / multi
+            elif mode == "multi":
+                # multi mode: @results is a per-pixel list (no results_df), in the
+                # column order of the filtered SpatialRNA counts
+                ro.r("""
+._rctd_res   <- ._rctd_obj@results
+._rctd_types <- vapply(._rctd_res, function(r)
+    if (length(r$cell_type_list)) as.character(r$cell_type_list[1]) else NA_character_,
+    character(1))
+names(._rctd_types) <- colnames(._rctd_obj@spatialRNA@counts)[seq_along(._rctd_types)]
+._rctd_types <- ._rctd_types[!is.na(._rctd_types)]
+""")
+            else:  # doublet
                 ro.r("""
 ._rctd_res   <- ._rctd_obj@results$results_df
 ._rctd_types <- as.character(._rctd_res$first_type)
@@ -551,11 +731,14 @@ names(._rctd_types) <- rownames(._rctd_res)
             cell_vals = [str(v) for v in types_r]
             labels    = pd.Series(dict(zip(cell_ids, cell_vals)), name="label").astype(str)
             labels.index  = labels.index.astype(str)
+            if len(labels) == 0:
+                raise RuntimeError(f"RCTD ({mode}) returned no cell labels")
 
             unique_types = labels.unique().tolist()
             print(f"  RCTD: {len(labels):,} cells → {len(unique_types)} types", flush=True)
 
-            pd.DataFrame({"label": labels}).to_parquet(cache_file)
+            _check_dataset_gen(_gen)
+            _annot_cache_frame(labels, cache_sig).to_parquet(cache_file)
 
             # ── 8. Extract and cache weight matrix (full mode only) ───────────
             weights_df = None
@@ -575,43 +758,54 @@ names(._rctd_types) <- rownames(._rctd_res)
                     print(f"  RCTD: weight extraction failed: {_we}", flush=True)
             weights_key = f"rctd_weights_{labels_key}"
             with _annot_lock:
+                _check_dataset_gen(_gen)
                 _annot_state[weights_key] = weights_df
 
             _set("done", f"Done — {len(unique_types)} cell types in {len(labels):,} cells",
                  labels=labels)
 
-            # Cleanup R temporaries (best-effort)
-            try:
-                ro.r("rm(list=ls(pattern='^\\._rctd_'))")
-            except Exception:
-                pass
-            import shutil; shutil.rmtree(tmpdir, ignore_errors=True)
-
     except Exception as exc:
         import traceback; traceback.print_exc()
         _set("error", str(exc)[:300])
+    finally:
+        # Cleanup R temporaries and the temp dir on every exit path (best-effort).
+        # The names start with a dot, so ls() needs all.names=TRUE.
+        if ro is not None:
+            try:
+                from rpy2.rinterface_lib import openrlib as _orl
+                with _orl.rlock:
+                    ro.r("rm(list=ls(pattern='^[.]_rctd_', all.names=TRUE, envir=globalenv()), "
+                         "envir=globalenv()); invisible(gc())")
+            except Exception:
+                pass
+        if tmpdir:
+            import shutil; shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _run_seurat_annotation(rds_path: str, label_col: str = "Names", labels_key: str = "labels",
-                            expr_override=None, cell_ids_override=None) -> None:
+                            expr_override=None, cell_ids_override=None, cache_sig=None) -> None:
     """
     Background thread: transfer cell type labels from a Seurat RDS reference
     to Xenium cells via PCA + cosine kNN majority voting.
     Uses the same rpy2 + SpaGE PV alignment already set up for SpaGE.
     """
     _redirect_rpy2_console()
-    import rpy2.robjects.conversion as _rconv
-    import rpy2.robjects as _ro_mod
-    _rconv.set_conversion(_ro_mod.default_converter)
+    _gen = _dataset_gen
 
     def _set(status, message, labels=None):
         with _annot_lock:
+            if _stale_job(_gen, status):
+                return
             _annot_state["status"]  = status
             _annot_state["message"] = message
             if labels is not None:
                 _annot_state[labels_key] = labels
 
     try:
+        # inside the try so a missing rpy2 reports an error instead of a stuck "running"
+        import rpy2.robjects.conversion as _rconv
+        import rpy2.robjects as _ro_mod
+        _rconv.set_conversion(_ro_mod.default_converter)
         cache_key = f"seurat_{os.path.basename(rds_path)}_{label_col}_{labels_key}"
         cache_file = _cache_path(cache_key)
         if os.path.exists(cache_file):
@@ -620,11 +814,9 @@ def _run_seurat_annotation(rds_path: str, label_col: str = "Names", labels_key: 
             labels = cached["label"].astype(str)
             labels.index = labels.index.astype(str)
             if cell_ids_override is not None:
-                _sample = set([str(c) for c in cell_ids_override[:200]])
-                _overlap = len(set(labels.index[:200]) & _sample)
-                if _overlap < max(1, len(_sample) * 0.05):
-                    print(f"  Warning: cached Seurat annotation index mismatch "
-                          f"(overlap {_overlap}/{len(_sample)}) — re-running", flush=True)
+                if not _annot_cache_valid(cached, cell_ids_override, cache_sig):
+                    print(f"  Warning: cached Seurat annotation belongs to another segmentation "
+                          f"— re-running", flush=True)
                     try:
                         os.remove(cache_file)
                     except Exception:
@@ -680,7 +872,11 @@ def _run_seurat_annotation(rds_path: str, label_col: str = "Names", labels_key: 
             ref_genes_all = list(ro.r['rownames'](mat_r))
             ref_bcs = list(ro.r['colnames'](mat_r))
 
-            xenium_genes = list(DATA["gene_names"])
+            # Xenium: measured panel genes only (SpaGE-imputed columns are not counts)
+            xenium_genes = _panel_gene_names()
+            if expr_override is not None:
+                # reseg matrix holds the measured panel columns only
+                xenium_genes = list(DATA["gene_names"])[:expr_override.shape[1]]
             shared = sorted(set(xenium_genes) & set(ref_genes_all))
             if len(shared) < 10:
                 _set("error", f"Only {len(shared)} shared genes — not enough for label transfer.")
@@ -713,7 +909,8 @@ rm(._annot_mat, ._annot_genes, ._annot_dir, ._annot_rds_tmp, mat_sub)
         ref_genes = pd.read_csv(os.path.join(tmpdir, "genes.txt"), header=None)[0].tolist()
         ref_bcs   = pd.read_csv(os.path.join(tmpdir, "barcodes.txt"), header=None)[0].tolist()
 
-        xen_gene_idx = {g: i for i, g in enumerate(xenium_genes)}
+        xen_gene_idx = ({g: i for i, g in enumerate(xenium_genes)} if expr_override is not None
+                        else DATA["gene_name_to_idx"])
         shared_xen_idx = [xen_gene_idx[g] for g in ref_genes]  # ref_genes == shared after subset
 
         # Reference matrix for shared genes (cells × shared) — already subset
@@ -721,11 +918,14 @@ rm(._annot_mat, ._annot_genes, ._annot_dir, ._annot_rds_tmp, mat_sub)
 
         # Xenium/reseg matrix for shared genes — build from sparse expr
         xen_expr = expr_override if expr_override is not None else DATA["expr"]
-        xen_shared = xen_expr[:, shared_xen_idx].toarray().astype("float32")
+        # Kept sparse: a dense cells x shared-genes copy is tens of GB on a 5K panel
+        xen_shared = xen_expr[:, shared_xen_idx].tocsr().astype("float32")
         # CP10K + log1p normalize Xenium
-        row_sums = xen_shared.sum(axis=1, keepdims=True)
+        row_sums = np.asarray(xen_shared.sum(axis=1)).ravel().astype("float32")
         row_sums[row_sums == 0] = 1.0
-        xen_shared = np.log1p(xen_shared / row_sums * 10_000)
+        xen_shared = sp_.diags((1e4 / row_sums).astype("float32")).dot(xen_shared).tocsr()
+        xen_shared.data = np.log1p(xen_shared.data)
+        xen_shared.sort_indices()
 
         # Also normalize reference (already log-normalized from Seurat data layer, but z-score both)
         import scipy.stats as st_
@@ -739,16 +939,21 @@ rm(._annot_mat, ._annot_genes, ._annot_dir, ._annot_rds_tmp, mat_sub)
         ref_std  = ref_dense.std(axis=0, keepdims=True) + 1e-8
         ref_z = (ref_dense - ref_mean) / ref_std
 
-        xen_mean = xen_shared.mean(axis=0, keepdims=True)
-        xen_std  = xen_shared.std(axis=0, keepdims=True) + 1e-8
-        xen_z = (xen_shared - xen_mean) / xen_std
+        # per-gene mean / population std from the sparse matrix (float64 sums)
+        _n_xen  = xen_shared.shape[0]
+        _n_sh   = xen_shared.shape[1]
+        _xd64   = xen_shared.data.astype(np.float64)
+        _x_m    = np.bincount(xen_shared.indices, weights=_xd64, minlength=_n_sh) / max(_n_xen, 1)
+        _x_sq   = np.bincount(xen_shared.indices, weights=_xd64 * _xd64, minlength=_n_sh) / max(_n_xen, 1)
+        del _xd64
+        xen_mean = _x_m.astype("float32")[None, :]
+        xen_std  = (np.sqrt(np.maximum(_x_sq - _x_m ** 2, 0.0)) + 1e-8).astype("float32")[None, :]
 
         # PCA on reference, project Xenium
         n_comp = min(50, len(shared) - 1, ref_dense.shape[0] - 1)
         _set("running", f"PCA ({n_comp} components)…")
         svd = TruncatedSVD(n_components=n_comp, random_state=0)
         ref_pca = svd.fit_transform(ref_z)   # (n_ref × n_comp)
-        xen_pca = xen_z @ svd.components_.T  # (n_xen × n_comp)
 
         # ── 5. kNN label transfer ────────────────────────────────────────
         _set("running", "kNN label transfer (50 neighbours)…")
@@ -757,15 +962,22 @@ rm(._annot_mat, ._annot_genes, ._annot_dir, ._annot_rds_tmp, mat_sub)
 
         k = min(50, len(ref_bcs))
         nbrs = NearestNeighbors(n_neighbors=k, metric="cosine").fit(ref_pca)
-        _, indices = nbrs.kneighbors(xen_pca)
 
-        # Majority vote
+        # Majority vote (ties -> smallest label, as pd.Series.mode()[0])
         ref_label_arr = ref_label_series.values  # ordered by ref_bcs
+        _lab_u, _lab_codes = np.unique(ref_label_arr.astype(str), return_inverse=True)
+        _n_lab = len(_lab_u)
         xen_labels = []
-        for row in indices:
-            votes = ref_label_arr[row]
-            winner = pd.Series(votes).mode()[0]
-            xen_labels.append(winner)
+        # z-score, project and vote in row chunks so the dense block stays small
+        _chunk = 20_000
+        for _s in range(0, _n_xen, _chunk):
+            _zc = (xen_shared[_s:_s + _chunk].toarray() - xen_mean) / xen_std
+            _pc = _zc @ svd.components_.T   # (chunk × n_comp)
+            _, indices = nbrs.kneighbors(_pc)
+            _m = indices.shape[0]
+            _cnt = np.bincount((np.arange(_m)[:, None] * _n_lab + _lab_codes[indices]).ravel(),
+                               minlength=_m * _n_lab).reshape(_m, _n_lab)
+            xen_labels.extend(_lab_u[_cnt.argmax(axis=1)].tolist())
 
         xen_barcodes = cell_ids_override if cell_ids_override is not None else DATA["barcodes"]
         pred_labels = pd.Series(xen_labels, index=[str(b) for b in xen_barcodes], name="label")
@@ -773,8 +985,9 @@ rm(._annot_mat, ._annot_genes, ._annot_dir, ._annot_rds_tmp, mat_sub)
         print(f"  Label transfer done: {len(unique_final)} cell types", flush=True)
 
         # Cache
+        _check_dataset_gen(_gen)
         try:
-            pd.DataFrame({"label": pred_labels}).to_parquet(cache_file)
+            _annot_cache_frame(pred_labels, cache_sig).to_parquet(cache_file)
         except Exception as ce:
             print(f"  Warning: cache failed: {ce}", flush=True)
 
@@ -783,6 +996,229 @@ rm(._annot_mat, ._annot_genes, ._annot_dir, ._annot_rds_tmp, mat_sub)
     except Exception as exc:
         import traceback
         _set("error", f"{exc}\n{traceback.format_exc()[-300:]}")
+
+
+# Control / non-gene feature-name prefixes (used when transcripts.parquet has no is_gene column)
+_TX_CONTROL_RE = r"^(NegControl|BLANK_|UnassignedCodeword|DeprecatedCodeword|Intergenic_Region|GenomicControl)"
+
+
+def _read_tx_region(path, columns=None, x0=None, x1=None, y0=None, y1=None,
+                    extra_filters=None, read_dictionary=None):
+    """Read transcripts.parquet restricted to a bounding box (inclusive) with predicate
+    pushdown, so memory scales with the region instead of the whole run."""
+    import pyarrow.parquet as _pq
+    flt = list(extra_filters or [])
+    if x0 is not None: flt.append(("x_location", ">=", float(x0)))
+    if x1 is not None: flt.append(("x_location", "<=", float(x1)))
+    if y0 is not None: flt.append(("y_location", ">=", float(y0)))
+    if y1 is not None: flt.append(("y_location", "<=", float(y1)))
+    return _pq.read_table(path, columns=columns, filters=flt or None,
+                          read_dictionary=read_dictionary).to_pandas()
+
+
+_TX_NON_GENE_CATEGORIES = ["unassigned_codeword", "negative_control_codeword",
+                           "negative_control_probe", "genomic_control_probe",
+                           "deprecated_codeword"]
+
+
+def _tx_gene_filters(schema_names, qv_min=20) -> list:
+    """Row filters (pyarrow tuples) selecting the transcripts the Xenium cell-feature
+    matrix counts: Q-score ≥ qv_min and gene features only. Bundles without `is_gene`
+    additionally need _tx_drop_control_features() on the rows read."""
+    flt = []
+    if "qv" in schema_names and qv_min is not None:
+        flt.append(("qv", ">=", float(qv_min)))
+    if "is_gene" in schema_names:
+        flt.append(("is_gene", "==", True))
+    elif "codeword_category" in schema_names:
+        flt.append(("codeword_category", "not in", list(_TX_NON_GENE_CATEGORIES)))
+    return flt
+
+
+def _tx_control_feature_mask(names) -> np.ndarray:
+    """True for feature names that are control / non-gene features (by name prefix)."""
+    names = pd.Series(names)
+    if isinstance(names.dtype, pd.CategoricalDtype):
+        cats = pd.Series(names.cat.categories)
+        bad = _tx_control_feature_mask(cats)
+        codes = names.cat.codes.to_numpy()
+        return np.append(bad, False)[codes]          # code -1 (null) → trailing False
+    names = names.map(lambda v: v.decode() if isinstance(v, bytes) else v).astype(str)
+    return names.str.match(_TX_CONTROL_RE).to_numpy(dtype=bool)
+
+
+def _tx_drop_control_features(tx: pd.DataFrame) -> pd.DataFrame:
+    """Drop control / non-gene rows by feature-name prefix (bundles without `is_gene`)."""
+    if "feature_name" not in tx.columns or not len(tx):
+        return tx
+    bad = _tx_control_feature_mask(tx["feature_name"])
+    return tx[~bad].copy() if bad.any() else tx
+
+
+def _tx_write_gene_only(src: str, dst: str, qv_min=20) -> int:
+    """Stream transcripts.parquet into *dst* keeping Q ≥ qv_min gene transcripts only
+    (all columns kept; memory stays at one record batch). Returns the rows written."""
+    import pyarrow as _pa
+    import pyarrow.dataset as _ds
+    import pyarrow.parquet as _pq
+    dataset = _ds.dataset(src, format="parquet")
+    schema = dataset.schema
+    flt = _tx_gene_filters(schema.names, qv_min)
+    expr = _pq.filters_to_expression(flt) if flt else None
+    by_name = "is_gene" not in schema.names and "feature_name" in schema.names
+    n = 0
+    tmp = dst + ".tmp"
+    with _pq.ParquetWriter(tmp, schema) as writer:
+        for batch in dataset.scanner(filter=expr).to_batches():
+            if batch.num_rows and by_name:
+                bad = _tx_control_feature_mask(batch.column("feature_name").to_pandas())
+                if bad.any():
+                    batch = batch.filter(_pa.array(~bad))
+            if batch.num_rows:
+                writer.write_batch(batch)
+                n += batch.num_rows
+    os.replace(tmp, dst)
+    return n
+
+
+def _proseg_prior_type(prior_type) -> str:
+    """Proseg prior the app supports: "nucleus" (default) or "cell". Anything else -
+    e.g. the removed "none" option still held in a browser's saved state - is the
+    default: proseg 1.x cannot run without an initial segmentation."""
+    return prior_type if prior_type in ("nucleus", "cell") else "nucleus"
+
+
+def _patch_owned_mask(x, y, pi, bounds, ok_idx):
+    """True for centroids that patch `pi` keeps: a centroid lying in several patches that
+    actually returned cells (`ok_idx`) belongs to the one it sits deepest inside (ties →
+    lower patch index). On a regular grid this splits the overlap strip at its midline;
+    nothing is ceded to skipped or failed patches."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    x0, y0, x1, y1 = bounds[pi]
+    depth = np.minimum(np.minimum(x - x0, x1 - x), np.minimum(y - y0, y1 - y))
+    keep = np.ones(len(x), dtype=bool)
+    for j in ok_idx:
+        if j == pi:
+            continue
+        a0, b0, a1, b1 = bounds[j]
+        inside = (x >= a0) & (x < a1) & (y >= b0) & (y < b1)
+        if not inside.any():
+            continue
+        dj = np.minimum(np.minimum(x - a0, a1 - x), np.minimum(y - b0, b1 - y))
+        keep &= ~(inside & ((dj > depth) | ((dj == depth) & (j < pi))))
+    return keep
+
+
+# Seam de-duplication of patch runs (stored in params.json as "seam_dedup" so a cache
+# load repeats exactly what the live run did; runs without the key were not de-duplicated).
+_SEAM_DEDUP = {"version": 1, "min_overlap": 0.5, "max_centroid_dist": 1.5, "margin": 25.0}
+
+
+def _patch_seam_dedup_mask(ids, patch_idx, x, y, n_tx, polys, bounds, ok_idx, cfg=None):
+    """Second step of the patch merge, after centroid ownership (_patch_owned_mask).
+
+    Two neighbouring patches segment the shared strip independently, so the same
+    biological cell can be kept from both when its two centroids fall on either side
+    of the ownership line. Among the kept cells near such a line, two cells of
+    different patches are one cell when their polygons overlap by more than
+    cfg["min_overlap"] of the smaller polygon's area, or their centroids are closer
+    than cfg["max_centroid_dist"] µm (the only test for cells without a polygon).
+    Of such a pair the cell lying deeper inside its own patch is kept (ties: more
+    transcripts, then lower patch index).
+
+    ids / patch_idx / x / y / n_tx describe the cells kept by ownership; polys maps
+    id → (xs, ys). Returns a bool mask (True = keep). The result depends only on the
+    cells' values, not on their order, so the live run and a cache load agree."""
+    cfg = cfg or _SEAM_DEDUP
+    patch_idx = np.asarray(patch_idx, dtype=np.int64)
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    n = len(x)
+    keep = np.ones(n, dtype=bool)
+    ok_idx = [int(j) for j in ok_idx]
+    if n < 2 or len(ok_idx) < 2:
+        return keep
+    n_tx = np.nan_to_num(np.asarray(n_tx, dtype=float)) if n_tx is not None else np.zeros(n)
+    b = np.asarray([tuple(float(v) for v in bb) for bb in bounds], dtype=float)
+    own = b[patch_idx]
+    depth = np.minimum(np.minimum(x - own[:, 0], own[:, 2] - x),
+                       np.minimum(y - own[:, 1], own[:, 3] - y))
+    # Only cells near an ownership line can have a twin in another patch: within
+    # `margin` of patch j's box and at most 2·margin deeper in their own patch than in j
+    margin = float(cfg["margin"])
+    near = np.zeros(n, dtype=bool)
+    for j in ok_idx:
+        a0, b0, a1, b1 = b[j]
+        dj = np.minimum(np.minimum(x - a0, a1 - x), np.minimum(y - b0, b1 - y))
+        near |= (patch_idx != j) & (dj > -margin) & (depth - dj <= 2.0 * margin)
+    cand = np.where(near)[0]
+    if len(cand) < 2 or len(np.unique(patch_idx[cand])) < 2:
+        return keep
+
+    pairs = set()
+    from scipy.spatial import cKDTree
+    _cp = cKDTree(np.column_stack([x[cand], y[cand]])).query_pairs(
+        float(cfg["max_centroid_dist"]), output_type="ndarray")
+    for i, j in _cp:
+        if patch_idx[cand[i]] != patch_idx[cand[j]]:
+            pairs.add((int(min(i, j)), int(max(i, j))))
+    try:
+        import shapely
+        geoms, gpos = [], []
+        for k, ci in enumerate(cand):
+            ring = polys.get(ids[ci]) if polys else None
+            if ring is None or len(ring[0]) < 3:
+                continue
+            # float32 like the live run's arrays, so files re-read as float64 agree
+            g = shapely.Polygon(np.column_stack([np.asarray(ring[0], dtype=np.float32),
+                                                 np.asarray(ring[1], dtype=np.float32)]
+                                                ).astype(float))
+            if not g.is_valid:
+                g = g.buffer(0)
+            if g.is_empty or not g.area > 0:
+                continue
+            geoms.append(g)
+            gpos.append(k)
+        if len(geoms) > 1:
+            geoms = np.asarray(geoms, dtype=object)
+            gpos = np.asarray(gpos)
+            qi, ti = shapely.STRtree(geoms).query(geoms, predicate="intersects")
+            sel = (qi < ti) & (patch_idx[cand[gpos[qi]]] != patch_idx[cand[gpos[ti]]])
+            qi, ti = qi[sel], ti[sel]
+            if len(qi):
+                inter = shapely.area(shapely.intersection(geoms[qi], geoms[ti]))
+                small = np.minimum(shapely.area(geoms[qi]), shapely.area(geoms[ti]))
+                for i, j in zip(gpos[qi[inter > float(cfg["min_overlap"]) * small]],
+                                gpos[ti[inter > float(cfg["min_overlap"]) * small]]):
+                    pairs.add((int(min(i, j)), int(max(i, j))))
+    except ImportError:
+        print("  Seam de-duplication: shapely not available — centroid test only", flush=True)
+    if not pairs:
+        return keep
+
+    # Strict, order-independent priority; best cell first, a cell is dropped when a
+    # twin of it has already been kept
+    involved = np.array(sorted({k for p in pairs for k in p}), dtype=np.int64)
+    ci = cand[involved]
+    order = np.lexsort((y[ci], x[ci], patch_idx[ci], -n_tx[ci], -depth[ci]))
+    twins: dict = {}
+    for i, j in pairs:
+        twins.setdefault(i, []).append(j)
+        twins.setdefault(j, []).append(i)
+    kept = set()
+    for k in involved[order]:
+        if any(t in kept for t in twins[int(k)]):
+            keep[cand[k]] = False
+        else:
+            kept.add(int(k))
+    return keep
+
+
+def _patch_bounds_tag(bounds) -> str:
+    """Short hash of a patch layout, for the reseg cache-dir tag."""
+    return hashlib.md5(repr([tuple(round(float(v), 1) for v in b)
+                             for b in bounds]).encode()).hexdigest()[:8]
 
 
 def _get_patch_bounds_um():
@@ -847,7 +1283,8 @@ def _baysor_run_single(tx_df, patch_dir, baysor_bin, scale, min_mol, use_prior, 
     if not os.path.exists(seg_csv):
         raise RuntimeError(f"segmentation.csv not found in {patch_dir}")
 
-    seg = pd.read_csv(seg_csv)
+    seg = pd.read_csv(seg_csv, usecols=lambda c: c in ("cell", "gene", "x", "y",
+                                                       "x_location", "y_location"))
     seg = seg[seg["cell"].notna()].copy()
 
     x_col = "x" if "x" in seg.columns else "x_location"
@@ -894,34 +1331,44 @@ def _proseg_run_single(tx_df, patch_dir, proseg_bin, voxel_size, n_threads, n_sa
                        nuclear_reassign_prob=None, prior_seg_prob=None,
                        prior_type: str = "nucleus"):
     """Run Proseg on tx_df (written as parquet), write outputs to patch_dir.
+    tx_df may also be the path of an existing transcripts.parquet to use as is.
     Returns (cells_df, cell_bounds_dict, tx_meta_df) or raises on failure.
     """
     import gzip
     os.makedirs(patch_dir, exist_ok=True)
-    tx_path = os.path.join(patch_dir, "transcripts.parquet")
-    tx_df.to_parquet(tx_path, index=False)
+    prior_type = _proseg_prior_type(prior_type)
 
     poly_out    = os.path.join(patch_dir, "cell-polygons.geojson.gz")
     meta_out    = os.path.join(patch_dir, "cell-metadata.csv.gz")
     tx_meta_out = os.path.join(patch_dir, "transcript-metadata.csv.gz")
 
-    # Adjust prior based on prior_type before writing parquet
-    if prior_type == "cell" and "overlaps_nucleus" in tx_df.columns and "cell_id" in tx_df.columns:
-        # Override overlaps_nucleus: treat all cell-assigned transcripts as "in nucleus"
-        # so Proseg uses cell boundaries as the prior instead of nuclear boundaries.
-        tx_df = tx_df.copy()
-        tx_df["overlaps_nucleus"] = (tx_df["cell_id"] != 0).astype(tx_df["overlaps_nucleus"].dtype)
-        tx_df.to_parquet(tx_path, index=False)
-    elif prior_type == "none":
-        # No prior: write parquet without the overlaps_nucleus column if present
-        tx_df = tx_df.drop(columns=["overlaps_nucleus"], errors="ignore")
+    if isinstance(tx_df, str):
+        tx_path = tx_df
+    else:
+        tx_path = os.path.join(patch_dir, "transcripts.parquet")
+        # Adjust prior based on prior_type before writing parquet
+        if prior_type == "cell" and "overlaps_nucleus" in tx_df.columns and "cell_id" in tx_df.columns:
+            # Override overlaps_nucleus: treat all cell-assigned transcripts as "in nucleus"
+            # so Proseg uses cell boundaries as the prior instead of nuclear boundaries.
+            tx_df = tx_df.copy()
+            _cid = tx_df["cell_id"]
+            # Xenium cell_id is a string ("UNASSIGNED" when not in a cell); old runs use ints
+            if pd.api.types.is_numeric_dtype(_cid):
+                _in_cell = _cid > 0
+            else:
+                _in_cell = _cid.notna() & ~_cid.isin(["UNASSIGNED", b"UNASSIGNED", ""])
+            tx_df["overlaps_nucleus"] = _in_cell.astype(tx_df["overlaps_nucleus"].dtype)
         tx_df.to_parquet(tx_path, index=False)
 
-    use_xenium_flag = prior_type != "none"
-    cmd = ([proseg_bin, "--xenium"] if use_xenium_flag else [proseg_bin]) + [tx_path,
+    # Always the --xenium preset: proseg 1.x has no mode without an initial segmentation
+    # (without the preset it stops on the missing --gene-column / --cell-id-column).
+    cmd = [proseg_bin, "--xenium", tx_path,
            "--output-cell-polygons",       poly_out,
            "--output-cell-metadata",       meta_out,
            "--output-transcript-metadata", tx_meta_out]
+    # The --xenium preset of proseg 1.x does not drop low-quality transcripts
+    # (--min-qv defaults to 0): keep Q-score ≥ 20 like the Xenium matrix / Baysor path
+    cmd += ["--min-qv", "20"]
     if voxel_size:
         cmd += ["--initial-voxel-size", str(voxel_size)]
     if n_threads:
@@ -983,25 +1430,46 @@ def _proseg_run_single(tx_df, patch_dir, proseg_bin, voxel_size, n_threads, n_sa
     tx_meta_df = None
     if os.path.exists(tx_meta_out):
         try:
-            tx_meta_df = pd.read_csv(tx_meta_out)
+            tx_meta_df = _read_proseg_tx_meta(tx_meta_out)
         except Exception:
             pass
 
     return cells_df, cell_bounds, tx_meta_df
 
 
+def _read_proseg_tx_meta(path):
+    """Proseg transcript-metadata, reduced to the gene and cell-assignment columns."""
+    return pd.read_csv(path, usecols=lambda c: c in ("gene", "cell", "assignment"),
+                       dtype={"gene": "category"})
+
+
+def _expr_gene_cols(genes, gene_to_idx):
+    """Column index per transcript gene (-1 when the gene is not in the app's gene list)."""
+    gcat = genes.astype("category")
+    lut = np.array([gene_to_idx.get(c, -1) for c in gcat.cat.categories] + [-1], dtype=np.int64)
+    return lut[gcat.cat.codes.to_numpy()]      # code -1 (missing gene) → trailing -1
+
+
 def _build_baysor_expr(seg_df, cells_df):
     """Build cell×gene CSR expression matrix from merged Baysor segmentation DataFrame."""
-    gene_names_list = list(DATA["gene_names"])
+    # measured panel genes only (DATA["gene_names"] may also list SpaGE-imputed genes)
+    gene_names_list = _panel_gene_names()
     gene_to_idx = {g: i for i, g in enumerate(gene_names_list)}
     if "gene" not in seg_df.columns:
         return None
-    cell_to_row = {c: i for i, c in enumerate(cells_df.index)}
-    panel = seg_df[seg_df["gene"].isin(gene_to_idx) & seg_df["cell"].isin(cell_to_row)].copy()
-    rows = panel["cell"].map(cell_to_row).astype(int).values
-    cols = panel["gene"].map(gene_to_idx).astype(int).values
+    # seg_df is per transcript, or already reduced to per-(cell, gene) counts in column "n"
+    _cidx = pd.Index(cells_df.index)
+    if _cidx.is_unique:
+        rows = _cidx.get_indexer(seg_df["cell"])
+    else:
+        cell_to_row = {c: i for i, c in enumerate(cells_df.index)}
+        rows = seg_df["cell"].map(cell_to_row).fillna(-1).astype("int64").to_numpy()
+    cols = _expr_gene_cols(seg_df["gene"], gene_to_idx)
+    ok = (rows >= 0) & (cols >= 0)
+    vals = (seg_df["n"].to_numpy()[ok].astype(np.float32) if "n" in seg_df.columns
+            else np.ones(int(ok.sum()), dtype=np.float32))
     mat = sp.csr_matrix(
-        (np.ones(len(rows), dtype=np.float32), (rows, cols)),
+        (vals, (rows[ok], cols[ok])),
         shape=(len(cells_df), len(gene_names_list))
     )
     print(f"  Baysor: built expression matrix {mat.shape}", flush=True)
@@ -1012,24 +1480,35 @@ def _build_proseg_expr(tx_meta_df, cells_df):
     """Build cell×gene CSR expression matrix from merged Proseg transcript-metadata."""
     if tx_meta_df is None:
         return None
-    gene_names_list = list(DATA["gene_names"])
+    # measured panel genes only (DATA["gene_names"] may also list SpaGE-imputed genes)
+    gene_names_list = _panel_gene_names()
     gene_to_idx = {g: i for i, g in enumerate(gene_names_list)}
     gene_col = "gene" if "gene" in tx_meta_df.columns else None
     cell_col = ("cell" if "cell" in tx_meta_df.columns
                 else "assignment" if "assignment" in tx_meta_df.columns else None)
     if not gene_col or not cell_col:
         return None
-    cell_to_row = {str(c): i for i, c in enumerate(cells_df.index)}
-    assigned = tx_meta_df[tx_meta_df[cell_col].notna()].copy()
+    # tx_meta_df is per transcript, or already reduced to per-(cell, gene) counts in column "n".
+    # Ids are matched as integers (no per-row string conversion).
+    ids = pd.to_numeric(tx_meta_df[cell_col], errors="coerce")
+    keep = ids.notna().to_numpy()
     if cell_col == "assignment":
         # Filter out proseg's "unassigned" sentinel value (0xFFFFFFFF)
-        assigned = assigned[assigned[cell_col] != 4294967295]
-    assigned[cell_col] = assigned[cell_col].astype(int).astype(str)
-    valid = assigned[assigned[gene_col].isin(gene_to_idx) & assigned[cell_col].isin(cell_to_row)]
-    rows = valid[cell_col].map(cell_to_row).astype(int).values
-    cols = valid[gene_col].map(gene_to_idx).astype(int).values
+        keep &= (ids != 4294967295).to_numpy()
+    ids = ids[keep].astype("int64")
+    _cidx = pd.Index(pd.to_numeric(cells_df.index, errors="coerce"))
+    if _cidx.hasnans or not _cidx.is_unique:
+        # non-integer or repeated cell ids: match as strings
+        cell_to_row = {str(c): i for i, c in enumerate(cells_df.index)}
+        rows = ids.astype(str).map(cell_to_row).fillna(-1).astype("int64").to_numpy()
+    else:
+        rows = _cidx.get_indexer(ids)
+    cols = _expr_gene_cols(tx_meta_df[gene_col][keep], gene_to_idx)
+    ok = (rows >= 0) & (cols >= 0)
+    vals = (tx_meta_df["n"].to_numpy()[keep][ok].astype(np.float32) if "n" in tx_meta_df.columns
+            else np.ones(int(ok.sum()), dtype=np.float32))
     mat = sp.csr_matrix(
-        (np.ones(len(rows), dtype=np.float32), (rows, cols)),
+        (vals, (rows[ok], cols[ok])),
         shape=(len(cells_df), len(gene_names_list))
     )
     print(f"  Proseg: built expression matrix {mat.shape}", flush=True)
@@ -1040,7 +1519,7 @@ def _load_zarr_obs_into_df(zarr_path: str, cells_df: pd.DataFrame) -> None:
     """Read obs columns from a SpatialData zarr and merge any missing ones into cells_df in-place."""
     try:
         import zarr as _zarr_mod
-        _zgrp = _zarr_mod.open_group(zarr_path, mode="r")
+        _zgrp = _zarr_mod.open_group(zarr_path, mode="r", use_consolidated=False)
         _obs = _zgrp["tables"]["table"]["obs"]
         _idx_key = _obs.attrs.get("_index", "_index")
         _zarr_idx = [str(v) for v in _obs[_idx_key][:]] if _idx_key in _obs else None
@@ -1050,12 +1529,15 @@ def _load_zarr_obs_into_df(zarr_path: str, cells_df: pd.DataFrame) -> None:
         if _zarr_idx is not None and len(_zarr_idx) > 0:
             import re as _re
             _stripped = [_re.sub(r'^p\d+_', '', _id) for _id in _zarr_idx]
-            _n = min(30, len(_zarr_idx))
-            if (len(set(_zarr_idx[:_n]) & set(cells_df.index[:_n].tolist())) == 0
-                    and len(set(_stripped[:_n]) & set(cells_df.index[:_n].tolist())) > 0):
+            # Compare the whole index: the two frames can hold the same cells in a
+            # different order, so a leading sample is not representative.
+            _df_ids  = pd.Index(cells_df.index.astype(str))
+            _n_raw   = int(pd.Index(_zarr_idx).isin(_df_ids).sum())
+            _n_strip = int(pd.Index(_stripped).isin(_df_ids).sum())
+            if max(_n_raw, _n_strip) >= 0.5 * len(_zarr_idx) and _n_strip > _n_raw:
                 print(f"  Stripping patch prefix from zarr obs index ({_zarr_idx[0]!r} → {_stripped[0]!r})", flush=True)
                 _zarr_idx = _stripped
-            elif len(set(_zarr_idx[:_n]) & set(cells_df.index[:_n].tolist())) == 0:
+            elif max(_n_raw, _n_strip) < 0.5 * len(_zarr_idx):
                 # Genuinely different run — skip, let caller recompute
                 print(f"  Warning: zarr obs index mismatch "
                       f"({_zarr_idx[0]!r} vs {cells_df.index[0]!r}). "
@@ -1068,13 +1550,37 @@ def _load_zarr_obs_into_df(zarr_path: str, cells_df: pd.DataFrame) -> None:
                 try:
                     _vals = _obs[_col][:]
                     if _zarr_idx is not None:
-                        cells_df[_col] = pd.Series(_vals, index=_zarr_idx).reindex(cells_df.index).values
+                        cells_df[_col] = pd.Series(_vals, index=_zarr_idx).reindex(
+                            cells_df.index.astype(str)).values
                     else:
                         cells_df[_col] = _vals
                 except Exception:
                     pass
     except Exception as _ze:
         print(f"  Warning: could not load obs from zarr: {_ze}", flush=True)
+
+
+def _align_zarr_rows_to_cells(mat, zarr_ids, cells_df, tool_label: str):
+    """Reorder the rows of a zarr table matrix (one row per zarr obs) into cells_df
+    order by cell id; cells missing from the zarr get zero rows. Returns None when
+    the two id sets do not match (the caller then has no corrected counts)."""
+    if mat is None:
+        return None
+    _zids  = pd.Index([str(i) for i in zarr_ids])
+    _dfids = pd.Index(cells_df.index.astype(str))
+    if len(_zids) == len(_dfids) and (_zids == _dfids).all():
+        return mat
+    _zstrip = _zids.str.replace(r'^p\d+_', '', regex=True)
+    _use = _zids if _zids.isin(_dfids).sum() >= _zstrip.isin(_dfids).sum() else _zstrip
+    _pos = _use.get_indexer(_dfids) if not _use.has_duplicates else np.full(len(_dfids), -1)
+    if len(_dfids) == 0 or mat.shape[0] != len(_zids) or (_pos >= 0).mean() < 0.99:
+        print(f"  Warning: {tool_label} X_corrected rows do not match the loaded cells "
+              f"— SPLIT-corrected counts not loaded (re-run SPLIT)", flush=True)
+        return None
+    _ok  = np.where(_pos >= 0)[0]
+    _coo = sp.csr_matrix(mat)[_pos[_ok], :].tocoo()
+    return sp.csr_matrix((_coo.data, (_ok[_coo.row], _coo.col)),
+                         shape=(len(_dfids), mat.shape[1]))
 
 
 def _load_zarr_boundaries_into_dict(sdata, cell_bounds: dict, tool_label: str) -> None:
@@ -1092,11 +1598,26 @@ def _load_zarr_boundaries_into_dict(sdata, cell_bounds: dict, tool_label: str) -
         print(f"  Loaded {len(cell_bounds):,} {tool_label} boundaries from zarr shapes", flush=True)
 
 
-def _update_reseg_zarr_obs(zarr_path: str, cells_df: pd.DataFrame) -> None:
+# One lock per SpatialData store for the low-level table writers below (obs
+# columns, X_corrected, imputed genes), so two of them never rewrite the same
+# table at once. _sdata_lock only guards _sdata_state and is not held for I/O.
+_zarr_write_locks: dict = {}
+_zarr_write_locks_guard = threading.Lock()
+
+
+def _zarr_write_lock(path: str):
+    with _zarr_write_locks_guard:
+        return _zarr_write_locks.setdefault(os.path.abspath(path), threading.RLock())
+
+
+def _update_reseg_zarr_obs(zarr_path: str, cells_df: pd.DataFrame, force_cols=()) -> None:
     """Update the obs (cell metadata) in a reseg SpatialData zarr with new columns from cells_df.
-    Writes directly via zarr low-level API to avoid spatialdata's 'target path in use' error."""
+    Writes directly via zarr low-level API to avoid spatialdata's 'target path in use' error.
+    Columns named in force_cols are rewritten even when they already exist."""
     if not os.path.isdir(zarr_path):
         return
+    _zlock = _zarr_write_lock(zarr_path)
+    _zlock.acquire()
     try:
         import zarr as _zarr_mod
         _zroot = _zarr_mod.open_group(zarr_path, mode="r+", use_consolidated=False)
@@ -1109,7 +1630,7 @@ def _update_reseg_zarr_obs(zarr_path: str, cells_df: pd.DataFrame) -> None:
         new_cols = [c for c in cells_df.columns
                     if c not in existing_cols or c.startswith("roi_")
                     or c.startswith("split_umap_") or c == "cluster_split_10"
-                    or c == "cell_area"]
+                    or c == "cell_area" or c in force_cols]
         if not new_cols:
             return
         # Read the existing index to align values correctly
@@ -1118,23 +1639,22 @@ def _update_reseg_zarr_obs(zarr_path: str, cells_df: pd.DataFrame) -> None:
             _existing_idx = [str(v) for v in _obs_grp[_idx_key][:]]
         else:
             _existing_idx = None
-        # Detect stale zarr index (different run): update zarr index to match cells_df.
+        # Detect a zarr that belongs to a different cell set. Compare the whole index
+        # (same cells can be stored in another order) and never rewrite the obs index:
+        # X, layers and the other obs columns would keep the old rows.
         # First strip any patch prefix (p0_, p1_, ...) from existing index before comparing.
         if _existing_idx is not None and len(_existing_idx) > 0:
             import re as _re2
             _stripped_existing = [_re2.sub(r'^p\d+_', '', _id) for _id in _existing_idx]
-            _n = min(30, len(_existing_idx))
-            _df_sample = set(cells_df.index[:_n].astype(str).tolist())
-            _raw_overlap      = len(set(_existing_idx[:_n]) & _df_sample)
-            _stripped_overlap = len(set(_stripped_existing[:_n]) & _df_sample)
-            _overlap = _raw_overlap or _stripped_overlap
-            if _overlap == 0:
-                print(f"  Updating stale zarr obs index to match current cells_df", flush=True)
-                _new_idx = np.array(list(cells_df.index.astype(str)), dtype=str)
-                _obs_grp.create_dataset(_idx_key, data=_new_idx, shape=_new_idx.shape,
-                                        dtype=_new_idx.dtype, overwrite=True)
-                _existing_idx = list(cells_df.index.astype(str))
-            elif _raw_overlap == 0 and _stripped_overlap > 0:
+            _df_ids = pd.Index(cells_df.index.astype(str))
+            _raw_overlap      = int(pd.Index(_existing_idx).isin(_df_ids).sum())
+            _stripped_overlap = int(pd.Index(_stripped_existing).isin(_df_ids).sum())
+            if max(_raw_overlap, _stripped_overlap) < 0.5 * len(_existing_idx):
+                print(f"  Warning: zarr obs index does not match current cells_df "
+                      f"({max(_raw_overlap, _stripped_overlap):,}/{len(_existing_idx):,} ids) "
+                      f"— not updating {os.path.basename(zarr_path)}", flush=True)
+                return
+            elif _stripped_overlap > _raw_overlap:
                 # Zarr uses p{N}_ patch prefix but cells_df uses bare IDs — strip for reindex
                 _existing_idx = _stripped_existing
         try:
@@ -1163,6 +1683,8 @@ def _update_reseg_zarr_obs(zarr_path: str, cells_df: pd.DataFrame) -> None:
         print(f"  Updated zarr obs: added {new_cols} to {os.path.basename(zarr_path)}", flush=True)
     except Exception as _e:
         print(f"  Warning: failed to update zarr obs ({_e})", flush=True)
+    finally:
+        _zlock.release()
 
 
 def _build_reseg_sdata(cells_df, cell_bounds, expr_mat, gene_names, source, out_dir) -> str:
@@ -1177,6 +1699,10 @@ def _build_reseg_sdata(cells_df, cell_bounds, expr_mat, gene_names, source, out_
         print("  Warning: spatialdata/geopandas/shapely not available — skipping reseg zarr", flush=True)
         return ""
 
+    if expr_mat is not None and expr_mat.shape[1] < len(gene_names):
+        # callers pass DATA["gene_names"]: panel genes first, then any genes imputed
+        # into the Xenium table, which the reseg matrix does not have
+        gene_names = list(gene_names)[:expr_mat.shape[1]]
     var_df = pd.DataFrame({"is_imputed": False}, index=list(gene_names))
     obs_df = cells_df.copy()
     obs_df.index = obs_df.index.astype(str)
@@ -1220,6 +1746,11 @@ def _build_reseg_sdata(cells_df, cell_bounds, expr_mat, gene_names, source, out_
 
     zarr_path = os.path.join(out_dir, f"spatialdata_{source}.zarr")
     try:
+        # A re-run into the same cache dir must replace the previous run's store
+        # (sdata.write refuses to overwrite and the old cells would be loaded later).
+        if os.path.isdir(zarr_path):
+            import shutil
+            shutil.rmtree(zarr_path)
         sdata.write(zarr_path)
         print(f"  Reseg zarr written: {zarr_path}", flush=True)
     except Exception as e:
@@ -1327,14 +1858,93 @@ def _fast_load_reseg_zarr(zarr_path: str):
     return cells_df, expr_mat, X_corrected, corr_imp_genes, cell_bounds
 
 
+def _reseg_zarr_gene_index(zarr_path: str, n_cols: int) -> dict:
+    """Result-dict entries ('gene_name_to_idx', 'imputed_genes') for a reseg zarr whose
+    table holds SpaGE-imputed columns, so a run reloaded from its cache lists and
+    indexes them like the session that imputed them. Empty for a panel-only table."""
+    try:
+        import zarr as _zarr_mod
+        _var = _zarr_mod.open_group(zarr_path, mode="r",
+                                    use_consolidated=False)["tables"]["table"]["var"]
+        _names = [str(v) for v in _var[_var.attrs.get("_index", "_index")][:]]
+        if "is_imputed" not in _var or len(_names) != n_cols:
+            return {}
+        _imp = np.asarray(_var["is_imputed"][:]).astype(bool)
+        if not _imp.any():
+            return {}
+        return {"gene_name_to_idx": {g: i for i, g in enumerate(_names)},
+                "imputed_genes":    [g for g, f in zip(_names, _imp) if f]}
+    except Exception as _ge:
+        print(f"  Warning: could not read gene index from reseg zarr: {_ge}", flush=True)
+        return {}
+
+
+def _reseg_patch_keep_mask(out_dir: str, zarr_path: str, ids, patch_idx, x, y,
+                           n_tx=None, polys=None):
+    """Slow-path cache load of a patch run: which of the cells read from the patch_XXXX
+    directories did the live run keep? Taken from the run's zarr table when it exists,
+    else recomputed from the patch layout stored in params.json ('patch_bounds'):
+    centroid ownership, then - for runs whose params.json records 'seam_dedup' - the
+    same seam de-duplication (needs *n_tx* and the boundaries *polys*, id → (xs, ys)).
+    Returns a bool mask over *ids*, or None when neither is available."""
+    ids = pd.Index([str(i) for i in ids])
+    try:
+        if os.path.isdir(zarr_path):
+            import zarr as _zarr_mod
+            _obs = _zarr_mod.open_group(zarr_path, mode="r",
+                                        use_consolidated=False)["tables"]["table"]["obs"]
+            _zids = pd.Index([str(v) for v in _obs[_obs.attrs.get("_index", "_index")][:]])
+            # live Baysor patch runs prefix the ids with "p<patch>_"
+            for _z in (_zids, _zids.str.replace(r'^p\d+_', '', regex=True)):
+                if len(_z) and _z.isin(ids).all():
+                    return np.asarray(ids.isin(_z))
+    except Exception as _ke:
+        print(f"  Warning: could not read cell ids from reseg zarr: {_ke}", flush=True)
+    try:
+        with open(os.path.join(out_dir, "params.json")) as _pf:
+            _params = json.load(_pf)
+        _pb = [tuple(float(v) for v in b) for b in (_params.get("patch_bounds") or [])]
+    except Exception:
+        _params, _pb = {}, []
+    if not _pb:
+        return None
+    patch_idx = np.asarray(patch_idx)
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    if _params.get("patch_ok") is not None:
+        _ok = sorted(int(p) for p in _params["patch_ok"] if 0 <= int(p) < len(_pb))
+    else:
+        _ok = sorted(int(p) for p in set(patch_idx.tolist()) if 0 <= p < len(_pb))
+    keep = np.zeros(len(ids), dtype=bool)
+    for _pi in _ok:
+        x0, y0, x1, y1 = _pb[_pi]
+        _idx = np.where((patch_idx == _pi) & (x >= x0) & (x < x1) & (y >= y0) & (y < y1))[0]
+        keep[_idx] = _patch_owned_mask(x[_idx], y[_idx], _pi, _pb, _ok)
+    _cfg = _params.get("seam_dedup")
+    if _cfg:
+        _k = np.where(keep)[0]
+        _seam = _patch_seam_dedup_mask(
+            ids[_k], patch_idx[_k], x[_k], y[_k],
+            None if n_tx is None else np.asarray(n_tx, dtype=float)[_k],
+            polys, _pb, _ok, cfg=_cfg)
+        keep[_k[~_seam]] = False
+    return keep
+
+
 def _load_cached_baysor(out_dir: str) -> None:
     """Load a cached Baysor result from disk into _baysor_state."""
+    _gen = _dataset_gen
+
     def _set(status, message, result=None):
         with _baysor_lock:
+            if _stale_job(_gen, status):
+                return
             _baysor_state["status"]  = status
             _baysor_state["message"] = message
             if result is not None:
                 _baysor_state["result"] = result
+            if status != "running":
+                _baysor_state["loading_out_dir"] = None   # see load_seg_run_from_cache
     print(f"Loading cached Baysor: {os.path.basename(out_dir)}…", flush=True)
     try:
         _set("running", "Loading cached Baysor result…")
@@ -1390,10 +2000,13 @@ def _load_cached_baysor(out_dir: str) -> None:
                     "split_corrected_imputed_genes": _baysor_corr_imp,
                     "spage_result_path": _spage_rpath,
                     "spage_result_genes": _spage_rgenes,
+                    **_reseg_zarr_gene_index(zarr_path_fast, expr_mat.shape[1]),
                 })
                 print(f"Loaded cached Baysor (fast): {n_cells:,} cells, "
                       f"{len(cell_bounds):,} boundaries", flush=True)
                 return
+            except _DatasetChanged:
+                raise
             except Exception as _fe:
                 print(f"  Fast zarr load failed ({_fe}), falling back to CSV…", flush=True)
 
@@ -1402,7 +2015,10 @@ def _load_cached_baysor(out_dir: str) -> None:
         seg_parts = []
         for root, dirs, files in os.walk(out_dir):
             if "segmentation.csv" in files:
-                seg_parts.append(pd.read_csv(os.path.join(root, "segmentation.csv")))
+                _part = pd.read_csv(os.path.join(root, "segmentation.csv"))
+                _pm = re.fullmatch(r"patch_(\d+)", os.path.basename(root))
+                _part["_patch"] = int(_pm.group(1)) if _pm else -1
+                seg_parts.append(_part)
         if not seg_parts:
             _set("error", f"segmentation.csv not found in {out_dir}")
             return
@@ -1414,11 +2030,12 @@ def _load_cached_baysor(out_dir: str) -> None:
         cells_df = (
             seg.groupby("cell")
             .agg(x_centroid=(x_col, "mean"), y_centroid=(y_col, "mean"),
-                 transcript_counts=(x_col, "count"))
+                 transcript_counts=(x_col, "count"), _patch=("_patch", "first"))
             .rename_axis("cell_id")
         )
         cells_df.index = cells_df.index.astype(str)
-        # Build cell boundaries from polygon files
+        # Build cell boundaries from polygon files (before the patch merge below, which
+        # uses them for the seam de-duplication)
         cell_bounds: dict = {}
         for root, dirs, files in os.walk(out_dir):
             for poly_name in ("segmentation_polygons_2d.json", "segmentation_polygons.json",
@@ -1434,6 +2051,25 @@ def _load_cached_baysor(out_dir: str) -> None:
                         if coords:
                             cell_bounds[cid] = ([c[0] for c in coords], [c[1] for c in coords])
                     break  # only one polygon file per dir needed
+        # Patch run: the per-patch CSVs also hold the cells of the overlap buffers that
+        # the live run gave to one patch only - keep the cells the live run kept.
+        _pkeep = None
+        if (cells_df["_patch"] >= 0).any():
+            _pkeep = _reseg_patch_keep_mask(
+                out_dir, os.path.join(out_dir, "spatialdata_baysor.zarr"), cells_df.index,
+                cells_df["_patch"].values, cells_df["x_centroid"].values,
+                cells_df["y_centroid"].values,
+                n_tx=cells_df["transcript_counts"].values, polys=cell_bounds)
+            if _pkeep is None:
+                print("  Warning: Baysor patch run without zarr table or stored patch layout "
+                      "— cells in the patch overlaps may be loaded twice", flush=True)
+            else:
+                cells_df = cells_df[_pkeep]
+                seg = seg[seg["cell"].isin(cells_df.index)]
+        cells_df = cells_df.drop(columns="_patch")
+        if _pkeep is not None:
+            _kept_ids = set(cells_df.index)
+            cell_bounds = {k: v for k, v in cell_bounds.items() if k in _kept_ids}
         expr_mat = _build_baysor_expr(seg, cells_df)
         n_cells = len(cells_df)
 
@@ -1448,6 +2084,7 @@ def _load_cached_baysor(out_dir: str) -> None:
                 _set("running", f"Computing UMAP and clusters for {n_cells:,} cells…")
                 _compute_reseg_clusters_umap(cells_df, expr_mat,
                                              progress_fn=lambda msg: _set("running", msg))
+            _check_dataset_gen(_gen)   # DATA["gene_names"] must be this run's dataset
             zarr_path = _build_reseg_sdata(
                 cells_df, cell_bounds, expr_mat, DATA["gene_names"], "baysor", out_dir
             )
@@ -1476,6 +2113,9 @@ def _load_cached_baysor(out_dir: str) -> None:
                     sp.csr_matrix(_adata_b.layers["X_corrected"])
                     if "X_corrected" in _adata_b.layers else None
                 )
+                # cells_df here is rebuilt from the CSVs: align the zarr rows by id
+                _baysor_corr = _align_zarr_rows_to_cells(
+                    _baysor_corr, _adata_b.obs_names, cells_df, "Baysor")
                 _baysor_corr_imp = list(_adata_b.uns.get("split_corrected_imputed_genes", []))
                 _load_zarr_boundaries_into_dict(_sdata_b, cell_bounds, "Baysor")
             except Exception as _ze2:
@@ -1546,12 +2186,18 @@ def _load_proseg_patch_boundaries(out_dir: str, patch_names: list) -> dict:
 
 def _load_cached_proseg(out_dir: str) -> None:
     """Load a cached Proseg result from disk into _proseg_state."""
+    _gen = _dataset_gen
+
     def _set(status, message, result=None):
         with _proseg_lock:
+            if _stale_job(_gen, status):
+                return
             _proseg_state["status"]  = status
             _proseg_state["message"] = message
             if result is not None:
                 _proseg_state["result"] = result
+            if status != "running":
+                _proseg_state["loading_out_dir"] = None   # see load_seg_run_from_cache
     print(f"Loading cached Proseg: {os.path.basename(out_dir)}…", flush=True)
     try:
         _set("running", "Loading cached Proseg result…")
@@ -1651,6 +2297,9 @@ def _load_cached_proseg(out_dir: str) -> None:
                     ])
                     if _fp_patch_names:
                         cell_bounds = _load_proseg_patch_boundaries(out_dir, _fp_patch_names)
+                        # the files also hold the cells the patch merge did not keep
+                        _fp_ids = set(cells_df.index.astype(str))
+                        cell_bounds = {k: v for k, v in cell_bounds.items() if k in _fp_ids}
                         if cell_bounds:
                             print(f"  Proseg: loaded {len(cell_bounds):,} patch boundaries "
                                   f"(polygon files)", flush=True)
@@ -1664,10 +2313,13 @@ def _load_cached_proseg(out_dir: str) -> None:
                     "split_corrected_imputed_genes": _proseg_corr_imp,
                     "spage_result_path": _spage_rpath,
                     "spage_result_genes": _spage_rgenes,
+                    **_reseg_zarr_gene_index(zarr_path_fast, expr_mat.shape[1]),
                 })
                 print(f"Loaded cached Proseg (fast): {n_cells:,} cells, "
                       f"{len(cell_bounds):,} boundaries", flush=True)
                 return
+            except _DatasetChanged:
+                raise
             except Exception as _fe:
                 print(f"  Fast zarr load failed ({_fe}), falling back to CSV…", flush=True)
 
@@ -1692,10 +2344,12 @@ def _load_cached_proseg(out_dir: str) -> None:
                 _df     = pd.read_csv(os.path.join(_pdir, "cell-metadata.csv.gz"))
                 _remap  = {int(lid): int(lid) + _offset for lid in _df["cell"].values}
                 _df["cell"] = _df["cell"].map(_remap)
+                _pm = re.fullmatch(r"patch_(\d+)", _pname)
+                _df["_patch"] = int(_pm.group(1)) if _pm else -1
                 meta_parts.append(_df)
                 _tx_path = os.path.join(_pdir, "transcript-metadata.csv.gz")
                 if os.path.exists(_tx_path):
-                    _tx_df = pd.read_csv(_tx_path)
+                    _tx_df = _read_proseg_tx_meta(_tx_path)
                     if "assignment" in _tx_df.columns:
                         _mask = _tx_df["assignment"] != _PROSEG_UNASSIGNED
                         _tx_df = _tx_df.copy()
@@ -1712,7 +2366,7 @@ def _load_cached_proseg(out_dir: str) -> None:
                 if "cell-metadata.csv.gz" in _files:
                     meta_parts.append(pd.read_csv(os.path.join(_root, "cell-metadata.csv.gz")))
                 if "transcript-metadata.csv.gz" in _files:
-                    tx_parts.append(pd.read_csv(os.path.join(_root, "transcript-metadata.csv.gz")))
+                    tx_parts.append(_read_proseg_tx_meta(os.path.join(_root, "transcript-metadata.csv.gz")))
         if not meta_parts:
             _set("error", f"cell-metadata.csv.gz not found in {out_dir}")
             return
@@ -1725,10 +2379,30 @@ def _load_cached_proseg(out_dir: str) -> None:
         if "cell_id" in cells_df.columns:
             cells_df = cells_df.set_index("cell_id")
         cells_df.index = cells_df.index.astype(str)
-        # Build cell boundaries from polygon files.
+        # Patch run: sopa patches overlap, and the live run gave each cell of an overlap
+        # to one patch only - keep the cells the live run kept.
+        # Cell boundaries from the polygon files come first: the patch merge uses them
+        # for the seam de-duplication.
         cell_bounds: dict = {}
         if _patch_names:
             cell_bounds = _load_proseg_patch_boundaries(out_dir, _patch_names)
+        _pkeep = None
+        if "_patch" in cells_df.columns:
+            _pkeep = _reseg_patch_keep_mask(
+                out_dir, os.path.join(out_dir, "spatialdata_proseg.zarr"), cells_df.index,
+                cells_df["_patch"].values, cells_df["x_centroid"].values,
+                cells_df["y_centroid"].values,
+                n_tx=cells_df["transcript_counts"].values, polys=cell_bounds)
+            if _pkeep is None:
+                print("  Warning: Proseg patch run without zarr table or stored patch layout "
+                      "— cells in the patch overlaps may be loaded twice", flush=True)
+            else:
+                cells_df = cells_df[_pkeep]
+            cells_df = cells_df.drop(columns="_patch")
+        if _patch_names:
+            if _pkeep is not None:
+                _kept_ids = set(cells_df.index)
+                cell_bounds = {k: v for k, v in cell_bounds.items() if k in _kept_ids}
             if cell_bounds:
                 print(f"  Proseg: loaded {len(cell_bounds):,} patch boundaries", flush=True)
         else:
@@ -1770,6 +2444,7 @@ def _load_cached_proseg(out_dir: str) -> None:
                 _set("running", f"Computing UMAP and clusters for {n_cells:,} cells…")
                 _compute_reseg_clusters_umap(cells_df, expr_mat,
                                              progress_fn=lambda msg: _set("running", msg))
+            _check_dataset_gen(_gen)   # DATA["gene_names"] must be this run's dataset
             zarr_path = _build_reseg_sdata(
                 cells_df, cell_bounds, expr_mat, DATA["gene_names"], "proseg", out_dir
             )
@@ -1809,6 +2484,9 @@ def _load_cached_proseg(out_dir: str) -> None:
                     sp.csr_matrix(_adata_p.layers["X_corrected"])
                     if "X_corrected" in _adata_p.layers else None
                 )
+                # cells_df here is rebuilt from the CSVs: align the zarr rows by id
+                _proseg_corr = _align_zarr_rows_to_cells(
+                    _proseg_corr, _adata_p.obs_names, cells_df, "Proseg")
                 _proseg_corr_imp = list(_adata_p.uns.get("split_corrected_imputed_genes", []))
                 _load_zarr_boundaries_into_dict(_sdata_p, cell_bounds, "Proseg")
             except Exception as _ze2:
@@ -1835,11 +2513,14 @@ def _load_cached_proseg(out_dir: str) -> None:
 def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
                 x_min=None, x_max=None, y_min=None, y_max=None,
                 scale_std=None, n_clusters=10, use_patches=True,
-                prior_type: str = "nucleus") -> None:
+                prior_type: str = "nucleus", qv_min: float = 20) -> None:
     """Background thread: run Baysor resegmentation, using sopa patches if available."""
+    _gen = _dataset_gen
 
     def _set(status, message, result=None):
         with _baysor_lock:
+            if _stale_job(_gen, status):
+                return
             _baysor_state["status"]  = status
             _baysor_state["message"] = message
             if result is not None:
@@ -1862,67 +2543,17 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
         return None
 
     try:
+        if not DATA.get("data_dir"):
+            _set("error", "Resegmentation needs the original Xenium output directory "
+                          "(transcripts.parquet); this dataset was loaded from a .zarr.")
+            return
         baysor_bin = _find_baysor()
         if baysor_bin is None:
             _set("error", "baysor not found. Install from github.com/kharchenkolab/Baysor")
             return
         print(f"  Using baysor: {baysor_bin}", flush=True)
 
-        _param_str = (f"s{scale}_ss{scale_std}_m{min_mol}_i{n_clusters}_p{int(use_prior)}"
-                      f"{'_c'+str(prior_conf) if use_prior else ''}"
-                      f"{'_pt'+prior_type if use_prior else ''}"
-                      f"_x{x_min or 'A'}-{x_max or 'A'}_y{y_min or 'A'}-{y_max or 'A'}")
-        _param_tag = hashlib.md5(_param_str.encode()).hexdigest()[:8]
-        out_dir = os.path.join(CACHE_BASE_DIR,
-                               f"baysor_{os.path.basename(DATA['data_dir'])}_{_param_tag}")
-        os.makedirs(out_dir, exist_ok=True)
-        print(f"  Baysor: cache dir = {os.path.basename(out_dir)} ({_param_str})", flush=True)
-
-        # ── Load & prepare all transcripts (once) ────────────────────────
-        _set("running", "Loading transcripts…")
-        import pyarrow.parquet as _pq
-        _tx_path = os.path.join(DATA["data_dir"], "transcripts.parquet")
-        _tx_schema_cols = _pq.read_schema(_tx_path).names
-        _tx_cols = ["x_location", "y_location", "feature_name", "cell_id"]
-        if "overlaps_nucleus" in _tx_schema_cols:
-            _tx_cols.append("overlaps_nucleus")
-        tx_all = pd.read_parquet(
-            os.path.join(DATA["data_dir"], "transcripts.parquet"),
-            columns=_tx_cols,
-        )
-        # Map Xenium string cell IDs → integers (0 = unassigned)
-        cid = tx_all["cell_id"].astype(str)
-        _unassigned = {"UNASSIGNED", "nan", "None", "<NA>", ""}
-        unique_assigned = [c for c in cid.unique() if c not in _unassigned]
-        id_map = {c: i + 1 for i, c in enumerate(unique_assigned)}
-        tx_all["cell_id"] = cid.map(id_map).fillna(0).astype("int64")
-        # Build nucleus_prior_id: cell_id only for transcripts overlapping a nucleus.
-        # This gives Baysor a tighter nuclear prior instead of the full cell boundary prior.
-        if prior_type == "nucleus":
-            if "overlaps_nucleus" in tx_all.columns:
-                tx_all["nucleus_prior_id"] = (
-                    tx_all["cell_id"].where(tx_all["overlaps_nucleus"].astype(bool), 0)
-                )
-                print(f"  Baysor: nucleus prior — "
-                      f"{int((tx_all['nucleus_prior_id'] != 0).sum()):,} / {len(tx_all):,} "
-                      f"transcripts inside nuclei", flush=True)
-            else:
-                tx_all["nucleus_prior_id"] = tx_all["cell_id"]
-                print("  Baysor: overlaps_nucleus column not found — using cell_id as prior", flush=True)
-        else:
-            # prior_type == "cell": use all cell-assigned transcripts as prior (no nucleus restriction).
-            # _baysor_run_single falls back to "cell_id" column when "nucleus_prior_id" is absent.
-            print(f"  Baysor: cell boundary prior — "
-                  f"{int((tx_all['cell_id'] != 0).sum()):,} / {len(tx_all):,} "
-                  f"transcripts in cells", flush=True)
-
-        # Apply user's region filter
-        if x_min is not None: tx_all = tx_all[tx_all["x_location"] >= x_min]
-        if x_max is not None: tx_all = tx_all[tx_all["x_location"] <= x_max]
-        if y_min is not None: tx_all = tx_all[tx_all["y_location"] >= y_min]
-        if y_max is not None: tx_all = tx_all[tx_all["y_location"] <= y_max]
-
-        # ── Check for sopa patches ────────────────────────────────────────
+        # ── Check for sopa patches (first: the patch layout is part of the cache tag) ──
         patch_bounds = _get_patch_bounds_um() if use_patches else None
         # Intersect patches with user region filter
         if patch_bounds and any(v is not None for v in [x_min, x_max, y_min, y_max]):
@@ -1938,22 +2569,105 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
                 ))
             patch_bounds = filtered or None
 
+        _A = lambda v: "A" if v is None else v
+        _param_str = (f"s{scale}_ss{scale_std}_m{min_mol}_i{n_clusters}_p{int(use_prior)}"
+                      f"{'_c'+str(prior_conf) if use_prior else ''}"
+                      f"{'_pt'+prior_type if use_prior else ''}"
+                      f"_x{_A(x_min)}-{_A(x_max)}_y{_A(y_min)}-{_A(y_max)}")
+        # Appended only when it applies, so non-patch runs keep their previous tag
+        if qv_min != 20:
+            _param_str += f"_qv{qv_min}"
+        if patch_bounds:
+            _param_str += f"_pb{_patch_bounds_tag(patch_bounds)}"
+        _param_tag = hashlib.md5(_param_str.encode()).hexdigest()[:8]
+        out_dir = _seg_run_dir("baysor", _param_tag)
+        os.makedirs(out_dir, exist_ok=True)
+        print(f"  Baysor: cache dir = {os.path.basename(out_dir)} ({_param_str})", flush=True)
+
+        # ── Transcript reader: one region at a time, filtered while reading ──
+        _set("running", "Loading transcripts…")
+        import pyarrow as _pa
+        import pyarrow.parquet as _pq
+        _tx_path = os.path.join(DATA["data_dir"], "transcripts.parquet")
+        _tx_schema = _pq.read_schema(_tx_path)
+        _tx_schema_cols = _tx_schema.names
+        _tx_cols = ["x_location", "y_location", "feature_name", "cell_id"]
+        if "overlaps_nucleus" in _tx_schema_cols:
+            _tx_cols.append("overlaps_nucleus")
+        # Dictionary-encode the string columns (no per-row Python strings)
+        _tx_dict_cols = [
+            c for c in ("feature_name", "cell_id")
+            if _pa.types.is_string(_tx_schema.field(c).type)
+            or _pa.types.is_large_string(_tx_schema.field(c).type)
+            or _pa.types.is_binary(_tx_schema.field(c).type)
+        ]
+        # Same transcript set as the Xenium cell-feature matrix: Q-score ≥ qv_min, genes only
+        _tx_filters = _tx_gene_filters(_tx_schema_cols, qv_min)
+        _unassigned = {"UNASSIGNED", "nan", "None", "<NA>", ""}
+
+        def _as_str_cat(col):
+            col = col if isinstance(col.dtype, pd.CategoricalDtype) else col.astype("category")
+            _cats = col.cat.categories
+            if len(_cats) and isinstance(_cats[0], bytes):
+                col = col.cat.rename_categories([c.decode() for c in _cats])
+            return col
+
+        def _load_tx(bx0, bx1, by0, by1):
+            tx = _read_tx_region(_tx_path, _tx_cols, bx0, bx1, by0, by1,
+                                 extra_filters=_tx_filters, read_dictionary=_tx_dict_cols)
+            tx["feature_name"] = _as_str_cat(tx["feature_name"])
+            if "is_gene" not in _tx_schema_cols:
+                _fcats = pd.Index(tx["feature_name"].cat.categories.astype(str))
+                tx = tx[~tx["feature_name"].isin(_fcats[_fcats.str.match(_TX_CONTROL_RE)])].copy()
+            # Map Xenium string cell IDs → integers (0 = unassigned); ids only need to be
+            # consistent within one Baysor run, so they are numbered per loaded region.
+            _cid = _as_str_cat(tx["cell_id"])
+            _bad = pd.Index(_cid.cat.categories.astype(str)).isin(_unassigned)
+            _lut = np.zeros(len(_bad) + 1, dtype="int64")      # last slot: code -1 (null)
+            _lut[:-1][~_bad] = np.arange(1, int((~_bad).sum()) + 1)
+            tx["cell_id"] = _lut[_cid.cat.codes.to_numpy()]
+            # Build nucleus_prior_id: cell_id only for transcripts overlapping a nucleus.
+            # This gives Baysor a tighter nuclear prior instead of the full cell boundary prior.
+            if prior_type == "nucleus":
+                if "overlaps_nucleus" in tx.columns:
+                    tx["nucleus_prior_id"] = (
+                        tx["cell_id"].where(tx["overlaps_nucleus"].astype(bool), 0)
+                    )
+                    print(f"  Baysor: nucleus prior — "
+                          f"{int((tx['nucleus_prior_id'] != 0).sum()):,} / {len(tx):,} "
+                          f"transcripts inside nuclei", flush=True)
+                else:
+                    tx["nucleus_prior_id"] = tx["cell_id"]
+                    print("  Baysor: overlaps_nucleus column not found — using cell_id as prior", flush=True)
+            else:
+                # prior_type == "cell": use all cell-assigned transcripts as prior (no nucleus restriction).
+                # _baysor_run_single falls back to "cell_id" column when "nucleus_prior_id" is absent.
+                print(f"  Baysor: cell boundary prior — "
+                      f"{int((tx['cell_id'] != 0).sum()):,} / {len(tx):,} "
+                      f"transcripts in cells", flush=True)
+            return tx
+
         if patch_bounds:
             n_patches = len(patch_bounds)
             print(f"  Baysor: using {n_patches} sopa patch(es)", flush=True)
+            ok_patches: list  = []   # indices of patches that returned cells
 
             all_cells: list   = []
             all_bounds: dict  = {}
             all_seg: list     = []
-            buf = float(scale)  # overlap buffer = cell radius
+            # overlap buffer = cell radius; scale -1 means "estimate from prior" → use the default 20 µm
+            buf = float(scale) if (scale is not None and float(scale) > 0) else 20.0
 
             for pi, (px0, py0, px1, py1) in enumerate(patch_bounds):
                 _set("running", f"Baysor patch {pi + 1}/{n_patches}…")
-                # Filter with overlap buffer so cells at edges are fully captured
-                tx_patch = tx_all[
-                    (tx_all["x_location"] >= px0 - buf) & (tx_all["x_location"] <= px1 + buf) &
-                    (tx_all["y_location"] >= py0 - buf) & (tx_all["y_location"] <= py1 + buf)
-                ]
+                # Read with overlap buffer so cells at edges are fully captured
+                # (clipped to the user's region filter)
+                tx_patch = _load_tx(
+                    px0 - buf if x_min is None else max(px0 - buf, x_min),
+                    px1 + buf if x_max is None else min(px1 + buf, x_max),
+                    py0 - buf if y_min is None else max(py0 - buf, y_min),
+                    py1 + buf if y_max is None else min(py1 + buf, y_max),
+                )
                 if len(tx_patch) < min_mol * 2:
                     print(f"  Baysor: patch {pi + 1} has too few transcripts — skipping", flush=True)
                     continue
@@ -1969,7 +2683,9 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
                     print(f"  Baysor: patch {pi + 1} failed: {pe}", flush=True)
                     continue
 
-                # Boundary resolution: keep cells whose centroid is inside this patch (non-buffered)
+                # Boundary resolution, step 1: keep cells whose centroid is inside this
+                # patch's (non-buffered) box. Cells in the overlap with another patch are
+                # resolved after the loop, once it is known which patches returned cells.
                 in_patch = (
                     (cells_i["x_centroid"] >= px0) & (cells_i["x_centroid"] < px1) &
                     (cells_i["y_centroid"] >= py0) & (cells_i["y_centroid"] < py1)
@@ -1981,10 +2697,15 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
                 remap = {old: f"p{pi}_{old}" for old in valid_ids}
                 cells_i.index = pd.Index([remap[c] for c in cells_i.index], name="cell_id")
                 all_cells.append(cells_i)
+                ok_patches.append(pi)
                 for old_id, bnd in bounds_i.items():
                     if old_id in valid_ids:
                         all_bounds[remap[old_id]] = bnd
                 seg_i_valid = seg_i[seg_i["cell"].isin(valid_ids)].copy()
+                if "gene" in seg_i_valid.columns:
+                    # keep per-(cell, gene) counts only, not every transcript of every patch
+                    seg_i_valid = (seg_i_valid.groupby(["cell", "gene"], observed=True)
+                                   .size().rename("n").reset_index())
                 seg_i_valid["cell"] = seg_i_valid["cell"].map(remap)
                 all_seg.append(seg_i_valid)
 
@@ -1992,13 +2713,33 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
                 _set("error", "No cells found across all patches. Check Baysor output.")
                 return
 
+            # Boundary resolution, step 2: a centroid inside several successful patches is
+            # kept by the patch it lies deepest in (no cell kept twice, none ceded to a
+            # skipped or failed patch)
+            all_cells = [
+                c[_patch_owned_mask(c["x_centroid"].values, c["y_centroid"].values,
+                                    _pi, patch_bounds, ok_patches)]
+                for _pi, c in zip(ok_patches, all_cells)
+            ]
             cells_df  = pd.concat(all_cells)
-            cell_bounds = all_bounds
+            # Step 3: one biological cell segmented by two patches with its centroids
+            # on either side of the ownership line is kept once
+            _seam_keep = _patch_seam_dedup_mask(
+                cells_df.index, np.repeat(ok_patches, [len(c) for c in all_cells]),
+                cells_df["x_centroid"].values, cells_df["y_centroid"].values,
+                cells_df["transcript_counts"].values, all_bounds, patch_bounds, ok_patches)
+            if not _seam_keep.all():
+                print(f"  Baysor: dropped {int((~_seam_keep).sum()):,} seam duplicate(s)", flush=True)
+                cells_df = cells_df[_seam_keep]
+            _owned    = set(cells_df.index)
+            cell_bounds = {k: v for k, v in all_bounds.items() if k in _owned}
             seg_merged  = pd.concat(all_seg)
+            seg_merged  = seg_merged[seg_merged["cell"].isin(_owned)]
             print(f"  Baysor: merged {len(cells_df):,} cells from {n_patches} patch(es)", flush=True)
 
         else:
             # ── Single run (no patches or no sopa data) ───────────────────
+            tx_all = _load_tx(x_min, x_max, y_min, y_max)
             n_assigned = int((tx_all["cell_id"] != 0).sum())
             print(f"  Baysor: {n_assigned:,} / {len(tx_all):,} transcripts have prior cell assignment", flush=True)
             _up = use_prior and n_assigned > 0
@@ -2019,25 +2760,38 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
         expr_mat = _build_baysor_expr(seg_merged, cells_df)
 
         n_cells = len(cells_df)
+        _check_dataset_gen(_gen)   # params.json / zarr below describe this run's dataset
         import json as _json
         _params_out = {
             "tool": "baysor", "scale": scale, "scale_std": scale_std,
             "min_mol": min_mol, "n_clusters": n_clusters,
             "use_prior": use_prior, "prior_conf": prior_conf,
+            "prior_type": prior_type, "qv_min": qv_min,
+            "n_patches": len(patch_bounds) if patch_bounds else 0,
+            # layout by patch_XXXX index: lets a cache load redo the overlap resolution
+            "patch_bounds": [[float(v) for v in b] for b in patch_bounds] if patch_bounds else None,
+            # patches that returned cells, and the seam de-duplication applied after ownership
+            "patch_ok": [int(p) for p in ok_patches] if patch_bounds else None,
+            "seam_dedup": dict(_SEAM_DEDUP) if patch_bounds else None,
             "x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max,
             "n_cells": n_cells, "param_tag": _param_tag,
-            "dataset_hash": hashlib.md5(DATA["data_dir"].encode()).hexdigest()[:8],
+            "dataset_hash": hashlib.md5(_dataset_key().encode()).hexdigest()[:8],
         }
         with open(os.path.join(out_dir, "params.json"), "w") as _f:
             _json.dump(_params_out, _f)
+        # SpaGE result of a previous run in this dir belongs to other cells
+        if os.path.exists(os.path.join(out_dir, "spage_result.json")):
+            os.remove(os.path.join(out_dir, "spage_result.json"))
         _set("running", "Computing UMAP and clusters…")
         _compute_reseg_clusters_umap(cells_df, expr_mat,
                                      progress_fn=lambda msg: _set("running", msg))
         # Normalize cell_bounds keys to strings (GeoJSON may produce int keys)
         cell_bounds = {str(k): v for k, v in cell_bounds.items()}
         _set("running", "Writing SpatialData zarr…")
+        _gene_names = DATA["gene_names"]
+        _check_dataset_gen(_gen)
         zarr_path = _build_reseg_sdata(
-            cells_df, cell_bounds, expr_mat, DATA["gene_names"], "baysor", out_dir
+            cells_df, cell_bounds, expr_mat, _gene_names, "baysor", out_dir
         )
         _set("done", f"Done — {n_cells:,} cells", result={
             "cells_df":    cells_df,
@@ -2063,9 +2817,12 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
                 x_min=None, x_max=None, y_min=None, y_max=None,
                 prior_type: str = "nucleus") -> None:
     """Background thread: run Proseg resegmentation, using sopa patches if available."""
+    _gen = _dataset_gen
 
     def _set(status, message, result=None):
         with _proseg_lock:
+            if _stale_job(_gen, status):
+                return
             _proseg_state["status"]  = status
             _proseg_state["message"] = message
             if result is not None:
@@ -2092,23 +2849,34 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
         return None
 
     try:
+        # a stale "none" (option removed from the UI) runs as the default prior and
+        # therefore shares the default prior's cache tag
+        prior_type = _proseg_prior_type(prior_type)
+        if not DATA.get("data_dir"):
+            _set("error", "Resegmentation needs the original Xenium output directory "
+                          "(transcripts.parquet); this dataset was loaded from a .zarr.")
+            return
         proseg_bin = _find_proseg()
         if proseg_bin is None:
             _set("error", "proseg not found. Install via: conda install bioconda::rust-proseg")
             return
         print(f"  Using proseg: {proseg_bin}", flush=True)
 
-        _param_str = (f"v{voxel_size or 'A'}_t{n_threads or 'A'}"
-                      f"_x{x_min or 'A'}-{x_max or 'A'}_y{y_min or 'A'}-{y_max or 'A'}")
-        _param_tag = hashlib.md5(_param_str.encode()).hexdigest()[:8]
-        out_dir = os.path.join(CACHE_BASE_DIR,
-                               f"proseg_{os.path.basename(DATA['data_dir'])}_{_param_tag}")
-        os.makedirs(out_dir, exist_ok=True)
-        print(f"  Proseg: cache dir = {os.path.basename(out_dir)} ({_param_str})", flush=True)
-
         tx_src = os.path.join(DATA["data_dir"], "transcripts.parquet")
+        # Same transcript set as the Xenium cell-feature matrix and the Baysor path:
+        # Q-score ≥ 20, genes only. Proseg has no option to exclude features, and its
+        # --xenium preset keeps control / unassigned codewords, so the input is filtered here.
+        import pyarrow.parquet as _pq
+        _tx_schema_cols = _pq.read_schema(tx_src).names
+        _tx_filters = _tx_gene_filters(_tx_schema_cols, 20)
 
-        # ── Check for sopa patches ────────────────────────────────────────
+        def _load_tx(bx0, bx1, by0, by1):
+            tx = _read_tx_region(tx_src, None, bx0, bx1, by0, by1, extra_filters=_tx_filters)
+            if "is_gene" not in _tx_schema_cols:
+                tx = _tx_drop_control_features(tx)
+            return tx
+
+        # ── Check for sopa patches (first: the patch layout is part of the cache tag) ──
         patch_bounds = _get_patch_bounds_um()
         if patch_bounds and any(v is not None for v in [x_min, x_max, y_min, y_max]):
             filtered = []
@@ -2123,15 +2891,28 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
                 ))
             patch_bounds = filtered or None
 
+        _A = lambda v: "A" if v is None else v
+        _param_str = (f"v{voxel_size or 'A'}_t{n_threads or 'A'}"
+                      f"_x{_A(x_min)}-{_A(x_max)}_y{_A(y_min)}-{_A(y_max)}")
+        # Every option that changes the result is part of the tag; appended only when
+        # non-default so runs made with the defaults keep their previous tag.
+        for _k, _v in (("nc", None if n_samples in (None, 10) else n_samples),
+                       ("rs", recorded_samples or None), ("sch", schedule or None),
+                       ("nr", nuclear_reassign_prob), ("ps", prior_seg_prob),
+                       ("pt", None if prior_type == "nucleus" else prior_type)):
+            if _v is not None:
+                _param_str += f"_{_k}{_v}"
+        if patch_bounds:
+            _param_str += f"_pb{_patch_bounds_tag(patch_bounds)}"
+        _param_tag = hashlib.md5(_param_str.encode()).hexdigest()[:8]
+        out_dir = _seg_run_dir("proseg", _param_tag)
+        os.makedirs(out_dir, exist_ok=True)
+        print(f"  Proseg: cache dir = {os.path.basename(out_dir)} ({_param_str})", flush=True)
+
         if patch_bounds:
             n_patches = len(patch_bounds)
             print(f"  Proseg: using {n_patches} sopa patch(es)", flush=True)
-            _set("running", "Loading transcripts for patch-based Proseg…")
-            tx_all = pd.read_parquet(tx_src)
-            if x_min is not None: tx_all = tx_all[tx_all["x_location"] >= x_min]
-            if x_max is not None: tx_all = tx_all[tx_all["x_location"] <= x_max]
-            if y_min is not None: tx_all = tx_all[tx_all["y_location"] >= y_min]
-            if y_max is not None: tx_all = tx_all[tx_all["y_location"] <= y_max]
+            ok_patches: list  = []   # indices of patches that returned cells
 
             all_cells: list   = []
             all_bounds: dict  = {}
@@ -2141,10 +2922,8 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
 
             for pi, (px0, py0, px1, py1) in enumerate(patch_bounds):
                 _set("running", f"Proseg patch {pi + 1}/{n_patches}…")
-                tx_patch = tx_all[
-                    (tx_all["x_location"] >= px0) & (tx_all["x_location"] <= px1) &
-                    (tx_all["y_location"] >= py0) & (tx_all["y_location"] <= py1)
-                ]
+                # One patch at a time (patch bounds are already clipped to the user's region)
+                tx_patch = _load_tx(px0, px1, py0, py1)
                 if len(tx_patch) < 10:
                     print(f"  Proseg: patch {pi + 1} has too few transcripts — skipping", flush=True)
                     continue
@@ -2162,7 +2941,9 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
                     print(f"  Proseg: patch {pi + 1} failed: {pe}", flush=True)
                     continue
 
-                # Boundary resolution: keep cells with centroid in this patch
+                # Boundary resolution, step 1: keep cells with centroid in this patch's box.
+                # Cells in the overlap with another patch are resolved after the loop, once
+                # it is known which patches returned cells.
                 in_patch = (
                     (cells_i["x_centroid"] >= px0) & (cells_i["x_centroid"] < px1) &
                     (cells_i["y_centroid"] >= py0) & (cells_i["y_centroid"] < py1)
@@ -2174,28 +2955,51 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
                 remap = {old: old + cell_offset for old in valid_ids}
                 cells_i.index = pd.Index([remap[c] for c in cells_i.index], name="cell_id")
                 all_cells.append(cells_i)
+                ok_patches.append(pi)
                 for old_id, bnd in bounds_i.items():
                     if old_id in valid_ids:
                         all_bounds[remap[old_id]] = bnd
-                if tx_meta_i is not None:
-                    _UNASSIGNED_P = 4294967295
-                    tx_meta_i = tx_meta_i.copy()
-                    if "cell" in tx_meta_i.columns:
-                        tx_meta_i = tx_meta_i[tx_meta_i["cell"].isin(valid_ids)]
-                        tx_meta_i["cell"] = tx_meta_i["cell"].map(remap)
-                    elif "assignment" in tx_meta_i.columns:
-                        _asgn = tx_meta_i["assignment"].astype(float).astype(int)
-                        _valid_mask = (_asgn != _UNASSIGNED_P) & (_asgn.isin(valid_ids))
-                        tx_meta_i.loc[_valid_mask, "assignment"] = _asgn[_valid_mask].map(remap)
-                    all_tx_meta.append(tx_meta_i)
+                _ccol = (None if tx_meta_i is None or "gene" not in tx_meta_i.columns
+                         else "cell" if "cell" in tx_meta_i.columns
+                         else "assignment" if "assignment" in tx_meta_i.columns else None)
+                if _ccol:
+                    # Keep only transcripts of the cells this patch owns (a rejected cell's
+                    # local id must not be matched to another cell's global id), remapped
+                    # like the cells and reduced to per-(cell, gene) counts.
+                    _asgn = pd.to_numeric(tx_meta_i[_ccol], errors="coerce")
+                    _valid_mask = _asgn.isin(valid_ids)
+                    all_tx_meta.append(
+                        pd.DataFrame({_ccol: _asgn[_valid_mask].astype("int64") + cell_offset,
+                                      "gene": tx_meta_i.loc[_valid_mask, "gene"]})
+                        .groupby([_ccol, "gene"], observed=True).size().rename("n").reset_index()
+                    )
                 cell_offset += CELL_ID_STRIDE
 
             if not all_cells:
                 _set("error", "No cells found across all patches. Check Proseg output.")
                 return
 
+            # Boundary resolution, step 2: a centroid inside several successful patches is
+            # kept by the patch it lies deepest in (no cell kept twice, none ceded to a
+            # skipped or failed patch)
+            all_cells = [
+                c[_patch_owned_mask(c["x_centroid"].values, c["y_centroid"].values,
+                                    _pi, patch_bounds, ok_patches)]
+                for _pi, c in zip(ok_patches, all_cells)
+            ]
             cells_df       = pd.concat(all_cells)
-            cell_bounds    = all_bounds
+            # Step 3: one biological cell segmented by two patches with its centroids
+            # on either side of the ownership line is kept once
+            _seam_keep = _patch_seam_dedup_mask(
+                cells_df.index, np.repeat(ok_patches, [len(c) for c in all_cells]),
+                cells_df["x_centroid"].values, cells_df["y_centroid"].values,
+                cells_df["transcript_counts"].values, all_bounds, patch_bounds, ok_patches)
+            if not _seam_keep.all():
+                print(f"  Proseg: dropped {int((~_seam_keep).sum()):,} seam duplicate(s)", flush=True)
+                cells_df = cells_df[_seam_keep]
+            _owned         = set(cells_df.index)
+            cell_bounds    = {k: v for k, v in all_bounds.items() if k in _owned}
+            all_tx_meta    = [t[t.iloc[:, 0].isin(_owned)] for t in all_tx_meta]
             tx_meta_merged = pd.concat(all_tx_meta) if all_tx_meta else None
             print(f"  Proseg: merged {len(cells_df):,} cells from {n_patches} patch(es)", flush=True)
 
@@ -2203,14 +3007,17 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
             # ── Single run (no patches or no sopa data) ───────────────────
             if any(v is not None for v in [x_min, x_max, y_min, y_max]):
                 _set("running", "Filtering transcripts to region…")
-                tx = pd.read_parquet(tx_src)
-                if x_min is not None: tx = tx[tx["x_location"] >= x_min]
-                if x_max is not None: tx = tx[tx["x_location"] <= x_max]
-                if y_min is not None: tx = tx[tx["y_location"] >= y_min]
-                if y_max is not None: tx = tx[tx["y_location"] <= y_max]
+                tx = _load_tx(x_min, x_max, y_min, y_max)
                 print(f"  Proseg: filtered to {len(tx):,} transcripts", flush=True)
+            elif prior_type == "nucleus":
+                # whole slide, columns unmodified: stream the gene-only Q ≥ 20 rows to a
+                # file for Proseg instead of loading the slide into memory
+                _set("running", "Filtering transcripts (genes, Q ≥ 20)…")
+                tx = os.path.join(out_dir, "transcripts.parquet")
+                _n_tx = _tx_write_gene_only(tx_src, tx, 20)
+                print(f"  Proseg: {_n_tx:,} gene transcripts with Q ≥ 20 written", flush=True)
             else:
-                tx = pd.read_parquet(tx_src)
+                tx = _load_tx(None, None, None, None)
 
             _set("running", "Running Proseg…")
             try:
@@ -2223,30 +3030,52 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
             except Exception as e:
                 _set("error", str(e)[:300])
                 return
+            finally:
+                # the whole-slide filtered copy is large and can be rebuilt from the bundle
+                if isinstance(tx, str) and tx != tx_src and os.path.exists(tx):
+                    os.remove(tx)
 
         # ── Build expression matrix ───────────────────────────────────────
         _set("running", "Building expression matrix…")
         expr_mat = _build_proseg_expr(tx_meta_merged, cells_df)
 
         n_cells = len(cells_df)
+        _check_dataset_gen(_gen)   # params.json / zarr below describe this run's dataset
         import json as _json
         _params_out = {
             "tool": "proseg", "voxel_size": voxel_size, "n_threads": n_threads,
+            "n_samples": n_samples, "recorded_samples": recorded_samples,
+            "schedule": schedule, "nuclear_reassign_prob": nuclear_reassign_prob,
+            "prior_seg_prob": prior_seg_prob, "prior_type": prior_type,
+            "n_patches": len(patch_bounds) if patch_bounds else 0,
+            # layout by patch_XXXX index: lets a cache load redo the overlap resolution
+            "patch_bounds": [[float(v) for v in b] for b in patch_bounds] if patch_bounds else None,
+            # patches that returned cells, and the seam de-duplication applied after ownership
+            "patch_ok": [int(p) for p in ok_patches] if patch_bounds else None,
+            "seam_dedup": dict(_SEAM_DEDUP) if patch_bounds else None,
             "x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max,
             "n_cells": n_cells, "param_tag": _param_tag,
-            "dataset_hash": hashlib.md5(DATA["data_dir"].encode()).hexdigest()[:8],
+            "dataset_hash": hashlib.md5(_dataset_key().encode()).hexdigest()[:8],
         }
         with open(os.path.join(out_dir, "params.json"), "w") as _f:
             _json.dump(_params_out, _f)
+        # SpaGE result of a previous run in this dir belongs to other cells
+        if os.path.exists(os.path.join(out_dir, "spage_result.json")):
+            os.remove(os.path.join(out_dir, "spage_result.json"))
         _set("running", "Computing UMAP and clusters…")
         _compute_reseg_clusters_umap(cells_df, expr_mat,
                                      progress_fn=lambda msg: _set("running", msg))
         # Normalize cell_bounds keys to strings (GeoJSON may produce int keys)
         cell_bounds = {str(k): v for k, v in cell_bounds.items()}
         _set("running", "Writing SpatialData zarr…")
+        _gene_names = DATA["gene_names"]
+        _check_dataset_gen(_gen)
         zarr_path = _build_reseg_sdata(
-            cells_df, cell_bounds, expr_mat, DATA["gene_names"], "proseg", out_dir
+            cells_df, cell_bounds, expr_mat, _gene_names, "proseg", out_dir
         )
+        # Same string index as the cache-load paths, so plot customdata (str ids)
+        # matches for lasso ROIs / ROI metadata in the session that ran Proseg.
+        cells_df.index = cells_df.index.astype(str)
         _set("done", f"Done — {n_cells:,} cells", result={
             "cells_df":    cells_df,
             "cell_bounds": cell_bounds,
@@ -2264,6 +3093,19 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
 
 
 # ─── Reseg clustering + UMAP ─────────────────────────────────────────────────
+
+# Above this many cells UMAP runs unseeded on all cores (a fixed random_state
+# forces umap-learn to one thread) and the t-SNE fallback is skipped.
+_UMAP_PARALLEL_MIN_CELLS = 300_000
+
+
+def _umap_seed_kwargs(n_cells: int, seed: int) -> dict:
+    if n_cells <= _UMAP_PARALLEL_MIN_CELLS:
+        return {"random_state": seed}
+    print(f"  UMAP: {n_cells:,} cells — running multi-threaded without a fixed seed "
+          f"(layout not reproducible between runs)", flush=True)
+    return {"n_jobs": -1}
+
 
 def _compute_reseg_clusters_umap(cells_df: pd.DataFrame, expr_mat,
                                   progress_fn=None) -> None:
@@ -2312,25 +3154,36 @@ def _compute_reseg_clusters_umap(cells_df: pd.DataFrame, expr_mat,
         from umap.umap_ import UMAP
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="n_jobs value.*overridden")
-            reducer = UMAP(n_neighbors=min(15, n_cells - 1), min_dist=0.1, random_state=42)
+            reducer = UMAP(n_neighbors=min(15, n_cells - 1), min_dist=0.1,
+                           **_umap_seed_kwargs(n_cells, 42))
             umap_coords = reducer.fit_transform(pca_coords)
-    except Exception:
-        from sklearn.manifold import TSNE
-        perp = min(30, max(5, n_cells // 10))
-        umap_coords = TSNE(n_components=2, perplexity=perp, random_state=42).fit_transform(pca_coords)
+    except Exception as _umap_err:
+        if n_cells > _UMAP_PARALLEL_MIN_CELLS:
+            # t-SNE on this many cells would not finish; leave the embedding empty
+            print(f"  Reseg: UMAP failed ({_umap_err}) — no embedding for {n_cells:,} cells", flush=True)
+            umap_coords = np.full((n_cells, 2), np.nan)
+        else:
+            from sklearn.manifold import TSNE
+            perp = min(30, max(5, n_cells // 10))
+            umap_coords = TSNE(n_components=2, perplexity=perp, random_state=42).fit_transform(pca_coords)
 
     cells_df["umap_1"] = umap_coords[:, 0]
     cells_df["umap_2"] = umap_coords[:, 1]
 
     # Store result in _umap_reseg_state so the existing UMAP scatter works
     umap_df = pd.DataFrame(umap_coords, index=cells_df.index, columns=["umap_1", "umap_2"])
-    with _umap_reseg_lock:
-        _umap_reseg_state["status"]  = "done"
-        _umap_reseg_state["message"] = f"Done — {n_cells:,} cells"
-        _umap_reseg_state["result"]  = umap_df
-
+    # Reported first: a caller whose dataset was replaced meanwhile stops here
     if progress_fn:
         progress_fn(f"UMAP + clustering done ({n_cells:,} cells)")
+    with _umap_reseg_lock:
+        # A "Rerun UMAP" job owns the state while it runs; publishing here would end
+        # its poll early. The embedding is in cells_df["umap_1/2"] either way.
+        if _umap_reseg_state["status"] != "running":
+            _umap_reseg_state["status"]  = "done"
+            _umap_reseg_state["message"] = f"Done — {n_cells:,} cells"
+            _umap_reseg_state["result"]  = umap_df
+            # Owning run unknown here; make_umap_fig then reads umap_1/2 from cells_df
+            _umap_reseg_state["owner"]   = None
     print(f"  Reseg: UMAP + {n_clusters} KMeans clusters computed for {n_cells:,} cells", flush=True)
 
 
@@ -2374,7 +3227,11 @@ def _compute_split_clusters_umap(cells_df: pd.DataFrame, corrected_mat,
         # KMeans
         if progress_fn:
             progress_fn("SPLIT: KMeans clustering (k=10)…")
-        km = KMeans(n_clusters=10, random_state=42, n_init=10)
+        if n_cells > _UMAP_PARALLEL_MIN_CELLS:
+            from sklearn.cluster import MiniBatchKMeans
+            km = MiniBatchKMeans(n_clusters=10, random_state=42, n_init=3)
+        else:
+            km = KMeans(n_clusters=10, random_state=42, n_init=10)
         labels = km.fit_predict(pca)
 
         # UMAP
@@ -2385,7 +3242,7 @@ def _compute_split_clusters_umap(cells_df: pd.DataFrame, corrected_mat,
             try:
                 n_neighbors = min(30, n_cells - 1)
                 reducer = _UMAP(n_components=2, n_neighbors=n_neighbors,
-                                    min_dist=0.3, random_state=42)
+                                    min_dist=0.3, **_umap_seed_kwargs(n_cells, 42))
                 embedding = reducer.fit_transform(pca)
                 print(f"  [SPLIT UMAP] computed embedding shape={embedding.shape}", flush=True)
             except Exception as _umap_err:
@@ -2433,7 +3290,9 @@ def _split_write_zarr(sdata_path: str, corrected_mat, cells_df: pd.DataFrame,
         except ImportError:
             from anndata.experimental import write_elem as _write_elem
 
-        with _sdata_lock:
+        # (per-store write lock, not _sdata_lock: that one is taken by the figure and
+        # patch callbacks, which would wait for the whole X_corrected write)
+        with _zarr_write_lock(sdata_path):
             zroot = _zarr_mod.open_group(sdata_path, mode="r+", use_consolidated=False)
             if "tables" not in zroot or "table" not in zroot["tables"]:
                 print("  SPLIT: no table in zarr — skipping zarr write", flush=True)
@@ -2447,7 +3306,8 @@ def _split_write_zarr(sdata_path: str, corrected_mat, cells_df: pd.DataFrame,
 
             # Align corrected_mat rows to zarr obs order
             # Use corrected_cell_ids (from R colnames) when available — RCTD may drop cells
-            if corrected_cell_ids is not None:
+            # (ignored when they do not describe the matrix rows one to one)
+            if corrected_cell_ids is not None and len(corrected_cell_ids) == corrected_mat.shape[0]:
                 id_to_row = {str(cid): i for i, cid in enumerate(corrected_cell_ids)}
             else:
                 id_to_row = {str(cid): i for i, cid in enumerate(cells_df.index)}
@@ -2552,6 +3412,42 @@ def _r_dgcmatrix_to_scipy(r_mat):
     return sp_.csc_matrix((x, i, p), shape=(dims[0], dims[1]))
 
 
+def _scipy_csc_parts(mat_cells_x_genes):
+    """genes × cells CSC parts (i, p, x, shape) for an R dgCMatrix.
+    i and p are 0-based int32 (dgCMatrix slots are 0-based), x is float64."""
+    m = sp.csc_matrix(mat_cells_x_genes.T, dtype=np.float64, copy=True)
+    m.sum_duplicates()
+    m.eliminate_zeros()
+    m.sort_indices()
+    if m.nnz >= 2**31 - 1:
+        raise RuntimeError(f"Matrix has {m.nnz:,} non-zeros — too many for an R dgCMatrix "
+                           f"(limit 2^31-1). Subset the cells first.")
+    return (np.ascontiguousarray(m.indices, dtype=np.int32),
+            np.ascontiguousarray(m.indptr, dtype=np.int32),
+            np.ascontiguousarray(m.data, dtype=np.float64),
+            m.shape)
+
+
+def _scipy_to_r_dgc(mat_cells_x_genes, rownames, colnames, r_name: str) -> None:
+    """Assign a cells × genes scipy matrix to the R global `r_name` as a
+    genes × cells dgCMatrix, passing only the sparse parts (never dense)."""
+    import rpy2.robjects as ro
+    i, p, x, shape = _scipy_csc_parts(mat_cells_x_genes)
+    if len(rownames) != shape[0] or len(colnames) != shape[1]:
+        raise ValueError(f"dimnames {len(rownames)}×{len(colnames)} do not match matrix {shape}")
+    ro.r.assign("._dgc_i", ro.IntVector(i))
+    ro.r.assign("._dgc_p", ro.IntVector(p))
+    ro.r.assign("._dgc_x", ro.FloatVector(x))
+    ro.r.assign("._dgc_rn", ro.StrVector(list(rownames)))
+    ro.r.assign("._dgc_cn", ro.StrVector(list(colnames)))
+    ro.r(f"""
+{r_name} <- Matrix::sparseMatrix(i=as.integer(._dgc_i), p=as.integer(._dgc_p),
+    x=as.numeric(._dgc_x), dims=c({int(shape[0])}L, {int(shape[1])}L), index1=FALSE,
+    dimnames=list(._dgc_rn, ._dgc_cn))
+rm(._dgc_i, ._dgc_p, ._dgc_x, ._dgc_rn, ._dgc_cn)
+""")
+
+
 def _run_split_correction(rds_path: str, label_col: str = "Names",
                            max_cores: int = 4, seg_source: str = "xenium",
                            min_umi: int = 10, min_umi_sigma: int = 100,
@@ -2564,9 +3460,12 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
           f"max_cores={max_cores}, purify_singlets={purify_singlets}, "
           f"seg_source={seg_source!r}", flush=True)
     _redirect_rpy2_console()
+    _gen = _dataset_gen
 
     def _set(status, message, result=None):
         with _split_lock:
+            if _stale_job(_gen, status):
+                return
             _split_state["status"]  = status
             _split_state["message"] = message
             if result is not None:
@@ -2588,9 +3487,11 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
         # Clear stale "Rerun UMAP" result so make_umap_fig uses the fresh
         # split_umap_1/2 computed below, not a cached result from a previous
         # run with different parameters.
+        # (left alone while a "Rerun UMAP" job is running: it owns the state)
         with _umap_reseg_lock:
-            _umap_reseg_state["status"] = "idle"
-            _umap_reseg_state["result"] = None
+            if _umap_reseg_state["status"] != "running":
+                _umap_reseg_state["status"] = "idle"
+                _umap_reseg_state["result"] = None
 
         # ── 1. Get active data ──────────────────────────────────────────────
         _tool = _seg_tool(seg_source)
@@ -2615,12 +3516,24 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
             cells_df   = DATA["df"].copy()
             sdata_path = DATA.get("sdata_path", "")
             gni        = DATA.get("gene_name_to_idx", {})
+            # DATA["df"] rows map to expr rows through df_to_expr (differs from
+            # the identity when subset() is active) - pair them explicitly.
+            _x_d2e = np.asarray(DATA["df_to_expr"])
+            if len(_x_d2e) != expr.shape[0] or (_x_d2e != np.arange(len(_x_d2e))).any():
+                _x_good  = _x_d2e >= 0
+                cells_df = cells_df[_x_good]
+                _x_d2e   = _x_d2e[_x_good]
+                expr     = expr[_x_d2e, :]
+            else:
+                _x_d2e = None
 
-        panel_genes = DATA["gene_names"]  # always use panel gene list
+        # Panel genes only: DATA["gene_names"] can also hold SpaGE-imputed genes
+        panel_genes = [g for g in _panel_gene_names() if g in gni and gni[g] < expr.shape[1]]
+        _panel_idx  = [gni[g] for g in panel_genes]
         n_panel     = len(panel_genes)
         # Slice to panel-only columns (drop imputed)
-        if expr.shape[1] > n_panel:
-            expr_panel = expr[:, :n_panel]
+        if _panel_idx != list(range(expr.shape[1])):
+            expr_panel = expr[:, _panel_idx]
         else:
             expr_panel = expr
         n_cells, n_genes = expr_panel.shape
@@ -2688,25 +3601,13 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
             # ── 6. Build SpatialRNA (panel genes only) ───────────────────────────
             _set("running", f"Building SpatialRNA object ({n_cells:,} cells)…")
             # Subset expr_panel to shared genes
-            shared_idx = [gni[g] for g in shared_genes if g in gni and gni[g] < n_panel]
-            shared_genes_present = [g for g in shared_genes if g in gni and gni[g] < n_panel]
+            _panel_pos = {g: i for i, g in enumerate(panel_genes)}
+            shared_idx = [_panel_pos[g] for g in shared_genes if g in _panel_pos]
+            shared_genes_present = [g for g in shared_genes if g in _panel_pos]
             expr_shared = expr_panel[:, shared_idx]  # cells × shared_genes
-            # gene × cells for R
-            expr_t = expr_shared.T.toarray() if hasattr(expr_shared, 'toarray') else expr_shared.T
-            counts_r_mat = ro.r.matrix(
-                ro.FloatVector(expr_t.flatten(order='F').tolist()),
-                nrow=len(shared_genes_present),
-                ncol=n_cells
-            )
+            # gene × cells dgCMatrix for R, built from the sparse parts
             cell_ids = [str(c) for c in cells_df.index]
-            ro.r.assign("._split_counts_mat", counts_r_mat)
-            ro.r.assign("._split_rownames", ro.StrVector(shared_genes_present))
-            ro.r.assign("._split_colnames", ro.StrVector(cell_ids))
-            ro.r("""
-rownames(._split_counts_mat) <- ._split_rownames
-colnames(._split_counts_mat) <- ._split_colnames
-._split_counts_mat <- as(._split_counts_mat, 'dgCMatrix')
-""")
+            _scipy_to_r_dgc(expr_shared, shared_genes_present, cell_ids, "._split_counts_mat")
 
             ro.r.assign("._split_x", ro.FloatVector(cells_df["x_centroid"].astype(float).tolist()))
             ro.r.assign("._split_y", ro.FloatVector(cells_df["y_centroid"].astype(float).tolist()))
@@ -2728,8 +3629,16 @@ rownames(._split_coords) <- colnames(._split_counts_mat)
                 _rctd_tag  = hashlib.md5((_alt_res.get("out_dir", "")).encode()).hexdigest()[:8]
                 _rctd_tool = _alt_res.get("source", "baysor")
                 _rctd_lkey = f"labels_rctd_doublet_{_rctd_tool}_{_rctd_tag}"
+            # Under an active subset() the cell set is part of the key (full-dataset
+            # runs keep the old name). It goes before the labels key: _annot_autoload
+            # takes everything after the last "_labels_" in the file name as that key.
+            _cells_extra = ""
+            if (_alt_res is not None and "_cells_df_original" in _alt_res) or \
+                    (_alt_res is None and "_df_original" in DATA):
+                _cells_extra = (f"_n{len(cell_ids)}_"
+                                + hashlib.md5("\n".join(cell_ids).encode()).hexdigest()[:8])
             _rctd_cache_key  = (f"rctd_{os.path.basename(rds_path)}_{label_col}_doublet"
-                                f"_umi{min_umi}_sig{min_umi_sigma}_{_rctd_lkey}")
+                                f"_umi{min_umi}_sig{min_umi_sigma}{_cells_extra}_{_rctd_lkey}")
             _rctd_cache_file = _cache_path(_rctd_cache_key)
             _rctd_obj_file   = _rctd_cache_file.replace(".parquet", "_rctd_obj.rds")
 
@@ -2739,9 +3648,11 @@ rownames(._split_coords) <- colnames(._split_counts_mat)
                     _cached_rctd = pd.read_parquet(_rctd_cache_file)
                     _split_labels_cached = _cached_rctd["label"].astype(str)
                     _split_labels_cached.index = _split_labels_cached.index.astype(str)
-                    _sample = set(cell_ids[:200])
-                    _overlap = len(set(_split_labels_cached.index[:200]) & _sample)
-                    if _overlap >= max(1, len(_sample) * 0.05):
+                    # Every cached cell must belong to this run (RCTD drops low-UMI
+                    # cells, so the cache may hold fewer cells, never other ones).
+                    _sample = _split_labels_cached.index
+                    _overlap = int(_sample.isin(set(cell_ids)).sum())
+                    if len(_sample) > 0 and _overlap == len(_sample):
                         ro.r(f'._split_rctd <- readRDS("{_rctd_obj_file}")')
                         _split_labels = _split_labels_cached
                         _rctd_from_cache = True
@@ -2771,6 +3682,7 @@ cat("  SPLIT R: detected cores =", parallel::detectCores(),
                 # Save RCTD object + labels to cache for future re-runs.
                 # Use as.character() in R to avoid rpy2 converting factor levels to
                 # integer codes (which would show numbers instead of cell type names).
+                _check_dataset_gen(_gen)
                 try:
                     ro.r(f'saveRDS(._split_rctd, "{_rctd_obj_file}")')
                     ro.r("""
@@ -2793,6 +3705,7 @@ names(._split_rctd_types) <- rownames(._split_rctd_res)
             if _split_labels is not None:
                 _rctd_generic_key = "_".join(_rctd_lkey.split("_")[:2] + _rctd_lkey.split("_")[3:])
                 with _annot_lock:
+                    _check_dataset_gen(_gen)
                     _annot_state[_rctd_lkey]       = _split_labels
                     _annot_state[_rctd_generic_key] = _split_labels
 
@@ -2801,19 +3714,7 @@ names(._split_rctd_types) <- rownames(._split_rctd_res)
             # ── 8. Run SPLIT::purify ─────────────────────────────────────────────
             _set("running", "Running SPLIT::purify()…")
             # Full counts matrix (all panel genes) gene × cells
-            expr_full_t = expr_panel.T.toarray() if hasattr(expr_panel, 'toarray') else expr_panel.T
-            full_r_mat = ro.r.matrix(
-                ro.FloatVector(expr_full_t.flatten(order='F').tolist()),
-                nrow=n_panel,
-                ncol=n_cells
-            )
-            ro.r.assign("._split_full_counts", full_r_mat)
-            ro.r.assign("._split_panel_genes", ro.StrVector(list(panel_genes)))
-            ro.r("""
-rownames(._split_full_counts) <- ._split_panel_genes
-colnames(._split_full_counts) <- ._split_colnames
-""")
-            ro.r("""._split_full_counts <- as(._split_full_counts, 'dgCMatrix')""")
+            _scipy_to_r_dgc(expr_panel, list(panel_genes), cell_ids, "._split_full_counts")
             ro.r.assign("._split_do_purify_singlets", ro.BoolVector([purify_singlets]))
             ro.r("""
 ._split_res <- SPLIT::purify(
@@ -2832,10 +3733,31 @@ colnames(._split_full_counts) <- ._split_colnames
                 corrected_cell_ids = list(ro.r['colnames'](purified_r))
             except Exception:
                 corrected_cell_ids = None
+            # purify() returns only the genes RCTD used (panel ∩ reference), not the panel
+            try:
+                corrected_gene_ids = list(ro.r['rownames'](purified_r))
+            except Exception:
+                corrected_gene_ids = None
             # Convert dgCMatrix → scipy CSR (cells × genes)
             purified_csr_t = _r_dgcmatrix_to_scipy(purified_r)  # gene × cells
         corrected_mat  = purified_csr_t.T.tocsr()             # cells × genes
         corrected_mat.data = np.clip(corrected_mat.data, 0, None)
+        if corrected_gene_ids is not None and corrected_gene_ids != list(panel_genes):
+            # Put every column back at its panel-gene position (one column per panel
+            # gene, as all readers assume); genes purify() dropped stay zero.
+            _pg_pos = {g: i for i, g in enumerate(panel_genes)}
+            _gcols  = np.array([_pg_pos.get(str(g), -1) for g in corrected_gene_ids], dtype=np.int64)
+            _coo    = corrected_mat.tocoo()
+            _gok    = _gcols[_coo.col] >= 0
+            corrected_mat = sp_.csr_matrix(
+                (_coo.data[_gok], (_coo.row[_gok], _gcols[_coo.col[_gok]])),
+                shape=(corrected_mat.shape[0], n_panel))
+            print(f"  SPLIT: purify() returned {len(corrected_gene_ids)} of {n_panel} panel genes "
+                  f"— columns re-aligned to the panel ({n_panel - int((_gcols >= 0).sum())} genes "
+                  f"not in the reference have no corrected counts)", flush=True)
+        elif corrected_gene_ids is None and corrected_mat.shape[1] != n_panel:
+            raise RuntimeError(f"SPLIT::purify returned {corrected_mat.shape[1]} genes without names "
+                               f"for a {n_panel}-gene panel — cannot align the corrected counts")
         n_corr = corrected_mat.shape[0]
         n_orig = len(cells_df)
         print(f"  SPLIT: corrected matrix shape {corrected_mat.shape} "
@@ -2884,6 +3806,7 @@ colnames(._split_full_counts) <- ._split_colnames
                   f"({len(_valid_in)}/{n_corr} cells mapped)", flush=True)
 
         # ── 12. Update in-memory ─────────────────────────────────────────────
+        _check_dataset_gen(_gen)
         if _alt_res is not None:
             _lock = _baysor_lock if _tool == "baysor" else _proseg_lock
             with _lock:
@@ -2895,14 +3818,41 @@ colnames(._split_full_counts) <- ._split_colnames
                 for col in ["cluster_split_10", "split_umap_1", "split_umap_2"]:
                     if col in cells_df.columns:
                         _alt_res["cells_df"][col] = cells_df[col].values
+                # SPLIT ran on a subset(): also keep a full-size copy (zero rows
+                # outside the subset) so unsubset() restores an aligned matrix.
+                _orig_df = _alt_res.get("_cells_df_original")
+                if _orig_df is not None and _orig_df.index.is_unique:
+                    _opos = _orig_df.index.get_indexer(cells_df.index)
+                    if len(_opos) == corrected_mat.shape[0] and (_opos >= 0).all():
+                        _coo = corrected_mat.tocoo()
+                        _alt_res["_corrected_original"] = sp_.csr_matrix(
+                            (_coo.data, (_opos[_coo.row], _coo.col)),
+                            shape=(len(_orig_df), corrected_mat.shape[1]))
+                        for col in ["cluster_split_10", "split_umap_1", "split_umap_2"]:
+                            if col in cells_df.columns:
+                                _orig_df[col] = cells_df[col].reindex(_orig_df.index).values
         else:
+            if _x_d2e is not None:
+                # Keep the invariant "one row per DATA['expr'] row": scatter the
+                # rows (in cells_df order) back to their expression-matrix rows.
+                _coo = corrected_mat.tocoo()
+                corrected_mat = sp_.csr_matrix(
+                    (_coo.data, (_x_d2e[_coo.row], _coo.col)),
+                    shape=(DATA["expr"].shape[0], corrected_mat.shape[1]))
             DATA["split_corrected_expr"] = corrected_mat
             DATA["split_corrected_cell_ids"] = corrected_cell_ids
             DATA["split_panel_genes"] = list(panel_genes)
             DATA["split_corrected_imputed_genes"] = []
             for col in ["cluster_split_10", "split_umap_1", "split_umap_2"]:
                 if col in cells_df.columns:
-                    DATA["df"][col] = cells_df[col].values
+                    if _x_d2e is not None:
+                        # cells_df is a subset of DATA["df"]: write back by cell id
+                        DATA["df"][col] = cells_df[col].reindex(DATA["df"].index).values
+                        if "_df_original" in DATA:
+                            DATA["_df_original"][col] = \
+                                cells_df[col].reindex(DATA["_df_original"].index).values
+                    else:
+                        DATA["df"][col] = cells_df[col].values
                     print(f"  [SPLIT] wrote {col} to DATA['df']", flush=True)
                 else:
                     print(f"  [SPLIT] WARNING: {col} NOT in cells_df — skipping", flush=True)
@@ -2916,28 +3866,41 @@ colnames(._split_full_counts) <- ._split_colnames
         msg = traceback.format_exc()
         print(f"  SPLIT ERROR:\n{msg}", flush=True)
         with _split_lock:
-            _split_state["status"]  = "error"
-            _split_state["message"] = msg.strip().splitlines()[-1]
+            if not _stale_job(_gen, "error"):
+                _split_state["status"]  = "error"
+                _split_state["message"] = msg.strip().splitlines()[-1]
 
 
 # ─── Reseg UMAP computation (manual re-run) ───────────────────────────────────
 
 def _run_reseg_umap() -> None:
     """Background thread: compute UMAP for the active resegmented cells."""
+    _gen = _dataset_gen
+
     def _set(status, message, result=None):
         with _umap_reseg_lock:
+            if _stale_job(_gen, status):
+                return
             _umap_reseg_state["status"]  = status
             _umap_reseg_state["message"] = message
             if result is not None:
                 _umap_reseg_state["result"] = result
 
     try:
-        # Get the active reseg result (Proseg > Baysor)
-        with _proseg_lock:
-            pres = _proseg_state["result"] if _proseg_state["status"] == "done" else None
-        with _baysor_lock:
-            bres = _baysor_state["result"] if not pres and _baysor_state["status"] == "done" else None
+        # Get the reseg result for the segmentation source selected in the UI
+        with _umap_reseg_lock:
+            _tool = _seg_tool(_umap_reseg_state.get("seg_source", "xenium"))
+        pres = bres = None
+        if _tool == "proseg":
+            with _proseg_lock:
+                pres = _proseg_state["result"] if _proseg_state["status"] == "done" else None
+        elif _tool == "baysor":
+            with _baysor_lock:
+                bres = _baysor_state["result"] if _baysor_state["status"] == "done" else None
         alt_res = pres or bres
+        if _tool != "xenium" and alt_res is None:
+            _set("error", "Selected segmentation is not loaded")
+            return
 
         if alt_res is None:
             # Xenium mode: use SPLIT-corrected expr if counts_mode == "corrected",
@@ -2954,14 +3917,16 @@ def _run_reseg_umap() -> None:
             # If corrected expr is full-size (loaded from zarr at startup), corr_ids
             # won't be set. Identify SPLIT-kept cells by non-zero rows (zeroed for
             # non-corrected cells during zarr write) and subset the matrix.
+            # DATA["df"] row -> DATA["expr"] row (identity unless subset() is active)
+            _d2e = np.asarray(DATA["df_to_expr"])
             if _corr_expr is not None and _corr_ids is None and \
-                    _corr_expr.shape[0] == len(_xen_df):
+                    _corr_expr.shape[0] == DATA["expr"].shape[0] and len(_d2e) == len(_xen_df):
                 _row_sums = np.asarray(_corr_expr.sum(axis=1)).flatten()
-                _kept_idx = np.where(_row_sums > 0)[0]
+                _kept_idx = np.where((_d2e >= 0) & (_row_sums[np.clip(_d2e, 0, None)] > 0))[0]
                 if len(_kept_idx) > 0:
                     _corr_ids = [str(i) for i in _xen_df.index[_kept_idx]]
-                    _corr_expr = _corr_expr[_kept_idx, :]
-                    DATA["split_corrected_cell_ids"] = _corr_ids
+                    if "_df_original" not in DATA:
+                        DATA["split_corrected_cell_ids"] = _corr_ids
                     print(f"  UMAP: derived {len(_corr_ids):,} SPLIT cell IDs from non-zero rows",
                           flush=True)
 
@@ -2996,8 +3961,11 @@ def _run_reseg_umap() -> None:
                         _kept_rows = np.where(_kept_mask)[0]
                         _corr_expr = _xcorr_full[_kept_rows, :]
                         _corr_ids  = [_all_ids[i] for i in _kept_rows]
-                        # Cache in DATA so subsequent calls don't re-read zarr
-                        DATA["split_corrected_expr"]     = _corr_expr
+                        # Cache in DATA so subsequent calls don't re-read zarr.
+                        # Keep the full-size matrix there: _get_expr_values needs
+                        # one row per DATA["expr"] row.
+                        _check_dataset_gen(_gen)
+                        DATA["split_corrected_expr"]     = _xcorr_full
                         DATA["split_corrected_cell_ids"] = _corr_ids
                         print(f"  Xenium UMAP: loaded X_corrected from zarr "
                               f"({len(_corr_ids):,} SPLIT-corrected cells)", flush=True)
@@ -3006,13 +3974,21 @@ def _run_reseg_umap() -> None:
                           flush=True)
 
             if _corr_expr is not None and _corr_ids is not None:
-                # Build index mapping: corrected_cell_ids → rows in _corr_expr
-                _id_to_row = {str(cid): i for i, cid in enumerate(_corr_ids)}
                 _df_ids    = [str(i) for i in _xen_df.index]
-                _sub_rows  = [_id_to_row[i] for i in _df_ids if i in _id_to_row]
-                _sub_mask  = [i in _id_to_row for i in _df_ids]  # bool mask over DATA["df"]
-                expr = _corr_expr[_sub_rows, :]
-                _n   = len(_sub_rows)
+                if _corr_expr.shape[0] == DATA["expr"].shape[0] and len(_d2e) == len(_df_ids):
+                    # Full-size matrix, one row per DATA["expr"] row (zero rows for
+                    # cells SPLIT dropped): select the kept cells through df_to_expr.
+                    _corr_set = {str(cid) for cid in _corr_ids}
+                    _sub_mask = [(c in _corr_set) and (r >= 0)
+                                 for c, r in zip(_df_ids, _d2e)]  # bool mask over DATA["df"]
+                    expr = _corr_expr[_d2e[np.where(_sub_mask)[0]], :]
+                else:
+                    # Rows in corrected_cell_ids order
+                    _id_to_row = {str(cid): i for i, cid in enumerate(_corr_ids)}
+                    _sub_rows  = [_id_to_row[i] for i in _df_ids if i in _id_to_row]
+                    _sub_mask  = [i in _id_to_row for i in _df_ids]  # bool mask over DATA["df"]
+                    expr = _corr_expr[_sub_rows, :]
+                _n   = expr.shape[0]
                 _set("running", f"Normalising {_n:,} SPLIT-corrected cells…")
                 print(f"  Xenium UMAP: using SPLIT-corrected counts for {_n:,}/{len(_xen_df):,} cells",
                       flush=True)
@@ -3022,7 +3998,15 @@ def _run_reseg_umap() -> None:
                     _set("error", "No expression matrix loaded")
                     return
                 _sub_mask = None
-                _n        = len(_xen_df)
+                # Embed only the cells of DATA["df"] (panel genes, no SpaGE-imputed columns)
+                _good = _d2e >= 0
+                if len(_d2e) != expr.shape[0] or (_d2e != np.arange(len(_d2e))).any():
+                    expr = expr[_d2e[_good], :]
+                _pg_idx = [DATA["gene_name_to_idx"][g] for g in _panel_gene_names()
+                           if g in DATA["gene_name_to_idx"]]
+                if _pg_idx and _pg_idx != list(range(expr.shape[1])):
+                    expr = expr[:, _pg_idx]
+                _n        = expr.shape[0]
                 _set("running", f"Normalising {_n:,} Xenium cells…")
                 print(f"  Xenium UMAP: using original counts for {_n:,} cells", flush=True)
 
@@ -3049,13 +4033,16 @@ def _run_reseg_umap() -> None:
                 with _w2.catch_warnings():
                     _w2.filterwarnings("ignore", message="n_jobs value.*overridden")
                     _emb2 = _UMAP2(n_neighbors=min(15, _n - 1), min_dist=0.1,
-                                   random_state=0).fit_transform(_pca2)
+                                   **_umap_seed_kwargs(_n, 0)).fit_transform(_pca2)
             except Exception:
+                if _n > _UMAP_PARALLEL_MIN_CELLS:
+                    raise   # t-SNE on this many cells would not finish; report the UMAP error
                 from sklearn.manifold import TSNE as _TSNE2
                 _set("running", "Running t-SNE (umap-learn unavailable)…")
                 _emb2 = _TSNE2(n_components=2, perplexity=min(30, max(5, _n // 10)),
                                random_state=0).fit_transform(_pca2)
 
+            _check_dataset_gen(_gen)
             if _sub_mask is not None:
                 # Write NaN for cells SPLIT dropped, UMAP coords for cells it kept.
                 # Use split_umap_1/2 so make_umap_fig can distinguish corrected vs original UMAP.
@@ -3067,8 +4054,12 @@ def _run_reseg_umap() -> None:
                 DATA["df"]["split_umap_1"] = _u1
                 DATA["df"]["split_umap_2"] = _u2
             else:
-                DATA["df"]["umap_1"] = _emb2[:, 0]
-                DATA["df"]["umap_2"] = _emb2[:, 1]
+                _u1 = np.full(len(_xen_df), np.nan)
+                _u2 = np.full(len(_xen_df), np.nan)
+                _u1[_good] = _emb2[:, 0]
+                _u2[_good] = _emb2[:, 1]
+                DATA["df"]["umap_1"] = _u1
+                DATA["df"]["umap_2"] = _u2
             _umap_df_cache.clear()
             with _umap_reseg_lock:
                 _umap_reseg_state["_xenium_bumped"] = False
@@ -3166,9 +4157,11 @@ def _run_reseg_umap() -> None:
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message="n_jobs value.*overridden")
                 reducer = UMAP(n_neighbors=min(15, n_cells - 1),
-                               min_dist=0.1, random_state=0)
+                               min_dist=0.1, **_umap_seed_kwargs(n_cells, 0))
                 embedding = reducer.fit_transform(pca_coords)
         except Exception:
+            if n_cells > _UMAP_PARALLEL_MIN_CELLS:
+                raise   # t-SNE on this many cells would not finish; report the UMAP error
             from sklearn.manifold import TSNE
             _set("running", "Running t-SNE (umap-learn not installed or TF error)…")
             perp = min(30, max(5, n_cells // 10))
@@ -3179,6 +4172,9 @@ def _run_reseg_umap() -> None:
             {"umap_1": embedding[:, 0], "umap_2": embedding[:, 1]},
             index=cell_ids,
         )
+        with _umap_reseg_lock:
+            _check_dataset_gen(_gen)
+            _umap_reseg_state["owner"] = alt_res.get("out_dir")
         _set("done", f"Done — {n_cells:,} cells", result=umap_df)
         print(f"  Reseg UMAP: computed for {n_cells:,} cells", flush=True)
 
@@ -3195,11 +4191,19 @@ def _run_reseg_umap() -> None:
             if _pos is not None:
                 _u1[_pos] = _e1
                 _u2[_pos] = _e2
+        # An embedding of SPLIT-corrected counts goes to split_umap_1/2 (as in Xenium
+        # mode); umap_1/2 keep the original-counts embedding.
+        _c1, _c2 = (("split_umap_1", "split_umap_2") if _src_label == "SPLIT-corrected"
+                    else ("umap_1", "umap_2"))
         with _lock:
-            alt_res["cells_df"]["umap_1"] = _u1
-            alt_res["cells_df"]["umap_2"] = _u2
+            alt_res["cells_df"][_c1] = _u1
+            alt_res["cells_df"][_c2] = _u2
         if _sdata_path and os.path.isdir(_sdata_path):
-            _update_reseg_zarr_obs(_sdata_path, alt_res["cells_df"])
+            # Existing umap_1/2 columns are rewritten too, except under subset():
+            # the zarr holds every cell and the others would be set to NaN.
+            _update_reseg_zarr_obs(
+                _sdata_path, alt_res["cells_df"],
+                force_cols=() if "_cells_df_original" in alt_res else (_c1, _c2))
             print(f"  Reseg UMAP: cached to zarr", flush=True)
         _set("done", f"Done — {n_cells:,} cells", result=umap_df)
 
@@ -3210,7 +4214,8 @@ def _run_reseg_umap() -> None:
 
 
 # ─── SpaGE imputation ─────────────────────────────────────────────────────────
-SPAGE_REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SpaGE_repo")
+SPAGE_REPO = os.environ.get("SPAGE_REPO") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "SpaGE_repo")
 
 
 def _spage_cache_dir() -> str:
@@ -3224,12 +4229,13 @@ def _spage_index_path() -> str:
 
 
 def _spage_cache_path(rds_path: str, genes_key: str) -> str:
-    tag = hashlib.md5((rds_path + DATA["data_dir"] + genes_key).encode()).hexdigest()[:12]
+    tag = hashlib.md5((rds_path + _dataset_key() + genes_key).encode()).hexdigest()[:12]
     return os.path.join(_spage_cache_dir(), f"spage_{tag}.parquet")
 
 
-def _spage_index_update(cache_file: str) -> None:
-    """Record the latest spage cache file for this dataset."""
+def _spage_index_update(cache_file: str, dataset_key: str = None) -> None:
+    """Record the latest spage cache file for this dataset (*dataset_key*: the
+    key captured when the job started; default: the dataset loaded now)."""
     import json
     idx_path = _spage_index_path()
     try:
@@ -3237,7 +4243,7 @@ def _spage_index_update(cache_file: str) -> None:
             idx = json.load(f)
     except Exception:
         idx = {}
-    idx[DATA["data_dir"]] = cache_file
+    idx[dataset_key or _dataset_key()] = cache_file
     with open(idx_path, "w") as f:
         json.dump(idx, f, indent=2)
 
@@ -3245,12 +4251,14 @@ def _spage_index_update(cache_file: str) -> None:
 def _annot_autoload() -> None:
     """On startup, load all cached Xenium annotations for this dataset (all methods)."""
     import glob
-    tag       = hashlib.md5(DATA["data_dir"].encode()).hexdigest()[:8]
+    tag       = hashlib.md5(_dataset_key().encode()).hexdigest()[:8]
     cache_dir = CACHE_BASE_DIR
     pattern   = os.path.join(cache_dir, f"*_{tag}.parquet")
     label_files  = [f for f in glob.glob(pattern)
                     if not os.path.basename(f).startswith(("labels_", "spage_", "spatialdata_"))
-                    and not os.path.basename(f).endswith("_weights.parquet")]
+                    and not os.path.basename(f).endswith("_weights.parquet")
+                    # SPLIT's RCTD labels of a subset() run cover only part of the cells
+                    and not re.search(r"_n\d+_[0-9a-f]{8}_labels_", os.path.basename(f))]
     weight_files = [f for f in glob.glob(pattern)
                     if os.path.basename(f).endswith("_weights.parquet")]
     if not label_files and not weight_files:
@@ -3332,7 +4340,7 @@ def _spage_autoload() -> None:
     try:
         with open(idx_path) as f:
             idx = json.load(f)
-        cache_file = idx.get(DATA["data_dir"])
+        cache_file = idx.get(_dataset_key())
         if cache_file and (os.path.exists(cache_file) or os.path.isdir(cache_file)):
             zarr_path = (cache_file if os.path.isdir(cache_file)
                          else cache_file.replace(".parquet", ".zarr")
@@ -3385,6 +4393,11 @@ def _vectorized_spage(spatial_df: pd.DataFrame, rna_df: pd.DataFrame,
     Python for-loop — ~200× faster for 200k spatial cells.
     """
     import sys
+    if not os.path.isfile(os.path.join(SPAGE_REPO, "SpaGE", "principal_vectors.py")):
+        raise RuntimeError(
+            f"SpaGE is not installed at {SPAGE_REPO} (the directory is a git submodule and is "
+            "empty until fetched). Run `git submodule update --init SpaGE_repo` in the "
+            "repository, or set SPAGE_REPO to a clone of https://github.com/tabdelaal/SpaGE.")
     if SPAGE_REPO not in sys.path:
         sys.path.insert(0, SPAGE_REPO)
     from SpaGE.principal_vectors import PVComputation
@@ -3395,15 +4408,27 @@ def _vectorized_spage(spatial_df: pd.DataFrame, rna_df: pd.DataFrame,
     if len(shared) == 0:
         raise ValueError("No shared genes between spatial and reference data.")
 
-    n_pv = min(n_pv, len(shared))
-
     # Z-score (SpaGE normalizes internally on shared genes) — use float32 to halve memory
     rna_scaled   = pd.DataFrame(
-        st.zscore(rna_df[shared],     axis=0).astype(np.float32),
+        st.zscore(rna_df[shared],     axis=0).astype(np.float32, copy=False),
         index=rna_df.index,     columns=shared)
     spat_scaled  = pd.DataFrame(
-        st.zscore(spatial_df[shared], axis=0).astype(np.float32),
+        st.zscore(spatial_df[shared], axis=0).astype(np.float32, copy=False),
         index=spatial_df.index, columns=shared)
+
+    # A gene that is constant in either dataset (e.g. no counts in this tissue /
+    # ROI) z-scores to NaN and breaks the PCA — drop those columns.
+    _ok = (np.isfinite(rna_scaled.values.sum(axis=0))
+           & np.isfinite(spat_scaled.values.sum(axis=0)))
+    if not _ok.all():
+        print(f"  SpaGE: dropping {int((~_ok).sum())} zero-variance shared genes", flush=True)
+        shared = shared[_ok]
+        if len(shared) == 0:
+            raise ValueError("No shared genes with non-zero variance in both datasets.")
+        rna_scaled  = rna_scaled.loc[:, shared]
+        spat_scaled = spat_scaled.loc[:, shared]
+
+    n_pv = min(n_pv, len(shared))
 
     # Principal Vectors
     pv = PVComputation(n_factors=n_pv, n_pv=n_pv, dim_reduction="pca", dim_reduction_target="pca")
@@ -3484,13 +4509,21 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
     back to the reseg SpatialData zarr (alt_res['sdata_path']).
     When use_corrected=True, uses SPLIT-corrected counts as the spatial input."""
     _redirect_rpy2_console()
+    _gen = _dataset_gen
+    _ds_key = _dataset_key()   # the dataset this job belongs to (for the cache index)
 
     def _set(status, message, result=None):
         with _spage_lock:
+            if _stale_job(_gen, status):
+                return
             _spage_state["status"]  = status
             _spage_state["message"] = message
             if result is not None:
                 _spage_state["result"] = result
+            if status == "done":
+                # '<gene> [imp]' vectors of a previous run must not be served again
+                _gene_expr_cache.clear()
+                _umap_fig_cache.clear()
 
     try:
         import tempfile
@@ -3562,17 +4595,44 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
         _cache_corr_suffix = "_corr" if use_corrected else ""
         _cache_seg_suffix = (f"__{seg_source.replace(':', '_')}{_cache_corr_suffix}"
                              if (seg_source and seg_source != "xenium") else _cache_corr_suffix)
-        cache_file = _spage_cache_path(rds_path, genes_key + _cache_seg_suffix)
+        # n_pv and an active subset() change the result; they are added to the key only
+        # when they differ from the default / full dataset so existing caches stay valid.
+        _cache_extra = f"_pv{n_pv}" if int(n_pv) != 50 else ""
+        if _alt_res is not None and "_cells_df_original" in _alt_res:
+            _cache_extra += f"_n{len(_alt_res['cells_df'])}"
+        elif _alt_res is None and "_df_original" in DATA:
+            _cache_extra += f"_n{len(DATA['df'])}"
+        cache_file = _spage_cache_path(rds_path, genes_key + _cache_seg_suffix + _cache_extra)
         zarr_cache = cache_file.replace(".parquet", ".zarr")
+        # A streamed result has one row per current DATA["df"] row and no cell ids:
+        # under a subset() it must not be registered for auto-load at startup.
+        _xen_subset = _alt_res is None and "_df_original" in DATA
+
+        def _record_reseg_result(_path, _genes):
+            """Reseg results are indexed by reseg cells: keep them on the run, not
+            in the global (Xenium) SpaGE state / startup index."""
+            try:
+                import json as _json_sc
+                with open(os.path.join(_alt_res["out_dir"], "spage_result.json"), "w") as _sjf:
+                    _json_sc.dump({"path": _path, "genes": list(_genes)}, _sjf)
+            except Exception as _sje:
+                print(f"  SpaGE: could not persist result ref: {_sje}", flush=True)
+            _alock = _baysor_lock if _seg_tool(seg_source or "") == "baysor" else _proseg_lock
+            with _alock:
+                _alt_res["spage_result_path"]  = _path
+                _alt_res["spage_result_genes"] = list(_genes)
+
+        _check_dataset_gen(_gen)
         if os.path.isdir(zarr_cache):
             try:
                 import zarr as _zarr_c
                 _zc = _zarr_c.open_array(zarr_cache, mode='r')
                 _genes_c = list(_zc.attrs.get('genes', []))
                 if _genes_c:
-                    with _spage_lock:
-                        _spage_state["result_path"]  = zarr_cache
-                        _spage_state["result_genes"] = _genes_c
+                    if _alt_res is None:
+                        with _spage_lock:
+                            _spage_state["result_path"]  = zarr_cache
+                            _spage_state["result_genes"] = _genes_c
                     if _alt_res is not None:
                         try:
                             import json as _json_sc
@@ -3585,8 +4645,8 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                         with _alock:
                             _alt_res["spage_result_path"]  = zarr_cache
                             _alt_res["spage_result_genes"] = _genes_c
-                    else:
-                        _spage_index_update(zarr_cache)
+                    elif not _xen_subset:
+                        _spage_index_update(zarr_cache, _ds_key)
                     _set("done", f"Done (cached) — {len(_genes_c):,} genes (streaming)", result=None)
                     return
             except Exception as _zce:
@@ -3600,17 +4660,25 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                 _nr_c = _pf_c.metadata.num_rows
                 if _nr_c * _nc_c > SPAGE_STREAM_THRESHOLD:
                     _genes_c = _pf_c.schema_arrow.names
-                    with _spage_lock:
-                        _spage_state["result_path"]  = cache_file
-                        _spage_state["result_genes"] = list(_genes_c)
-                    _spage_index_update(cache_file)
+                    if _alt_res is None:
+                        with _spage_lock:
+                            _spage_state["result_path"]  = cache_file
+                            _spage_state["result_genes"] = list(_genes_c)
+                        if not _xen_subset:
+                            _spage_index_update(cache_file, _ds_key)
+                    else:
+                        _record_reseg_result(cache_file, _genes_c)
                     _set("done", f"Done (cached, streaming) — {_nc_c:,} genes", result=None)
                     return
             except Exception:
                 pass
             imp_df = pd.read_parquet(cache_file)
-            _spage_index_update(cache_file)
-            _set("done", f"Done (cached) — {len(imp_df.columns):,} genes imputed", result=imp_df)
+            if _alt_res is None:
+                _spage_index_update(cache_file, _ds_key)
+            else:
+                _record_reseg_result(cache_file, list(imp_df.columns))
+            _set("done", f"Done (cached) — {len(imp_df.columns):,} genes imputed",
+                 result=imp_df if _alt_res is None else None)
             return
 
         # ── Extract submatrix from R and save to temp files ──────────────
@@ -3687,9 +4755,11 @@ writeLines(colnames(mat_sub), "{cells_file}")
             if not shared_in_rna_use:
                 _set("error", "No shared genes found in reseg expression matrix.")
                 return
-            xen_raw = reseg_expr[:, xen_idx_use].toarray().astype(np.float32)
+            xen_raw = reseg_expr[:, xen_idx_use].toarray().astype(np.float32, copy=False)
             rs = xen_raw.sum(axis=1, keepdims=True); rs[rs == 0] = 1.0
-            xen_norm = np.log1p(xen_raw / rs * 10_000)
+            # in place: no extra cells × shared-genes temporaries
+            xen_raw /= rs; xen_raw *= 10_000; np.log1p(xen_raw, out=xen_raw)
+            xen_norm = xen_raw
             del xen_raw, rs
             spatial_df = pd.DataFrame(xen_norm, index=_alt_res["cells_df"].index,
                                       columns=shared_in_rna_use)
@@ -3707,33 +4777,43 @@ writeLines(colnames(mat_sub), "{cells_file}")
             panel_gni = DATA["gene_name_to_idx"]
             shared_in_rna_use = [g for g in shared_in_rna if g in panel_gni]
             xen_idx = [panel_gni[g] for g in shared_in_rna_use]
-            xen_raw = _xenium_expr[:, xen_idx].toarray().astype(np.float32)
+            xen_raw = _xenium_expr[:, xen_idx].toarray().astype(np.float32, copy=False)
             rs = xen_raw.sum(axis=1, keepdims=True); rs[rs == 0] = 1.0
-            xen_norm = np.log1p(xen_raw / rs * 10_000)
+            # in place: no extra cells × shared-genes temporaries
+            xen_raw /= rs; xen_raw *= 10_000; np.log1p(xen_raw, out=xen_raw)
+            xen_norm = xen_raw
             del xen_raw, rs
             df  = DATA["df"]
-            idx = DATA["df_to_expr"]
+            idx = np.asarray(DATA["df_to_expr"])
             good = idx >= 0
-            xen_aligned = np.zeros((len(df), len(shared_in_rna_use)), dtype=np.float32)
-            xen_aligned[good] = xen_norm[idx[good]]
+            if (len(idx) == xen_norm.shape[0] and good.all()
+                    and np.array_equal(idx, np.arange(len(idx)))):
+                xen_aligned = xen_norm   # identity mapping: no second copy
+            else:
+                xen_aligned = np.zeros((len(df), len(shared_in_rna_use)), dtype=np.float32)
+                xen_aligned[good] = xen_norm[idx[good]]
             del xen_norm
             spatial_df = pd.DataFrame(xen_aligned, index=df.index, columns=shared_in_rna_use)
             del xen_aligned
 
         # ── Run SpaGE — streaming or in-memory based on output size ─────
         _n_out = len(spatial_df) * len(genes_to_predict)
-        _streaming = _n_out > SPAGE_STREAM_THRESHOLD
+        # Large cell counts also stream: the in-memory path appends dense imputed
+        # columns to the whole expression matrix and rewrites the table.
+        _streaming = _n_out > SPAGE_STREAM_THRESHOLD or len(spatial_df) > 400_000
         if _streaming:
             print(f"  SpaGE: large output ({len(spatial_df):,}×{len(genes_to_predict):,})"
                   f" → streaming to {os.path.basename(zarr_cache)}", flush=True)
             _set("running", f"Running SpaGE (n_pv={n_pv}, {len(genes_to_predict):,} genes, streaming)…")
             _vectorized_spage(spatial_df, rna_df, n_pv, genes_to_predict, out_zarr=zarr_cache)
             del spatial_df, rna_df
-            with _spage_lock:
-                _spage_state["result_path"]  = zarr_cache
-                _spage_state["result_genes"] = genes_to_predict
+            _check_dataset_gen(_gen)
             if _alt_res is None:
-                _spage_index_update(zarr_cache)
+                with _spage_lock:
+                    _spage_state["result_path"]  = zarr_cache
+                    _spage_state["result_genes"] = genes_to_predict
+                if not _xen_subset:
+                    _spage_index_update(zarr_cache, _ds_key)
             else:
                 try:
                     import json as _json_sc
@@ -3757,7 +4837,7 @@ writeLines(colnames(mat_sub), "{cells_file}")
         _set("running", "Saving imputed results…")
         imp_df.to_parquet(cache_file)
         if _alt_res is None:
-            _spage_index_update(cache_file)
+            _spage_index_update(cache_file, _ds_key)
         else:
             try:
                 import json as _json_sc
@@ -3772,37 +4852,108 @@ writeLines(colnames(mat_sub), "{cells_file}")
                 _alt_res["spage_result_genes"] = genes_to_predict
         print(f"  SpaGE: {len(imp_df.columns)} genes cached to {cache_file}", flush=True)
 
+        def _spage_replace_cols(X, col_idx, dense_vals):
+            """X (sparse, cells × genes) with the columns col_idx replaced by dense_vals."""
+            Xc = sp.csc_matrix(X, copy=True)
+            for _j in col_idx:
+                Xc.data[Xc.indptr[_j]:Xc.indptr[_j + 1]] = 0
+            Xc.eliminate_zeros()
+            _vals = np.asarray(dense_vals, dtype=np.float32)
+            _rr = np.tile(np.arange(Xc.shape[0]), len(col_idx))
+            _cc = np.repeat(np.asarray(col_idx), Xc.shape[0])
+            _add = sp.csc_matrix((_vals.ravel(order="F"), (_rr, _cc)), shape=Xc.shape)
+            return (Xc + _add).tocsr()
+
         def _spage_write_zarr(sdata_path, imp_df_sub, lock_ctx=None):
             """Append imputed gene columns to a SpatialData zarr table. Returns list of new genes written."""
+            _zlock = _zarr_write_lock(sdata_path)
+            _zlock.acquire()
             try:
                 import spatialdata as _sd_w, anndata as _ad_w
+                import shutil as _sh_w
                 _sdata_w = _sd_w.read_zarr(sdata_path)
                 _adata_w = _sdata_w.tables["table"]
+                # Imputed rows follow the cells the run saw; the table has its own
+                # row order. Pair them by cell id and write only a complete match
+                # (under a subset() the result stays in the SpaGE cache only).
+                _obs_ids = pd.Index(_adata_w.obs_names.astype(str))
+                _imp_ids = pd.Index(imp_df_sub.index.astype(str))
+                _pos = _imp_ids.get_indexer(_obs_ids) if _imp_ids.is_unique \
+                    else np.full(len(_obs_ids), -1)
+                if (_pos < 0).any() and _imp_ids.is_unique:
+                    _pos = _imp_ids.get_indexer(_obs_ids.str.replace(r'^p\d+_', '', regex=True))
+                if len(_imp_ids) != len(_obs_ids) or (_pos < 0).any():
+                    print("  SpaGE: imputed cells do not match the zarr table "
+                          "(subset active?) — zarr write-back skipped", flush=True)
+                    return [], None
+                if np.array_equal(_pos, np.arange(len(_pos))):
+                    _pos = slice(None)   # same order: no reordered copy of the values
                 _existing = set(_adata_w.var_names)
                 _new_genes = [g for g in imp_df_sub.columns if g not in _existing]
-                if not _new_genes:
-                    return []
-                _new_X = sp.csr_matrix(imp_df_sub[_new_genes].values.astype(np.float32))
+                # Genes imputed by an earlier run get their column replaced
+                _is_imp = (_adata_w.var["is_imputed"].astype(bool)
+                           if "is_imputed" in _adata_w.var.columns
+                           else pd.Series(False, index=_adata_w.var_names))
+                _re_genes = [g for g in imp_df_sub.columns
+                             if g in _existing and bool(_is_imp.get(g, False))]
+                if not _new_genes and not _re_genes:
+                    return [], None
+                _old_X = sp.csr_matrix(_adata_w.X)
+                if _re_genes:
+                    _old_X = _spage_replace_cols(
+                        _old_X, [_adata_w.var_names.get_loc(g) for g in _re_genes],
+                        imp_df_sub[_re_genes].values[_pos])
+                _n_new = len(_new_genes)
+                _new_X = sp.csr_matrix(imp_df_sub[_new_genes].values[_pos].astype(np.float32))
                 _new_var = pd.DataFrame(
                     {"is_imputed": True},
                     index=pd.Index(_new_genes, name=_adata_w.var.index.name or "gene"),
                 )
+                # obs columns added through the low-level zarr API (UMAP, SPLIT
+                # clusters, ROI tags) are not returned by read_zarr: carry them over.
+                _obs_w = _adata_w.obs.copy()
+                _load_zarr_obs_into_df(sdata_path, _obs_w)
                 _adata_new = _ad_w.AnnData(
-                    X=sp.hstack([_adata_w.X, _new_X]).tocsr(),
-                    obs=_adata_w.obs.copy(),
-                    var=pd.concat([_adata_w.var, _new_var]),
+                    X=sp.hstack([_old_X, _new_X]).tocsr(),
+                    obs=_obs_w,
+                    var=pd.concat([_adata_w.var, _new_var]) if _n_new else _adata_w.var.copy(),
                     uns=dict(_adata_w.uns),
+                    obsm=dict(_adata_w.obsm),
+                    # other layers (SPLIT's X_corrected) get zero columns for the new genes
+                    layers={_k: sp.hstack([sp.csr_matrix(_v), sp.csr_matrix(
+                                (_v.shape[0], _n_new), dtype=_v.dtype)]).tocsr()
+                            for _k, _v in _adata_w.layers.items()},
                 )
                 _adata_new.uns["imputed_genes"] = list(_adata_w.uns.get("imputed_genes", [])) + _new_genes
                 _sdata_w.tables["table"] = _adata_new
+                # The table on disk has to be deleted before it can be rewritten:
+                # keep a copy (and the root metadata) to put back if the write fails.
+                _root_w  = str(sdata_path).rstrip("/\\")
+                _tbl_dir = os.path.join(_root_w, "tables", "table")
+                _bak_dir = _root_w + ".spage_table_bak"
+                _meta_w  = [f for f in ("zarr.json", ".zmetadata", ".zattrs", ".zgroup")
+                            if os.path.isfile(os.path.join(_root_w, f))]
+                _sh_w.rmtree(_bak_dir, ignore_errors=True)
+                _sh_w.copytree(_tbl_dir, os.path.join(_bak_dir, "table"))
+                for _f in _meta_w:
+                    _sh_w.copy2(os.path.join(_root_w, _f), os.path.join(_bak_dir, _f))
                 try:
+                    _sdata_w.delete_element_from_disk("table")
                     _sdata_w.write_element("table")
                 except Exception:
-                    _sdata_w.write(sdata_path, overwrite=True)
+                    _sh_w.rmtree(_tbl_dir, ignore_errors=True)
+                    _sh_w.copytree(os.path.join(_bak_dir, "table"), _tbl_dir)
+                    for _f in _meta_w:
+                        _sh_w.copy2(os.path.join(_bak_dir, _f), os.path.join(_root_w, _f))
+                    _sh_w.rmtree(_bak_dir, ignore_errors=True)
+                    raise
+                _sh_w.rmtree(_bak_dir, ignore_errors=True)
                 return _new_genes, _adata_new
             except Exception as _ze:
                 print(f"  SpaGE: zarr write-back failed (non-fatal): {_ze}", flush=True)
                 return [], None
+            finally:
+                _zlock.release()
 
         if _alt_res is not None:
             # ── Reseg write-back: update alt_res["expr"] and per-reseg gene index ──
@@ -3811,18 +4962,39 @@ writeLines(colnames(mat_sub), "{cells_file}")
                 _set("running", "Writing imputed genes to reseg SpatialData zarr…")
                 result_pair = _spage_write_zarr(sdata_path, imp_df)
                 new_genes = result_pair[0] if result_pair else []
-                if new_genes:
+                adata_new = result_pair[1] if len(result_pair) > 1 else None
+                if adata_new is not None:
                     print(f"  SpaGE reseg: wrote {len(new_genes)} genes to {os.path.basename(sdata_path)}", flush=True)
                     with _spage_lock:
-                        # Extend alt_res["expr"] with new imputed columns
-                        new_cols = sp.csr_matrix(imp_df[new_genes].values.astype(np.float32))
-                        _alt_res["expr"] = sp.hstack([_alt_res["expr"], new_cols]).tocsr()
-                        # Rebuild per-reseg gene index (preserves order)
-                        prev_gni = _alt_res.get("gene_name_to_idx") or DATA["gene_name_to_idx"]
-                        prev_names = sorted(prev_gni, key=prev_gni.__getitem__)
-                        extended_names = prev_names + new_genes
-                        _alt_res["gene_name_to_idx"] = {g: i for i, g in enumerate(extended_names)}
-                        _alt_res["imputed_genes"] = list(_alt_res.get("imputed_genes", [])) + new_genes
+                        _prev_imp = list(_alt_res.get("imputed_genes") or [])
+                        _prev_gni = _alt_res.get("gene_name_to_idx") or {}
+                        # Genes imputed before: replace their columns in memory too
+                        _re_genes = [g for g in imp_df.columns
+                                     if g in _prev_imp and g in _prev_gni
+                                     and _prev_gni[g] < _alt_res["expr"].shape[1]]
+                        if _re_genes:
+                            _alt_res["expr"] = _spage_replace_cols(
+                                _alt_res["expr"], [_prev_gni[g] for g in _re_genes],
+                                imp_df[_re_genes].values)
+                        if new_genes:
+                            # Extend alt_res["expr"] with new imputed columns
+                            new_cols = sp.csr_matrix(imp_df[new_genes].values.astype(np.float32))
+                            _alt_res["expr"] = sp.hstack([_alt_res["expr"], new_cols]).tocsr()
+                        if _alt_res["expr"].shape[1] == adata_new.n_vars:
+                            # Same columns as the zarr table (also for a run reloaded
+                            # from a zarr that already held imputed genes)
+                            _alt_res["gene_name_to_idx"] = {
+                                g: i for i, g in enumerate(adata_new.var_names)}
+                            _alt_res["imputed_genes"] = [
+                                g for g in adata_new.var_names
+                                if bool(adata_new.var.loc[g, "is_imputed"])]
+                        elif new_genes:
+                            # Rebuild per-reseg gene index (preserves order)
+                            prev_gni = _alt_res.get("gene_name_to_idx") or DATA["gene_name_to_idx"]
+                            prev_names = sorted(prev_gni, key=prev_gni.__getitem__)
+                            extended_names = prev_names + new_genes
+                            _alt_res["gene_name_to_idx"] = {g: i for i, g in enumerate(extended_names)}
+                            _alt_res["imputed_genes"] = _prev_imp + new_genes
         else:
             # ── Xenium write-back: update DATA["expr"] and gene_names ─────────────
             sdata_path = DATA.get("sdata_path", "")
@@ -3831,9 +5003,10 @@ writeLines(colnames(mat_sub), "{cells_file}")
                 result_pair = _spage_write_zarr(sdata_path, imp_df)
                 new_genes = result_pair[0] if result_pair else []
                 adata_new  = result_pair[1] if len(result_pair) > 1 else None
-                if new_genes and adata_new is not None:
+                if adata_new is not None:
                     print(f"  SpaGE: wrote {len(new_genes)} imputed genes to zarr", flush=True)
                     with _spage_lock:
+                        _check_dataset_gen(_gen)
                         DATA["gene_names"]       = list(adata_new.var_names)
                         DATA["gene_name_to_idx"] = {g: i for i, g in enumerate(DATA["gene_names"])}
                         DATA["expr"]             = sp.csr_matrix(adata_new.X)
@@ -3841,7 +5014,8 @@ writeLines(colnames(mat_sub), "{cells_file}")
                         DATA["gene_var"]         = adata_new.var
                         _gene_expr_cache.clear()
 
-        _set("done", f"Done — {len(imp_df.columns):,} genes imputed", result=imp_df)
+        _set("done", f"Done — {len(imp_df.columns):,} genes imputed",
+             result=imp_df if _alt_res is None else None)
 
     except Exception as exc:
         import traceback
@@ -3902,7 +5076,10 @@ def subset(cluster=None, cell_type=None,
 
     # ── Cluster filter ────────────────────────────────────────────────────
     if cluster is not None:
-        _method = method or DATA["cluster_methods"][0]
+        _cm = DATA.get("cluster_methods") or []
+        _method = method or (_cm[0] if _cm else None)
+        if _method is None:
+            raise ValueError("No cluster sets are available for this dataset.")
         col  = f"clust__{_method}"
         vals = [cluster] if not isinstance(cluster, (list, tuple)) else list(cluster)
         vals = [int(v) for v in vals]
@@ -3934,9 +5111,19 @@ def subset(cluster=None, cell_type=None,
 
     # ── Gene expression filter ────────────────────────────────────────────
     if gene is not None and (min_expr is not None or max_expr is not None):
-        expr_vals = pd.Series(get_gene_expression(gene), index=df.index)
-        if min_expr is not None: mask &= expr_vals >= min_expr
-        if max_expr is not None: mask &= expr_vals <= max_expr
+        # Compute against the ORIGINAL cell→expr mapping: get_gene_expression() is
+        # aligned to the current (possibly already subset) DATA["df"].
+        _base = gene[:-6] if gene.endswith(" [imp]") else gene
+        if _base in DATA["gene_name_to_idx"]:
+            _raw = DATA["expr_csc"][:, DATA["gene_name_to_idx"][_base]].toarray().ravel()
+            _idx = DATA["_df_to_expr_orig"]
+            expr_vals = pd.Series(
+                np.log1p(np.where(_idx >= 0, _raw[np.clip(_idx, 0, len(_raw) - 1)], 0.0)),
+                index=df.index)
+            if min_expr is not None: mask &= expr_vals >= min_expr
+            if max_expr is not None: mask &= expr_vals <= max_expr
+        else:
+            print(f"  subset: gene '{gene}' not found - skipping gene filter", flush=True)
 
     # ── Numeric range filters ─────────────────────────────────────────────
     if min_transcripts  is not None: mask &= df["transcript_counts"] >= min_transcripts
@@ -4066,6 +5253,12 @@ def unsubset():
         _orig_corr = _alt_res.pop("_corrected_original")
         if _orig_corr is not None:
             _alt_res["split_corrected_expr"] = _orig_corr
+        elif (_alt_res.get("split_corrected_expr") is not None
+              and _alt_res["split_corrected_expr"].shape[0] != len(_alt_res["cells_df"])):
+            # Corrected matrix sized to the subset cannot be paired with the full cells_df
+            _alt_res["split_corrected_expr"] = None
+            print("  unsubset: dropped SPLIT-corrected counts computed on the subset "
+                  "(re-run SPLIT on the full dataset)", flush=True)
 
     _umap_df_cache.clear()
     _gene_expr_cache.clear()
@@ -4095,19 +5288,34 @@ def retry_split_zarr_write(seg_source: str = None) -> None:
     else:
         res = None  # Xenium uses DATA directly
 
+    # The in-memory matrix is already expanded to one row per cell (reseg: per
+    # cells_df row; Xenium: per DATA["expr"] row), while split_corrected_cell_ids
+    # lists only the cells RCTD kept - so rows are paired with cell ids here.
     if res is not None:
         corrected_mat     = res.get("split_corrected_expr")
-        corrected_ids     = res.get("split_corrected_cell_ids")
         panel_genes       = res.get("split_panel_genes")
         sdata_path        = res.get("sdata_path", "")
         cells_df          = res.get("cells_df")
+        if res.get("_cells_df_original") is not None and res.get("_corrected_original") is not None:
+            # subset() active: write the full-size copy
+            corrected_mat = res["_corrected_original"]
+            cells_df      = res["_cells_df_original"]
     else:
         corrected_mat     = DATA.get("split_corrected_expr")
-        corrected_ids     = DATA.get("split_corrected_cell_ids")
         panel_genes       = DATA.get("split_panel_genes")
         sdata_path        = DATA.get("sdata_path", "")
-        cells_df          = DATA.get("df")
+        cells_df          = DATA.get("_df_original", DATA.get("df"))
+        if corrected_mat is not None and cells_df is not None:
+            _d2e  = np.asarray(DATA.get("_df_to_expr_orig", DATA["df_to_expr"]))
+            _good = (_d2e >= 0) & (_d2e < corrected_mat.shape[0])
+            cells_df      = cells_df[_good]
+            corrected_mat = corrected_mat[_d2e[_good], :]
 
+    if corrected_mat is not None and (cells_df is None
+                                      or corrected_mat.shape[0] != len(cells_df)):
+        print("  retry_split_zarr_write: corrected matrix does not match the loaded cells "
+              "— rerun SPLIT", flush=True)
+        return
     if corrected_mat is None:
         print("  retry_split_zarr_write: no split_corrected_expr in memory — "
               "has SPLIT been run this session?", flush=True)
@@ -4123,7 +5331,7 @@ def retry_split_zarr_write(seg_source: str = None) -> None:
     print(f"  retry_split_zarr_write: writing {corrected_mat.shape} matrix to {sdata_path}",
           flush=True)
     _split_write_zarr(sdata_path, corrected_mat, cells_df, panel_genes,
-                      corrected_cell_ids=corrected_ids)
+                      corrected_cell_ids=None)
 
 
 def get_genes(file: str = None) -> list:
@@ -4169,7 +5377,8 @@ def _compute_cooccurrence_from_raw(raw_matrix, freqs):
     total_pairs = raw_matrix.sum()
     if total_pairs == 0:
         return raw_matrix.copy()
-    expected = np.outer(freqs, freqs) * total_pairs * 2
+    # raw_matrix counts directed (cell, neighbour) pairs, so no factor 2 here
+    expected = np.outer(freqs, freqs) * total_pairs
     return np.log2(raw_matrix / (expected + 1e-9) + 1e-9)
 
 
@@ -4187,6 +5396,7 @@ def _compute_enrichment_from_raw(raw_matrix, row_counts, freqs):
 def _run_spatial_analysis(label_key, n_neighbors, alt_res):
     """Background thread: compute spatial analysis plots."""
     global _spatial_state
+    _gen = _dataset_gen
     try:
         with _spatial_lock:
             _spatial_state["status"] = "running"
@@ -4277,6 +5487,7 @@ def _run_spatial_analysis(label_key, n_neighbors, alt_res):
                 umap_coords = (u[:, 0], u[:, 1])
 
         with _spatial_lock:
+            _check_dataset_gen(_gen)
             _spatial_state["status"] = "done"
             _spatial_state["message"] = f"Done. {n_types} cell types, {len(coords_valid):,} cells."
             _spatial_state["result"] = {
@@ -4291,8 +5502,9 @@ def _run_spatial_analysis(label_key, n_neighbors, alt_res):
     except Exception as e:
         import traceback
         with _spatial_lock:
-            _spatial_state["status"] = "error"
-            _spatial_state["message"] = f"Error: {e}\n{traceback.format_exc()}"
+            if not _stale_job(_gen, "error"):
+                _spatial_state["status"] = "error"
+                _spatial_state["message"] = f"Error: {e}\n{traceback.format_exc()}"
 
 
 def _run_spatial_niches(n_clusters: int, n_neighbors: int, label_key: str | None,
@@ -4300,6 +5512,7 @@ def _run_spatial_niches(n_clusters: int, n_neighbors: int, label_key: str | None
     """Background thread: compute spatial niches via BuildNicheAssay-style KMeans."""
     from sklearn.neighbors import NearestNeighbors
     from sklearn.cluster import KMeans
+    _gen = _dataset_gen
     try:
         with _niche_lock:
             _niche_state["status"] = "running"
@@ -4334,7 +5547,15 @@ def _run_spatial_niches(n_clusters: int, n_neighbors: int, label_key: str | None
 
         if labels_series is not None:
             # Align labels to cells_df index
-            aligned = labels_series.reindex(cells_df.index).fillna("Unknown")
+            aligned = labels_series.reindex(cells_df.index)
+            if aligned.isna().all():
+                # label ids are stored as str; a reseg cells_df index may be int
+                aligned = pd.Series(labels_series.reindex(cells_df.index.astype(str)).values,
+                                    index=cells_df.index)
+            if aligned.isna().all():
+                raise ValueError("The selected annotation has no labels for the cells of the "
+                                 "active segmentation")
+            aligned = aligned.fillna("Unknown")
             cell_types = sorted(aligned.unique())
             ct_to_idx = {ct: i for i, ct in enumerate(cell_types)}
             label_arr = aligned.map(ct_to_idx).values  # int array
@@ -4366,12 +5587,14 @@ def _run_spatial_niches(n_clusters: int, n_neighbors: int, label_key: str | None
         niche_labels = km.fit_predict(composition).astype(str)
 
         # Write niche column to cells_df
+        _check_dataset_gen(_gen)
         cells_df = cells_df.copy()
         cells_df["niche"] = niche_labels
         if alt_res is not None:
             alt_res["cells_df"] = cells_df
         else:
             DATA["df"]["niche"] = niche_labels
+            _umap_df_cache.clear()   # cached dropna() copies lack the new column
 
         # Print proportion table if cell types available
         if cell_types is not None and labels_series is not None:
@@ -4383,21 +5606,23 @@ def _run_spatial_niches(n_clusters: int, n_neighbors: int, label_key: str | None
                 if mask.sum() == 0:
                     continue
                 ct_counts = np.bincount(label_arr[mask], minlength=len(cell_types))
-                rows[f"Niche {niche_id + 1}"] = ct_counts / max(ct_counts.sum(), 1)
+                rows[f"Niche {niche_id}"] = ct_counts / max(ct_counts.sum(), 1)
             prop_df = _pd_inner.DataFrame(rows, index=cell_types).T
             print("\n── Spatial Niche × Cell Type proportions ──", flush=True)
             print(prop_df.to_string(float_format=lambda v: f"{v:.2f}"), flush=True)
             print("", flush=True)
 
         with _niche_lock:
+            _check_dataset_gen(_gen)
             _niche_state["status"] = "done"
             _niche_state["message"] = f"Done — {n_clusters} niches computed for {n_cells:,} cells"
     except Exception as exc:
         import traceback
         traceback.print_exc()
         with _niche_lock:
-            _niche_state["status"] = "error"
-            _niche_state["message"] = str(exc)
+            if not _stale_job(_gen, "error"):
+                _niche_state["status"] = "error"
+                _niche_state["message"] = str(exc)
 
 
 def run_spage(rds_path: str, genes_file: str = None, n_pv: int = 50,
@@ -4502,13 +5727,13 @@ _PREFETCH_FRAC = 0.15   # was 0.50; smaller = faster first render, less pan buff
 # ── Change 2 & 3: per-channel handles with LRU store cache ────────────────────
 # One TiffFile + LRU-backed zarr per channel per z-level → parallel reads,
 # no shared-lock needed, LRU avoids re-reading the same tiles from disk.
-_morph_handles: dict = {}    # {z_level: {"handles": [(tif, arr)×n_ch], "H", "W", "n_ch"} | None}
+_morph_handles: dict = {}    # {(data_dir, z_level): {"handles": [(tif, arr)×n_ch], "H", "W", "n_ch"} | None}
 _morph_init_lock = threading.Lock()   # only held during one-time initialisation
 
 # Low-resolution overviews cached in memory and on disk
 # Coarse (stride ~26): for viewport > ~4,400 µm  — fast zoomed-out view
 # Medium (stride  ~8): for viewport 1,300–4,400 µm — eliminates mid-zoom tile reads
-_morph_overview: dict = {}        # {z_level: ov_dict, "med_z_level": ov_dict}
+_morph_overview: dict = {}        # {(data_dir, z_level): ov_dict, (data_dir, "med", z_level): ov_dict}
 _morph_overview_lock  = threading.Lock()
 _overview_generating  = set()     # keys currently being generated in background
 
@@ -4520,6 +5745,24 @@ _morph_render_lock  = threading.Lock()
 # ── Change 4: progressive rendering queue ─────────────────────────────────────
 # Background hires fetches append here; the Dash callback polls and pushes a Patch.
 _morph_hires_queue: list = []   # list of image-dict results; GIL protects appends/pops
+
+
+def _reset_morph_caches() -> None:
+    """Drop all in-memory morphology state (called when a different dataset is loaded)."""
+    with _morph_init_lock:
+        for _info in _morph_handles.values():
+            if _info:
+                for _tif, _ in _info["handles"]:
+                    try:
+                        _tif.close()
+                    except Exception:
+                        pass
+        _morph_handles.clear()
+    with _morph_overview_lock:
+        _morph_overview.clear()
+    with _morph_render_lock:
+        _morph_render_cache.clear()
+    _morph_hires_queue.clear()
 
 
 class _ZarrTiffArray:
@@ -4538,8 +5781,15 @@ class _ZarrTiffArray:
         meta = json.loads(store[".zarray"])
         self.shape   = tuple(meta["shape"])   # (n_ch, H, W)
         self._csize  = meta["chunks"]         # [1, tile_h, tile_w]
+        # Single-channel images (e.g. DAPI-only morphology_focus) are 2-D (H, W):
+        # present them as (1, H, W) so callers keep the (C, H, W) contract.
+        self._2d     = len(self.shape) == 2
+        if self._2d:
+            self.shape  = (1, *self.shape)
+            self._csize = [1, *self._csize]
         self._dtype  = np.dtype(meta["dtype"])
         self._store  = store
+        self._pyr    = {}                     # c_idx -> [(factor, store, (Hl, Wl), (cy, cx))]
 
     def __getitem__(self, idx):
         if not isinstance(idx, tuple) or len(idx) != 3:
@@ -4559,57 +5809,133 @@ class _ZarrTiffArray:
             out_w = len(range(x0, x1, dx)) if w > 0 else 0
             return np.zeros((out_h, out_w), dtype=self._dtype)
 
-        out = np.zeros((h, w), dtype=self._dtype)
-        cy0_blk = y0 // cy;  cy1_blk = (y1 - 1) // cy + 1
-        cx0_blk = x0 // cx;  cx1_blk = (x1 - 1) // cx + 1
+        # Fill the strided output directly (same pixels as out[::dy, ::dx] of the
+        # full-resolution region, without allocating that region).
+        ys_idx = np.arange(y0, y1, dy)
+        xs_idx = np.arange(x0, x1, dx)
 
-        for bcy in range(cy0_blk, cy1_blk):
-            for bcx in range(cx0_blk, cx1_blk):
-                raw = self._store.get(f"{c_idx}.{bcy}.{bcx}")
+        # Zoomed-out reads: take the pixels from the coarsest pyramid level that is still
+        # at least as fine as the requested stride, so far fewer tiles are decoded.
+        levels = self._pyr.get(c_idx) if min(dy, dx) >= 2 else None
+        if levels:
+            best = None
+            for lv in levels:                       # (factor, store, (Hl, Wl), (cyl, cxl))
+                if lv[0] <= min(dy, dx) * 1.02 and (best is None or lv[0] > best[0]):   # levels are ~2^k
+                    best = lv
+            if best is not None:
+                _f, lstore, (Hl, Wl), (cyl, cxl) = best
+                ys_l = np.minimum(ys_idx * Hl // H, Hl - 1)
+                xs_l = np.minimum(xs_idx * Wl // W, Wl - 1)
+                return self._gather(lstore, lambda by, bx: f"{by}.{bx}", cyl, cxl, ys_l, xs_l)
+
+        key_fn = ((lambda by, bx: f"{by}.{bx}") if self._2d
+                  else (lambda by, bx: f"{c_idx}.{by}.{bx}"))
+        return self._gather(self._store, key_fn, cy, cx, ys_idx, xs_idx)
+
+    def _gather(self, store, key_fn, cy, cx, ys_idx, xs_idx):
+        """Assemble out[i, j] = image[ys_idx[i], xs_idx[j]] from the tiles of *store*
+        (ys_idx / xs_idx are sorted pixel indices; only tiles they touch are decoded)."""
+        out = np.zeros((len(ys_idx), len(xs_idx)), dtype=self._dtype)
+        for bcy in range(int(ys_idx[0]) // cy, int(ys_idx[-1]) // cy + 1):
+            ylo, yhi = np.searchsorted(ys_idx, [bcy * cy, (bcy + 1) * cy])
+            if ylo == yhi:
+                continue
+            for bcx in range(int(xs_idx[0]) // cx, int(xs_idx[-1]) // cx + 1):
+                xlo, xhi = np.searchsorted(xs_idx, [bcx * cx, (bcx + 1) * cx])
+                if xlo == xhi:
+                    continue   # stride skips this tile entirely
+                raw = store.get(key_fn(bcy, bcx))
                 if raw is None:
                     continue
                 tile = np.asarray(raw).reshape(cy, cx)
-                ty0 = max(y0, bcy * cy) - bcy * cy
-                ty1 = min(y1, (bcy + 1) * cy) - bcy * cy
-                tx0 = max(x0, bcx * cx) - bcx * cx
-                tx1 = min(x1, (bcx + 1) * cx) - bcx * cx
-                oy0 = max(y0, bcy * cy) - y0
-                oy1 = min(y1, (bcy + 1) * cy) - y0
-                ox0 = max(x0, bcx * cx) - x0
-                ox1 = min(x1, (bcx + 1) * cx) - x0
-                out[oy0:oy1, ox0:ox1] = tile[ty0:ty1, tx0:tx1]
+                out[ylo:yhi, xlo:xhi] = tile[np.ix_(ys_idx[ylo:yhi] - bcy * cy,
+                                                    xs_idx[xlo:xhi] - bcx * cx)]
+        return out
 
-        return out[::dy, ::dx]
+    def attach_pyramid(self, c_idx, tif):
+        """Register the reduced-resolution levels of *tif* (a TiffFile whose first series is
+        the 2-D plane of channel *c_idx*) for use by zoomed-out reads. No-op if it has none."""
+        import json
+        try:
+            series = tif.series[0]
+            _, H, W = self.shape
+            if len(series.levels) < 2 or tuple(series.levels[0].shape[-2:]) != (H, W):
+                return
+            levels = []
+            for li in range(1, len(series.levels)):
+                lstore = tif.aszarr(level=li)
+                meta = json.loads(lstore[".zarray"])
+                if len(meta["shape"]) != 2 or np.dtype(meta["dtype"]) != self._dtype:
+                    return
+                Hl, Wl = meta["shape"]
+                levels.append((H / Hl, lstore, (Hl, Wl), tuple(meta["chunks"])))
+            self._pyr[c_idx] = levels
+        except Exception:
+            self._pyr.pop(c_idx, None)
 
 
 def _open_tiff_as_array(tif):
     """Open a TiffFile as an array-like, falling back to _ZarrTiffArray for zarr v3."""
     import warnings
     warnings.filterwarnings("ignore", message=".*OME series cannot read multi-file pyramids.*")
-    store = tif.aszarr()
+    # level=0: a single-file pyramid would otherwise yield a multiscale group
+    store = tif.aszarr(level=0)
     try:
         import zarr as zarr_mod
-        return zarr_mod.open(store, mode="r")
+        arr = zarr_mod.open(store, mode="r")
+        if getattr(arr, "ndim", None) != 3:
+            return _ZarrTiffArray(store)   # 2-D image → (1, H, W) adapter
+        return arr
     except (TypeError, AttributeError):
         return _ZarrTiffArray(store)
 
 
+def _morph_focus_path(data_dir: str, z_level: int):
+    """Locate the morphology focus image for a file index, or None if absent."""
+    import glob
+    d = os.path.join(data_dir, "morphology_focus")
+    p = os.path.join(d, f"morphology_focus_{z_level:04d}.ome.tif")     # XOA 2.x/3.x
+    if os.path.exists(p):
+        return p
+    hits = sorted(h for h in glob.glob(os.path.join(d, f"ch{z_level:04d}_*.ome.tif"))
+                  if not os.path.basename(h).startswith("._"))         # XOA 4.x
+    if hits:
+        return hits[0]
+    if z_level == 0:
+        try:   # path recorded by the instrument, then the XOA 1.x single-file layout
+            rel = DATA.get("metadata", {}).get("images", {}).get("morphology_focus_filepath")
+        except Exception:
+            rel = None
+        root = os.path.abspath(data_dir)
+        for cand in (rel, "morphology_focus.ome.tif"):
+            if not cand or not isinstance(cand, str):
+                continue
+            # the recorded path comes from the bundle's metadata: it must name a TIFF
+            # inside the bundle (the WebGL viewer serves this file to the browser)
+            full = os.path.abspath(os.path.join(root, cand))
+            if (full.startswith(root + os.sep) and full.lower().endswith((".tif", ".tiff"))
+                    and os.path.isfile(full)):
+                return os.path.join(data_dir, os.path.relpath(full, root))
+    return None
+
+
 def _get_morph_handles(data_dir: str, z_level: int):
     """Lazily open one TiffFile per channel with a direct-tile array adapter."""
+    hk = (data_dir, z_level)   # keyed by dataset so a switched sample never reuses handles
     with _morph_init_lock:
-        if z_level in _morph_handles:
-            return _morph_handles[z_level]
+        if hk in _morph_handles:
+            return _morph_handles[hk]
 
         import warnings, logging, tifffile
         warnings.filterwarnings("ignore", message=".*OME series cannot read multi-file pyramids.*")
         logging.getLogger("tifffile").setLevel(logging.ERROR)
 
-        fname = f"morphology_focus_{z_level:04d}.ome.tif"
-        path  = os.path.join(data_dir, "morphology_focus", fname)
+        path  = _morph_focus_path(data_dir, z_level)
 
-        if not os.path.exists(path):
-            _morph_handles[z_level] = None
+        if path is None:
+            _morph_handles[hk] = None
             return None
+        fname = os.path.basename(path)
 
         try:
             # Probe shape
@@ -4620,19 +5946,36 @@ def _get_morph_handles(data_dir: str, z_level: int):
 
             # Open one handle per channel
             handles = []
-            for _ in range(n_ch):
+            for _ci in range(n_ch):
                 tif_ch = tifffile.TiffFile(path)
                 arr    = _open_tiff_as_array(tif_ch)
                 handles.append((tif_ch, arr))
+                # Pyramid levels: tifffile exposes them for a single-file 2-D image, but not
+                # through a multi-file OME series, so open the channel's own file directly.
+                if isinstance(arr, _ZarrTiffArray):
+                    try:
+                        if arr._2d:
+                            arr.attach_pyramid(0, tif_ch)
+                        else:
+                            _pg    = tif_ch.series[0].pages[_ci]
+                            _cpath = _pg.parent.filehandle.path
+                            _tif_p = tifffile.TiffFile(_cpath, is_ome=False)
+                            arr.attach_pyramid(_ci, _tif_p)
+                            if _ci in arr._pyr:
+                                arr._pyr_tifs = getattr(arr, "_pyr_tifs", []) + [_tif_p]  # keep open
+                            else:
+                                _tif_p.close()
+                    except Exception:
+                        pass
 
-            _morph_handles[z_level] = {"handles": handles, "H": H, "W": W, "n_ch": n_ch}
+            _morph_handles[hk] = {"handles": handles, "H": H, "W": W, "n_ch": n_ch}
             adapter = type(handles[0][1]).__name__
             print(f"  Morphology z{z_level}: {n_ch}ch × {H}×{W} px [{adapter}]", flush=True)
         except Exception as exc:
             print(f"  Warning: could not open {fname}: {exc}", flush=True)
-            _morph_handles[z_level] = None
+            _morph_handles[hk] = None
 
-    return _morph_handles.get(z_level)
+    return _morph_handles.get(hk)
 
 
 def _overview_cache_path(data_dir: str, z_level: int, medium: bool = False) -> str:
@@ -4658,31 +6001,31 @@ def _load_overview_from_disk(path: str):
 
 def _load_or_generate_overview(data_dir: str, z_level: int):
     """Return coarse (stride ~26) overview dict, or None if not yet ready."""
+    ov_key = (data_dir, z_level)
     with _morph_overview_lock:
-        if z_level in _morph_overview:
-            return _morph_overview[z_level]
+        if ov_key in _morph_overview:
+            return _morph_overview[ov_key]
 
     ov_path = _overview_cache_path(data_dir, z_level, medium=False)
     if os.path.exists(ov_path):
         ov = _load_overview_from_disk(ov_path)
         if ov:
             with _morph_overview_lock:
-                _morph_overview[z_level] = ov
+                _morph_overview[ov_key] = ov
             print(f"  Overview z{z_level} (coarse): loaded from cache", flush=True)
             return ov
 
     # Generate coarse + medium together in one background pass
     with _morph_overview_lock:
-        if f"coarse_{z_level}" in _overview_generating:
+        if ("coarse", data_dir, z_level) in _overview_generating:
             return None
-        _overview_generating.add(f"coarse_{z_level}")
+        _overview_generating.add(("coarse", data_dir, z_level))
 
     def _gen_overviews():
         try:
             import tifffile
-            fname = f"morphology_focus_{z_level:04d}.ome.tif"
-            path  = os.path.join(data_dir, "morphology_focus", fname)
-            if not os.path.exists(path):
+            path  = _morph_focus_path(data_dir, z_level)
+            if path is None:
                 return
 
             tif_ov  = tifffile.TiffFile(path)
@@ -4725,14 +6068,16 @@ def _load_or_generate_overview(data_dir: str, z_level: int):
             ov_coarse = {"channels": coarse_channels, "stride": coarse_stride}
 
             with _morph_overview_lock:
-                _morph_overview[z_level]              = ov_coarse
-                _morph_overview[f"med_{z_level}"]     = ov_med
+                # Skip the in-memory copy if another dataset was loaded meanwhile
+                if data_dir == DATA.get("data_dir"):
+                    _morph_overview[ov_key]                     = ov_coarse
+                    _morph_overview[(data_dir, "med", z_level)] = ov_med
             print(f"  Overviews z{z_level}: generated and cached", flush=True)
         except Exception as exc:
             print(f"  Overview generation error z{z_level}: {exc}", flush=True)
         finally:
             with _morph_overview_lock:
-                _overview_generating.discard(f"coarse_{z_level}")
+                _overview_generating.discard(("coarse", data_dir, z_level))
 
     threading.Thread(target=_gen_overviews, daemon=True).start()
     return None
@@ -4740,7 +6085,7 @@ def _load_or_generate_overview(data_dir: str, z_level: int):
 
 def _load_or_get_medium_overview(data_dir: str, z_level: int):
     """Return medium (stride ~8) overview dict, or None if not yet ready."""
-    key = f"med_{z_level}"
+    key = (data_dir, "med", z_level)
     with _morph_overview_lock:
         if key in _morph_overview:
             return _morph_overview[key]
@@ -4879,6 +6224,9 @@ def make_morphology_overlay(data_dir, relayout, z_level, channels, brightness, i
         return None, ""
     if not channels or not relayout:
         return None, ""
+    # Checklist values arrive in click order; the render cache key is order-free,
+    # so keep one canonical order for reads, cached layers and compositing.
+    channels = sorted(channels)
 
     handles_info = _get_morph_handles(data_dir, z_level)
     if handles_info is None:
@@ -4929,7 +6277,7 @@ def make_morphology_overlay(data_dir, relayout, z_level, channels, brightness, i
             return img, " (medium overview)"
 
     sorted_ch  = tuple(sorted(channels))
-    cache_key  = (z_level, sorted_ch, stride)
+    cache_key  = (data_dir, z_level, sorted_ch, stride)
 
     # ── Path 2: render cache hit (brightness-independent raw layers) ──────
     with _morph_render_lock:
@@ -4987,6 +6335,8 @@ def make_morphology_overlay(data_dir, relayout, z_level, channels, brightness, i
         rgb = _compose_rgb(layers, p1p99, brightness, cy1 - cy0, cx1 - cx0, channels,
                            crop=(cy0, cy1, cx0, cx1))
         img = _encode_overlay_jpeg(rgb, vp_px_x0, vp_px_y0, rw_vp, rh_vp, img_opacity)
+        if data_dir != DATA.get("data_dir"):
+            return   # dataset was switched while reading — do not show the old slide
         _morph_hires_queue.append(img)   # picked up by push_hires_overlay callback
 
     # ── Change 4: progressive rendering ───────────────────────────────────
@@ -5052,7 +6402,10 @@ def load_xenium_data(data_dir: str) -> dict:
 
 
 def _build_boundary_dict(df: pd.DataFrame) -> dict:
-    """Return {cell_id: (vertex_x_array, vertex_y_array)} for fast polygon lookup."""
+    """Return {cell_id: (vertex_x_array, vertex_y_array)} for fast polygon lookup.
+
+    A cell with several rings (XOA 2+ nucleus boundaries: one `label_id` per nucleus)
+    gets one NaN-separated vertex array, so the rings are not joined into one path."""
     if df.empty:
         return {}
     # Pre-sort by cell_id for contiguous slicing via numpy split
@@ -5060,9 +6413,22 @@ def _build_boundary_dict(df: pd.DataFrame) -> dict:
     vx = df["vertex_x"].values
     vy = df["vertex_y"].values
     order = np.argsort(cell_ids, kind="mergesort")
+    if "label_id" in df.columns:
+        # stable two-pass sort → (cell_id, label_id), vertex order within a ring kept
+        _lab = df["label_id"].values
+        order = np.argsort(_lab, kind="mergesort")
+        order = order[np.argsort(cell_ids[order], kind="mergesort")]
     cell_ids_s = cell_ids[order]
     vx_s = vx[order]
     vy_s = vy[order]
+    if "label_id" in df.columns:
+        _lab_s = _lab[order]
+        _brk = np.flatnonzero((cell_ids_s[1:] == cell_ids_s[:-1]) & (_lab_s[1:] != _lab_s[:-1])) + 1
+        if len(_brk):
+            # NaN vertex between two rings of the same cell
+            vx_s = np.insert(vx_s.astype(float), _brk, np.nan)
+            vy_s = np.insert(vy_s.astype(float), _brk, np.nan)
+            cell_ids_s = np.insert(cell_ids_s, _brk, cell_ids_s[_brk])
     # Find split points where cell_id changes
     change = np.flatnonzero(cell_ids_s[1:] != cell_ids_s[:-1]) + 1
     unique_ids = cell_ids_s[np.r_[0, change]]
@@ -5073,12 +6439,57 @@ def _build_boundary_dict(df: pd.DataFrame) -> dict:
 
 def _gdf_to_bounds_dict(gdf) -> dict:
     """Convert GeoDataFrame of cell polygons back to {cell_id: (x_verts, y_verts)}."""
-    result = {}
-    for idx, geom in gdf.geometry.items():
-        if geom is not None and not geom.is_empty:
-            xy = geom.exterior.coords.xy
-            result[idx] = (np.array(xy[0]), np.array(xy[1]))
-    return result
+    import shapely
+    geoms = np.asarray(gdf.geometry.values)
+    # Polygons (type id 3) and MultiPolygons (6: a cell with several rings, e.g. several
+    # nuclei); missing/empty geometries are skipped as before
+    _tid = shapely.get_type_id(geoms)
+    ok = ((_tid == 3) | (_tid == 6)) & ~shapely.is_empty(geoms)
+    if not ok.any():
+        return {}
+    parts, pidx = shapely.get_parts(geoms[ok], return_index=True)
+    coords, ridx = shapely.get_coordinates(shapely.get_exterior_ring(parts),
+                                           return_index=True)
+    cidx = pidx[ridx]                       # geometry (cell) index of every vertex
+    # NaN vertex between two parts of the same cell
+    _brk = np.flatnonzero((ridx[1:] != ridx[:-1]) & (cidx[1:] == cidx[:-1])) + 1
+    cx, cy = coords[:, 0], coords[:, 1]
+    if len(_brk):
+        cx = np.insert(cx, _brk, np.nan)
+        cy = np.insert(cy, _brk, np.nan)
+        cidx = np.insert(cidx, _brk, cidx[_brk])
+    change = np.flatnonzero(cidx[1:] != cidx[:-1]) + 1
+    _starts = np.r_[0, change]
+    keys = gdf.index.values[ok][cidx[_starts]]
+    xs = np.split(cx, change)
+    ys = np.split(cy, change)
+    # Stores written before multi-ring support hold a multi-nucleus cell as ONE ring made of
+    # its closed rings back to back. Split such a ring where it returns to its start vertex,
+    # but only when every resulting piece is itself a closed ring.
+    _first = np.repeat(_starts, np.diff(np.r_[_starts, len(cx)]))
+    _pos   = np.arange(len(cx))
+    _last  = np.r_[change, len(cx)] - 1
+    _mid   = (cx == cx[_first]) & (cy == cy[_first]) & (_pos != _first)
+    _mid[_last] = False
+    for _g in np.unique(np.searchsorted(_starts, np.flatnonzero(_mid), side="right") - 1):
+        gx, gy = xs[_g], ys[_g]
+        if np.isnan(gx).any():
+            continue
+        pieces, a, n = [], 0, len(gx)
+        while a < n:
+            if a == n - 1 and gx[a] == gx[0] and gy[a] == gy[0]:
+                break                       # closing vertex shapely added to the merged ring
+            hit = np.flatnonzero((gx[a + 1:] == gx[a]) & (gy[a + 1:] == gy[a]))
+            if not len(hit) or hit[0] < 2:
+                pieces = []
+                break
+            b = a + 1 + hit[0]
+            pieces.append((a, b + 1))
+            a = b + 1
+        if len(pieces) > 1:
+            xs[_g] = np.concatenate([np.r_[gx[a:b], np.nan] for a, b in pieces])[:-1]
+            ys[_g] = np.concatenate([np.r_[gy[a:b], np.nan] for a, b in pieces])[:-1]
+    return dict(zip(keys, zip(xs, ys)))
 
 
 def _build_xenium_sdata(data_dir: str) -> None:
@@ -5103,32 +6514,77 @@ def _build_xenium_sdata(data_dir: str) -> None:
     cells = pd.read_parquet(os.path.join(data_dir, "cells.parquet"))
     cells = cells.set_index("cell_id")
 
-    umap_df = pd.read_csv(
-        os.path.join(data_dir, "analysis/umap/gene_expression_2_components/projection.csv"),
-        index_col="Barcode",
-    )
-
-    cluster_dir = os.path.join(data_dir, "analysis/clustering")
+    # Secondary analysis is optional: use analysis/ when extracted, else read the
+    # same CSVs straight from analysis.tar.gz, else go without UMAP / clustering.
+    umap_df = None
     cluster_methods = {}
-    for method in sorted(os.listdir(cluster_dir)):
-        path = os.path.join(cluster_dir, method, "clusters.csv")
-        if os.path.exists(path):
-            df_c = pd.read_csv(path, index_col="Barcode")
-            cluster_methods[method] = df_c["Cluster"]
+    _umap_rel   = "analysis/umap/gene_expression_2_components/projection.csv"
+    cluster_dir = os.path.join(data_dir, "analysis/clustering")
+    _analysis_tar = os.path.join(data_dir, "analysis.tar.gz")
+    if os.path.isdir(os.path.join(data_dir, "analysis")):
+        if os.path.exists(os.path.join(data_dir, _umap_rel)):
+            umap_df = pd.read_csv(os.path.join(data_dir, _umap_rel), index_col="Barcode")
+        for method in (sorted(os.listdir(cluster_dir)) if os.path.isdir(cluster_dir) else []):
+            path = os.path.join(cluster_dir, method, "clusters.csv")
+            if os.path.exists(path):
+                df_c = pd.read_csv(path, index_col="Barcode")
+                cluster_methods[method] = df_c["Cluster"]
+    elif os.path.exists(_analysis_tar):
+        try:
+            import tarfile
+            with tarfile.open(_analysis_tar, "r:gz") as _tf:
+                for _m in sorted(_tf.getmembers(), key=lambda m: m.name):
+                    _name = _m.name.lstrip("./")
+                    _parts = _name.split("/")
+                    if not _m.isfile():
+                        continue
+                    if _name == _umap_rel:
+                        umap_df = pd.read_csv(_tf.extractfile(_m), index_col="Barcode")
+                    elif (len(_parts) == 4 and _parts[:2] == ["analysis", "clustering"]
+                          and _parts[3] == "clusters.csv"):
+                        df_c = pd.read_csv(_tf.extractfile(_m), index_col="Barcode")
+                        cluster_methods[_parts[2]] = df_c["Cluster"]
+        except Exception as exc:
+            print(f"  Warning: could not read analysis.tar.gz: {exc}", flush=True)
+    if umap_df is None or not {"UMAP-1", "UMAP-2"} <= set(umap_df.columns):
+        print("  Note: no UMAP projection found — UMAP coordinates will be empty.", flush=True)
+        umap_df = None
+    if not cluster_methods:
+        print("  Note: no clustering results found — no cluster sets available.", flush=True)
 
     with h5py.File(os.path.join(data_dir, "cell_feature_matrix.h5"), "r") as f:
         barcodes   = [b.decode() for b in f["matrix/barcodes"][:]]
         gene_names = [g.decode() for g in f["matrix/features/name"][:]]
+        ftypes     = ([t.decode() for t in f["matrix/features/feature_type"][:]]
+                      if "feature_type" in f["matrix/features"] else None)
         shape      = tuple(f["matrix/shape"][:])
         expr = sp.csc_matrix(
             (f["matrix/data"][:], f["matrix/indices"][:], f["matrix/indptr"][:]),
             shape=shape,
         ).T.tocsr()   # → (cells × genes)
 
+    # Keep only real genes: control probes/codewords, unassigned/deprecated codewords
+    # and genomic controls are not genes (thousands of them on Xenium Prime 5K).
+    if ftypes is not None:
+        _keep = np.array([t == "Gene Expression" for t in ftypes], dtype=bool)
+    else:
+        _ctrl = ("NegControl", "BLANK_", "UnassignedCodeword", "DeprecatedCodeword",
+                 "Intergenic_Region", "GenomicControl")
+        _keep = np.array([not g.startswith(_ctrl) for g in gene_names], dtype=bool)
+    if _keep.any() and not _keep.all():
+        print(f"  Dropping {int((~_keep).sum())} non-gene features "
+              f"(controls / unassigned codewords); keeping {int(_keep.sum())} genes", flush=True)
+        expr = expr[:, np.flatnonzero(_keep)].tocsr()
+        gene_names = [g for g, k in zip(gene_names, _keep) if k]
+
     print("  Building obs DataFrame…", flush=True)
     df = cells.copy()
-    df["umap_1"] = umap_df["UMAP-1"].reindex(df.index)
-    df["umap_2"] = umap_df["UMAP-2"].reindex(df.index)
+    if umap_df is not None:
+        df["umap_1"] = umap_df["UMAP-1"].reindex(df.index)
+        df["umap_2"] = umap_df["UMAP-2"].reindex(df.index)
+    else:
+        df["umap_1"] = np.nan
+        df["umap_2"] = np.nan
     for method, series in cluster_methods.items():
         df[f"clust__{method}"] = series.reindex(df.index).fillna(0).astype(int)
 
@@ -5169,11 +6625,44 @@ def _build_xenium_sdata(data_dir: str) -> None:
 
     def _bounds_to_gdf(bounds_dict):
         geoms = {}
-        for cid, (vx, vy) in bounds_dict.items():
-            try:
-                geoms[str(cid)] = Polygon(zip(vx, vy))
-            except Exception:
-                pass
+        try:
+            # Vectorised: one shapely call for all polygons (rings need >= 3 vertices)
+            import shapely
+            # NaN-separated entries (several rings per cell) → one item per ring
+            _items = []
+            for cid, (vx, vy) in bounds_dict.items():
+                vx = np.asarray(vx, dtype=float)
+                if np.isnan(vx).any():
+                    _cut = np.flatnonzero(np.isnan(vx))
+                    _items.extend((cid, rx, ry) for rx, ry in
+                                  zip(np.split(vx, _cut), np.split(np.asarray(vy, dtype=float), _cut)))
+                else:
+                    _items.append((cid, vx, vy))
+            # (pieces after the first start with the NaN separator: drop it)
+            _items = [(cid, vx[np.isfinite(vx)], np.asarray(vy)[np.isfinite(vx)])
+                      for cid, vx, vy in _items]
+            _items = [(cid, vx, vy) for cid, vx, vy in _items if len(vx) >= 3]
+            _n     = np.array([len(vx) for _, vx, _ in _items])
+            _xy    = np.column_stack([np.concatenate([vx for _, vx, _ in _items]),
+                                      np.concatenate([vy for _, _, vy in _items])]).astype(float)
+            _polys = shapely.polygons(shapely.linearrings(_xy, indices=np.repeat(np.arange(len(_items)), _n)))
+            _multi: dict = {}
+            for (cid, _, _), g in zip(_items, _polys):
+                if str(cid) in geoms:               # further ring of the same cell
+                    _multi.setdefault(str(cid), [geoms[str(cid)]]).append(g)
+                else:
+                    geoms[str(cid)] = g
+            for cid, _parts in _multi.items():
+                geoms[cid] = shapely.multipolygons(_parts)
+        except Exception:
+            geoms = {}
+            for cid, (vx, vy) in bounds_dict.items():
+                try:
+                    _ok = np.isfinite(np.asarray(vx, dtype=float))   # first ring only if several
+                    _end = len(_ok) if _ok.all() else int(np.argmin(_ok))
+                    geoms[str(cid)] = Polygon(zip(vx[:_end], vy[:_end]))
+                except Exception:
+                    pass
         gdf = gpd.GeoDataFrame(
             geometry=list(geoms.values()),
             index=pd.Index(list(geoms.keys()), name="cell_id"),
@@ -5196,7 +6685,13 @@ def _build_xenium_sdata(data_dir: str) -> None:
 
     zarr_path = os.path.join(data_dir, "spatialdata_xenium.zarr")
     print(f"  Writing {os.path.basename(zarr_path)} ({n_cells:,} cells, {n_genes} genes)…", flush=True)
-    sdata.write(zarr_path)
+    # Write to a temporary store and rename, so an interrupted write is never
+    # mistaken for a complete cache on the next start.
+    import shutil
+    tmp_path = os.path.join(data_dir, "spatialdata_xenium.tmp.zarr")
+    shutil.rmtree(tmp_path, ignore_errors=True)
+    sdata.write(tmp_path)
+    os.replace(tmp_path, zarr_path)
     print("  spatialdata_xenium.zarr generation complete.", flush=True)
 
 
@@ -5231,6 +6726,14 @@ def _load_from_xenium_sdata(zarr_path: str, data_dir: str) -> dict:
         print(f"  Warning: could not load nucleus boundaries from zarr: {e}", flush=True)
 
     obs_df = adata.obs.copy()
+    # obs columns added later through the low-level zarr API (SPLIT clusters /
+    # UMAP) are not in the table's column-order, so read_zarr does not return them.
+    _load_zarr_obs_into_df(zarr_path, obs_df)
+    if "cluster_split_10" in obs_df.columns:
+        # stored as plain strings with "" for cells SPLIT dropped
+        _cs = obs_df["cluster_split_10"].astype(str)
+        obs_df["cluster_split_10"] = pd.array(
+            [v if v not in ("", "nan", "<NA>") else pd.NA for v in _cs], dtype="string")
     cluster_methods = list(adata.uns.get("cluster_methods", []))
     print(f"  Done: {n:,} cells | {len(gene_names)} genes | {len(cluster_methods)} cluster sets", flush=True)
 
@@ -5286,19 +6789,72 @@ if _startup_arg.rstrip("/").endswith(".zarr"):
 else:
     DATA = load_xenium_data(_startup_arg)
 
-# Precompute CSC matrix for fast column (gene) access — O(nnz_col) vs O(nnz_total) for CSR
-if DATA.get("expr") is not None:
-    DATA["expr_csc"] = DATA["expr"].tocsc()
-
-# Precompute sorted gene names and default gene (avoid re-sorting on every callback)
-_sorted_gene_names = sorted(DATA["gene_names"])
-_default_gene = _sorted_gene_names[0] if _sorted_gene_names else None
-
 # Gene expression cache: keyed by (gene, data_dir, use_corrected) → np.ndarray
-_gene_expr_cache: dict = {}
+# Bounded LRU: one n_cells vector per gene adds up on a 5K panel.
+from collections import OrderedDict as _OrderedDict
+_gene_expr_cache: "_OrderedDict" = _OrderedDict()
+_GENE_EXPR_CACHE_MAX = 32
+
+
+def _gene_cache_put(key, arr):
+    """Store arr in _gene_expr_cache, evicting the least recently used entries."""
+    _gene_expr_cache[key] = arr
+    try:
+        _gene_expr_cache.move_to_end(key)
+        while len(_gene_expr_cache) > _GENE_EXPR_CACHE_MAX:
+            _gene_expr_cache.popitem(last=False)
+    except KeyError:   # cleared by another callback thread meanwhile
+        pass
+    return arr
+
 
 # UMAP figure cache: (key_tuple, figure)
 _umap_fig_cache: dict = {}
+
+# UMAP dataframe cache (dropna copies of DATA["df"]) and viewport centroid arrays
+_umap_df_cache: dict = {}
+_viewport_arrays: dict = {}
+
+
+def _refresh_derived_data() -> None:
+    """Recompute everything derived from DATA. Called at startup and after a dataset swap."""
+    global _sorted_gene_names, _default_gene
+    # CSC matrix for fast column (gene) access — O(nnz_col) vs O(nnz_total) for CSR
+    if DATA.get("expr") is not None:
+        DATA["expr_csc"] = DATA["expr"].tocsc()
+    else:
+        DATA.pop("expr_csc", None)
+    # Sorted gene names and default gene (avoid re-sorting on every callback)
+    _sorted_gene_names = sorted(DATA["gene_names"])
+    _default_gene = _sorted_gene_names[0] if _sorted_gene_names else None
+    _gene_expr_cache.clear()
+    _umap_fig_cache.clear()
+    _umap_df_cache.clear()
+    _viewport_arrays.clear()
+
+
+def _install_dataset(new_data: dict) -> None:
+    """Replace the contents of DATA with new_data (Load Sample) and rebuild derived state."""
+    global _dataset_gen
+    # From here on, background jobs started for the previous dataset stop publishing
+    _dataset_gen += 1
+    # Drop keys the new dataset does not carry (subset originals, SPLIT ids, sdata, …)
+    # so they cannot leak from the previous dataset through DATA.update().
+    for _k in [k for k in DATA if k not in new_data]:
+        DATA.pop(_k, None)
+    DATA.update(new_data)
+    _refresh_derived_data()
+    _reset_morph_caches()
+    # WebGL viewer: release the previous bundle's tile / polygon caches
+    _va = sys.modules.get("xenium_viewer_api")
+    if _va is not None:
+        _va.reset(DATA.get("data_dir"))
+    _vp = globals().get("_viewer_provider")
+    if _vp is not None:
+        _vp.forget()
+
+
+_refresh_derived_data()
 
 # ─── Extra datasets for multi-sample display ──────────────────────────────────
 # Each entry is like DATA but with an added "x_offset" key (µm shift on x-axis).
@@ -5312,8 +6868,13 @@ def get_gene_expression(gene: str) -> np.ndarray:
     with fallback to _spage_state['result'] for pre-zarr cached results.
     Results are cached to avoid recomputation on pan/zoom."""
     _cache_key = (gene, DATA.get("data_dir"))
-    if _cache_key in _gene_expr_cache:
-        return _gene_expr_cache[_cache_key]
+    _hit = _gene_expr_cache.get(_cache_key)
+    if _hit is not None:
+        try:
+            _gene_expr_cache.move_to_end(_cache_key)
+        except KeyError:
+            pass
+        return _hit
 
     if gene.endswith(" [imp]"):
         base = gene[:-6]
@@ -5325,7 +6886,7 @@ def get_gene_expression(gene: str) -> np.ndarray:
             idx  = DATA["df_to_expr"]
             vals = np.where(idx >= 0, raw[np.clip(idx, 0, len(raw) - 1)], 0.0)
             result = np.log1p(vals)
-            _gene_expr_cache[_cache_key] = result
+            _gene_cache_put(_cache_key, result)
             return result
         # Fallback: old-style _spage_state result DataFrame, or streaming zarr/parquet
         with _spage_lock:
@@ -5333,8 +6894,16 @@ def get_gene_expression(gene: str) -> np.ndarray:
             res_path  = _spage_state.get("result_path")
             res_genes = _spage_state.get("result_genes") or []
         if res is not None and base in res.columns:
-            result = res[base].values.astype(np.float64)
-            _gene_expr_cache[_cache_key] = result
+            # Result rows follow DATA["df"] as it was when SpaGE ran; realign by
+            # cell id when a subset has been applied or cleared since.
+            if len(res) != len(DATA["df"]) and res.index.is_unique:
+                _ridx = DATA["df"].index
+                if res.index.dtype == object and _ridx.dtype != object:
+                    _ridx = _ridx.astype(str)
+                result = res[base].reindex(_ridx).fillna(0).values.astype(np.float64)
+            else:
+                result = res[base].values.astype(np.float64)
+            _gene_cache_put(_cache_key, result)
             return result
         if res_path and base in res_genes:
             try:
@@ -5345,7 +6914,12 @@ def get_gene_expression(gene: str) -> np.ndarray:
                     result = np.array(_z_ge[:, _gi], dtype=np.float64)
                 else:                          # large parquet — read single column
                     result = pd.read_parquet(res_path, columns=[base])[base].values.astype(np.float64)
-                _gene_expr_cache[_cache_key] = result
+                result = _align_expr_rows_to_df(result)
+                if len(result) != len(DATA["df"]):
+                    # streamed under another subset(): rows cannot be matched to cells
+                    raise ValueError(f"result has {len(result):,} rows for "
+                                     f"{len(DATA['df']):,} cells — re-run SpaGE")
+                _gene_cache_put(_cache_key, result)
                 return result
             except Exception as _sge:
                 print(f"  SpaGE: streaming read failed for {base}: {_sge}", flush=True)
@@ -5356,8 +6930,16 @@ def get_gene_expression(gene: str) -> np.ndarray:
     idx  = DATA["df_to_expr"]
     vals = np.where(idx >= 0, raw[np.clip(idx, 0, len(raw) - 1)], 0.0)
     result = np.log1p(vals)
-    _gene_expr_cache[_cache_key] = result
+    _gene_cache_put(_cache_key, result)
     return result
+
+
+def _panel_gene_names() -> list:
+    """Measured panel genes: DATA['gene_names'] without SpaGE-imputed entries."""
+    gv = DATA.get("gene_var")
+    if gv is not None and "is_imputed" in gv.columns:
+        return [g for g in DATA["gene_names"] if not bool(gv.loc[g, "is_imputed"])]
+    return list(DATA["gene_names"])
 
 
 def cluster_col(method: str) -> str:
@@ -5369,8 +6951,6 @@ def cluster_color_map(method: str) -> dict:
     clusters = sorted(DATA["df"][col].unique())
     return {c: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, c in enumerate(clusters)}
 
-
-_viewport_arrays: dict = {}
 
 def viewport_cell_ids(relayout: dict) -> list | None:
     """
@@ -5559,22 +7139,54 @@ def _cell_type_traces(x, y, df, size, opacity, mode="spatial", labels_key="label
     return traces
 
 
+def _align_expr_rows_to_df(full):
+    """Map a per-expression-row array (one value per row of DATA['expr']) onto
+    the current DATA['df'] rows via DATA['df_to_expr']. Arrays of any other
+    length are returned unchanged. Identity mapping (no subset) is a no-op."""
+    d2e = DATA.get("df_to_expr")
+    if d2e is None or DATA.get("expr") is None or len(full) != DATA["expr"].shape[0]:
+        return full
+    d2e = np.asarray(d2e)
+    if len(d2e) == len(full) and (d2e == np.arange(len(full))).all():
+        return full
+    return np.where(d2e >= 0, full[np.clip(d2e, 0, len(full) - 1)], 0).astype(full.dtype)
+
+
+def _csc_view(holder: dict, key: str):
+    """holder[key] as CSC for O(nnz_col) gene lookups. The CSC copy is built on
+    first use and kept in holder[key + '_csc']; it is rebuilt automatically when
+    holder[key] is replaced by another matrix object."""
+    m = holder.get(key)
+    if m is None or not sp.issparse(m) or m.format == "csc":
+        return m
+    ck = key + "_csc"
+    c = holder.get(ck)
+    if c is None or holder.get(ck + "_src") is not m:
+        c = m.tocsc()
+        holder[ck + "_src"] = m
+        holder[ck] = c
+    return c
+
+
 def _get_expr_values(gene: str, alt_res=None, use_corrected: bool = False) -> "np.ndarray | None":
     """Unified expression lookup supporting original and SPLIT-corrected counts."""
     lookup = gene.replace(" [imp]", "").replace(" [corr+imp]", "")
     is_imputed_gene = ("[imp]" in gene) or ("[corr+imp]" in gene)
     if alt_res is not None:
-        _corr = alt_res.get("split_corrected_expr") if use_corrected else None
-        expr = _corr if _corr is not None else alt_res.get("expr")
+        _corr = _csc_view(alt_res, "split_corrected_expr") if use_corrected else None
+        expr = _corr if _corr is not None else _csc_view(alt_res, "expr")
         gni  = alt_res.get("gene_name_to_idx") or DATA.get("gene_name_to_idx", {})
     else:
-        _corr = DATA.get("split_corrected_expr") if use_corrected else None
+        _corr = _csc_view(DATA, "split_corrected_expr") if use_corrected else None
         expr = _corr if _corr is not None else DATA.get("expr_csc")# or DATA.get("expr")
         gni  = DATA.get("gene_name_to_idx", {})
     if expr is not None and lookup in gni:
         idx = gni[lookup]
         if idx < expr.shape[1]:
-            return np.log1p(expr.getcol(idx).toarray().ravel().astype(np.float32))
+            _col = expr.getcol(idx).toarray().ravel().astype(np.float32)
+            if alt_res is None:
+                _col = _align_expr_rows_to_df(_col)
+            return np.log1p(_col)
     # If corrected mode is active and this is an imputed gene not in the corrected-imputed list,
     # do NOT fall through to the zarr fallback (which holds uncorrected imputed values).
     if use_corrected and is_imputed_gene:
@@ -5603,8 +7215,15 @@ def _get_expr_values(gene: str, alt_res=None, use_corrected: bool = False) -> "n
             if os.path.isdir(_rp):
                 import zarr as _zarr_ev
                 _gi_ev = _rg.index(lookup)
-                return np.log1p(np.array(
-                    _zarr_ev.open_array(_rp, mode='r')[:, _gi_ev], dtype=np.float32))
+                _zcol = np.array(
+                    _zarr_ev.open_array(_rp, mode='r')[:, _gi_ev], dtype=np.float32)
+                if alt_res is None:
+                    _zcol = _align_expr_rows_to_df(_zcol)
+                    if len(_zcol) != len(DATA["df"]):
+                        # streamed under another subset(): rows cannot be matched to cells
+                        raise ValueError(f"result has {len(_zcol):,} rows for "
+                                         f"{len(DATA['df']):,} cells — re-run SpaGE")
+                return np.log1p(_zcol)
         except Exception as _e:
             print(f"  SpaGE zarr read error for {lookup!r}: {_e}", flush=True)
     return None
@@ -5614,7 +7233,7 @@ def _get_reseg_expr_values(gene: str, alt_res: dict) -> "np.ndarray | None":
     """log1p expression for *gene* in resegmented cells, or None if not available.
     Uses alt_res['gene_name_to_idx'] if present (includes reseg-imputed genes),
     falling back to DATA['gene_name_to_idx'] for panel genes."""
-    expr = alt_res.get("expr")
+    expr = _csc_view(alt_res, "expr")
     if expr is None:
         return None
     # Strip [imp] suffix if present
@@ -5630,10 +7249,64 @@ def _get_reseg_expr_values(gene: str, alt_res: dict) -> "np.ndarray | None":
     return np.log1p(vals)
 
 
+# Figure-specific layout shapes (multi-sample separators + RCTD pies) of the last
+# spatial figure, so callbacks that patch layout.shapes can keep them.
+_spatial_base_shapes: list = []
+
+
+def _spatial_overlay_shapes(sdata_roi_on: bool = False, sdata_patches_on: bool = False) -> list:
+    """Layout shapes that do not depend on the figure: saved ROI outlines, the
+    pending lasso hull and the sopa tissue-ROI / patch-grid overlays."""
+    shapes = []
+    with _roi_lock:
+        roi_visible = _roi_state["show"]
+        rois_snap   = list(_roi_state["rois"])
+        pending     = _roi_state.get("pending_hull")
+    if roi_visible and rois_snap:
+        shapes += _roi_shapes_for_fig(rois_snap)
+    if pending:
+        shapes += _roi_shapes_for_fig([], pending_hull=pending)
+    if sdata_roi_on or sdata_patches_on:
+        shapes += _sdata_overlays_to_shapes(sdata_roi_on, sdata_patches_on)
+    return shapes
+
+
+def _rctd_pie_shapes_for_view(color_by, relayout):
+    """RCTD weight pies for the cells inside the current viewport (single-sample
+    Xenium view). Returns None when pies do not apply to *color_by*, and an empty
+    list when more than PIE_THRESHOLD cells are in view."""
+    if EXTRA_DATASETS or not str(color_by or "").startswith("cell_type:"):
+        return None
+    _lkey = f"labels_{color_by.split(':')[1]}"
+    with _annot_lock:
+        _weights_df = _annot_state.get(f"rctd_weights_{_lkey}")
+    if _weights_df is None:
+        return None
+    df = DATA["df"]
+    df_vp = df
+    if relayout:
+        try:
+            _x0 = float(relayout.get("xaxis.range[0]", -1e18))
+            _x1 = float(relayout.get("xaxis.range[1]",  1e18))
+            _y0 = float(relayout.get("yaxis.range[0]", -1e18))
+            _y1 = float(relayout.get("yaxis.range[1]",  1e18))
+            if _x1 - _x0 < 1e17:  # real range, not default placeholder
+                x =  df["x_centroid"].values
+                y = -df["y_centroid"].values
+                df_vp = df[(x >= _x0) & (x <= _x1) & (y >= _y0) & (y <= _y1)]
+        except Exception:
+            pass
+    if len(df_vp) > PIE_THRESHOLD:
+        return []
+    # colours from the full frame so pies match the scatter traces
+    return _build_rctd_pie_shapes(df_vp, _weights_df, _cell_type_color_map(_lkey, df))
+
+
 def make_spatial_fig(color_by, method, gene, size, opacity,
                      boundary_toggles, relayout,
                      morph_image=None, extra_title="", baysor_active=False, proseg_active=False,
-                     use_corrected: bool = False, cbar_range=None):
+                     use_corrected: bool = False, cbar_range=None,
+                     sdata_roi_on: bool = False, sdata_patches_on: bool = False):
     # Choose data source: Proseg > Baysor > original Xenium (priority order)
     with _proseg_lock:
         pres = _proseg_state["result"] if proseg_active and _proseg_state["result"] else None
@@ -5799,22 +7472,6 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
         y   = -df["y_centroid"].values   # y_centroid is in µm, negate for plot
         source_label    = ""
 
-        # ── Viewport-filtered copies for pie chart threshold + rendering ─
-        df_vp, x_vp, y_vp = df, x, y   # default: full dataset
-        if relayout:
-            try:
-                _x0 = float(relayout.get("xaxis.range[0]", -1e18))
-                _x1 = float(relayout.get("xaxis.range[1]",  1e18))
-                _y0 = float(relayout.get("yaxis.range[0]", -1e18))
-                _y1 = float(relayout.get("yaxis.range[1]",  1e18))
-                if _x1 - _x0 < 1e17:  # real range, not default placeholder
-                    _vp_mask = (x >= _x0) & (x <= _x1) & (y >= _y0) & (y <= _y1)
-                    df_vp = df[_vp_mask]
-                    x_vp  = x[_vp_mask]
-                    y_vp  = y[_vp_mask]
-            except Exception:
-                pass
-
         # ── Multi-sample: merge extra datasets ──────────────────────────
         if EXTRA_DATASETS:
             # Concatenate extra datasets into combined arrays
@@ -5967,7 +7624,7 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                         eds = EXTRA_DATASETS[di - 1]
                         g_idx = eds.get("gene_name_to_idx", {}).get(gene)
                         if g_idx is not None:
-                            raw  = eds["expr"][:, g_idx].toarray().flatten()
+                            raw  = _csc_view(eds, "expr")[:, g_idx].toarray().flatten()
                             idx_ = eds["df_to_expr"]
                             vals_i = np.where(idx_ >= 0, raw[np.clip(idx_, 0, len(raw) - 1)], 0.0)
                             all_vals.append(np.log1p(vals_i))
@@ -5983,6 +7640,25 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                     text=ids_combined, customdata=ids_combined,
                     hovertemplate="<b>%{text}</b><br>" + gene + ": %{marker.color:.2f}<extra></extra>",
                     name=gene,
+                )]
+                show_legend = False
+
+            elif color_by.startswith("roi_"):
+                # ROI class: categorical colours; samples without the column show "(none)"
+                labels = pd.concat([
+                    (edf[color_by] if color_by in edf.columns
+                     else pd.Series(pd.NA, index=edf.index, dtype=object))
+                    for edf in all_dfs
+                ]).fillna("(none)").astype(str)
+                u_vals = [v for v in sorted(labels.unique()) if v != "(none)"]
+                cmap   = {v: _roi_color(i) for i, v in enumerate(u_vals)}
+                cmap["(none)"] = "#666666"
+                traces = [go.Scattergl(
+                    x=x_combined, y=y_combined, mode="markers",
+                    marker=dict(size=size, color=labels.map(cmap).values, opacity=opacity),
+                    text=ids_combined, customdata=ids_combined,
+                    hovertemplate="<b>%{text}</b><extra></extra>",
+                    name=color_by,
                 )]
                 show_legend = False
 
@@ -6018,6 +7694,17 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
             # _separator_shapes already = [] from function-level init
 
             # ── Cell scatter traces ──────────────────────────────────────────
+            # A niche / ROI column can be missing (niches computed on a reseg run or a
+            # subset, ROI deleted, dataset switched): fall back like the reseg branch.
+            # The same goes for any plain column colour (a QC column absent from an
+            # exported store) and for 'cluster' when its column does not exist (no cluster
+            # sets, or a reseg source is selected but its result is not loaded).
+            if (color_by not in ("cluster", "gene") and not color_by.startswith("cell_type:")
+                    and color_by not in df.columns):
+                color_by = "transcript_counts"
+            # (`cluster_col` is a local name in this function: spell the column out)
+            if color_by == "cluster" and f"clust__{method}" not in df.columns:
+                color_by = "transcript_counts"
             if color_by == "niche":
                 if "niche" in df.columns:
                     _niche_vals = df["niche"].astype(str)
@@ -6042,18 +7729,11 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
             elif color_by.startswith("cell_type:"):
                 _method = color_by.split(":")[1]
                 _lkey = f"labels_{_method}"
-                _wkey = f"rctd_weights_{_lkey}"
-                with _annot_lock:
-                    _weights_df = _annot_state.get(_wkey)
-                if _weights_df is not None and len(df_vp) <= PIE_THRESHOLD:
-                    # Pie chart mode: invisible ghost scatter for hover + SVG wedge shapes
-                    _ct_colors = _cell_type_color_map(_lkey, df_vp)
-                    traces = _cell_type_traces(x_vp, y_vp, df_vp, size, opacity, "spatial",
-                                               labels_key=_lkey, invisible=True)
-                    _pie_shapes = _build_rctd_pie_shapes(df_vp, _weights_df, _ct_colors)
-                else:
-                    traces = _cell_type_traces(x, y, df, size, opacity, "spatial",
-                                               labels_key=_lkey)
+                # Always draw every cell; RCTD weight pies (SVG wedge shapes) are added
+                # on top for the cells in view and refreshed on pan/zoom by update_plots.
+                traces = _cell_type_traces(x, y, df, size, opacity, "spatial",
+                                           labels_key=_lkey)
+                _pie_shapes = _rctd_pie_shapes_for_view(color_by, relayout) or []
                 show_legend = True
             elif color_by == "gene":
                 _cv = _get_expr_values(gene, use_corrected=True) if use_corrected else None
@@ -6086,7 +7766,8 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                 show_legend = False
             else:
                 label = QC_METRICS.get(color_by, color_by)
-                vals = _color_vals(df[color_by].values, color_by)
+                vals = (_color_vals(df[color_by].values, color_by) if color_by in df.columns
+                        else np.zeros(len(df)))
                 if color_by == "transcript_counts":
                     label = "Transcript Counts (log1p)"
                 traces = [go.Scattergl(
@@ -6166,17 +7847,12 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
             itemsizing="constant", tracegroupgap=1,
             x=0.01, y=0.99, xanchor="left", yanchor="top",
         ),
-        uirevision="spatial",
+        # per dataset: after Load Sample the client must drop the previous zoom
+        uirevision=f"spatial-{_dataset_gen}",
     )
     all_shapes = list(_separator_shapes) + list(_pie_shapes)
-    with _roi_lock:
-        roi_visible = _roi_state["show"]
-        rois_snap   = list(_roi_state["rois"])
-        pending     = _roi_state.get("pending_hull")
-    if roi_visible and rois_snap:
-        all_shapes += _roi_shapes_for_fig(rois_snap)
-    if pending:
-        all_shapes += _roi_shapes_for_fig([], pending_hull=pending)
+    _spatial_base_shapes[:] = all_shapes
+    all_shapes += _spatial_overlay_shapes(sdata_roi_on, sdata_patches_on)
     if all_shapes:
         layout_kwargs["shapes"] = all_shapes
     fig.update_layout(**layout_kwargs)
@@ -6192,9 +7868,6 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                 yaxis_range=[float(ry0), float(ry1)],
             )
     return fig
-
-
-_umap_df_cache = {}
 
 
 def make_cell_type_abundance_fig(width=None, height=None):
@@ -6399,14 +8072,15 @@ def make_interaction_graph_fig(width=None, height=None, normalize=False, min_fre
     # Top 30 edges by weight
     edges = []
     for a in range(n):
-        for b in range(a, n):
+        # Same-type pairs (a == b) have no drawable edge in this layout; skip them
+        # so they do not take top-30 slots or set the width scale.
+        for b in range(a + 1, n):
             raw_w = adjacency[a, b] + adjacency[b, a]
             if raw_w > 0:
                 if normalize:
                     # Observed / expected under random mixing
                     expected = freqs[a] * freqs[b] * adjacency.sum()
-                    if a != b:
-                        expected *= 2  # both orderings
+                    expected *= 2  # both orderings
                     w = (raw_w / expected) if expected > 0 else 0
                 else:
                     w = raw_w
@@ -6495,8 +8169,10 @@ def make_chord_fig(width=None, height=None, normalize=False, min_freq=0.0):
 
     # Build weight matrix — optionally normalize by expected frequency
     adj_sym = adjacency + adjacency.T
+    # adjacency is directed: A + A.T would count same-type pairs twice
+    adj_sym[np.diag_indices_from(adj_sym)] = np.diag(adjacency)
     if normalize:
-        total = adj_sym.sum() / 2  # total undirected edges
+        total = adjacency.sum()  # total directed neighbour pairs
         norm_mat = np.zeros_like(adj_sym, dtype=float)
         for a in range(n):
             for b in range(n):
@@ -6507,12 +8183,14 @@ def make_chord_fig(width=None, height=None, normalize=False, min_freq=0.0):
         weight_mat = norm_mat
     else:
         weight_mat = adj_sym.astype(float)
-    max_adj = weight_mat.max()
+    # Scale by between-type weights only; same-type pairs are not drawn as chords
+    _offdiag = weight_mat[~np.eye(n, dtype=bool)]
+    max_adj = _offdiag.max() if _offdiag.size else 0
     if max_adj == 0:
         max_adj = 1
 
     for a in range(n):
-        for b in range(a, n):
+        for b in range(a + 1, n):
             w = weight_mat[a, b]
             if w < max_adj * 0.01:
                 continue
@@ -6563,10 +8241,16 @@ def make_chord_fig(width=None, height=None, normalize=False, min_freq=0.0):
     return fig
 
 
-def make_niche_umap_fig(width=None, height=None):
+def make_niche_umap_fig(width=None, height=None, baysor_active=False, proseg_active=False):
     if DATA is None or DATA.get("df") is None:
         return _make_placeholder_fig()
-    df = DATA["df"]
+    # Niches computed on a Baysor/Proseg run live in that run's cells_df
+    with _proseg_lock:
+        pres = _proseg_state["result"] if proseg_active and _proseg_state["result"] else None
+    with _baysor_lock:
+        bres = _baysor_state["result"] if baysor_active and not pres and _baysor_state["result"] else None
+    alt_res = pres or bres
+    df = alt_res["cells_df"] if alt_res is not None else DATA["df"]
     if "niche" not in df.columns:
         return _make_placeholder_fig("Run Spatial Niches to populate this tab.")
     # Use re-run UMAP columns if present, otherwise fall back to bundled DATA["umap"]
@@ -6574,7 +8258,7 @@ def make_niche_umap_fig(width=None, height=None):
         xu = df["umap_1"].values.astype(float)
         yu = df["umap_2"].values.astype(float)
         axis_labels = ("UMAP 1", "UMAP 2")
-    elif DATA.get("umap") is not None and len(DATA["umap"]) == len(df):
+    elif alt_res is None and DATA.get("umap") is not None and len(DATA["umap"]) == len(df):
         xu = DATA["umap"][:, 0].astype(float)
         yu = DATA["umap"][:, 1].astype(float)
         axis_labels = ("UMAP 1", "UMAP 2")
@@ -6714,6 +8398,18 @@ def make_umap_fig(color_by, method, gene, size, opacity,
 
     # Fall back to UMAP columns embedded in cells_df (loaded from zarr) when no explicit reseg UMAP.
     # When SPLIT-corrected counts are active, prefer split_umap_1/2 if available.
+    # A stored "Rerun UMAP" result belongs to the run it was computed on: ignore it
+    # for any other run, and keep only cells still present (subset()).
+    if alt_res is not None and reseg_umap is not None:
+        with _umap_reseg_lock:
+            _reseg_owner = _umap_reseg_state.get("owner")
+        if _reseg_owner is None or _reseg_owner != alt_res.get("out_dir"):
+            reseg_umap = None
+        else:
+            _keep = reseg_umap.index.astype(str).isin(alt_res["cells_df"].index.astype(str))
+            if not _keep.all():
+                reseg_umap = reseg_umap[_keep] if _keep.any() else None
+
     if alt_res is not None and reseg_umap is None:
         _bdf = alt_res["cells_df"]
         if use_corrected and "split_umap_1" in _bdf.columns and _bdf["split_umap_1"].notna().any():
@@ -6746,6 +8442,18 @@ def make_umap_fig(color_by, method, gene, size, opacity,
         cell_ids     = udf.index.tolist()
         cell_ids_str = [str(c) for c in cell_ids]
         _ids_arr     = np.asarray(cell_ids_str)
+        # udf can hold fewer cells than cells_df (cells without UMAP coords, SPLIT-
+        # dropped cells): map per-cell arrays of the full cells_df onto udf rows.
+        _upos = pd.Index(_bdf.index.astype(str)).get_indexer(pd.Index(cell_ids_str)) \
+            if _bdf.index.is_unique else np.arange(len(cell_ids_str))
+
+        def _al(a):
+            a = np.asarray(a)
+            if len(a) == len(_upos) and (_upos == np.arange(len(_upos))).all():
+                return a
+            return np.where(_upos >= 0,
+                            a.astype(float)[np.clip(_upos, 0, max(len(a) - 1, 0))], np.nan)
+
         if color_by.startswith("cell_type:"):
             _method    = color_by.split(":")[1]
             labels_key = _labels_key_for_method(_method, alt_res)
@@ -6770,6 +8478,8 @@ def make_umap_fig(color_by, method, gene, size, opacity,
 
         if color_by == "gene":
             vals = _get_expr_values(gene, alt_res, use_corrected=use_corrected)
+            if vals is not None and len(vals) == len(_bdf):
+                vals = _al(vals)
             if vals is not None:
                 traces = [go.Scattergl(
                     x=xu, y=yu, mode="markers",
@@ -6825,18 +8535,37 @@ def make_umap_fig(color_by, method, gene, size, opacity,
             else:
                 color_by = "transcript_counts"
 
-        if not color_by.startswith("cell_type:") and color_by not in ("gene", "cluster", "niche"):
+        if color_by.startswith("roi_"):
+            # ROI class column holds names / NA, not numbers: categorical colours
+            bdf = alt_res["cells_df"]
+            if color_by in bdf.columns:
+                _lab = bdf[color_by].reindex(udf.index).fillna("(none)").astype(str)
+                _uv  = [v for v in sorted(_lab.unique()) if v != "(none)"]
+                _rcm = {v: _roi_color(i) for i, v in enumerate(_uv)}
+                _rcm["(none)"] = "#666666"
+                traces = [go.Scattergl(
+                    x=xu, y=yu, mode="markers",
+                    marker=dict(size=mk, color=_lab.map(_rcm).values, opacity=opacity),
+                    text=cell_ids, customdata=cell_ids,
+                    hovertemplate="<b>%{text}</b><extra></extra>", name=color_by,
+                )]
+            else:
+                color_by = "transcript_counts"
+
+        if (not color_by.startswith("cell_type:") and not color_by.startswith("roi_")
+                and color_by not in ("gene", "cluster", "niche")):
             bdf = alt_res["cells_df"]
             if color_by in bdf.columns:
                 raw = bdf["transcript_counts"].values if color_by == "transcript_counts" \
                       else bdf[color_by].values
+                raw   = _al(raw)
                 vals  = np.log1p(raw) if color_by == "transcript_counts" else raw.astype(float)
                 label = QC_METRICS.get(color_by, color_by)
                 if color_by == "transcript_counts":
                     label = "Transcript Counts (log1p)"
                 cs    = COLORSCALES.get(color_by, "Viridis")
             else:
-                vals  = np.log1p(bdf["transcript_counts"].values)
+                vals  = np.log1p(_al(bdf["transcript_counts"].values))
                 label = "Transcript Counts (log1p)"
                 cs    = "Viridis"
             _ckw = {}
@@ -6874,6 +8603,18 @@ def make_umap_fig(color_by, method, gene, size, opacity,
             df = _umap_df_cache["df"]
             xu = df["umap_1"].values
             yu = df["umap_2"].values
+
+        # Missing columns: niche → cluster → transcript counts, as in make_spatial_fig
+        # (no cluster sets, a reseg source selected but not loaded, a QC column absent
+        # from an exported store). ROI columns are handled in their own branch.
+        if color_by == "niche" and "niche" not in df.columns:
+            color_by = "cluster"
+        if color_by == "cluster" and cluster_col(method) not in df.columns:
+            color_by = "transcript_counts"
+        if (color_by not in ("cluster", "gene", "niche")
+                and not color_by.startswith(("cell_type:", "roi_"))
+                and color_by not in df.columns):
+            color_by = "transcript_counts"
 
         if color_by == "niche":
             if "niche" in df.columns:
@@ -6921,9 +8662,27 @@ def make_umap_fig(color_by, method, gene, size, opacity,
                 text=df.index.tolist(), customdata=df.index.tolist(),
                 hovertemplate="<b>%{text}</b><extra></extra>", name=gene,
             )]
+        elif color_by.startswith("roi_"):
+            # ROI class column holds names / NA, not numbers: categorical colours.
+            # Read the live frame; the cached dropna() copy may predate the column.
+            _lab = (DATA["df"][color_by].reindex(df.index) if color_by in DATA["df"].columns
+                    else pd.Series(pd.NA, index=df.index, dtype=object)
+                    ).fillna("(none)").astype(str)
+            _uv  = [v for v in sorted(_lab.unique()) if v != "(none)"]
+            _rcm = {v: _roi_color(i) for i, v in enumerate(_uv)}
+            _rcm["(none)"] = "#666666"
+            traces = [go.Scattergl(
+                x=xu, y=yu, mode="markers",
+                marker=dict(size=mk, color=_lab.map(_rcm).values, opacity=opacity),
+                text=df.index.tolist(), customdata=df.index.tolist(),
+                hovertemplate="<b>%{text}</b><extra></extra>", name=color_by,
+            )]
         else:
             label = QC_METRICS.get(color_by, color_by)
-            vals = np.log1p(df[color_by].values) if color_by == "transcript_counts" else df[color_by].values
+            if color_by not in df.columns:
+                vals = np.zeros(len(df))
+            else:
+                vals = np.log1p(df[color_by].values) if color_by == "transcript_counts" else df[color_by].values
             if color_by == "transcript_counts":
                 label = "Transcript Counts (log1p)"
             _ckw = {}
@@ -7168,6 +8927,20 @@ def _apply_cellnest_filters(ccc_df, f_ligand=None, f_receptor=None,
     return sub
 
 
+def _cellnest_split_pair(pair: str, ccc_df) -> tuple:
+    """Split a 'LIGAND-RECEPTOR' label. Symbols may themselves contain '-'
+    (HLA-DRA, MT-CO2), so with more than one hyphen pick the split that exists
+    in ccc_df; otherwise split on the first hyphen as before."""
+    parts = str(pair).split("-")
+    if len(parts) > 2:
+        known = set(zip(ccc_df["ligand"], ccc_df["receptor"]))
+        for i in range(1, len(parts)):
+            cand = ("-".join(parts[:i]), "-".join(parts[i:]))
+            if cand in known:
+                return cand
+    return tuple(str(pair).split("-", 1))
+
+
 def _cellnest_make_bar(f_ligand=None, f_receptor=None,
                        f_sender=None, f_receiver=None, annot_col=None):
     """Return a Plotly bar chart using the pre-computed CellNEST histogram CSV."""
@@ -7186,10 +8959,13 @@ def _cellnest_make_bar(f_ligand=None, f_receptor=None,
     count_col = freq.columns[1]   # "Total Count"
 
     # Apply ligand/receptor name filters if set
+    # (the filter dropdowns are multi-select, so these arrive as lists)
     if f_ligand:
-        freq = freq[freq[pair_col].str.startswith(f_ligand + "-")]
+        _lv = f_ligand if isinstance(f_ligand, list) else [f_ligand]
+        freq = freq[freq[pair_col].astype(str).str.startswith(tuple(f"{v}-" for v in _lv))]
     if f_receptor:
-        freq = freq[freq[pair_col].str.endswith("-" + f_receptor)]
+        _rv = f_receptor if isinstance(f_receptor, list) else [f_receptor]
+        freq = freq[freq[pair_col].astype(str).str.endswith(tuple(f"-{v}" for v in _rv))]
 
     freq = freq.head(30)
     if freq.empty:
@@ -7391,7 +9167,7 @@ def _cellnest_make_spatial(lr_pair, top_n=100, color_by="_default",
     if node_degree and lr_pairs:
         all_sub = []
         for pair in lr_pairs:
-            lig, rec = pair.split("-", 1)
+            lig, rec = _cellnest_split_pair(pair, ccc_df)
             all_sub.append(ccc_df[(ccc_df["ligand"] == lig) & (ccc_df["receptor"] == rec)])
         combined = pd.concat(all_sub) if all_sub else pd.DataFrame()
         if not combined.empty:
@@ -7422,7 +9198,7 @@ def _cellnest_make_spatial(lr_pair, top_n=100, color_by="_default",
                      for i, r in enumerate(sorted(ccc_df["receptor"].unique()))}
 
     for pi, pair in enumerate(lr_pairs):
-        ligand, receptor = pair.split("-", 1)
+        ligand, receptor = _cellnest_split_pair(pair, ccc_df)
         sub = ccc_df[(ccc_df["ligand"] == ligand) & (ccc_df["receptor"] == receptor)]
         sub = _apply_cellnest_filters(sub, f_ligand, f_receptor, f_sender, f_receiver, annot_col)
         sub = sub.nlargest(int(top_n or 100), "attention_score")
@@ -7438,6 +9214,8 @@ def _cellnest_make_spatial(lr_pair, top_n=100, color_by="_default",
             edge_color_hex = _rec_cmap.get(receptor, "#888888")
         else:
             edge_color_hex = None  # attention: handled per-edge below
+        # Solid per-pair color for markers (arrows, autocrine rings, sender/receiver dots)
+        pair_color_hex = edge_color_hex or pair_palette[pi % len(pair_palette)]
 
         # ── Edge lines ──────────────────────────────────────────────────────
         if color_by == "attention":
@@ -7602,7 +9380,7 @@ def _cellnest_make_circos(lr_pairs, annot_col, top_n=500, color_by="lr_pair",
 
     subs = []
     for pair in pairs:
-        ligand, receptor = pair.split("-", 1)
+        ligand, receptor = _cellnest_split_pair(pair, ccc_df)
         sub = ccc_df[(ccc_df["ligand"] == ligand) & (ccc_df["receptor"] == receptor)]
         sub = _apply_cellnest_filters(sub, f_ligand, f_receptor, f_sender, f_receiver, annot_col)
         sub = sub.nlargest(int(top_n or 500), "attention_score")
@@ -7615,7 +9393,7 @@ def _cellnest_make_circos(lr_pairs, annot_col, top_n=500, color_by="lr_pair",
     # Build per-pair aggregation: (pair, src_type, tgt_type) → sum weight
     records = []
     for pair, sub in subs:
-        ligand, receptor = pair.split("-", 1)
+        ligand, receptor = _cellnest_split_pair(pair, ccc_df)
         agg = (sub.groupby([from_col, to_col])["attention_score"]
                   .sum().reset_index())
         agg.columns = ["source", "target", "weight"]
@@ -7767,7 +9545,7 @@ def _cellnest_overlay_traces(lr_pair, top_n=100, edge_width=1, color_by="lr_pair
     participating_ids = set()  # track from_id/to_id indices for gray-out exclusion
 
     for pi, pair in enumerate(pairs):
-        ligand, receptor = pair.split("-", 1)
+        ligand, receptor = _cellnest_split_pair(pair, ccc_df)
         sub = ccc_df[(ccc_df["ligand"] == ligand) & (ccc_df["receptor"] == receptor)]
         sub = sub.nlargest(int(top_n or 100), "attention_score")
         if sub.empty:
@@ -7911,7 +9689,15 @@ def _ensure_cellnest_db():
         local = os.path.join(_CELLNEST_DB_CACHE, os.path.basename(url))
         if not os.path.isfile(local):
             print(f"[CellNEST-DB] Downloading {url} …", flush=True)
-            urllib.request.urlretrieve(url, local)
+            # download to a temp name so an interrupted transfer is not taken as complete
+            _tmp = local + ".part"
+            try:
+                urllib.request.urlretrieve(url, _tmp)
+                os.replace(_tmp, local)
+            except Exception:
+                if os.path.exists(_tmp):
+                    os.remove(_tmp)
+                raise
             print(f"[CellNEST-DB] Saved to {local}", flush=True)
         result[key] = pd.read_csv(local)
     with _cellnest_db_lock:
@@ -7976,10 +9762,27 @@ _spage_autoload()
 
 def _sdata_cache_path() -> str:
     """Return the directory path for the SpatialData Zarr cache for this dataset."""
-    tag = hashlib.md5(DATA["data_dir"].encode()).hexdigest()[:12]
+    tag = hashlib.md5(_dataset_key().encode()).hexdigest()[:12]
     cache_dir = CACHE_BASE_DIR
     os.makedirs(cache_dir, exist_ok=True)
     return os.path.join(cache_dir, f"spatialdata_{tag}.zarr")
+
+
+def _sdata_cache_valid(cache: str) -> bool:
+    """True if the SpatialData cache was written completely (an interrupted write
+    leaves a directory that would otherwise load with elements or rows missing)."""
+    if not os.path.isdir(cache):
+        return False
+    if os.path.exists(os.path.join(cache, ".complete")):
+        return True
+    # Caches written before the marker existed: consolidated metadata is written last
+    if os.path.exists(os.path.join(cache, ".zmetadata")):
+        return True
+    try:
+        with open(os.path.join(cache, "zarr.json")) as _f:
+            return json.load(_f).get("consolidated_metadata") is not None
+    except Exception:
+        return False
 
 
 def _sdata_fix_categories(sdata) -> None:
@@ -8008,6 +9811,8 @@ def _sdata_summary(sdata) -> str:
 
 def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bool = False) -> None:
     """Background thread: write current SpatialData + analysis results to disk."""
+    _gen = _dataset_gen
+
     def _set(status, msg):
         with _save_sdata_lock:
             _save_sdata_state["status"]  = status
@@ -8035,17 +9840,26 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
                 warnings.simplefilter("ignore")
                 sdata = sd.read_zarr(sdata_path)
             cells_df  = _alt_res["cells_df"]
-            cluster_methods = [c for c in cells_df.columns if c.startswith("cluster")]
-            annot_key = f"labels_{tool}"   # e.g. "labels_baysor"
+            cluster_methods = [c for c in cells_df.columns
+                               if c.startswith("cluster") or c == "niche" or c.startswith("roi_")]
         else:
-            with _sdata_lock:
-                sdata = _sdata_state.get("sdata")
-            if sdata is None:
-                _set("error", "No SpatialData loaded. Open 'Resegment Cells' first to build it.")
+            # The app's own per-cell store (table + cell / nucleus boundaries), read
+            # fresh; the sopa object of the Resegment modal has no table and no cells.
+            _alt_res   = None
+            sdata_path = DATA.get("sdata_path", "")
+            if not sdata_path or not os.path.isdir(sdata_path):
+                _set("error", "No SpatialData store found for this dataset.")
                 return
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                sdata = sd.read_zarr(sdata_path)
             cells_df        = DATA.get("df")
-            cluster_methods = list(DATA.get("cluster_methods", {}).keys())
-            annot_key       = None   # loop over _ANNOT_METHODS keys directly
+            # The store already holds the columns DATA["df"] was loaded from; only
+            # columns added in this session are attached below.
+            cluster_methods = [] if cells_df is None else [
+                c for c in cells_df.columns
+                if c.startswith("cluster") or c == "niche" or c.startswith("roi_")]
 
         _set("running", f"Writing to {save_path}…")
         print(f"  save_spatialdata: writing to {save_path} (seg={seg_source}, roi_only={roi_only})…", flush=True)
@@ -8065,6 +9879,7 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
                     print("  save_spatialdata: roi_only requested but no ROI columns found — exporting all cells", flush=True)
 
         # ── Attach analysis results to sdata table ─────────────────────────────
+        out_tbl = None
         if "table" in sdata.tables:
             tbl = sdata.tables["table"]
             has_cell_id   = "cell_id" in tbl.obs.columns
@@ -8072,7 +9887,7 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
 
             def _map(series: "pd.Series") -> list:
                 """Align a Series (index=cell_id str) to zarr obs rows."""
-                series = series.astype(str)
+                series = series.dropna().astype(str)
                 series.index = series.index.astype(str)
                 if has_cell_id:
                     return zarr_cell_ids.map(series.to_dict()).fillna("Unknown").tolist()
@@ -8084,28 +9899,31 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
                     if method in cells_df.columns:
                         tbl.obs[method] = _map(cells_df[method])
 
-            # Cell-type annotations
+            # Cell-type annotations: per-method labels of the exported segmentation
+            # (Xenium: labels_<method>; reseg: labels_<method>_<tool>_<run tag>)
             with _annot_lock:
-                if annot_key:
-                    # Reseg: single combined label
-                    lbl = _annot_state.get(annot_key)
+                _first_lbl = None
+                for m in _ANNOT_METHODS:
+                    lbl = _annot_state.get(_labels_key_for_method(m, _alt_res))
                     if lbl is not None:
-                        tbl.obs["cell_type"] = _map(lbl)
-                else:
-                    # Xenium: per-method labels
-                    for m in _ANNOT_METHODS:
-                        lbl = _annot_state.get(f"labels_{m}")
-                        if lbl is not None:
-                            tbl.obs[f"cell_type_{m}"] = _map(lbl)
-                    # RCTD weights → obsm
-                    rctd_w = _annot_state.get("rctd_weights_labels_rctd")
-                    if rctd_w is not None:
-                        if has_cell_id:
-                            aligned = rctd_w.reindex(zarr_cell_ids.values).fillna(0.0)
-                        else:
-                            aligned = rctd_w.reindex(tbl.obs.index.astype(str)).fillna(0.0)
-                        tbl.obsm["rctd_weights"] = aligned.values
-                        tbl.uns["rctd_weight_columns"] = list(rctd_w.columns)
+                        tbl.obs[f"cell_type_{m}"] = _map(lbl)
+                        if _first_lbl is None:
+                            _first_lbl = lbl
+                if _alt_res is not None and _first_lbl is not None:
+                    # Reseg: single combined label (first available method)
+                    tbl.obs["cell_type"] = _map(_first_lbl)
+                # RCTD weights → obsm
+                rctd_w = _annot_state.get(
+                    f"rctd_weights_{_labels_key_for_method('rctd', _alt_res)}")
+                if rctd_w is not None:
+                    rctd_w = rctd_w.copy()
+                    rctd_w.index = rctd_w.index.astype(str)
+                    if has_cell_id:
+                        aligned = rctd_w.reindex(zarr_cell_ids.values).fillna(0.0)
+                    else:
+                        aligned = rctd_w.reindex(tbl.obs.index.astype(str)).fillna(0.0)
+                    tbl.obsm["rctd_weights"] = aligned.values
+                    tbl.uns["rctd_weight_columns"] = list(rctd_w.columns)
 
             # ROI filter: subset table rows
             if roi_ids is not None:
@@ -8115,7 +9933,7 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
                     keep_mask = tbl.obs.index.astype(str).isin(roi_ids)
                 tbl = tbl[keep_mask].copy()
                 print(f"  save_spatialdata: table filtered to {tbl.n_obs:,} cells", flush=True)
-            sdata.tables["table"] = tbl
+            out_tbl = tbl
 
         # ── Filter shapes to ROI cells ─────────────────────────────────────────
         out_shapes = {}
@@ -8129,11 +9947,11 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
                 out_shapes[name] = gdf
 
         # ── Write output (table + shapes only; images stay in original Xenium dir) ──
-        out_tbl = sdata.tables.get("table")
         sdata_out = sd.SpatialData(
             shapes=out_shapes,
             tables={"table": out_tbl} if out_tbl is not None else {},
         )
+        _check_dataset_gen(_gen)   # reported as an error: the export would mix two datasets
         sdata_out.write(save_path, overwrite=True)
         n_cells = out_tbl.n_obs if out_tbl is not None else 0
         print(f"  save_spatialdata: done → {save_path} ({n_cells:,} cells)", flush=True)
@@ -8146,7 +9964,7 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
 def _sdata_autoload() -> None:
     """If a Zarr cache exists for this dataset, load it into _sdata_state at startup."""
     cache = _sdata_cache_path()
-    if not os.path.isdir(cache):
+    if not _sdata_cache_valid(cache):
         return
     try:
         import spatialdata
@@ -8154,12 +9972,14 @@ def _sdata_autoload() -> None:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             sdata = spatialdata.read_zarr(cache)
-        _sdata_fix_categories(sdata)
+        # No _sdata_fix_categories here: it scans the whole transcript table and
+        # is applied in the background before patching instead.
         summary = _sdata_summary(sdata)
         with _sdata_lock:
             _sdata_state["status"]  = "done"
             _sdata_state["message"] = f"Auto-loaded (cached) — {summary}"
             _sdata_state["sdata"]   = sdata
+            _sdata_state["qv"]      = None    # flag as stored; set by to_spatialdata()
         DATA["sdata"] = sdata
         print(f"  SpatialData: auto-loaded from cache — {summary}", flush=True)
         # Load any cell-type annotations stored in zarr tbl.obs into _annot_state
@@ -8216,9 +10036,25 @@ def _cache_dir() -> str:
     return CACHE_BASE_DIR
 
 
-def _cache_size_str() -> str:
-    """Return human-readable total size of the cache directory."""
+_cache_size_memo: dict = {"t": 0.0, "dir": None, "val": None}
+
+
+def _cache_size_str(max_age: float = 300.0) -> str:
+    """Return human-readable total size of the cache directory.
+    Walking a large cache tree is slow, so the value is reused for max_age
+    seconds; pass max_age=0 for an exact figure."""
+    import time
     cache = _cache_dir()
+    if (max_age > 0 and _cache_size_memo["val"] is not None
+            and _cache_size_memo["dir"] == cache
+            and time.time() - _cache_size_memo["t"] < max_age):
+        return _cache_size_memo["val"]
+    val = _cache_size_walk(cache)
+    _cache_size_memo.update({"t": time.time(), "dir": cache, "val": val})
+    return val
+
+
+def _cache_size_walk(cache: str) -> str:
     if not os.path.isdir(cache):
         return "0 B"
     total = 0
@@ -8270,18 +10106,21 @@ def _format_seg_label(tool: str, params: dict) -> str:
 def _list_cached_seg_runs() -> list:
     """Return list of {label, value} dicts for all complete cached Baysor/Proseg runs for the current dataset."""
     cache_base = CACHE_BASE_DIR
-    dataset = os.path.basename(DATA.get("data_dir", ""))
+    dataset = _dataset_name()
     opts = []
-    if not os.path.isdir(cache_base):
+    if not os.path.isdir(cache_base) or not dataset:
+        # no dataset name (.zarr input): the prefix "baysor__" could match unrelated dirs
         return opts
     for entry in sorted(os.listdir(cache_base)):
         out_dir = os.path.join(cache_base, entry)
         if not os.path.isdir(out_dir):
             continue
-        # Determine tool
+        # Determine tool (exact name match plus dataset identity — see _seg_run_tag)
         if entry.startswith(f"baysor_{dataset}_"):
             tool = "baysor"
-            param_tag = entry[len(f"baysor_{dataset}_"):]
+            param_tag = _seg_run_tag(entry, tool)
+            if param_tag is None:
+                continue
             # Check completeness: any segmentation.csv anywhere in the tree
             complete = any(
                 "segmentation.csv" in files
@@ -8289,7 +10128,9 @@ def _list_cached_seg_runs() -> list:
             )
         elif entry.startswith(f"proseg_{dataset}_"):
             tool = "proseg"
-            param_tag = entry[len(f"proseg_{dataset}_"):]
+            param_tag = _seg_run_tag(entry, tool)
+            if param_tag is None:
+                continue
             complete = any(
                 "cell-metadata.csv.gz" in files
                 for _, _, files in os.walk(out_dir)
@@ -8299,12 +10140,21 @@ def _list_cached_seg_runs() -> list:
         if not complete:
             continue
         params_path = os.path.join(out_dir, "params.json")
+        # Patch-based runs write params.json only after all patches are merged, so
+        # patch_* dirs without it mean an in-progress or aborted run.
+        if not os.path.exists(params_path) and any(
+                d.startswith("patch_") and os.path.isdir(os.path.join(out_dir, d))
+                for d in os.listdir(out_dir)):
+            continue
+        label = f"{tool.capitalize()}: [{param_tag}]"
         if os.path.exists(params_path):
-            with open(params_path) as f:
-                params = json.load(f)
-            label = _format_seg_label(tool, params)
-        else:
-            label = f"{tool.capitalize()}: [{param_tag}]"
+            try:
+                with open(params_path) as f:
+                    label = _format_seg_label(tool, json.load(f))
+            except Exception:
+                pass   # truncated/corrupt params.json: keep the tag label
+        if any(o["value"] == f"{tool}:{param_tag}" for o in opts):
+            continue   # same run under both the older and the hashed directory name
         opts.append({"label": label, "value": f"{tool}:{param_tag}", "out_dir": out_dir, "param_tag": param_tag})
     return opts
 
@@ -8323,7 +10173,7 @@ def _roi_color(index: int) -> str:
 def _roi_cache_path() -> str:
     cache_dir = CACHE_BASE_DIR
     os.makedirs(cache_dir, exist_ok=True)
-    tag = hashlib.md5(DATA["data_dir"].encode()).hexdigest()[:8]
+    tag = hashlib.md5(_dataset_key().encode()).hexdigest()[:8]
     return os.path.join(cache_dir, f"rois_{tag}.json")
 
 
@@ -8427,7 +10277,8 @@ def _roi_compute_hull(cell_ids, src_df=None):
     try:
         from shapely.geometry import MultiPoint
         df = src_df if src_df is not None else DATA["df"]
-        sub = df.loc[[c for c in cell_ids if c in df.index]]
+        # match as strings: plot customdata is str, a reseg cells_df index may be int
+        sub = df[df.index.astype(str).isin({str(c) for c in cell_ids})]
         if len(sub) < 3:
             return None
         pts = list(zip(sub["x_centroid"].values, -sub["y_centroid"].values))
@@ -8442,19 +10293,30 @@ def _roi_compute_hull(cell_ids, src_df=None):
         return None
 
 
-def _roi_cells_in_polygon(polygon_xy: list, src_df=None) -> list:
-    """Return cell IDs (index values) whose centroids lie inside polygon_xy."""
+def _roi_mask_in_polygon(polygon_xy: list, df: "pd.DataFrame") -> np.ndarray:
+    """Boolean mask over df rows whose centroids lie strictly inside polygon_xy
+    (vectorised; same result as shapely poly.contains(Point) per cell)."""
+    mask = np.zeros(len(df), dtype=bool)
     try:
-        from shapely.geometry import Polygon as _SPoly, Point as _SPoint
+        import shapely
+        from shapely.geometry import Polygon as _SPoly
         poly = _SPoly(polygon_xy)
-        df = src_df if src_df is not None else DATA["df"]
-        xs = df["x_centroid"].values
-        ys = -df["y_centroid"].values
-        ids = df.index.tolist()
-        return [cid for cid, px, py in zip(ids, xs, ys) if poly.contains(_SPoint(px, py))]
+        xs = df["x_centroid"].to_numpy(dtype=float)
+        ys = -df["y_centroid"].to_numpy(dtype=float)
+        minx, miny, maxx, maxy = poly.bounds
+        cand = (xs >= minx) & (xs <= maxx) & (ys >= miny) & (ys <= maxy)
+        if cand.any():
+            mask[cand] = shapely.contains_xy(poly, xs[cand], ys[cand])
     except Exception as e:
         print(f"  ROI containment error: {e}", flush=True)
-        return []
+        mask[:] = False
+    return mask
+
+
+def _roi_cells_in_polygon(polygon_xy: list, src_df=None) -> list:
+    """Return cell IDs (index values) whose centroids lie inside polygon_xy."""
+    df = src_df if src_df is not None else DATA["df"]
+    return df.index[_roi_mask_in_polygon(polygon_xy, df)].tolist()
 
 
 def _roi_apply_metadata_to_df(df: "pd.DataFrame", rois: list) -> None:
@@ -8471,16 +10333,58 @@ def _roi_apply_metadata_to_df(df: "pd.DataFrame", rois: list) -> None:
     overlap_warned: set = set()
     for roi in rois:
         col = f"roi_{roi['cls']}"
-        cell_ids = _roi_cells_in_polygon(roi["polygon_xy"], src_df=df)
+        _in_roi = _roi_mask_in_polygon(roi["polygon_xy"], df)
         # Warn on overlaps with existing same-class assignments
-        existing = df.loc[[c for c in cell_ids if c in df.index], col]
+        existing = df.loc[_in_roi, col]
         overlapping = existing.dropna()
         for existing_name in overlapping.unique():
             key = (existing_name, roi["name"])
             if key not in overlap_warned:
                 print(f"  ROI WARNING: '{roi['name']}' overlaps with '{existing_name}' (class '{roi['cls']}')", flush=True)
                 overlap_warned.add(key)
-        df.loc[[c for c in cell_ids if c in df.index], col] = roi["name"]
+        df.loc[_in_roi, col] = roi["name"]
+
+
+def _roi_apply_everywhere(rois: list) -> None:
+    """Apply ROI metadata to every loaded cell table, including the full
+    (pre-subset) frames, so roi_* columns survive unsubset()."""
+    _roi_apply_metadata_to_df(DATA["df"], rois)
+    _orig = DATA.get("_df_original")
+    if _orig is not None and _orig is not DATA["df"]:
+        _roi_apply_metadata_to_df(_orig, rois)
+    for _lock, _state in ((_baysor_lock, _baysor_state), (_proseg_lock, _proseg_state)):
+        with _lock:
+            _res = _state.get("result")
+        if _res:
+            _roi_apply_metadata_to_df(_res["cells_df"], rois)
+            _rorig = _res.get("_cells_df_original")
+            if _rorig is not None and _rorig is not _res["cells_df"]:
+                _roi_apply_metadata_to_df(_rorig, rois)
+    # UMAP df cache holds dropna() copies of DATA["df"] without the new columns
+    _umap_df_cache.clear()
+    _umap_fig_cache.clear()
+
+
+def _roi_manager_contents(rois: list):
+    """Return (table, op_options) for the ROI manager modal."""
+    if not rois:
+        table = html.P("No ROIs defined yet. Use lasso on the spatial plot to draw one.",
+                       style={"color": MUTED, "fontSize": "0.82rem"})
+    else:
+        rows = []
+        for i, r in enumerate(rois):
+            rows.append(html.Tr([
+                html.Td(html.Div(style={"width": "18px", "height": "18px",
+                                         "backgroundColor": r["color"], "borderRadius": "3px"})),
+                html.Td(r["cls"], style={"padding": "4px 8px"}),
+                html.Td(r["name"], style={"padding": "4px 8px"}),
+                html.Td(dbc.Button("✕", id={"type": "roi-delete-btn", "index": i},
+                                   size="sm", color="danger", style={"padding": "1px 7px"})),
+            ]))
+        table = dbc.Table([html.Tbody(rows)], bordered=False, hover=True,
+                          style={"fontSize": "0.82rem", "color": TEXT})
+    op_opts = [{"label": f"{r['cls']}: {r['name']}", "value": i} for i, r in enumerate(rois)]
+    return table, op_opts
 
 
 def _roi_write_all_zarrs_bg() -> None:
@@ -8491,27 +10395,30 @@ def _roi_write_all_zarrs_bg() -> None:
     try:
         sdata_path = DATA.get("sdata_path", "")
         if sdata_path and os.path.isdir(sdata_path):
-            _roi_apply_metadata_to_df(DATA["df"], rois)
-            _update_reseg_zarr_obs(sdata_path, DATA["df"])
+            # Write the full frame, not the active subset
+            _full_df = DATA.get("_df_original")
+            if _full_df is None:
+                _full_df = DATA["df"]
+            # roi_* columns were already applied by the caller (_roi_apply_everywhere)
+            _update_reseg_zarr_obs(sdata_path, _full_df)
             print(f"  ROI: wrote {len(rois)} ROIs to xenium zarr", flush=True)
     except Exception as e:
         print(f"  ROI zarr write error (xenium): {e}", flush=True)
     # Write to Baysor/Proseg zarrs
-    for run in _list_cached_seg_runs():
+    # (only the loaded result of each tool has its cell table in memory)
+    for tool, _lock, _state in (("baysor", _baysor_lock, _baysor_state),
+                                ("proseg", _proseg_lock, _proseg_state)):
         try:
-            tool = run["value"].split(":")[0]
-            if tool == "baysor":
-                with _baysor_lock:
-                    result = _baysor_state.get("result")
-            else:
-                with _proseg_lock:
-                    result = _proseg_state.get("result")
+            with _lock:
+                result = _state.get("result")
             if result and result.get("sdata_path") and os.path.isdir(result["sdata_path"]):
-                _roi_apply_metadata_to_df(result["cells_df"], rois)
-                _update_reseg_zarr_obs(result["sdata_path"], result["cells_df"])
+                _full_cdf = result.get("_cells_df_original")
+                if _full_cdf is None:
+                    _full_cdf = result["cells_df"]
+                _update_reseg_zarr_obs(result["sdata_path"], _full_cdf)
                 print(f"  ROI: wrote {len(rois)} ROIs to {tool} zarr", flush=True)
         except Exception as e:
-            print(f"  ROI zarr write error ({run['value']}): {e}", flush=True)
+            print(f"  ROI zarr write error ({tool}): {e}", flush=True)
 
 
 def _roi_shapes_for_fig(rois: list, pending_hull=None) -> list:
@@ -8541,7 +10448,7 @@ def _auto_load_rois() -> None:
     rois = _roi_load_cache()
     # Migration: if no ROIs found at the absolute-path hash (new scheme),
     # also try the relative-path hash that was used before os.path.abspath normalisation.
-    if not rois:
+    if not rois and DATA.get("data_dir"):
         _rel_tag = hashlib.md5(os.path.basename(DATA["data_dir"]).encode()).hexdigest()[:8]
         _cache_dir_path = CACHE_BASE_DIR
         for _try_tag in (_rel_tag,):
@@ -8560,7 +10467,7 @@ def _auto_load_rois() -> None:
     with _roi_lock:
         _roi_state["rois"] = rois
     if rois and "df" in DATA:
-        _roi_apply_metadata_to_df(DATA["df"], rois)
+        _roi_apply_everywhere(rois)
         print(f"  ROI: auto-loaded {len(rois)} ROIs from cache", flush=True)
 
 
@@ -8572,14 +10479,17 @@ def _clean_cache_for_dataset() -> str:
     cache = _cache_dir()
     if not os.path.isdir(cache):
         return "Cache directory not found."
-    tag = hashlib.md5(DATA["data_dir"].encode()).hexdigest()[:8]
-    dataset_name = os.path.basename(DATA["data_dir"])
+    tag = hashlib.md5(_dataset_key().encode()).hexdigest()[:8]
+    dataset_name = _dataset_name()
     removed = 0
     import shutil
     for entry in os.listdir(cache):
         full = os.path.join(cache, entry)
-        # Match files/dirs that contain the dataset tag or dataset name
-        if tag in entry or dataset_name in entry:
+        # Match files/dirs that contain the dataset tag, and the Baysor/Proseg run
+        # directories of this dataset (exact name + dataset identity, not a substring:
+        # 'run1' must not match 'baysor_run10_…')
+        if tag in entry or (os.path.isdir(full) and (
+                _seg_run_tag(entry, "baysor") or _seg_run_tag(entry, "proseg"))):
             try:
                 if os.path.isdir(full):
                     shutil.rmtree(full)
@@ -8624,19 +10534,29 @@ def to_spatialdata(qv_threshold: int = 20, force: bool = False) -> None:
         to_spatialdata(qv_threshold=30)
     """
     global _sdata_version
+    _gen = _dataset_gen
 
     def _run():
         global _sdata_version
 
         def _set(status, message, sdata=None):
             with _sdata_lock:
+                if _stale_job(_gen, status):
+                    return
                 _sdata_state["status"]  = status
                 _sdata_state["message"] = message
                 if sdata is not None:
                     _sdata_state["sdata"] = sdata
+                    # threshold behind this object's low_quality_transcript flag
+                    # (decides which transcripts count towards a patch)
+                    _sdata_state["qv"] = qv_threshold
                     DATA["sdata"] = sdata
 
         try:
+            if not DATA.get("data_dir"):
+                _set("error", "No raw Xenium data for a .zarr dataset — "
+                              "SpatialData patch setup is not available.")
+                return
             _set("running", "Importing sopa…")
             try:
                 import sopa, sopa.io, spatialdata
@@ -8647,7 +10567,7 @@ def to_spatialdata(qv_threshold: int = 20, force: bool = False) -> None:
             cache = _sdata_cache_path()
 
             # ── Try cache first ───────────────────────────────────────────
-            if not force and os.path.isdir(cache):
+            if not force and _sdata_cache_valid(cache):
                 _set("running", "Loading from cache…")
                 print(f"  to_spatialdata: loading from cache {cache} …", flush=True)
                 try:
@@ -8655,6 +10575,12 @@ def to_spatialdata(qv_threshold: int = 20, force: bool = False) -> None:
                     with warnings.catch_warnings():
                         warnings.simplefilter("ignore")
                         sdata = spatialdata.read_zarr(cache)
+                    # The cached flag was computed with the threshold used when the cache
+                    # was built; re-derive it (lazily) for the requested threshold.
+                    for _pk in list(sdata.points.keys()):
+                        _pts = sdata.points[_pk]
+                        if "qv" in _pts.columns and "low_quality_transcript" in _pts.columns:
+                            sdata.points[_pk]["low_quality_transcript"] = _pts["qv"] < qv_threshold
                     _sdata_fix_categories(sdata)
                     summary = _sdata_summary(sdata)
                     msg = f"Done (cached) — {summary}"
@@ -8699,9 +10625,12 @@ def to_spatialdata(qv_threshold: int = 20, force: bool = False) -> None:
                     warnings.filterwarnings("ignore", category=FutureWarning)
                     warnings.filterwarnings("ignore", category=UserWarning)
                     sdata.write(cache)
+                open(os.path.join(cache, ".complete"), "w").close()
                 print(f"  to_spatialdata: cache saved ✓", flush=True)
             except Exception as save_exc:
                 print(f"  to_spatialdata: cache save failed: {save_exc}", flush=True)
+                # do not leave a partial store that a later start would load as complete
+                shutil.rmtree(cache, ignore_errors=True)
 
             summary = _sdata_summary(sdata)
             msg = f"Done — {summary}"
@@ -8733,11 +10662,125 @@ def clear_sdata_cache() -> None:
 _sdata_autoload()
 
 
+# ── Re-use of the tissue ROI and the patches saved in the SpatialData cache store ──
+# sopa writes both into the store (shapes/…), but nothing in the store says which
+# parameters produced the patches. The app therefore records them next to the shapes
+# (_SDATA_PATCH_PARAMS_FILE) and restores the patches only when that record matches
+# the request and still describes the shapes on disk.
+_SDATA_PATCH_PARAMS_FILE = ".xe_patch_params.json"
+_SDATA_PATCH_OVERLAP_UM  = 50.0    # sopa.make_transcript_patches default (not set by the app)
+
+
+def _sdata_roi_key(sdata):
+    return next((k for k in sdata.shapes
+                 if k == "region_of_interest" or "roi" in k.lower() or "tissue" in k.lower()),
+                None)
+
+
+def _sdata_patch_key(sdata):
+    return next((k for k in sdata.shapes
+                 if k == "transcripts_patches" or "patch" in k.lower()), None)
+
+
+def _sdata_disk_shapes_hash(sdata, key):
+    """md5 of the geometries of shapes element *key* as stored on disk; None when the
+    object is not backed by a store or the element is not in it."""
+    try:
+        if key is None or not sdata.is_backed():
+            return None
+        _p = os.path.join(str(sdata.path), "shapes", key, "shapes.parquet")
+        if not os.path.exists(_p):
+            return None
+        import geopandas as _gpd
+        _h = hashlib.md5()
+        for _w in _gpd.read_parquet(_p).geometry.to_wkb():
+            _h.update(_w)
+        return _h.hexdigest()
+    except Exception as _he:
+        print(f"  SpatialData: could not hash shapes '{key}': {_he}", flush=True)
+        return None
+
+
+def _sdata_patch_request(sdata, width_um, min_transcripts, qv) -> dict:
+    """Everything the patch layout depends on: grid width and overlap, the minimum
+    transcript count and the Q-score threshold deciding which transcripts count,
+    the tissue ROI the grid is clipped to, and the sopa version."""
+    try:
+        import sopa as _sopa
+        _sopa_ver = str(_sopa.__version__)
+    except Exception:
+        _sopa_ver = None
+    return {"version": 1,
+            "patch_width": float(width_um),
+            "patch_overlap": _SDATA_PATCH_OVERLAP_UM,
+            "min_transcripts": int(min_transcripts),
+            "qv_threshold": None if qv is None else float(qv),
+            "roi_hash": _sdata_disk_shapes_hash(sdata, _sdata_roi_key(sdata)),
+            "sopa": _sopa_ver}
+
+
+def _sdata_restore_patches(sdata, width_um, min_transcripts, qv):
+    """The patches stored in the cache store, if they are known to be the result of this
+    request; else None (the caller then recomputes them)."""
+    try:
+        _key = _sdata_patch_key(sdata)
+        if _key is None or not sdata.is_backed():
+            return None
+        _pfile = os.path.join(str(sdata.path), _SDATA_PATCH_PARAMS_FILE)
+        if not os.path.exists(_pfile):
+            print("  create_patches: stored patches have no parameter record — recomputing",
+                  flush=True)
+            return None
+        with open(_pfile) as _f:
+            _saved = json.load(_f)
+        _want = _sdata_patch_request(sdata, width_um, min_transcripts, qv)
+        _diff = [k for k, v in _want.items() if _saved.get(k) != v]
+        if _diff:
+            print("  create_patches: stored patches were made with other settings ("
+                  + ", ".join(f"{k}: {_saved.get(k)!r} → {_want[k]!r}" for k in _diff)
+                  + ") — recomputing", flush=True)
+            return None
+        _patches = sdata.shapes[_key]
+        if (_saved.get("patches_key") != _key or _saved.get("n_patches") != len(_patches)
+                or not _saved.get("patches_hash")
+                or _saved.get("patches_hash") != _sdata_disk_shapes_hash(sdata, _key)):
+            print("  create_patches: stored patches differ from their parameter record "
+                  "— recomputing", flush=True)
+            return None
+        return _patches
+    except Exception as _re:
+        print(f"  create_patches: could not restore stored patches ({_re}) — recomputing",
+              flush=True)
+        return None
+
+
+def _sdata_record_patches(sdata, width_um, min_transcripts, qv) -> None:
+    """Write the parameter record for the patches just computed (if they reached the store)."""
+    try:
+        _key = _sdata_patch_key(sdata)
+        _hash = _sdata_disk_shapes_hash(sdata, _key)
+        if _hash is None:
+            return
+        _rec = _sdata_patch_request(sdata, width_um, min_transcripts, qv)
+        _rec.update({"patches_key": _key, "n_patches": int(len(sdata.shapes[_key])),
+                     "patches_hash": _hash})
+        _pfile = os.path.join(str(sdata.path), _SDATA_PATCH_PARAMS_FILE)
+        with open(_pfile + ".tmp", "w") as _f:
+            json.dump(_rec, _f)
+        os.replace(_pfile + ".tmp", _pfile)
+    except Exception as _we:
+        print(f"  create_patches: could not record patch parameters: {_we}", flush=True)
+
+
 def segment_tissue_roi() -> None:
     """Run sopa.segmentation.tissue() to detect tissue ROI in the SpatialData object.
     Callable from REPL. Requires to_spatialdata() to have completed first.
+    A ROI already saved in the cache store is re-used (it depends on the image only;
+    Re-build clears the store and with it the ROI).
     """
     global _sdata_version
+
+    _gen = _dataset_gen
 
     def _run():
         global _sdata_version
@@ -8745,38 +10788,49 @@ def segment_tissue_roi() -> None:
             sdata = _sdata_state.get("sdata")
         if sdata is None:
             print("  segment_tissue_roi: no SpatialData. Run to_spatialdata() first.", flush=True)
+            with _sdata_lock:
+                _sdata_state["status"]  = "error"
+                _sdata_state["message"] = "No SpatialData loaded - run Prepare Patches first"
             return
         try:
             import sopa.segmentation
             with _sdata_lock:
+                _check_dataset_gen(_gen)
                 _sdata_state["status"]  = "running"
                 _sdata_state["message"] = "Segmenting tissue ROI…"
-            print("  segment_tissue_roi: running sopa.segmentation.tissue()…", flush=True)
-            sopa.segmentation.tissue(sdata, mode="staining")
+            _cached_roi = (_sdata_roi_key(sdata) is not None
+                           and _sdata_disk_shapes_hash(sdata, _sdata_roi_key(sdata)) is not None)
+            if _cached_roi:
+                print("  segment_tissue_roi: using the ROI saved in the cache store", flush=True)
+            else:
+                print("  segment_tissue_roi: running sopa.segmentation.tissue()…", flush=True)
+                sopa.segmentation.tissue(sdata, mode="staining")
             # Find ROI shapes key (default key_added='region_of_interest')
-            roi_key = next(
-                (k for k in sdata.shapes
-                 if k == "region_of_interest" or "roi" in k.lower() or "tissue" in k.lower()),
-                None
-            )
+            roi_key = _sdata_roi_key(sdata)
             if roi_key:
                 roi_shapes = sdata.shapes[roi_key]
                 with _sdata_lock:
+                    _check_dataset_gen(_gen)
                     _sdata_state["roi"]     = roi_shapes
                     _sdata_state["status"]  = "roi_done"
-                    _sdata_state["message"] = f"ROI done — {len(roi_shapes)} region(s)"
+                    _sdata_state["message"] = (f"ROI done — {len(roi_shapes)} region(s)"
+                                               + (" (cached)" if _cached_roi else ""))
                 _sdata_version += 1
                 print(f"  segment_tissue_roi: done, {len(roi_shapes)} region(s)", flush=True)
             else:
                 print("  segment_tissue_roi: no ROI shapes found in sdata", flush=True)
                 with _sdata_lock:
-                    _sdata_state["message"] = "No ROI shapes found after tissue segmentation"
+                    _check_dataset_gen(_gen)
+                    # status must leave "running" or the poll never re-enables the buttons
+                    _sdata_state["status"]  = "error"
+                    _sdata_state["message"] = "No tissue ROI found - use Skip, or Re-build and retry"
         except Exception as exc:
             import traceback
             traceback.print_exc()
             with _sdata_lock:
-                _sdata_state["status"]  = "error"
-                _sdata_state["message"] = str(exc)[:300]
+                if not _stale_job(_gen, "error"):
+                    _sdata_state["status"]  = "error"
+                    _sdata_state["message"] = str(exc)[:300]
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -8787,33 +10841,66 @@ def create_patches(width_um: float = 1000.0, min_transcripts: int = 10) -> None:
     """
     global _sdata_version
 
+    _gen = _dataset_gen
+
     def _run():
         global _sdata_version
         with _sdata_lock:
             sdata = _sdata_state.get("sdata")
         if sdata is None:
             print("  create_patches: no SpatialData. Run to_spatialdata() first.", flush=True)
+            with _sdata_lock:
+                _sdata_state["status"]  = "error"
+                _sdata_state["message"] = "No SpatialData loaded - run Prepare Patches first"
             return
         try:
             import sopa
             with _sdata_lock:
+                _check_dataset_gen(_gen)
                 _sdata_state["status"]  = "running"
                 _sdata_state["message"] = "Creating transcript patches…"
+                _qv = _sdata_state.get("qv")
             print(f"  create_patches: width={width_um}µm, min_tx={min_transcripts}…", flush=True)
+            # Patches saved in the cache store by an earlier session with the same
+            # settings: use them instead of repeating sopa's pass over every transcript
+            _stored = _sdata_restore_patches(sdata, width_um, min_transcripts, _qv)
+            if _stored is not None:
+                with _sdata_lock:
+                    _check_dataset_gen(_gen)
+                    _sdata_state["patches"] = _stored
+                    _sdata_state["status"]  = "patches_done"
+                    _sdata_state["message"] = f"Patches done — {len(_stored)} patches (cached)"
+                _sdata_version += 1
+                print(f"  create_patches: {len(_stored)} patches restored from the cache store",
+                      flush=True)
+                return
+            try:
+                if sdata.is_backed():   # the record must never describe older patches
+                    os.remove(os.path.join(str(sdata.path), _SDATA_PATCH_PARAMS_FILE))
+            except OSError:
+                pass
+            _sdata_fix_categories(sdata)   # no-op when categories are already known
             sopa.make_transcript_patches(
                 sdata,
                 patch_width=width_um,
                 min_points_per_patch=min_transcripts,
             )
+            # sopa also dumps every in-patch transcript to CSV in its cache dir; only
+            # the patch polygons are used here (Baysor/Proseg re-read transcripts.parquet)
+            try:
+                import shutil as _sh_p
+                from sopa.utils import get_cache_dir as _sopa_cache_dir
+                _sh_p.rmtree(os.path.join(str(_sopa_cache_dir(sdata)), "transcript_patches"),
+                             ignore_errors=True)
+            except Exception:
+                pass
             # Find patches key (default key_added='transcripts_patches')
-            patch_key = next(
-                (k for k in sdata.shapes
-                 if k == "transcripts_patches" or "patch" in k.lower()),
-                None
-            )
+            patch_key = _sdata_patch_key(sdata)
             if patch_key:
                 patches = sdata.shapes[patch_key]
+                _sdata_record_patches(sdata, width_um, min_transcripts, _qv)
                 with _sdata_lock:
+                    _check_dataset_gen(_gen)
                     _sdata_state["patches"] = patches
                     _sdata_state["status"]  = "patches_done"
                     _sdata_state["message"] = f"Patches done — {len(patches)} patches"
@@ -8821,12 +10908,17 @@ def create_patches(width_um: float = 1000.0, min_transcripts: int = 10) -> None:
                 print(f"  create_patches: {len(patches)} patches created", flush=True)
             else:
                 print("  create_patches: no patch shapes found in sdata", flush=True)
+                with _sdata_lock:
+                    _check_dataset_gen(_gen)
+                    _sdata_state["status"]  = "error"
+                    _sdata_state["message"] = "No patch shapes produced"
         except Exception as exc:
             import traceback
             traceback.print_exc()
             with _sdata_lock:
-                _sdata_state["status"]  = "error"
-                _sdata_state["message"] = str(exc)[:300]
+                if not _stale_job(_gen, "error"):
+                    _sdata_state["status"]  = "error"
+                    _sdata_state["message"] = str(exc)[:300]
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -8991,6 +11083,9 @@ sidebar = html.Div([
             {"label": "Cell Area",         "value": "cell_area"},
             {"label": "Nucleus Area",      "value": "nucleus_area"},
             {"label": "Spatial Niches",    "value": "niche",          "disabled": True},
+            # ROIs auto-loaded from cache at startup (later changes: update_color_by_for_rois)
+            *[{"label": f"ROI: {c}", "value": f"roi_{c}"}
+              for c in dict.fromkeys(r["cls"] for r in _roi_state["rois"])],
         ],
         value="cluster",
         clearable=False,
@@ -9046,6 +11141,11 @@ sidebar = html.Div([
             f"Zoom in to see boundaries (limit {BOUNDARY_CELL_LIMIT:,} cells in viewport).",
             style={"fontSize": "10px", "color": MUTED, "marginTop": "4px", "lineHeight": "1.4"},
         ),
+        html.Div("Transcripts (WebGL view)",
+                 style={"fontSize": "11px", "color": MUTED, "marginTop": "10px", "marginBottom": "4px"}),
+        dcc.Dropdown(id="webgl-tx-genes", options=[], value=[], multi=True,
+                     placeholder="Genes to draw as transcripts…",
+                     style={"fontSize": "12px"}),
     ], style={"marginBottom": "10px"}),
 
 
@@ -9112,13 +11212,16 @@ sidebar = html.Div([
         style={"marginBottom": "8px"},
     ),
     html.Div(id="morph-controls", children=[
-        ctrl_label("Z-Level"),
-        dcc.Dropdown(
-            id="morph-zlevel",
-            options=[{"label": f"Z-level {i}", "value": i} for i in range(4)],
-            value=0, clearable=False,
-            style={"fontSize": "12px", "marginBottom": "8px"},
-        ),
+        # (wrapped so the WebGL glue can disable it and say why in a tooltip)
+        html.Div(id="morph-zlevel-wrap", children=[
+            ctrl_label("Z-Level"),
+            dcc.Dropdown(
+                id="morph-zlevel",
+                options=[{"label": f"Z-level {i}", "value": i} for i in range(4)],
+                value=0, clearable=False,
+                style={"fontSize": "12px", "marginBottom": "8px"},
+            ),
+        ]),
         ctrl_label("Channels"),
         dcc.Checklist(
             id="morph-channels",
@@ -9338,9 +11441,21 @@ app = dash.Dash(
     suppress_callback_exceptions=True,
 )
 
+# In-app Python REPL: off unless XENIUM_ENABLE_REPL is set ("1" = localhost requests only,
+# "remote" = any client). It runs arbitrary code, so never enable "remote" on an open network.
+_REPL_MODE         = os.environ.get("XENIUM_ENABLE_REPL", "").strip().lower()
+_REPL_ENABLED      = _REPL_MODE in ("1", "true", "yes", "on", "remote")
+_REPL_ALLOW_REMOTE = _REPL_MODE == "remote"
+
+# Spatial renderer shown at startup: "plotly" (default) or "webgl" (deck.gl view, beta).
+_DEFAULT_RENDERER = ("webgl" if os.environ.get("XENIUM_RENDERER", "").strip().lower() == "webgl"
+                     else "plotly")
+
 app.layout = html.Div([
     dcc.Store(id="selected-cell",    data=None),
     dcc.Store(id="spatial-relayout", data={}),
+    dcc.Store(id="webgl-click", data=None),     # {index, source, x, y} of a cell clicked in the WebGL view
+    dcc.Store(id="webgl-select", data=None),    # {indices, polygon} from a WebGL lasso / rectangle
     dcc.Store(id="annot-done",       data=0),
     dcc.Store(id="baysor-done",      data=0),
     dcc.Store(id="proseg-done",      data=0),
@@ -9688,7 +11803,6 @@ app.layout = html.Div([
                     options=[
                         {"label": html.Span(" Nucleus boundaries (default)", style={"fontSize": "12px", "color": TEXT}), "value": "nucleus"},
                         {"label": html.Span(" Cell boundaries",              style={"fontSize": "12px", "color": TEXT}), "value": "cell"},
-                        {"label": html.Span(" None (unsupervised)",          style={"fontSize": "12px", "color": TEXT}), "value": "none"},
                     ],
                     value="nucleus",
                     inputStyle={"marginRight": "6px"},
@@ -10376,6 +12490,45 @@ dbc.Modal([
                         },
                         style={"height": "100%"},
                     ),
+                    # WebGL (deck.gl) view: shown instead of the Plotly graph when selected
+                    html.Div(id="webgl-view", style={"position": "absolute", "inset": "0",
+                                                     "display": "none"}),
+                    html.Div([
+                        dcc.RadioItems(
+                            id="renderer-mode",
+                            options=[{"label": " Plotly", "value": "plotly"},
+                                     {"label": " WebGL (beta)", "value": "webgl"}],
+                            value=_DEFAULT_RENDERER,
+                            inline=True,
+                            inputStyle={"marginRight": "3px"},
+                            labelStyle={"marginRight": "10px", "fontSize": "11px",
+                                        "color": TEXT, "cursor": "pointer"},
+                        ),
+                        dcc.RadioItems(
+                            id="webgl-tool",
+                            options=[{"label": " Pan", "value": "pan"},
+                                     {"label": " Lasso", "value": "lasso"},
+                                     {"label": " Box", "value": "rect"}],
+                            value="pan", inline=True,
+                            inputStyle={"marginRight": "3px"},
+                            labelStyle={"marginRight": "8px", "fontSize": "11px",
+                                        "color": TEXT, "cursor": "pointer"},
+                            style={"borderLeft": f"1px solid {BORDER}", "paddingLeft": "10px"},
+                        ),
+                        # shown in WebGL mode only (assets/xenium_viewer_dash.js)
+                        html.Button("PNG", id="webgl-png-btn", n_clicks=0,
+                                    title="Download the current WebGL view as a PNG at 2x resolution, "
+                                          "with legend and scale bar (for vector SVG use the Plotly "
+                                          "renderer's camera button)",
+                                    style={"padding": "1px 7px", "fontSize": "11px",
+                                           "marginRight": "8px", "backgroundColor": CARD_BG,
+                                           "color": TEXT, "border": f"1px solid {BORDER}",
+                                           "borderRadius": "4px", "cursor": "pointer"}),
+                        html.Span(id="webgl-status", style={"fontSize": "11px", "color": MUTED}),
+                    ], style={"position": "absolute", "bottom": "10px", "left": "10px",
+                              "zIndex": "10", "display": "flex", "alignItems": "center",
+                              "backgroundColor": "rgba(13,17,23,0.85)", "padding": "3px 8px",
+                              "borderRadius": "4px"}),
                     html.Div([
                         html.Button("📏", id="measure-btn", n_clicks=0, title="Measure distance",
                                     style={"padding": "4px 7px", "fontSize": "14px",
@@ -10411,6 +12564,9 @@ dbc.Modal([
                                                       "modeBarButtonsToRemove": ["select2d", "lasso2d"],
                                                       "toImageButtonOptions": {"format": "svg", "filename": "xenium_umap"}},
                                               style={"flex": "1", "minHeight": "0"}),
+                                    html.Div(id="webgl-umap", style={"flex": "1", "minHeight": "0",
+                                                                     "position": "relative",
+                                                                     "display": "none"}),
                                     _plot_dim_controls("umap"),
                                 ], style={"display": "flex", "flexDirection": "column", "flex": "1", "minHeight": "0"})]),
                         dbc.Tab(label="Cell Type Abundance", tab_id="tab-abundance",
@@ -10715,7 +12871,10 @@ dbc.Modal([
                                     id="repl-input",
                                     type="text",
                                     debounce=False,
-                                    placeholder="Python expression or statement (e.g. _run_seurat_annotation(...))",
+                                    placeholder=("Python expression or statement (e.g. _run_seurat_annotation(...))"
+                                                 if _REPL_ENABLED else
+                                                 "REPL disabled (start with XENIUM_ENABLE_REPL=1 to enable)"),
+                                    disabled=not _REPL_ENABLED,
                                     style={
                                         "flex": "1", "backgroundColor": "#0d1117",
                                         "color": TEXT, "border": "none", "outline": "none",
@@ -10795,11 +12954,13 @@ app.clientside_callback(
     Output("morph-controls", "style"),
     Output("morph-hires-poll", "disabled", allow_duplicate=True),
     Input("morph-enable", "value"),
+    Input("renderer-mode", "value"),
     prevent_initial_call=True,
 )
-def toggle_morph_controls(enabled):
+def toggle_morph_controls(enabled, renderer_mode=None):
     active = "show" in (enabled or [])
-    return ({} if active else {"display": "none"}), (not active)
+    # (the hires poll feeds the Plotly figure only: the WebGL view reads the image itself)
+    return ({} if active else {"display": "none"}), (not active or renderer_mode == "webgl")
 
 
 app.clientside_callback(
@@ -10825,9 +12986,19 @@ def store_relayout(relayout_data, current):
     if "width" in relayout_data or "height" in relayout_data:
         return current or {}
     merged = dict(current or {})
+    for ax in ("xaxis", "yaxis"):
+        # Autoscale / double-click: the stored zoom is no longer what is on screen
+        if relayout_data.get(ax + ".autorange") is True:
+            for _k in (ax + ".range[0]", ax + ".range[1]", ax + ".range"):
+                merged.pop(_k, None)
+        # Reset-axes emits the list form; consumers read only the indexed keys
+        rng = relayout_data.get(ax + ".range")
+        if (isinstance(rng, (list, tuple)) and len(rng) == 2
+                and rng[0] is not None and rng[1] is not None):
+            merged[ax + ".range[0]"], merged[ax + ".range[1]"] = rng[0], rng[1]
     # Ignore autosize/autorange signals that would override explicit ranges
     ignore = {"autosize", "xaxis.autorange", "yaxis.autorange",
-              "xaxis.showspikes", "yaxis.showspikes"}
+              "xaxis.showspikes", "yaxis.showspikes", "xaxis.range", "yaxis.range"}
     for k, v in relayout_data.items():
         if k not in ignore:
             merged[k] = v
@@ -10864,6 +13035,7 @@ def store_relayout(relayout_data, current):
     Input("niche-done",             "data"),
     Input("colorbar-min",           "value"),
     Input("colorbar-max",           "value"),
+    Input("renderer-mode",          "value"),
     State("cellnest-lr-pair",        "value"),
     State("cellnest-top-n",          "value"),
     State("cellnest-edge-width",     "value"),
@@ -10875,6 +13047,9 @@ def store_relayout(relayout_data, current):
     State("cellnest-filter-sender",   "value"),
     State("cellnest-filter-receiver", "value"),
     State("cellnest-annot-col",       "value"),
+    State("sdata-show-roi",           "value"),
+    State("sdata-show-patches",       "value"),
+    State("measure-store",            "data"),
 )
 def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
                  _annot_done, morph_enable, morph_zlevel, morph_channels,
@@ -10882,16 +13057,38 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
                  _baysor_done, _proseg_done, seg_source,
                  _spage_done, _subset_ver, _startup, _ds_version, _extra_ds_version,
                  _split_done, _roi_done, counts_mode, _niche_done,
-                 cbar_min, cbar_max,
+                 cbar_min, cbar_max, renderer_mode,
                  cn_lr_pair, cn_top_n, cn_edge_width, cn_overlay_enable, cn_options,
                  cn_color_by, cn_f_ligand, cn_f_receptor, cn_f_sender, cn_f_receiver,
-                 cn_annot_col):
+                 cn_annot_col, sdata_show_roi=None, sdata_show_patches=None,
+                 measure_state=None):
     # If only the viewport changed, avoid full figure rebuild
     triggered = callback_context.triggered_id
     boundaries_active = bool(boundary_toggles)
     morph_active      = "show" in (morph_enable or [])
+    sdata_roi_on      = "yes" in (sdata_show_roi     or [])
+    sdata_patches_on  = "yes" in (sdata_show_patches or [])
+    # WebGL view: the browser draws the spatial and UMAP views itself from /viewer/* and
+    # /umap/viewer/*, so neither Plotly figure is built. Switching back to Plotly triggers
+    # this callback (renderer-mode is an Input) and rebuilds both.
+    if renderer_mode == "webgl":
+        return no_update, no_update
 
-    if triggered == "spatial-relayout":
+    # (sole trigger only: Load Sample resets the stored viewport together with
+    # dataset-version, and that must rebuild the figure)
+    if {t["prop_id"].split(".")[0] for t in callback_context.triggered} == {"spatial-relayout"}:
+        # RCTD pies cover only the cells in view: refresh them (layout shapes only)
+        _pies = None
+        if not boundaries_active and _seg_tool(seg_source or "xenium") == "xenium":
+            _pies = _rctd_pie_shapes_for_view(color_by, relayout or {})
+        if _pies is not None and not morph_active:
+            if not _pies and not _spatial_base_shapes:
+                return no_update, no_update   # no pies before, none now
+            _spatial_base_shapes[:] = _pies
+            patched = Patch()
+            patched["layout"]["shapes"] = _pies + _spatial_overlay_shapes(sdata_roi_on,
+                                                                           sdata_patches_on)
+            return patched, no_update
         if not boundaries_active and not morph_active:
             # Nothing overlay-related → skip entirely
             return no_update, no_update
@@ -10904,10 +13101,21 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
                 morph_opacity if morph_opacity is not None else 0.85,
             )
             if morph_image is None:
-                # Viewport too large or no valid range yet — preserve existing image
+                # Viewport too large or no valid range yet — preserve existing image,
+                # but still refresh the RCTD pies for the new viewport
+                if _pies is not None and (_pies or _spatial_base_shapes):
+                    _spatial_base_shapes[:] = _pies
+                    patched = Patch()
+                    patched["layout"]["shapes"] = _pies + _spatial_overlay_shapes(
+                        sdata_roi_on, sdata_patches_on)
+                    return patched, no_update
                 return no_update, no_update
             patched = Patch()
             patched["layout"]["images"] = [morph_image]
+            if _pies is not None and (_pies or _spatial_base_shapes):
+                _spatial_base_shapes[:] = _pies
+                patched["layout"]["shapes"] = _pies + _spatial_overlay_shapes(
+                    sdata_roi_on, sdata_patches_on)
             return patched, no_update
 
     if triggered in ("morph-brightness", "morph-opacity", "morph-channels",
@@ -10926,7 +13134,8 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
         return patched, no_update
 
     color_by         = color_by or "cluster"
-    method           = method   or cluster_methods[0]
+    _cm              = DATA.get("cluster_methods") or []
+    method           = method   or (_cm[0] if _cm else None)
     gene             = gene     or _default_gene
     size             = size     or 2
     opacity          = opacity  or 0.85
@@ -10934,6 +13143,15 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
     seg_source  = seg_source or "xenium"
     baysor_on   = (_seg_tool(seg_source) == "baysor")
     proseg_on   = (_seg_tool(seg_source) == "proseg")
+    if not (baysor_on or proseg_on):
+        # After Load Sample the dropdown State can still hold the previous dataset's
+        # selections for one callback round; fall back to this dataset's defaults.
+        if method is not None and method not in _cm:
+            method = _cm[0] if _cm else None
+        if gene and gene not in DATA["gene_name_to_idx"] and not gene.endswith("]"):
+            gene = _default_gene
+    if color_by == "cluster" and method is None and not (baysor_on or proseg_on):
+        color_by = "transcript_counts"   # dataset has no Xenium cluster sets
 
     # Morphology image overlay
     morph_image  = None
@@ -10952,7 +13170,8 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
     cbar_range = (cbar_min, cbar_max) if cbar_min is not None or cbar_max is not None else None
 
     # When counts mode, SPLIT status, or subset changes, clear cached UMAP
-    if triggered in ("counts-mode-store", "split-done", "subset-version"):
+    if triggered in ("counts-mode-store", "split-done", "subset-version",
+                     "dataset-version", "niche-done"):
         _umap_df_cache.clear()
         _umap_fig_cache.clear()
         if triggered == "subset-version":
@@ -10962,7 +13181,7 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
     _umap_key = (color_by, method, gene, size, opacity, baysor_on, proseg_on, use_corr,
                  _annot_done, _spage_done, _ds_version, _extra_ds_version,
                  _baysor_done, _proseg_done, _split_done, _subset_ver, _niche_done,
-                 cbar_min, cbar_max)
+                 _roi_done, cbar_min, cbar_max)
     _cache_hit = _umap_key in _umap_fig_cache
     if not _cache_hit:
         print(f"  [UMAP cache] miss — use_corr={use_corr}, triggered={triggered}", flush=True)
@@ -10979,7 +13198,8 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
                                    boundary_toggles, relayout,
                                    morph_image=morph_image, extra_title=morph_title,
                                    baysor_active=baysor_on, proseg_active=proseg_on,
-                                   use_corrected=use_corr, cbar_range=cbar_range)
+                                   use_corrected=use_corr, cbar_range=cbar_range,
+                                   sdata_roi_on=sdata_roi_on, sdata_patches_on=sdata_patches_on)
     # Re-add CellNEST overlay so it persists through pan/zoom rebuilds
     with _cellnest_lock:
         _cn_status = _cellnest_state.get("status")
@@ -10993,6 +13213,9 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
                                            f_sender=cn_f_sender, f_receiver=cn_f_receiver,
                                            annot_col=cn_annot_col):
             spatial_fig.add_trace(_t)
+    # Re-add the ruler drawing (draw_measurement only runs when measure-store changes)
+    for _t in _measure_traces(measure_state):
+        spatial_fig.add_trace(_t)
     return spatial_fig, umap_fig
 
 
@@ -11016,6 +13239,33 @@ def capture_click(spatial_click, umap_click, measure_state):
 
 
 # ─── Distance measurement ────────────────────────────────────────────────────
+
+def _measure_traces(store) -> list:
+    """Ruler traces (end markers, plus the dotted line once two points are set) for the
+    spatial figure; empty when the ruler is off or has no points."""
+    if not store or not store.get("active"):
+        return []
+    points = store.get("points") or []
+    if not points:
+        return []
+    traces = [{
+        "type": "scattergl", "mode": "markers",
+        "x": [p[0] for p in points],
+        "y": [p[1] for p in points],
+        "marker": {"size": 10, "color": "#f0c040",
+                   "symbol": "cross", "line": {"width": 2, "color": "#f0c040"}},
+        "name": "measure_points", "hoverinfo": "skip", "showlegend": False,
+    }]
+    if len(points) == 2:
+        (x1, y1), (x2, y2) = points
+        traces.append({
+            "type": "scattergl", "mode": "lines",
+            "x": [x1, x2], "y": [y1, y2],
+            "line": {"color": "#f0c040", "width": 2, "dash": "dot"},
+            "name": "measure_line", "hoverinfo": "skip", "showlegend": False,
+        })
+    return traces
+
 
 @app.callback(
     Output("measure-store", "data"),
@@ -11066,9 +13316,10 @@ def measure_capture_click(click_data, store):
     Output("measure-dist-display", "style"),
     Input("measure-store", "data"),
     State("spatial-plot", "figure"),
+    State("renderer-mode", "value"),
     prevent_initial_call=True,
 )
-def draw_measurement(store, fig):
+def draw_measurement(store, fig, renderer_mode=None):
     _dist_hidden = {"fontSize": "11px", "color": TEXT,
                     "backgroundColor": "rgba(13,17,23,0.85)",
                     "padding": "3px 6px", "borderRadius": "4px",
@@ -11077,6 +13328,12 @@ def draw_measurement(store, fig):
 
     if fig is None:
         return no_update, "", _dist_hidden
+
+    if renderer_mode == "webgl":
+        # The WebGL view draws the ruler itself; only the distance label comes from here
+        # (update_plots re-adds the traces when the Plotly figure is rebuilt).
+        _, _label, _style = draw_measurement(store, {"data": []})
+        return no_update, _label, _style
 
     # Remove previous measure traces
     fig["data"] = [t for t in fig.get("data", [])
@@ -11089,28 +13346,13 @@ def draw_measurement(store, fig):
     if not points:
         return fig, "", _dist_hidden
 
-    marker_trace = {
-        "type": "scattergl", "mode": "markers",
-        "x": [p[0] for p in points],
-        "y": [p[1] for p in points],
-        "marker": {"size": 10, "color": "#f0c040",
-                   "symbol": "cross", "line": {"width": 2, "color": "#f0c040"}},
-        "name": "measure_points", "hoverinfo": "skip", "showlegend": False,
-    }
-    fig["data"].append(marker_trace)
+    fig["data"].extend(_measure_traces(store))
 
     if len(points) == 2:
         x1, y1 = points[0]
         x2, y2 = points[1]
         # y coordinates in plot space are negated µm; distance is same either way
         dist_um = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
-        line_trace = {
-            "type": "scattergl", "mode": "lines",
-            "x": [x1, x2], "y": [y1, y2],
-            "line": {"color": "#f0c040", "width": 2, "dash": "dot"},
-            "name": "measure_line", "hoverinfo": "skip", "showlegend": False,
-        }
-        fig["data"].append(line_trace)
         label = f"{dist_um:.1f} µm"
         if dist_um >= 1000:
             label += f"  ({dist_um / 1000:.2f} mm)"
@@ -11136,9 +13378,10 @@ def show_cell_info(cell_id, method):
     if cell_id in df.index:
         # Original Xenium cell
         row    = df.loc[cell_id]
-        method = method or cluster_methods[0]
-        col    = cluster_col(method)
-        clust  = int(row[col]) if col in row and not pd.isna(row[col]) else "—"
+        _cm    = DATA.get("cluster_methods") or []
+        method = method or (_cm[0] if _cm else None)
+        col    = cluster_col(method) if method else None
+        clust  = int(row[col]) if col and col in row and not pd.isna(row[col]) else "—"
 
         cell_pos     = df.index.get_loc(cell_id)
         expr_row_idx = DATA["df_to_expr"][cell_pos]
@@ -11152,13 +13395,17 @@ def show_cell_info(cell_id, method):
         umap_1 = row.get("umap_1", float("nan"))
         umap_2 = row.get("umap_2", float("nan"))
 
+        def _num(col, fmt):   # bundles built from GEO tables lack the area columns
+            v = pd.to_numeric(row.get(col), errors="coerce")
+            return fmt.format(v) if pd.notna(v) else "—"
+
         chips = [
             info_chip("Cluster",     str(clust)),
             info_chip("X",           f"{row['x_centroid']:.1f} µm"),
             info_chip("Y",           f"{row['y_centroid']:.1f} µm"),
-            info_chip("Transcripts", str(int(row["transcript_counts"]))),
-            info_chip("Cell Area",   f"{row['cell_area']:.0f} µm²"),
-            info_chip("Nuc Area",    f"{row['nucleus_area']:.0f} µm²"),
+            info_chip("Transcripts", _num("transcript_counts", "{:.0f}")),
+            info_chip("Cell Area",   _num("cell_area", "{:.0f} µm²")),
+            info_chip("Nuc Area",    _num("nucleus_area", "{:.0f} µm²")),
             info_chip("UMAP 1",      f"{umap_1:.2f}" if not np.isnan(umap_1) else "—"),
             info_chip("UMAP 2",      f"{umap_2:.2f}" if not np.isnan(umap_2) else "—"),
         ]
@@ -11197,7 +13444,11 @@ def show_cell_info(cell_id, method):
         # Top genes from reseg expression matrix
         top_genes = []
         if alt_expr is not None:
-            gene_names_list = list(DATA["gene_names"])
+            # After SpaGE on a reseg result the matrix has extra imputed columns whose
+            # names live only in res["gene_name_to_idx"], not in DATA["gene_names"].
+            _gni = res.get("gene_name_to_idx") or DATA["gene_name_to_idx"]
+            gene_names_list = sorted(_gni, key=_gni.__getitem__)
+            _imp = set(res.get("imputed_genes") or [])
             # Find row index in reseg cells_df — always use integer position to avoid
             # boolean-array issues when cell IDs are non-unique (multi-patch Proseg runs)
             bdf = res["cells_df"]
@@ -11212,7 +13463,11 @@ def show_cell_info(cell_id, method):
         if alt_expr is not None:
             raw     = alt_expr[row_idx, :].toarray().flatten()
             top_idx = np.argsort(raw)[::-1][:12]
-            top_genes = [(gene_names_list[i], int(raw[i])) for i in top_idx if raw[i] > 0]
+            top_genes = [
+                ((gene_names_list[i] + " [imp]", round(float(raw[i]), 2))
+                 if gene_names_list[i] in _imp else (gene_names_list[i], int(raw[i])))
+                for i in top_idx if raw[i] > 0 and i < len(gene_names_list)
+            ]
 
         chips = [
             info_chip("X",           f"{row['x_centroid']:.1f} µm"),
@@ -11544,26 +13799,38 @@ def plot_downstream_tfs(selected_tfs, receptor):
     if not selected_tfs:
         raise dash.exceptions.PreventUpdate
     panel = set(DATA["gene_names"])
-    expr   = DATA["expr"]
-    genes  = DATA["gene_names"]
     df_app = DATA["df"]
 
     # Get expression for each selected TF
     fig = go.Figure()
     bg_coords = df_app[["x_centroid", "y_centroid"]]
     for tf in selected_tfs:
+        _tf_label = tf
         if tf not in panel:
-            continue
-        idx = genes.index(tf)
-        vals = np.log1p(np.asarray(expr.getcol(idx).todense()).flatten())
+            # "(targets only)" TF: show the mean log1p expression of its in-panel targets
+            try:
+                _tg = _downstream_tf_targets([tf], panel).get(tf, [])
+            except Exception:
+                _tg = []
+            _tg = [g for g in _tg if g in DATA["gene_name_to_idx"]]
+            if not _tg:
+                continue
+            _tcols = [DATA["gene_name_to_idx"][g] for g in _tg]
+            _tmean = np.asarray(DATA["expr_csc"][:, _tcols].log1p().mean(axis=1)).ravel()
+            _tidx  = DATA["df_to_expr"]
+            vals = np.where(_tidx >= 0, _tmean[np.clip(_tidx, 0, len(_tmean) - 1)], 0.0)
+            _tf_label = f"{tf} targets (mean log1p, n={len(_tg)})"
+        else:
+            # log1p, aligned to DATA["df"] through df_to_expr (subset-safe)
+            vals = get_gene_expression(tf)
         fig.add_trace(go.Scattergl(
             x=df_app["x_centroid"].tolist(),
             y=(-df_app["y_centroid"]).tolist(),
             mode="markers",
             marker={"size": 2, "color": vals.tolist(), "colorscale": "Viridis",
-                    "showscale": True, "colorbar": {"title": tf, "thickness": 10, "len": 0.6}},
-            name=tf,
-            hovertemplate=f"{tf}: %{{marker.color:.2f}}<extra></extra>",
+                    "showscale": True, "colorbar": {"title": _tf_label, "thickness": 10, "len": 0.6}},
+            name=_tf_label,
+            hovertemplate=f"{_tf_label}: %{{marker.color:.2f}}<extra></extra>",
         ))
     fig.update_layout(
         paper_bgcolor=DARK_BG, plot_bgcolor=DARK_BG,
@@ -11638,13 +13905,20 @@ def start_annotation(n_clicks, source, model_name, rds_path, label_col,
     if alt_res is not None:
         if alt_res.get("expr") is None:
             msg = "✗ No expression matrix for reseg cells — re-run Proseg/Baysor"
-            return False, msg, False, msg
-        expr_override     = alt_res["expr"]
+            return True, msg, False, msg   # no job started: keep the poll off
+        # Measured panel columns only: SpaGE appends imputed columns at the end
+        # (a run reloaded from its zarr has them without an 'imputed_genes' list)
+        _n_meas = min(alt_res["expr"].shape[1], len(_panel_gene_names()))
+        expr_override     = alt_res["expr"][:, :_n_meas] if _n_meas < alt_res["expr"].shape[1] \
+                            else alt_res["expr"]
         cell_ids_override = [str(c) for c in alt_res["cells_df"].index]
-        pass
+        # Identifies this segmentation's cells in the annotation disk cache
+        cache_sig = (hashlib.md5("\n".join(cell_ids_override).encode()).hexdigest()[:12]
+                     + f"_{expr_override.shape[0]}_{expr_override.nnz}")
     else:
         expr_override     = None
         cell_ids_override = None
+        cache_sig         = None
 
     method     = source if source in _ANNOT_METHODS else "celltypist"
     labels_key = _labels_key_for_method(method, alt_res)
@@ -11654,18 +13928,23 @@ def start_annotation(n_clicks, source, model_name, rds_path, label_col,
     else:
         mode_labels_key = labels_key
 
+    # Ensure rpy2 conversion rules are set in this callback thread BEFORE copy_context()
+    # so the spawned thread's context copy includes them (done before the status is
+    # set to "running" so a missing rpy2 cannot leave it stuck)
+    if source in ("seurat", "rctd"):
+        try:
+            import rpy2.robjects.conversion as _rconv
+            import rpy2.robjects as _ro_mod
+            _rconv.set_conversion(_ro_mod.default_converter)
+        except Exception as e:
+            msg = f"✗ rpy2 not available: {e}"
+            return True, msg, False, msg   # no job started: keep the poll off
+
     with _annot_lock:
         if _annot_state["status"] == "running":
             return False, "Already running…", True, "Already running…"
         _annot_state.update({"status": "running", "message": "Starting…",
                               labels_key: None, mode_labels_key: None})
-
-    # Ensure rpy2 conversion rules are set in this callback thread BEFORE copy_context()
-    # so the spawned thread's context copy includes them
-    if source in ("seurat", "rctd"):
-        import rpy2.robjects.conversion as _rconv
-        import rpy2.robjects as _ro_mod
-        _rconv.set_conversion(_ro_mod.default_converter)
 
     if source == "seurat":
         ctx = contextvars.copy_context()
@@ -11673,7 +13952,7 @@ def start_annotation(n_clicks, source, model_name, rds_path, label_col,
             target=lambda: ctx.run(
                 _run_seurat_annotation, rds_path or "", label_col or "Names",
                 labels_key=labels_key, expr_override=expr_override,
-                cell_ids_override=cell_ids_override,
+                cell_ids_override=cell_ids_override, cache_sig=cache_sig,
             ),
             daemon=True,
         ).start()
@@ -11688,7 +13967,7 @@ def start_annotation(n_clicks, source, model_name, rds_path, label_col,
                 cell_ids_override=cell_ids_override,
                 umi_min=int(rctd_umi_min or 20),
                 umi_min_sigma=int(rctd_umi_min_sigma or 100),
-                mode_labels_key=mode_labels_key,
+                mode_labels_key=mode_labels_key, cache_sig=cache_sig,
             ),
             daemon=True,
         ).start()
@@ -11697,7 +13976,7 @@ def start_annotation(n_clicks, source, model_name, rds_path, label_col,
             target=_run_celltypist,
             args=(model_name,),
             kwargs={"labels_key": labels_key, "expr_override": expr_override,
-                    "cell_ids_override": cell_ids_override},
+                    "cell_ids_override": cell_ids_override, "cache_sig": cache_sig},
             daemon=True,
         ).start()
     return False, "Starting…", True, "Starting…"
@@ -11753,6 +14032,9 @@ def poll_annotation(_, current_options, done_version, modal_open):
     if status == "loaded":
         # Already reported done — disable interval but don't re-bump done_version
         return f"✓ {message}", True, False, options, done_version, f"✓ {message}", modal_open
+    if status == "idle":
+        # No job to wait for (nothing started, or the state was reset): stop polling
+        return no_update, True, False, options, done_version, no_update, modal_open
     return message, False, True, options, done_version, message, modal_open   # keep polling
 
 
@@ -12056,7 +14338,8 @@ def run_reseg_modal(n_clicks, algo, patches_confirmed,
         with _baysor_lock:
             if _baysor_state["status"] == "running":
                 return "Already running…", True, False, no_update
-            _baysor_state.update({"status": "running", "message": "Starting…", "result": None})
+            _baysor_state.update({"status": "running", "message": "Starting…", "result": None,
+                                  "loading_out_dir": None})
         scale      = float(bscale) if bscale is not None else 20.0
         scale_std  = float(bscale_std) if bscale_std is not None else None
         min_mol     = int(bmin_mol    or 10)
@@ -12075,12 +14358,13 @@ def run_reseg_modal(n_clicks, algo, patches_confirmed,
                         prior_type=bprior_type or "nucleus"),
             daemon=True,
         ).start()
-        return "Baysor starting…", False, False, True
+        return "Baysor starting…", False, False, no_update
     else:  # proseg
         with _proseg_lock:
             if _proseg_state["status"] == "running":
                 return "Already running…", True, no_update, False
-            _proseg_state.update({"status": "running", "message": "Starting…", "result": None})
+            _proseg_state.update({"status": "running", "message": "Starting…", "result": None,
+                                  "loading_out_dir": None})
         region = {k: v for k, v in
                   dict(x_min=pxmin, x_max=pxmax, y_min=pymin, y_max=pymax).items()
                   if v is not None}
@@ -12127,14 +14411,16 @@ def update_reseg_status(baysor_done, proseg_done):
     Output("umap-reseg-btn",     "disabled"),
     Input("umap-reseg-btn",      "n_clicks"),
     State("counts-mode-store",   "data"),
+    State("seg-source",          "value"),
     prevent_initial_call=True,
 )
-def start_reseg_umap(_, counts_mode):
+def start_reseg_umap(_, counts_mode, seg_source):
     with _umap_reseg_lock:
         if _umap_reseg_state["status"] == "running":
             return False, "Already running…", True
         _umap_reseg_state.update({"status": "running", "message": "Starting…", "result": None,
                                   "_xenium_bumped": False,
+                                  "seg_source": seg_source or "xenium",
                                   "counts_mode": counts_mode or "original"})
     threading.Thread(target=_run_reseg_umap, daemon=True).start()
     return False, "Starting UMAP…", True
@@ -12240,9 +14526,10 @@ def confirm_seg_delete(n_clicks, seg_value, baysor_ver, proseg_ver):
     Output("seg-source",       "options"),
     Input("baysor-done",       "data"),
     Input("proseg-done",       "data"),
+    Input("dataset-version",   "data"),
     State("boundary-toggles",  "options"),
 )
-def update_boundary_options(baysor_done, proseg_done, boundary_opts):
+def update_boundary_options(baysor_done, proseg_done, _ds_version, boundary_opts):
     baysor_ready = _baysor_state["status"] == "done" and _baysor_state["result"] is not None
     proseg_ready = _proseg_state["status"] == "done" and _proseg_state["result"] is not None
 
@@ -12294,25 +14581,48 @@ def load_seg_run_from_cache(seg_value, baysor_ver, proseg_ver):
         return no_update, no_update, no_update, no_update, no_update
 
     tool, param_tag = seg_value.split(":", 1)
-    cache_base = CACHE_BASE_DIR
-    dataset = os.path.basename(DATA.get("data_dir", ""))
-    out_dir = os.path.join(cache_base, f"{tool}_{dataset}_{param_tag}")
-
     if tool == "baysor":
-        current_dir = (_baysor_state.get("result") or {}).get("out_dir", "")
-        if current_dir == out_dir and _baysor_state["status"] == "done":
-            return no_update, no_update, no_update, no_update, no_update
-        threading.Thread(target=_load_cached_baysor, args=(out_dir,), daemon=True).start()
+        state, lock, loader = _baysor_state, _baysor_lock, _load_cached_baysor
         # Enable baysor-poll so it detects the load completion and bumps baysor-done
-        return no_update, no_update, no_update, False, no_update
+        poll_on = (no_update, False, no_update)   # seg-source, baysor-poll, proseg-poll
     elif tool == "proseg":
-        current_dir = (_proseg_state.get("result") or {}).get("out_dir", "")
-        if current_dir == out_dir and _proseg_state["status"] == "done":
+        state, lock, loader = _proseg_state, _proseg_lock, _load_cached_proseg
+        poll_on = (no_update, no_update, False)
+    else:
+        return no_update, no_update, no_update, no_update, no_update
+    # Resolve the directory through the listing: it knows both directory name
+    # forms and skips runs that belong to another dataset with the same folder name.
+    run = next((r for r in _list_cached_seg_runs() if r["value"] == seg_value), None)
+    if run is None:
+        print(f"  {tool.capitalize()}: no cached run '{param_tag}' for this dataset", flush=True)
+        return no_update, no_update, no_update, no_update, no_update
+    out_dir = run["out_dir"]
+
+    with lock:
+        current_dir = (state.get("result") or {}).get("out_dir", "")
+        if current_dir == out_dir and state["status"] == "done":
             return no_update, no_update, no_update, no_update, no_update
-        threading.Thread(target=_load_cached_proseg, args=(out_dir,), daemon=True).start()
-        # Enable proseg-poll so it detects the load completion and bumps proseg-done
-        return no_update, no_update, no_update, no_update, False
-    return no_update, no_update, no_update, no_update, no_update
+        busy = state["status"] == "running"
+        if busy:
+            busy_dir = state.get("loading_out_dir")
+        else:
+            # Claim the state before the thread starts so a second selection
+            # (or Run) made meanwhile sees it as busy.
+            state.update({"status": "running",
+                          "message": f"Loading cached {tool.capitalize()} result…",
+                          "loading_out_dir": out_dir})
+    if busy:
+        # A live run or another cached load of this tool owns the state. A second
+        # thread would let whichever finishes last replace the result behind the
+        # dropdown, so put the dropdown back and keep polling the one in progress.
+        back = (f"{tool}:{os.path.basename(busy_dir).split('_')[-1]}" if busy_dir else "xenium")
+        if back == seg_value:
+            return (no_update, no_update) + poll_on
+        print(f"  {tool.capitalize()}: busy — select the cached run again when the "
+              f"current {'load' if busy_dir else 'run'} has finished", flush=True)
+        return (no_update, no_update, back) + poll_on[1:]
+    threading.Thread(target=loader, args=(out_dir,), daemon=True).start()
+    return (no_update, no_update) + poll_on
 
 
 # ─── SpaGE callbacks ──────────────────────────────────────────────────────────
@@ -12333,7 +14643,12 @@ def start_spage(n_clicks, rds_path, n_pv, genes_input, seg_source):
     with _spage_lock:
         if _spage_state["status"] == "running":
             return False, "Already running…", "Already running…", True
-        _spage_state.update({"status": "running", "message": "Starting…", "result": None})
+        _spage_state.update({"status": "running", "message": "Starting…"})
+        if _seg_tool(seg_source) == "xenium":
+            # a Baysor/Proseg run stores its result on the run; keep the Xenium one
+            _spage_state["result"] = None
+            _gene_expr_cache.clear()
+            _umap_fig_cache.clear()
     rds_path = rds_path or "/Users/ikuz/Documents/XeniumWorkflow/snRV_ref.rds"
     n_pv = int(n_pv or 50)
     genes_str = genes_input or ""
@@ -12451,17 +14766,17 @@ def update_gene_options(_spage_version, _ds_version, seg_source):
         return base
 
     # Xenium active: add imputed genes from zarr (already in DATA["expr"]) or _spage_state fallback
+    imp_genes = []
     if gene_var is not None and "is_imputed" in gene_var.columns:
         imp_genes = [g for g in DATA["gene_names"] if gene_var.loc[g, "is_imputed"]]
-        if imp_genes:
-            imp = [{"label": f"{g} [imp]", "value": f"{g} [imp]"} for g in sorted(imp_genes)]
-            return base + imp
 
-    # Fallback: old-style _spage_state result DataFrame, or streaming gene list
+    # Plus genes served from _spage_state (old-style result DataFrame or a streamed
+    # result): they are not in DATA["expr"] and would otherwise not be listed once
+    # the store holds written-back imputed genes.
     with _spage_lock:
         result       = _spage_state.get("result")
         result_genes = _spage_state.get("result_genes") or []
-    imp_gene_list = (sorted(result.columns) if result is not None else sorted(result_genes))
+    imp_gene_list = sorted(set(imp_genes) | set(result.columns if result is not None else result_genes))
     if imp_gene_list:
         imp = [{"label": f"{g} [imp]", "value": f"{g} [imp]"} for g in imp_gene_list]
         return base + imp
@@ -12633,8 +14948,9 @@ def poll_subset(_, current):
     Output("subset-indicator", "style"),
     Output("subset-count",     "children"),
     Input("subset-version",    "data"),
+    Input("dataset-version",   "data"),
 )
-def update_subset_indicator(_):
+def update_subset_indicator(_, _ds_version=None):
     active = "_df_original" in DATA
     if active:
         n_sub  = len(DATA["df"])
@@ -12676,6 +14992,16 @@ _repl_globals = globals()  # share module namespace with REPL
 def run_repl(_, __, code):
     if not code or not code.strip():
         return ""
+    # The REPL executes arbitrary Python: refuse unless explicitly enabled, and
+    # (unless XENIUM_ENABLE_REPL=remote) unless the request comes from this machine.
+    if not _REPL_ENABLED:
+        print("REPL is disabled. Start the app with XENIUM_ENABLE_REPL=1 to enable it.", flush=True)
+        return ""
+    if not _REPL_ALLOW_REMOTE:
+        import flask as _flask
+        if _flask.request.remote_addr not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+            print("REPL request refused: not from localhost.", flush=True)
+            return ""
     with _log_lock:
         _log_buffer.append(f">>> {code}")
 
@@ -12716,8 +15042,17 @@ def start_sdata_clear(n_clicks, qv):
             return False, "Already running…", True, True, no_update, no_update
         _sdata_state.update({"status": "running", "message": "Clearing cache…",
                               "roi": None, "patches": None})
-    clear_sdata_cache()
-    to_spatialdata(qv_threshold=int(qv or 20), force=True)
+    try:
+        if not DATA.get("data_dir"):
+            raise RuntimeError("not available for a dataset loaded from a .zarr")
+        clear_sdata_cache()
+        to_spatialdata(qv_threshold=int(qv or 20), force=True)
+    except Exception as exc:
+        # leave "running", otherwise every later click reports "Already running…"
+        with _sdata_lock:
+            _sdata_state.update({"status": "error",
+                                 "message": f"Clear cache failed: {exc}"[:300]})
+        return True, f"✗ Clear cache failed: {exc}", False, False, no_update, no_update
     return False, "Re-reading from raw files…", True, True, 0, {"display": "none"}
 
 
@@ -12762,7 +15097,8 @@ def poll_sdata(_, done_version, patch_width, patch_min_tx):
             return "Detecting tissue ROI…", False, True, True, no_chg, no_chg, no_chg, HIDE, no_chg
 
         # Chain: ROI done → auto-run patches if not done
-        if has_roi and not has_patches:
+        # (not on "error": a failed patch run must be shown, not retried every tick)
+        if status in ("done", "roi_done") and has_roi and not has_patches:
             width  = float(patch_width  or 1000)
             min_tx = int(patch_min_tx   or 10)
             with _sdata_lock:
@@ -12851,7 +15187,9 @@ def confirm_patches(n_clicks, skip_clicks):
 def update_sdata_overlays(show_roi, show_patches, _sdata_ver):
     roi_on     = "yes" in (show_roi     or [])
     patches_on = "yes" in (show_patches or [])
-    shapes = _sdata_overlays_to_shapes(roi_on, patches_on)
+    # layout.shapes also holds ROI outlines, RCTD pies and sample separators:
+    # rebuild the whole list instead of replacing it with the sdata overlays only
+    shapes = list(_spatial_base_shapes) + _spatial_overlay_shapes(roi_on, patches_on)
     patched = Patch()
     patched["layout"]["shapes"] = shapes
     return patched
@@ -12867,6 +15205,17 @@ def update_sdata_overlays(show_roi, show_patches, _sdata_ver):
 )
 def update_tissue_info(_, seg_source, _split_done):
     meta = DATA.get("metadata", {})
+    # experiment.xenium of XOA 3.x / Prime bundles has no num_transcripts:
+    # show the transcripts assigned to cells instead
+    _ntx_label, _ntx = "Transcripts", meta.get("num_transcripts")
+    if _ntx is None:
+        _tx_df = DATA.get("_df_original", DATA.get("df"))
+        if _tx_df is not None and "transcript_counts" in _tx_df.columns:
+            _ntx_label, _ntx = "Transcripts (assigned)", int(_tx_df["transcript_counts"].sum())
+    try:
+        _ntx_str = "\u2014" if _ntx is None else f"{int(_ntx):,}"
+    except (TypeError, ValueError):
+        _ntx_str = str(_ntx)
     cache_size = _cache_size_str()
 
     # Determine active cell count from reseg result if active
@@ -12902,7 +15251,7 @@ def update_tissue_info(_, seg_source, _split_done):
             html.Div([
                 stat_row("Cells",       n_cells_display),
                 stat_row("Seg",         seg_label),
-                stat_row("Transcripts", f"{meta.get('num_transcripts', 0):,}"),
+                stat_row(_ntx_label, _ntx_str),
                 stat_row("Panel",       meta.get("panel_name", "\u2014")),
                 stat_row("Genes",       str(len(DATA.get("gene_names", [])))),
                 stat_row("Tissue",      meta.get("panel_tissue_type", "\u2014")),
@@ -12948,8 +15297,9 @@ def update_tissue_info(_, seg_source, _split_done):
     Input("dataset-version", "data"),
 )
 def update_morph_enable_state(_):
-    """Disable morphology overlay toggle when no image data is available (zarr input)."""
-    has_images = DATA.get("data_dir") is not None
+    """Disable morphology overlay toggle when the dataset has no morphology image
+    (zarr input, or a bundle without image files such as one assembled from GEO)."""
+    has_images = bool(DATA.get("data_dir")) and _morph_focus_path(DATA["data_dir"], 0) is not None
     options = [{"label": html.Span(
         " Enable Image Overlay" + ("" if has_images else " (no image data)"),
         style={"fontSize": "13px", "color": TEXT if has_images else MUTED},
@@ -12957,6 +15307,29 @@ def update_morph_enable_state(_):
     label_style = {"display": "flex", "alignItems": "center",
                    "cursor": "pointer" if has_images else "not-allowed"}
     return options, label_style
+
+
+def _is_zarr_store(path: str) -> bool:
+    """True when *path* holds a zarr group: v3 stores (zarr >= 3, what this app
+    writes) have zarr.json at the root, v2 stores .zgroup / .zattrs."""
+    return any(os.path.exists(os.path.join(path, m)) for m in ("zarr.json", ".zgroup", ".zattrs"))
+
+
+def _running_jobs() -> list:
+    """Names of the background jobs that are running right now."""
+    busy = []
+    for name, lock, state in (
+            ("Baysor", _baysor_lock, _baysor_state), ("Proseg", _proseg_lock, _proseg_state),
+            ("annotation", _annot_lock, _annot_state), ("SpaGE", _spage_lock, _spage_state),
+            ("SpatialData / patches", _sdata_lock, _sdata_state),
+            ("UMAP", _umap_reseg_lock, _umap_reseg_state), ("SPLIT", _split_lock, _split_state),
+            ("niches", _niche_lock, _niche_state),
+            ("spatial analysis", _spatial_lock, _spatial_state),
+            ("Save as SpatialData", _save_sdata_lock, _save_sdata_state)):
+        with lock:
+            if state.get("status") in ("running", "starting"):
+                busy.append(name)
+    return busy
 
 
 @app.callback(
@@ -12977,31 +15350,46 @@ def toggle_sample_modal(open_clicks, close_clicks, is_open):
     Output("sample-load-status",  "children"),
     Output("sample-modal",        "is_open",       allow_duplicate=True),
     Output("dataset-version",     "data",          allow_duplicate=True),
+    Output("seg-source",          "value",         allow_duplicate=True),
+    Output("gene-selector",       "value",         allow_duplicate=True),
+    Output("roi-done",            "data",          allow_duplicate=True),
+    Output("spatial-relayout",    "data",          allow_duplicate=True),
     Input("sample-load-btn",      "n_clicks"),
     State("sample-picker",        "value"),
     State("sample-custom-path",   "value"),
     State("dataset-version",      "data"),
+    State("roi-done",             "data"),
     prevent_initial_call=True,
 )
-def load_sample(n_clicks, picked_path, custom_path, ds_version):
+def load_sample(n_clicks, picked_path, custom_path, ds_version, roi_done):
+    # seg-source, gene-selector, roi-done, spatial-relayout
+    _nu3 = (no_update, no_update, no_update, no_update)
     new_dir = (custom_path or "").strip() or picked_path
     if not new_dir:
-        return "Select a sample or enter a path.", no_update, no_update
+        return ("Select a sample or enter a path.", no_update, no_update) + _nu3
     new_dir = os.path.abspath(new_dir)
     is_zarr = new_dir.rstrip("/").endswith(".zarr")
     if is_zarr:
-        if not os.path.exists(os.path.join(new_dir, ".zgroup")):
-            return f"Not a valid SpatialData zarr: {new_dir}", no_update, no_update
+        if not _is_zarr_store(new_dir):
+            return (f"Not a valid SpatialData zarr: {new_dir}", no_update, no_update) + _nu3
         if new_dir == DATA.get("sdata_path"):
-            return "Already loaded.", no_update, no_update
+            return ("Already loaded.", no_update, no_update) + _nu3
     else:
         if not os.path.exists(os.path.join(new_dir, "experiment.xenium")):
-            return f"Not a valid Xenium directory: {new_dir}", no_update, no_update
+            return (f"Not a valid Xenium directory: {new_dir}", no_update, no_update) + _nu3
         if new_dir == DATA["data_dir"]:
-            return "Already loaded.", no_update, no_update
+            return ("Already loaded.", no_update, no_update) + _nu3
+    # A job still running for the current dataset would lose its result (jobs are
+    # fenced by the dataset generation, see _install_dataset) and leave its poll
+    # waiting on a reset state.
+    _busy = _running_jobs()
+    if _busy:
+        return (f"Still running: {', '.join(_busy)}. Wait for it to finish before "
+                f"loading another sample.", no_update, no_update) + _nu3
     try:
         new_data = load_from_sdata_zarr(new_dir) if is_zarr else load_xenium_data(new_dir)
-        DATA.update(new_data)
+        # Swap DATA and rebuild everything derived from it (expr_csc, gene lists, caches)
+        _install_dataset(new_data)
         # Reset all per-dataset state
         with _baysor_lock:
             _baysor_state.update({"status": "idle", "message": "", "result": None})
@@ -13010,23 +15398,40 @@ def load_sample(n_clicks, picked_path, custom_path, ds_version):
         with _annot_lock:
             _annot_state.update({"status": "idle", "message": "", "labels": None,
                                   "labels_proseg": None, "labels_baysor": None})
+            # Per-method label / weight keys (labels_celltypist, rctd_weights_…) too
+            for _k in list(_annot_state):
+                if _k not in ("status", "message"):
+                    _annot_state[_k] = None
         with _spage_lock:
-            _spage_state.update({"status": "idle", "message": "", "result": None})
+            _spage_state.update({"status": "idle", "message": "", "result": None,
+                                  "result_path": None, "result_genes": None})
         with _sdata_lock:
             _sdata_state.update({"status": "idle", "message": "", "sdata": None,
                                   "roi": None, "patches": None})
         with _umap_reseg_lock:
             _umap_reseg_state.update({"status": "idle", "message": "", "result": None})
+        with _split_lock:
+            _split_state.update({"status": "idle", "message": "", "result": None})
+        with _niche_lock:
+            _niche_state.update({"status": "idle", "message": ""})
+        with _spatial_lock:
+            _spatial_state.update({"status": "idle", "message": "", "result": None})
+        with _roi_lock:
+            _roi_state["rois"] = []
+            _roi_state["pending_hull"] = None
         # Re-run autoloads for the new dataset
+        _auto_load_rois()
         _annot_autoload()
         _sdata_autoload()
         _spage_autoload()
         print(f"  Loaded new dataset: {new_dir}", flush=True)
-        return "Loaded.", False, (ds_version or 0) + 1
+        # {}: the stored viewport belongs to the previous dataset
+        return ("Loaded.", False, (ds_version or 0) + 1,
+                "xenium", _default_gene, (roi_done or 0) + 1, {})
     except Exception as exc:
         import traceback
         traceback.print_exc()
-        return f"Error: {exc}", no_update, no_update
+        return (f"Error: {exc}", no_update, no_update) + _nu3
 
 
 @app.callback(
@@ -13049,7 +15454,7 @@ def add_sample(n_clicks, picked_path, custom_path, extra_ver):
     new_dir = os.path.abspath(new_dir)
     is_zarr = new_dir.rstrip("/").endswith(".zarr")
     if is_zarr:
-        if not os.path.exists(os.path.join(new_dir, ".zgroup")):
+        if not _is_zarr_store(new_dir):
             return f"Not a valid SpatialData zarr: {new_dir}", no_update, no_update, no_update
     else:
         if not os.path.exists(os.path.join(new_dir, "experiment.xenium")):
@@ -13093,6 +15498,10 @@ def add_sample(n_clicks, picked_path, custom_path, extra_ver):
 def remove_extra_samples(n_clicks, extra_ver):
     """Clear all extra datasets, reverting to single-sample view."""
     global EXTRA_DATASETS
+    # The button is re-created (n_clicks=0) on every tissue-info re-render, which
+    # requests this callback although nothing was clicked.
+    if not n_clicks:
+        raise dash.exceptions.PreventUpdate
     if not EXTRA_DATASETS:
         return no_update, "No extra samples loaded."
     n_removed = len(EXTRA_DATASETS)
@@ -13105,11 +15514,16 @@ def remove_extra_samples(n_clicks, extra_ver):
     Output("cluster-method", "options"),
     Output("cluster-method", "value"),
     Input("dataset-version", "data"),
+    State("cluster-method", "value"),
     prevent_initial_call=True,
 )
-def update_cluster_options(_):
+def update_cluster_options(_, current):
     methods = DATA["cluster_methods"]
     opts = [{"label": method_label(m), "value": m} for m in methods]
+    # dataset-version is also bumped by "Rerun UMAP": keep the user's selection
+    # whenever it still exists in the (possibly new) dataset
+    if current in methods:
+        return opts, current
     return opts, (methods[0] if methods else None)
 
 
@@ -13124,8 +15538,8 @@ def update_cluster_options(_):
 def toggle_cache_clean_modal(open_clicks, cancel_clicks, confirm_clicks):
     tid = callback_context.triggered_id
     if tid == "cache-clean-open-btn" and open_clicks:
-        size = _cache_size_str()
-        dataset_name = os.path.basename(DATA["data_dir"])
+        size = _cache_size_str(max_age=0)
+        dataset_name = _dataset_name()
         return True, (f"Delete all cache entries for dataset '{dataset_name}'? "
                       f"Total cache size: {size}. This cannot be undone.")
     return False, no_update
@@ -13135,14 +15549,36 @@ def toggle_cache_clean_modal(open_clicks, cancel_clicks, confirm_clicks):
     Output("cache-clean-modal",  "is_open",  allow_duplicate=True),
     Output("cache-clean-done",   "data"),
     Output("cache-size-display", "children"),
+    Output("seg-source",              "value", allow_duplicate=True),
+    Output("baysor-done",             "data",  allow_duplicate=True),
+    Output("proseg-done",             "data",  allow_duplicate=True),
+    Output("reseg-patches-confirmed", "data",  allow_duplicate=True),
     Input("cache-clean-confirm-btn", "n_clicks"),
     State("cache-clean-done",        "data"),
+    State("baysor-done",             "data"),
+    State("proseg-done",             "data"),
     prevent_initial_call=True,
 )
-def do_clean_cache(n_clicks, version):
+def do_clean_cache(n_clicks, version, baysor_ver, proseg_ver):
+    if not n_clicks:
+        raise dash.exceptions.PreventUpdate
     _clean_cache_for_dataset()
-    new_size = _cache_size_str()
-    return False, (version or 0) + 1, f"Cache: {new_size}"
+    # The cached runs and the patch store are gone from disk: drop the in-memory
+    # handles to them and rebuild the seg-source dropdown (as confirm_seg_delete does).
+    with _baysor_lock:
+        if _baysor_state.get("status") != "running":
+            _baysor_state.update({"status": "idle", "message": "", "result": None})
+    with _proseg_lock:
+        if _proseg_state.get("status") != "running":
+            _proseg_state.update({"status": "idle", "message": "", "result": None})
+    with _sdata_lock:
+        if _sdata_state.get("status") != "running":
+            _sdata_state.update({"status": "idle", "message": "", "sdata": None,
+                                  "roi": None, "patches": None})
+            DATA.pop("sdata", None)
+    new_size = _cache_size_str(max_age=0)
+    return (False, (version or 0) + 1, f"Cache: {new_size}",
+            "xenium", (baysor_ver or 0) + 1, (proseg_ver or 0) + 1, 0)
 
 
 # ─── Save as SpatialData callbacks ────────────────────────────────────────────
@@ -13340,11 +15776,12 @@ def sync_counts_mode(value):
      Input("seg-source",      "value"),
      Input("baysor-done",     "data"),
      Input("proseg-done",     "data"),
-     Input("startup-trigger", "n_intervals")],
+     Input("startup-trigger", "n_intervals"),
+     Input("dataset-version", "data")],
     State("counts-mode", "value"),
     prevent_initial_call=True,
 )
-def update_counts_options(_, seg_source, _bd, _pd, _startup, current_value):
+def update_counts_options(_, seg_source, _bd, _pd, _startup, _ds_version, current_value):
     _tool = _seg_tool(seg_source)
     with _baysor_lock:
         bres = _baysor_state["result"] if _baysor_state["status"] == "done" else None
@@ -13427,6 +15864,14 @@ def run_niche(n_clicks, n_clusters, n_neighbors, label_key, seg_source):
         pres = _proseg_state["result"] if tool == "proseg" and _proseg_state["result"] else None
     alt_res = pres or bres
 
+    # Label keys are per segmentation (Xenium ids vs the ids of one Baysor/Proseg
+    # run): use the chosen method's labels for the active one, or refuse.
+    if label_key:
+        label_key = _label_key_for_active_seg(label_key, alt_res)
+        if label_key is None:
+            return (False, True,
+                    f"No annotation for the active {tool} segmentation — run annotation first.")
+
     with _niche_lock:
         _niche_state["status"]  = "starting"
         _niche_state["message"] = "Starting…"
@@ -13505,9 +15950,11 @@ def run_spatial_analysis(n_clicks, label_key, n_neighbors, seg_source):
     elif tool == "proseg":
         with _proseg_lock:
             alt_res = _proseg_state.get("result")
-    # Determine label key: if "labels" and alt_res present, use tool-specific key
-    if label_key == "labels" and alt_res is not None:
-        label_key = f"labels_{tool}"
+    # Label keys are per segmentation: use the chosen method's labels for the active one
+    label_key = _label_key_for_active_seg(label_key, alt_res)
+    if label_key is None:
+        return (False, True,
+                f"No annotation for the active {tool} segmentation — run annotation first.")
     t = threading.Thread(target=_run_spatial_analysis, args=(label_key, n_neighbors, alt_res), daemon=True)
     t.start()
     return True, False, "Running…"
@@ -13567,9 +16014,13 @@ def update_spatial_plots(_spatial_done, _ds_version,
     Input("dataset-version", "data"),
     Input("niche-umap-plot-w", "value"),
     Input("niche-umap-plot-h", "value"),
+    State("seg-source", "value"),
 )
-def update_niche_umap(_niche_done, _spatial_done, _ds_version, w, h):
-    return make_niche_umap_fig(width=w, height=h)
+def update_niche_umap(_niche_done, _spatial_done, _ds_version, w, h, seg_source):
+    _tool = _seg_tool(seg_source)
+    return make_niche_umap_fig(width=w, height=h,
+                               baysor_active=(_tool == "baysor"),
+                               proseg_active=(_tool == "proseg"))
 
 
 @app.callback(
@@ -13615,12 +16066,15 @@ def capture_lasso_selection(selected_data, seg_source, roi_done):
     else:
         src_df = None
 
+    # Errors: the message Div lives inside the save modal, so open it (with no pending
+    # polygon — Save then asks for a new selection) and leave roi-done alone so the
+    # figure is not rebuilt for a rejected selection.
     if len(cell_ids) < 3:
-        return dash.no_update, False, "", "Need at least 3 cells to define an ROI.", roi_done
+        return None, True, "", "Need at least 3 cells to define an ROI.", dash.no_update
 
     hull = _roi_compute_hull(cell_ids, src_df=src_df)
     if hull is None:
-        return dash.no_update, False, "", "Could not compute hull (need ≥3 non-collinear cells).", roi_done
+        return None, True, "", "Could not compute hull (need ≥3 non-collinear cells).", dash.no_update
 
     with _roi_lock:
         _roi_state["pending_hull"] = hull
@@ -13668,18 +16122,7 @@ def save_roi(n_clicks, name, cls, polygon_xy, roi_done, seg_source):
     # Apply metadata to all loaded dfs
     with _roi_lock:
         rois = list(_roi_state["rois"])
-    _roi_apply_metadata_to_df(DATA["df"], rois)
-    tool = _seg_tool(seg_source)
-    if tool == "baysor":
-        with _baysor_lock:
-            result = _baysor_state.get("result")
-        if result:
-            _roi_apply_metadata_to_df(result["cells_df"], rois)
-    elif tool == "proseg":
-        with _proseg_lock:
-            result = _proseg_state.get("result")
-        if result:
-            _roi_apply_metadata_to_df(result["cells_df"], rois)
+    _roi_apply_everywhere(rois)
 
     threading.Thread(target=_roi_write_all_zarrs_bg, daemon=True).start()
     return False, "", (roi_done or 0) + 1
@@ -13754,31 +16197,17 @@ def open_roi_manager(open_clicks, close_clicks, is_open):
     with _roi_lock:
         rois = list(_roi_state["rois"])
 
-    def _make_table(rois):
-        if not rois:
-            return html.P("No ROIs defined yet. Use lasso on the spatial plot to draw one.",
-                          style={"color": MUTED, "fontSize": "0.82rem"})
-        rows = []
-        for i, r in enumerate(rois):
-            rows.append(html.Tr([
-                html.Td(html.Div(style={"width": "18px", "height": "18px",
-                                         "backgroundColor": r["color"], "borderRadius": "3px"})),
-                html.Td(r["cls"], style={"padding": "4px 8px"}),
-                html.Td(r["name"], style={"padding": "4px 8px"}),
-                html.Td(dbc.Button("✕", id={"type": "roi-delete-btn", "index": i},
-                                   size="sm", color="danger", style={"padding": "1px 7px"})),
-            ]))
-        return dbc.Table([html.Tbody(rows)], bordered=False, hover=True,
-                         style={"fontSize": "0.82rem", "color": TEXT})
-
-    table = _make_table(rois)
-    op_opts = [{"label": f"{r['cls']}: {r['name']}", "value": i} for i, r in enumerate(rois)]
+    table, op_opts = _roi_manager_contents(rois)
     return True, table, op_opts, op_opts
 
 
 @app.callback(
     Output("roi-done",     "data",     allow_duplicate=True),
     Output("roi-list-div", "children", allow_duplicate=True),
+    Output("roi-op-a",     "options",  allow_duplicate=True),
+    Output("roi-op-b",     "options",  allow_duplicate=True),
+    Output("roi-op-a",     "value",    allow_duplicate=True),
+    Output("roi-op-b",     "value",    allow_duplicate=True),
     Input({"type": "roi-delete-btn", "index": ALL}, "n_clicks"),
     State("roi-done", "data"),
     prevent_initial_call=True,
@@ -13801,40 +16230,20 @@ def delete_roi(n_clicks_list, roi_done):
 
     with _roi_lock:
         rois = list(_roi_state["rois"])
-    _roi_apply_metadata_to_df(DATA["df"], rois)
-    with _baysor_lock:
-        bres = _baysor_state.get("result")
-    if bres:
-        _roi_apply_metadata_to_df(bres["cells_df"], rois)
-    with _proseg_lock:
-        pres = _proseg_state.get("result")
-    if pres:
-        _roi_apply_metadata_to_df(pres["cells_df"], rois)
+    _roi_apply_everywhere(rois)
     threading.Thread(target=_roi_write_all_zarrs_bg, daemon=True).start()
 
-    # Rebuild table
-    if not rois:
-        table = html.P("No ROIs defined yet.", style={"color": MUTED, "fontSize": "0.82rem"})
-    else:
-        rows = []
-        for i, r in enumerate(rois):
-            rows.append(html.Tr([
-                html.Td(html.Div(style={"width": "18px", "height": "18px",
-                                         "backgroundColor": r["color"], "borderRadius": "3px"})),
-                html.Td(r["cls"], style={"padding": "4px 8px"}),
-                html.Td(r["name"], style={"padding": "4px 8px"}),
-                html.Td(dbc.Button("✕", id={"type": "roi-delete-btn", "index": i},
-                                   size="sm", color="danger", style={"padding": "1px 7px"})),
-            ]))
-        table = dbc.Table([html.Tbody(rows)], bordered=False, hover=True,
-                          style={"fontSize": "0.82rem", "color": TEXT})
-
-    return (roi_done or 0) + 1, table
+    # Rebuild table and A/B options (option values are list positions, which shifted)
+    table, op_opts = _roi_manager_contents(rois)
+    return (roi_done or 0) + 1, table, op_opts, op_opts, None, None
 
 
 @app.callback(
     Output("roi-op-error", "children"),
     Output("roi-done",     "data",    allow_duplicate=True),
+    Output("roi-list-div", "children", allow_duplicate=True),
+    Output("roi-op-a",     "options",  allow_duplicate=True),
+    Output("roi-op-b",     "options",  allow_duplicate=True),
     Input("roi-op-btn",    "n_clicks"),
     State("roi-op-a",      "value"),
     State("roi-op",        "value"),
@@ -13848,19 +16257,20 @@ def apply_roi_operation(n_clicks, idx_a, op, idx_b, result_name, result_cls, roi
     """CB-7: ROI set operation."""
     if not n_clicks:
         raise dash.exceptions.PreventUpdate
+    _nu3 = (no_update, no_update, no_update)   # roi-list-div, roi-op-a/b options
     result_name = (result_name or "").strip()
     result_cls  = (result_cls  or "region").strip()
     if idx_a is None or idx_b is None or not op:
-        return "Select ROI A, operation, and ROI B.", roi_done
+        return ("Select ROI A, operation, and ROI B.", roi_done) + _nu3
     if not result_name:
-        return "Enter a result name.", roi_done
+        return ("Enter a result name.", roi_done) + _nu3
 
     try:
         from shapely.geometry import Polygon as _SPoly
         with _roi_lock:
             rois = _roi_state["rois"]
             if idx_a >= len(rois) or idx_b >= len(rois):
-                return "Invalid ROI index.", roi_done
+                return ("Invalid ROI index.", roi_done) + _nu3
             poly_a = _SPoly(rois[idx_a]["polygon_xy"])
             poly_b = _SPoly(rois[idx_b]["polygon_xy"])
             if op == "union":
@@ -13869,17 +16279,23 @@ def apply_roi_operation(n_clicks, idx_a, op, idx_b, result_name, result_cls, roi
                 result_geom = poly_a.intersection(poly_b)
             else:
                 result_geom = poly_a.difference(poly_b)
-            hull = result_geom.convex_hull
-            if hull.is_empty or hull.geom_type not in ("Polygon", "LineString"):
-                return "Operation produced empty result.", roi_done
-            if hull.geom_type == "Polygon":
-                polygon_xy = [list(c) for c in hull.exterior.coords]
-            else:
-                polygon_xy = [list(c) for c in hull.coords]
+            # Store the exact outline: a convex hull would undo a difference/notch
+            # and fill the gap between two separate ROIs.
+            if result_geom.is_empty:
+                return ("Operation produced empty result.", roi_done) + _nu3
+            if result_geom.geom_type == "MultiPolygon":
+                return ("Result has several separate parts, which one ROI cannot hold "
+                        "— draw separate ROIs instead.", roi_done) + _nu3
+            if result_geom.geom_type != "Polygon":
+                return ("Operation produced empty result.", roi_done) + _nu3
+            if len(result_geom.interiors) > 0:
+                return ("Result has a hole (one ROI lies inside the other), which is "
+                        "not supported.", roi_done) + _nu3
+            polygon_xy = [list(c) for c in result_geom.exterior.coords]
 
             duplicate = any(r["name"] == result_name and r["cls"] == result_cls for r in rois)
             if duplicate:
-                return f"ROI '{result_name}' (class '{result_cls}') already exists.", roi_done
+                return (f"ROI '{result_name}' (class '{result_cls}') already exists.", roi_done) + _nu3
 
             color = _roi_color(len(rois))
             rois.append({"name": result_name, "cls": result_cls,
@@ -13888,36 +16304,62 @@ def apply_roi_operation(n_clicks, idx_a, op, idx_b, result_name, result_cls, roi
 
         with _roi_lock:
             rois_snap = list(_roi_state["rois"])
-        _roi_apply_metadata_to_df(DATA["df"], rois_snap)
+        _roi_apply_everywhere(rois_snap)
         threading.Thread(target=_roi_write_all_zarrs_bg, daemon=True).start()
-        return "", (roi_done or 0) + 1
+        table, op_opts = _roi_manager_contents(rois_snap)
+        return "", (roi_done or 0) + 1, table, op_opts, op_opts
     except Exception as e:
-        return f"Error: {e}", roi_done
+        return (f"Error: {e}", roi_done) + _nu3
 
 
-@app.callback(
-    Output("color-by", "options", allow_duplicate=True),
-    Input("startup-trigger", "n_intervals"),
-    State("color-by",        "options"),
-    prevent_initial_call=True,
-)
-def init_colorby_annot_options(_, current_options):
-    """On startup, enable cell-type color-by options for any pre-loaded annotations."""
+def _refresh_colorby_options(current_options) -> list:
+    """color-by options with the data-dependent entries recomputed for the loaded
+    dataset: cell-type entries enabled per available labels, 'Spatial Niches'
+    disabled when no niche column exists any more, roi_* entries rebuilt.
+    Shared by the two callbacks below: Load Sample triggers both, and each starts
+    from the same options snapshot, so they must return the same list."""
     with _annot_lock:
         methods_with_labels = {
             m for m in _ANNOT_METHODS
             if any(k.startswith(f"labels_{m}") and v is not None
                    for k, v in _annot_state.items())
         }
+    has_niche = "niche" in DATA["df"].columns
+    for _lock, _state in ((_baysor_lock, _baysor_state), (_proseg_lock, _proseg_state)):
+        with _lock:
+            _cdf = (_state.get("result") or {}).get("cells_df")
+        has_niche = has_niche or (_cdf is not None and "niche" in _cdf.columns)
+    with _roi_lock:
+        rois = list(_roi_state["rois"])
+    classes = list(dict.fromkeys(r["cls"] for r in rois))  # preserve order, deduplicate
     options = []
     for opt in (current_options or []):
         val = opt["value"]
+        if val.startswith("roi_"):
+            continue
         if val.startswith("cell_type:"):
             m = val.split(":")[1]
             options.append({**opt, "disabled": m not in methods_with_labels})
+        elif val == "niche" and not has_niche:
+            options.append({**opt, "disabled": True})
         else:
             options.append(opt)
+    for cls in classes:
+        options.append({"label": f"ROI: {cls}", "value": f"roi_{cls}"})
     return options
+
+
+@app.callback(
+    Output("color-by", "options", allow_duplicate=True),
+    Input("startup-trigger", "n_intervals"),
+    Input("dataset-version", "data"),
+    State("color-by",        "options"),
+    prevent_initial_call=True,
+)
+def init_colorby_annot_options(_, _ds_version, current_options):
+    """On startup and after Load Sample, enable cell-type color-by options for any
+    pre-loaded annotations of the current dataset."""
+    return _refresh_colorby_options(current_options)
 
 
 @app.callback(
@@ -13928,13 +16370,7 @@ def init_colorby_annot_options(_, current_options):
 )
 def update_color_by_for_rois(roi_done, current_options):
     """CB-8: Add/update roi_* options in color-by dropdown."""
-    with _roi_lock:
-        rois = list(_roi_state["rois"])
-    classes = list(dict.fromkeys(r["cls"] for r in rois))  # preserve order, deduplicate
-    options = [o for o in (current_options or []) if not o["value"].startswith("roi_")]
-    for cls in classes:
-        options.append({"label": f"ROI: {cls}", "value": f"roi_{cls}"})
-    return options
+    return _refresh_colorby_options(current_options)
 
 
 @app.callback(
@@ -13955,6 +16391,801 @@ def update_roi_sidebar_summary(roi_done):
     return f"{len(rois)} ROI{'s' if len(rois)!=1 else ''} ({', '.join(parts)})"
 
 
+# ─── WebGL viewer wiring ──────────────────────────────────────────────────────
+@app.callback(
+    Output("webgl-tx-genes", "options"),
+    Output("webgl-tx-genes", "value"),
+    Input("dataset-version", "data"),
+)
+def update_webgl_tx_gene_options(_ds_version):
+    """Panel genes that can be drawn as transcripts (reset when the dataset changes)."""
+    return [{"label": g, "value": g} for g in sorted(_panel_gene_names())], []
+
+
+@app.callback(
+    Output("roi-pending",      "data",     allow_duplicate=True),
+    Output("roi-save-modal",   "is_open",  allow_duplicate=True),
+    Output("roi-save-preview", "children", allow_duplicate=True),
+    Output("roi-save-error",   "children", allow_duplicate=True),
+    Input("webgl-select", "data"),
+    prevent_initial_call=True,
+)
+def capture_webgl_selection(sel):
+    """A lasso / rectangle drawn in the WebGL view: the drawn outline itself becomes the
+    pending ROI (the Plotly path has only the selected cells and uses their convex hull)."""
+    if not sel or not sel.get("polygon"):
+        raise dash.exceptions.PreventUpdate
+    n = int(sel.get("count") or 0)
+    pts = [[float(x), -float(y)] for x, y in sel["polygon"]]   # ROI space is plot space (y = -µm)
+    if len(pts) < 3 or n < 3:
+        return None, True, "", "Need at least 3 cells inside the outline to define an ROI."
+    if pts[0] != pts[-1]:
+        pts.append(pts[0])
+    try:
+        from shapely.geometry import Polygon as _SPoly
+        if not _SPoly(pts).is_valid:
+            return None, True, "", "The outline crosses itself; draw a simple closed shape."
+    except Exception:
+        pass
+    with _roi_lock:
+        _roi_state["pending_hull"] = pts
+    return pts, True, f"{n:,} cells selected — enter name and class below.", ""
+
+
+# Drives window.XeniumViewer (assets/xenium_viewer.js) from the sidebar controls; the glue
+# lives in assets/xenium_viewer_dash.js. Only state is sent: the viewer fetches its own data.
+app.clientside_callback(
+    ClientsideFunction(namespace="xenium_viewer", function_name="sync"),
+    Output("spatial-plot", "style"),
+    Output("webgl-view",   "style"),
+    Output("webgl-umap",   "style"),
+    Output("morph-zlevel",      "disabled"),   # the WebGL image layer has no use for it
+    Output("morph-zlevel-wrap", "title"),
+    Input("renderer-mode",     "value"),
+    Input("color-by",          "value"),
+    Input("cluster-method",    "value"),
+    Input("gene-selector",     "value"),
+    Input("point-size",        "value"),
+    Input("point-opacity",     "value"),
+    Input("boundary-toggles",  "value"),
+    Input("seg-source",        "value"),
+    Input("counts-mode-store", "data"),
+    Input("colorbar-min",      "value"),
+    Input("colorbar-max",      "value"),
+    Input("webgl-tx-genes",    "value"),
+    Input("morph-enable",      "value"),
+    Input("morph-channels",    "value"),
+    Input("morph-opacity",     "value"),
+    Input("morph-brightness",  "value"),
+    Input("dataset-version",   "data"),
+    Input("subset-version",    "data"),
+    Input("baysor-done",       "data"),
+    Input("proseg-done",       "data"),
+    Input("annot-done",        "data"),
+    Input("spage-done",        "data"),
+    Input("split-done",        "data"),
+    Input("roi-done",          "data"),
+    Input("niche-done",        "data"),
+    Input("webgl-tool",        "value"),
+    Input("umap-panel",        "style"),     # the UMAP viewer is only fed while its panel is open
+    Input("roi-save-modal",    "is_open"),   # closing it drops the lasso highlight / pending outline
+    Input("extra-datasets-version", "data"), # samples added / removed: cells, colours, separators
+    State("spatial-relayout",  "data"),      # Plotly's zoom, applied when switching to WebGL
+)
+
+# Overlays the Plotly view draws from other controls: the ruler, the SpatialData tissue ROI /
+# patch grid and the CellNEST edges. The glue keeps these values and fetches what it needs.
+app.clientside_callback(
+    ClientsideFunction(namespace="xenium_viewer", function_name="extras"),
+    Input("renderer-mode",            "value"),
+    Input("measure-store",            "data"),
+    Input("sdata-show-roi",           "value"),
+    Input("sdata-show-patches",       "value"),
+    Input("sdata-done",               "data"),
+    Input("cellnest-version",         "data"),
+    Input("cellnest-overlay-enable",  "value"),
+    Input("cellnest-lr-pair",         "value"),
+    Input("cellnest-top-n",           "value"),
+    Input("cellnest-edge-width",      "value"),
+    Input("cellnest-color-by",        "value"),
+    Input("cellnest-options",         "value"),
+    Input("cellnest-filter-ligand",   "value"),
+    Input("cellnest-filter-receptor", "value"),
+    Input("cellnest-filter-sender",   "value"),
+    Input("cellnest-filter-receiver", "value"),
+    Input("cellnest-annot-col",       "value"),
+)
+
+app.clientside_callback(
+    ClientsideFunction(namespace="xenium_viewer", function_name="exportPng"),
+    Input("webgl-png-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+
+
+# ─── WebGL viewer data provider (binary endpoints under /viewer/*) ────────────
+class _ViewerProvider:
+    """Feeds xenium_viewer_api's routes from the app's current state. The browser keeps
+    cell coordinates on the GPU and asks only for one value per cell on a recolour and
+    for boundaries / transcripts in the current viewport."""
+
+    _BOUNDARY_LIMIT = 20000   # polygons per viewport request before asking to zoom in
+    _BOUNDARY_PAD   = 30.0    # µm: a cell is "in view" if its centroid is within this margin
+
+    def __init__(self):
+        self._packed = {}     # (tool, kind) -> packed in-memory boundary dict
+        self._zip_ok = {}     # kind -> whether cells.zarr.zip matches DATA["df"]
+
+    @staticmethod
+    def _alt_res(source):
+        tool = _seg_tool(source)
+        if tool == "proseg":
+            with _proseg_lock:
+                return _proseg_state.get("result")
+        if tool == "baysor":
+            with _baysor_lock:
+                return _baysor_state.get("result")
+        return None
+
+    def _frame(self, source):
+        alt = self._alt_res(source)
+        return (alt["cells_df"] if alt is not None else DATA["df"]), alt
+
+    _multi_sample = True      # extra samples are drawn beside the primary one (not in the UMAP)
+
+    def _extras(self, alt=None):
+        """The extra samples shown with the Xenium source, as in make_spatial_fig (a
+        Baysor / Proseg source shows that run's cells only)."""
+        return list(EXTRA_DATASETS) if (self._multi_sample and alt is None) else []
+
+    def _xy(self, df, extras=()):
+        """Centroids of *df*'s cells followed by those of the extra samples, each shifted
+        by its x offset."""
+        x, y = df["x_centroid"].values, df["y_centroid"].values
+        if extras:
+            x = np.concatenate([x] + [e["df"]["x_centroid"].values + e["x_offset"] for e in extras])
+            y = np.concatenate([y] + [e["df"]["y_centroid"].values for e in extras])
+        return x, y
+
+    def data_dir(self):
+        return DATA.get("data_dir")
+
+    def image_files(self):
+        d = DATA.get("data_dir")
+        files = []
+        if d:
+            for i in range(16):
+                f = _morph_focus_path(d, i)
+                if f is None:
+                    break
+                files.append(f)
+        return files
+
+    def _bounds(self, df, extras=()):
+        x, y = self._xy(df, extras)
+        if len(x) == 0:
+            return [0.0, 0.0, 1.0, 1.0]
+        return [float(np.nanmin(x)), float(np.nanmin(y)), float(np.nanmax(x)), float(np.nanmax(y))]
+
+    def meta(self):
+        d = DATA.get("data_dir")
+        sources = ["xenium"]
+        for tool, lock, state in (("baysor", _baysor_lock, _baysor_state),
+                                  ("proseg", _proseg_lock, _proseg_state)):
+            with lock:
+                if state.get("result"):
+                    sources.append(tool)
+        import xenium_viewer_api as _va
+        store = _va.tile_store(d) if d else None
+        return {
+            "dataset": _dataset_name(),
+            "dataset_gen": _dataset_gen,
+            "sources": sources,
+            "bounds": self._bounds(DATA["df"], self._extras()),
+            "pixel_size": PIXEL_SIZE_UM,
+            "has_boundaries": bool(DATA.get("cell_bounds")) or bool(store and store.has_boundaries),
+            "has_transcripts": bool(store and store.has_transcripts),
+            # "v" identifies the file: /viewer/image/<index>?v=<v> may be cached by the browser
+            "images": [{"index": i, "name": os.path.basename(f), "v": _va.image_token(f)}
+                       for i, f in enumerate(self.image_files())],
+        }
+
+    def cells(self, source):
+        df, alt = self._frame(source)
+        extras = self._extras(alt)
+        x, y = self._xy(df, extras)
+        xy = np.empty(2 * len(x), dtype=np.float32)
+        xy[0::2] = x
+        xy[1::2] = y
+        return ({"n": int(len(x)), "bounds": self._bounds(df, extras), "samples": 1 + len(extras),
+                 "token": f"{_dataset_gen}:{_subset_version}:{_seg_tool(source)}:{len(x)}:{len(extras)}"},
+                {"xy": xy})
+
+    @staticmethod
+    def _categorical(labels, label, colors=None, order=None, names=None):
+        """Pack a Series of category labels as codes + legend."""
+        labels = pd.Series(np.asarray(labels))
+        cats = list(order) if order is not None else sorted(labels.dropna().unique(), key=str)
+        lut = {c: i for i, c in enumerate(cats)}
+        codes = labels.map(lut).fillna(65535).astype(np.uint16).values
+        cols = colors or [CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i in range(len(cats))]
+        return ({"kind": "categorical", "label": label,
+                 "categories": [str(names[c]) if names else str(c) for c in cats],
+                 "colors": list(cols)}, {"codes": codes})
+
+    @staticmethod
+    def _continuous(vals, label):
+        vals = np.asarray(vals, dtype=np.float32)
+        finite = vals[np.isfinite(vals)]
+        lo = float(finite.min()) if len(finite) else 0.0
+        hi = float(finite.max()) if len(finite) else 1.0
+        return {"kind": "continuous", "label": label, "min": lo, "max": hi}, {"values": vals}
+
+    def colors(self, args):
+        source = args.get("source", "xenium")
+        mode = args.get("mode") or "transcript_counts"
+        method = args.get("method") or ""
+        gene = args.get("gene") or ""
+        corrected = str(args.get("corrected", "0")).lower() in ("1", "true", "corrected")
+        df, alt = self._frame(source)
+        extras = self._extras(alt)
+        if extras:
+            return self._colors_multi(mode, method, gene, df, extras)
+
+        if mode == "cluster":
+            if alt is None:
+                col = cluster_col(method)
+                if col not in df.columns and DATA.get("cluster_methods"):
+                    col = cluster_col(DATA["cluster_methods"][0])
+            else:
+                cands = [c for c in df.columns if str(c).startswith("cluster")]
+                pref = [c for c in cands if ("split" in c) == corrected]
+                col = (pref or cands or [None])[0]
+            if col is not None and col in df.columns:
+                if alt is not None:
+                    # same order, names and NA handling as make_spatial_fig's reseg branch
+                    vals = df[col].astype(str)
+                    order = sorted(vals.unique(), key=lambda v: (0, int(v)) if v.isdigit() else (1, v))
+                    return self._categorical(vals.values, "Cluster", order=order,
+                                             names={c: f"Cluster {c}" for c in order})
+                vals = df[col]
+                order = sorted(vals.dropna().unique())
+                return self._categorical(vals.values, "Cluster", order=order)
+            mode = "transcript_counts"
+
+        if mode.startswith("cell_type:"):
+            key = _labels_key_for_method(mode.split(":", 1)[1], alt)
+            with _annot_lock:
+                labels = _annot_state.get(key)
+            if labels is not None:
+                aligned = labels.reindex(df.index.astype(str)).fillna("Unknown")
+                return self._categorical(aligned.values, "Cell type")
+            mode = "transcript_counts"
+
+        if mode == "niche":
+            if "niche" in df.columns:
+                vals = df["niche"].astype(str)
+                order = sorted(vals.unique(), key=lambda v: (0, int(v)) if v.isdigit() else (1, v))
+                return self._categorical(vals.values, "Niche", order=order,
+                                         names={n: f"Niche {n}" for n in order})
+            mode = "transcript_counts"
+
+        if mode.startswith("roi_"):
+            if mode in df.columns:
+                vals = df[mode].fillna("(none)").astype(str)
+                named = [v for v in sorted(vals.unique()) if v != "(none)"]
+                return self._categorical(vals.values, mode[4:] or "ROI", order=named + ["(none)"],
+                                         colors=[_roi_color(i) for i in range(len(named))] + ["#666666"])
+            mode = "transcript_counts"
+
+        if mode == "gene" and gene:
+            # Xenium source: as in make_spatial_fig, _get_expr_values only for corrected
+            # counts (its fallback for a streamed SpaGE gene applies log1p a second time)
+            vals = (_get_expr_values(gene, alt, use_corrected=corrected)
+                    if (alt is not None or corrected) else None)
+            if vals is None and alt is None:
+                try:
+                    vals = get_gene_expression(gene)
+                except KeyError:          # gene not in this dataset
+                    vals = None
+            if vals is not None and len(vals) == len(df):
+                return self._continuous(vals, f"{gene} (log1p)")
+            return self._continuous(np.full(len(df), np.nan), f"{gene} (unavailable)")
+
+        col = mode if mode in df.columns else "transcript_counts"
+        if col not in df.columns:
+            return self._continuous(np.full(len(df), np.nan), "No data")
+        raw = pd.to_numeric(df[col], errors="coerce").values.astype(np.float64)
+        if col == "transcript_counts":
+            return self._continuous(np.log1p(raw), "Transcript Counts (log1p)")
+        return self._continuous(raw, QC_METRICS.get(col, col))
+
+    def _colors_multi(self, mode, method, gene, df, extras):
+        """Colours for the primary sample followed by the extra ones, with the per-mode
+        rules of make_spatial_fig's multi-sample branch (cluster names prefixed per
+        sample, original counts only)."""
+        dsets = [DATA] + list(extras)
+        dfs = [df] + [e["df"] for e in extras]
+        if mode == "cluster" and not DATA.get("cluster_methods"):
+            mode = "transcript_counts"      # as update_plots does before building the figure
+        if mode == "gene" and not gene:
+            mode = "transcript_counts"
+
+        if mode == "cluster":
+            parts = []
+            for di, (ds, edf) in enumerate(zip(dsets, dfs)):
+                cm = ds.get("cluster_methods") or []
+                col = f"clust__{method if method in cm else (cm or [method])[0]}"
+                parts.append((f"S{di}:C" + edf[col].astype(str)).values if col in edf.columns
+                             else np.full(len(edf), f"S{di}:C0", dtype=object))
+            labels = np.concatenate(parts)
+            return self._categorical(labels, "Cluster", order=list(pd.unique(labels)))
+
+        if mode == "niche":
+            labels = np.concatenate([
+                edf["niche"].astype(str).values if "niche" in edf.columns
+                else np.full(len(edf), "N/A", dtype=object) for edf in dfs])
+            order = sorted(set(labels), key=lambda v: (0, int(v)) if v.isdigit() else (1, v))
+            return self._categorical(labels, "Niche", order=order,
+                                     names={n: f"Niche {n}" for n in order})
+
+        if mode.startswith("cell_type:"):
+            with _annot_lock:
+                primary = _annot_state.get(f"labels_{mode.split(':', 1)[1]}")
+            parts = []
+            for di, edf in enumerate(dfs):
+                lbl = primary if di == 0 else extras[di - 1].get("_cell_type_labels")
+                parts.append(lbl.reindex(edf.index).fillna("Unknown").astype(str).values
+                             if lbl is not None else np.full(len(edf), "Unknown", dtype=object))
+            return self._categorical(np.concatenate(parts), "Cell type")
+
+        if mode == "gene":
+            parts = []
+            for di, edf in enumerate(dfs):
+                vals = None
+                if di == 0:
+                    try:
+                        vals = get_gene_expression(gene)
+                    except KeyError:
+                        vals = None
+                else:
+                    eds = extras[di - 1]
+                    g_idx = eds.get("gene_name_to_idx", {}).get(gene)
+                    if g_idx is not None:
+                        raw = _csc_view(eds, "expr")[:, g_idx].toarray().flatten()
+                        idx_ = eds["df_to_expr"]
+                        vals = np.log1p(np.where(idx_ >= 0, raw[np.clip(idx_, 0, len(raw) - 1)], 0.0))
+                parts.append(np.asarray(vals, dtype=float) if vals is not None and len(vals) == len(edf)
+                             else np.zeros(len(edf)))
+            return self._continuous(np.concatenate(parts), f"{gene} (log1p)")
+
+        if mode.startswith("roi_") and any(mode in edf.columns for edf in dfs):
+            vals = pd.concat([
+                (edf[mode] if mode in edf.columns else pd.Series(pd.NA, index=edf.index, dtype=object))
+                for edf in dfs]).fillna("(none)").astype(str)
+            named = [v for v in sorted(vals.unique()) if v != "(none)"]
+            return self._categorical(vals.values, mode[4:] or "ROI", order=named + ["(none)"],
+                                     colors=[_roi_color(i) for i in range(len(named))] + ["#666666"])
+
+        col = mode if any(mode in edf.columns for edf in dfs) else "transcript_counts"
+        raw = np.concatenate([
+            pd.to_numeric(edf[col], errors="coerce").values.astype(np.float64) if col in edf.columns
+            else np.zeros(len(edf)) for edf in dfs])
+        if col == "transcript_counts":
+            return self._continuous(np.log1p(raw), "Transcript Counts (log1p)")
+        return self._continuous(raw, QC_METRICS.get(col, col))
+
+    def boundaries(self, source, kind, x0, y0, x1, y1):
+        """Polygons from the in-memory boundary dicts, or None to let the route read the
+        bundle's cells.zarr.zip (possible only when DATA["df"] holds exactly the bundle's
+        cells in file order, i.e. Xenium boundaries and no active subset)."""
+        # The kind picks the polygon set whatever the active source is, as the four
+        # checkboxes do in the Plotly view: "cell" / "nucleus" are the original Xenium
+        # boundaries, "baysor" / "proseg" that tool's loaded run.
+        if kind in ("cell", "nucleus"):
+            df, slot = DATA["df"], ("xenium", kind)
+            d = DATA.get("data_dir")
+            if (d and "_df_original" not in DATA
+                    and os.path.exists(os.path.join(d, "cells.zarr.zip"))
+                    and self._zip_matches(d, df, kind)):
+                return None
+            bounds = DATA.get("cell_bounds" if kind == "cell" else "nucleus_bounds") or {}
+        elif kind in ("baysor", "proseg"):
+            alt = self._alt_res(kind)
+            if alt is None:
+                return {"n": 0, "truncated": False, "available": False}, {}
+            df, slot = alt["cells_df"], (kind, "cell")
+            bounds = alt.get("cell_bounds") or {}
+        else:
+            return {"n": 0, "truncated": False, "available": False}, {}
+        if not bounds:
+            return {"n": 0, "truncated": False, "available": False}, {}
+        pad = self._BOUNDARY_PAD
+        cx, cy = df["x_centroid"].values, df["y_centroid"].values
+        rows = np.flatnonzero((cx >= x0 - pad) & (cx <= x1 + pad) & (cy >= y0 - pad) & (cy <= y1 + pad))
+        if len(rows) > self._BOUNDARY_LIMIT:
+            return {"n": int(len(rows)), "truncated": True, "available": True}, {}
+        xy_all, ring_start, poly_ring, row_poly = self._packed_bounds(slot, bounds, df)
+        # rings of the rows in view, gathered by index arithmetic (no per-cell loop)
+        ent = row_poly[rows]
+        rows, ent = rows[ent >= 0], ent[ent >= 0]
+        n_rings = poly_ring[ent + 1] - poly_ring[ent]
+        total = int(n_rings.sum())
+        if total == 0:
+            return {"n": 0, "truncated": False, "available": True}, {}
+        rings = np.repeat(poly_ring[ent] - (np.cumsum(n_rings) - n_rings), n_rings) + np.arange(total)
+        n_vert = ring_start[rings + 1] - ring_start[rings]
+        starts = np.zeros(total + 1, dtype=np.int64)
+        np.cumsum(n_vert, out=starts[1:])
+        verts = np.repeat(ring_start[rings] - starts[:-1], n_vert) + np.arange(int(starts[-1]))
+        return ({"n": total, "truncated": False, "available": True},
+                {"start": starts.astype(np.uint32), "xy": xy_all[verts].ravel(),
+                 "cell": np.repeat(rows, n_rings).astype(np.uint32)})
+
+    def forget(self):
+        """Drop what was derived from the previous dataset (called on Load Sample)."""
+        self._packed.clear()
+        self._zip_ok.clear()
+
+    def _zip_matches(self, d, df, kind):
+        """True when cells.zarr.zip can stand in for the in-memory polygons: it has readable
+        polygons of *kind*, and DATA["df"] holds exactly its cells in file order (a
+        spatialdata table written or filtered outside the app may not). Checked once per
+        dataset and frame."""
+        key = (_dataset_gen, d, len(df), kind)
+        hit = self._zip_ok.get(kind)
+        if hit is not None and hit[0] == key and hit[1] is df:
+            return hit[2]
+        ok = False
+        try:
+            import xenium_viewer_api as _va
+            store = _va.tile_store(d)
+            ids = store.cell_ids()
+            if ids is not None and len(ids) == len(df) and store._polygons(kind) is not None:
+                pick = np.unique(np.linspace(0, len(df) - 1, min(len(df), 512)).astype(int))
+                if ids.ndim == 2:   # (prefix, dataset suffix) -> "aaaaljij-1"
+                    names = ["".join(chr(97 + int(c, 16)) for c in f"{int(p):08x}") + f"-{int(s)}"
+                             for p, s in ids[pick]]
+                else:               # older bundles: integer cell ids
+                    names = [str(int(v)) for v in ids[pick]]
+                ok = names == [str(v) for v in df.index[pick]]
+        except Exception:
+            ok = False
+        self._zip_ok[kind] = (key, df, ok)
+        return ok
+
+    def _packed_bounds(self, slot, bounds, df):
+        """A {cell id: (xs, ys)} boundary dict packed once into flat arrays:
+        (xy (V, 2) float32, ring_start (R + 1), poly_ring (P + 1), row_poly (len(df))).
+        Multi-ring cells (several nuclei) are stored NaN-separated and become one ring
+        each; rings with fewer than 3 vertices are dropped. row_poly maps a row of *df* to
+        its dict entry (-1 = none). Rebuilt when the dict or the frame is replaced."""
+        hit = self._packed.get(slot)
+        if hit is None or hit["bounds"] is not bounds or hit["n"] != len(bounds):
+            polys = [p if p is not None else ((), ()) for p in bounds.values()]
+            n_pts = np.fromiter((len(p[0]) for p in polys), dtype=np.int64, count=len(polys))
+            if n_pts.sum():
+                x = np.concatenate([p[0] for p in polys], dtype=np.float32, casting="unsafe")
+                y = np.concatenate([p[1] for p in polys], dtype=np.float32, casting="unsafe")
+            else:
+                x = y = np.zeros(0, dtype=np.float32)
+            poly_of = np.repeat(np.arange(len(polys)), n_pts)
+            gap = np.isnan(x)
+            first = np.zeros(len(x), dtype=bool)          # vertex that opens a ring
+            first[(np.cumsum(n_pts) - n_pts)[n_pts > 0]] = True
+            first[1:] |= gap[:-1]
+            ring_of = np.cumsum(first) - 1
+            ring_len = np.bincount(ring_of[~gap], minlength=int(first.sum()))
+            keep = ~gap & (ring_len[ring_of] >= 3)
+            good = ring_len >= 3
+            ring_poly = np.zeros(len(ring_len), dtype=np.int64)
+            ring_poly[ring_of] = poly_of
+            ring_start = np.zeros(int(good.sum()) + 1, dtype=np.int64)
+            np.cumsum(ring_len[good], out=ring_start[1:])
+            poly_ring = np.searchsorted(ring_poly[good], np.arange(len(polys) + 1))
+            hit = {"bounds": bounds, "n": len(bounds), "df": None, "row_poly": None,
+                   "arrays": (np.stack([x[keep], y[keep]], axis=1), ring_start, poly_ring)}
+            self._packed[slot] = hit
+        if hit["df"] is not df:
+            keys = pd.Index(list(bounds.keys()))
+            row_poly = keys.get_indexer(df.index)
+            miss = row_poly < 0
+            if miss.any():      # ids kept as strings in the dict, numbers in the frame
+                row_poly[miss] = keys.get_indexer(df.index[miss].astype(str))
+            hit["df"], hit["row_poly"] = df, row_poly
+        return (*hit["arrays"], hit["row_poly"])
+
+    def overlays(self, source, args=None):
+        """Outlines for the viewer, in µm with y down: saved ROIs (stored in plot space,
+        y = -µm), the SpatialData tissue ROI / patch grid when asked for with sdata_roi=1 /
+        sdata_patches=1, and the separators between samples."""
+        args = args or {}
+        with _roi_lock:
+            rois = list(_roi_state["rois"]) if _roi_state.get("show", True) else []
+        polys, lines = [], []
+        for r in rois:
+            pts = [[float(x), -float(y)] for x, y in r.get("polygon_xy") or []]
+            if len(pts) >= 3:
+                polys.append({"points": pts, "color": r.get("color", "#ffffff"), "width": 2,
+                              "fill": r.get("color", "#ffffff"),
+                              "label": f"{r.get('name', '')} ({r.get('cls', '')})"})
+        show_roi = args.get("sdata_roi") == "1"
+        show_patches = args.get("sdata_patches") == "1"
+        if show_roi or show_patches:        # same geometry as _sdata_overlays_to_shapes
+            with _sdata_lock:
+                roi = _sdata_state.get("roi")
+                patches = _sdata_state.get("patches")
+            if show_roi and roi is not None:
+                try:
+                    for geom in _sdata_transform_to_um(roi).geometry:
+                        polys.append({"points": [[float(c[0]), float(c[1])] for c in geom.exterior.coords],
+                                      "color": "#52b788", "width": 2,
+                                      "fill": "#52b788", "fillAlpha": 13})
+                except Exception as exc:
+                    print(f"  ROI overlay error: {exc}", flush=True)
+            if show_patches and patches is not None:
+                try:
+                    for geom in _sdata_transform_to_um(patches).geometry:
+                        bx0, by0, bx1, by1 = (float(v) for v in geom.bounds)
+                        polys.append({"points": [[bx0, by0], [bx1, by0], [bx1, by1], [bx0, by1]],
+                                      "color": "#ffaa00", "width": 1,
+                                      "fill": "#ffaa00", "fillAlpha": 8})
+                except Exception as exc:
+                    print(f"  Patch overlay error: {exc}", flush=True)
+        for eds in self._extras(self._alt_res(source)):
+            sep_x = float(eds["x_offset"]) - 250    # middle of the gap, full height as in Plotly
+            lines.append({"from": [sep_x, -1e6], "to": [sep_x, 1e6], "color": MUTED, "width": 1})
+        return {"polygons": polys, "lines": lines}
+
+    def cell_at(self, source, index):
+        df, alt = self._frame(source)
+        offset, row = 0.0, int(index)
+        for eds in self._extras(alt):       # rows past the primary sample belong to the extra ones
+            if index < len(df):
+                break
+            index -= len(df)
+            df, offset = eds["df"], float(eds["x_offset"])
+        if index < 0 or index >= len(df):
+            return {}
+        return {"index": row, "id": str(df.index[index]),
+                "x": float(df["x_centroid"].iloc[index]) + offset,
+                "y": float(df["y_centroid"].iloc[index])}
+
+    # ── app-specific binary payloads: /viewer/extra/<name>.bin ─────────────────
+    def extra(self, name, args):
+        if name == "pies":
+            return self._pies(args)
+        if name == "cellnest":
+            return self._cellnest(args)
+        return None
+
+    def _pies(self, args):
+        """RCTD weights of the cells in the box, for the weight pies the Plotly view draws
+        (_rctd_pie_shapes_for_view): single-sample Xenium view, a cell_type colour mode with
+        stored weights, at most PIE_THRESHOLD cells. The browser builds the wedges."""
+        none = ({"n": 0, "available": False}, {})
+        mode = args.get("mode") or ""
+        if (_seg_tool(args.get("source", "xenium")) != "xenium" or self._extras()
+                or not mode.startswith("cell_type:")):
+            return none
+        lkey = f"labels_{mode.split(':')[1]}"
+        with _annot_lock:
+            weights = _annot_state.get(f"rctd_weights_{lkey}")
+        if weights is None:
+            return none
+        try:
+            x0, y0, x1, y1 = (float(args[k]) for k in ("x0", "y0", "x1", "y1"))
+        except (KeyError, ValueError):
+            return none
+        df = DATA["df"]
+        cx, cy = df["x_centroid"].values, df["y_centroid"].values
+        rows = np.flatnonzero((cx >= x0) & (cx <= x1) & (cy >= y0) & (cy <= y1))
+        if len(rows) > PIE_THRESHOLD:
+            return {"n": int(len(rows)), "available": True, "truncated": True}, {}
+        w = weights.reindex(df.index[rows].astype(str)).fillna(0).values.astype(float)
+        total = w.sum(axis=1) if w.size else np.zeros(len(rows))
+        keep = total > 0
+        rows, w = rows[keep], w[keep] / total[keep, None]
+        cmap = _cell_type_color_map(lkey, df)     # colours of the full frame, as the cells have
+        xy = np.empty(2 * len(rows), dtype=np.float32)
+        xy[0::2] = cx[rows]
+        xy[1::2] = cy[rows]
+        return ({"n": int(len(rows)), "available": True, "truncated": False,
+                 "types": [str(c) for c in weights.columns],
+                 "colors": [cmap.get(c, "#888888") for c in weights.columns],
+                 "radius": RCTD_PIE_RADIUS_UM, "min_frac": 0.02},
+                {"xy": xy, "frac": w.astype(np.float32).ravel()})
+
+    def _cellnest(self, args):
+        """CellNEST edges for the map as line segments (shaft plus two arrowhead strokes
+        per edge), selected and coloured as _cellnest_overlay_traces does. The controls
+        arrive as JSON in ``q``. With the gray-out option the rows of the participating
+        cells in the viewer's table are returned as ``cells``."""
+        none = ({"n": 0, "edges": 0, "available": False}, {})
+        try:
+            q = json.loads(args.get("q") or "{}")
+        except ValueError:
+            return none
+        with _cellnest_lock:
+            data = _cellnest_state.get("data") if _cellnest_state.get("status") == "done" else None
+        pairs = q.get("pairs") or []
+        pairs = pairs if isinstance(pairs, list) else [pairs]
+        if data is None or not pairs:
+            return none
+        opts = q.get("options") or []
+        color_by = q.get("color_by") or "lr_pair"
+        try:
+            top_n, edge_width = int(q.get("top_n") or 100), float(q.get("edge_width") or 1)
+        except (TypeError, ValueError):
+            top_n, edge_width = 100, 1.0
+        ccc_df = _apply_cellnest_filters(data["ccc_df"], q.get("ligand"), q.get("receptor"),
+                                         q.get("sender"), q.get("receiver"), q.get("annot_col"))
+
+        def _rgb(color):
+            if str(color).startswith("#"):
+                return [int(color[i:i + 2], 16) for i in (1, 3, 5)]
+            return [int(round(float(v))) for v in re.findall(r"[\d.]+", str(color))[:3]]
+
+        palette = qualitative.Plotly
+        lig_cmap = rec_cmap = viridis = None
+        if color_by == "ligand":
+            lig_cmap = {l: palette[i % len(palette)] for i, l in enumerate(sorted(ccc_df["ligand"].unique()))}
+        elif color_by == "receptor":
+            rec_cmap = {r: palette[i % len(palette)] for i, r in enumerate(sorted(ccc_df["receptor"].unique()))}
+        elif color_by == "attention":
+            import plotly.colors as _pc
+            viridis = np.array([_rgb(c) for c in _pc.sample_colorscale("Viridis", list(np.linspace(0, 1, 10)))])
+        seg_xy, seg_rgba, seg_w, ids, n_edges = [], [], [], set(), 0
+        for pi, pair in enumerate(pairs):
+            ligand, receptor = _cellnest_split_pair(pair, ccc_df)
+            sub = ccc_df[(ccc_df["ligand"] == ligand) & (ccc_df["receptor"] == receptor)]
+            sub = sub.nlargest(top_n, "attention_score")
+            if sub.empty:
+                continue
+            n = len(sub)
+            n_edges += n
+            ids.update(sub["from_app_id"].astype(str))
+            ids.update(sub["to_app_id"].astype(str))
+            score = sub["attention_score"].values.astype(float)
+            s01 = (score - score.min()) / ((score.max() - score.min()) or 1.0)
+            if viridis is not None:
+                rgb = viridis[np.minimum(9, (s01 * 10).astype(int))]
+            else:
+                col = palette[pi % len(palette)]
+                if lig_cmap is not None:
+                    col = lig_cmap.get(ligand, col)
+                elif rec_cmap is not None:
+                    col = rec_cmap.get(receptor, col)
+                rgb = np.tile(_rgb(col), (n, 1))
+            width = edge_width * (0.5 + 1.5 * s01) if "edge_weight" in opts else np.full(n, edge_width)
+            a = sub[["from_x", "from_y"]].values.astype(float)
+            b = sub[["to_x", "to_y"]].values.astype(float)
+            # arrowhead: two strokes at the target end, 30 % of the edge long, 25° off it
+            d = (a - b) * 0.3
+            cs, sn = np.cos(np.radians(25)), np.sin(np.radians(25))
+            h1 = b + np.stack([d[:, 0] * cs - d[:, 1] * sn, d[:, 0] * sn + d[:, 1] * cs], axis=1)
+            h2 = b + np.stack([d[:, 0] * cs + d[:, 1] * sn, -d[:, 0] * sn + d[:, 1] * cs], axis=1)
+            for p0, p1, alpha in ((a, b, 102), (b, h1, 178), (b, h2, 178)):   # opacity 0.4 / 0.7
+                seg_xy.append(np.hstack([p0, p1]))
+                seg_rgba.append(np.hstack([rgb, np.full((n, 1), alpha)]))
+                seg_w.append(width)
+        if not seg_xy:
+            return {"n": 0, "edges": 0, "available": True}, {}
+        arrays = {"xy": np.concatenate(seg_xy).astype(np.float32).ravel(),
+                  "rgba": np.concatenate(seg_rgba).astype(np.uint8).ravel(),
+                  "width": np.concatenate(seg_w).astype(np.float32)}
+        gray = "gray_bg" in opts
+        if gray:
+            df, _ = self._frame(args.get("source", "xenium"))
+            arrays["cells"] = np.flatnonzero(df.index.astype(str).isin(ids)).astype(np.uint32)
+        return ({"n": int(len(arrays["width"])), "edges": int(n_edges), "available": True,
+                 "gray": gray}, arrays)
+
+
+class _UmapViewerProvider(_ViewerProvider):
+    """Same cells and colours as the spatial provider, positioned by their UMAP embedding.
+    The viewer's source carries the counts mode as '<seg-source>|corr' so the corrected
+    embedding (split_umap_*) is served when corrected counts are active. Like the Plotly
+    UMAP it shows the primary sample only when extra samples are loaded."""
+
+    _multi_sample = False
+
+    @staticmethod
+    def _split(source):
+        base, _, flag = (source or "xenium").partition("|")
+        return base or "xenium", flag == "corr"
+
+    def _umap_xy(self, source):
+        base, corrected = self._split(source)
+        df, alt = self._frame(base)
+        n = len(df)
+        x = np.full(n, np.nan)
+        y = np.full(n, np.nan)
+        stored = None
+        if alt is not None:
+            # a "Rerun UMAP" result belongs to one run and one counts mode
+            with _umap_reseg_lock:
+                if (_umap_reseg_state.get("status") == "done"
+                        and _umap_reseg_state.get("owner") == alt.get("out_dir")
+                        and (_umap_reseg_state.get("counts_mode", "original") == "corrected") == corrected):
+                    stored = _umap_reseg_state.get("result")
+        cols = None
+        frame = df
+        if stored is not None and "umap_1" in getattr(stored, "columns", []):
+            frame = stored.copy()
+            frame.index = frame.index.astype(str)
+            frame = frame[~frame.index.duplicated()].reindex(df.index.astype(str))
+            cols = ("split_umap_1", "split_umap_2") if (corrected and "split_umap_1" in frame.columns
+                                                         and frame["split_umap_1"].notna().any()) \
+                else ("umap_1", "umap_2")
+        elif corrected and "split_umap_1" in df.columns and df["split_umap_1"].notna().any():
+            cols = ("split_umap_1", "split_umap_2")
+        elif "umap_1" in df.columns and "umap_2" in df.columns:
+            cols = ("umap_1", "umap_2")
+        if cols is not None:
+            x = pd.to_numeric(frame[cols[0]], errors="coerce").to_numpy(dtype=float)
+            y = -pd.to_numeric(frame[cols[1]], errors="coerce").to_numpy(dtype=float)   # viewer y is down
+        return x, y
+
+    @staticmethod
+    def _xy_bounds(x, y):
+        ok = np.isfinite(x) & np.isfinite(y)
+        if not ok.any():
+            return [0.0, 0.0, 1.0, 1.0]
+        return [float(x[ok].min()), float(y[ok].min()), float(x[ok].max()), float(y[ok].max())]
+
+    def data_dir(self):
+        return None            # no tiles, boundaries or images in embedding space
+
+    def image_files(self):
+        return []
+
+    def meta(self):
+        x, y = self._umap_xy("xenium")
+        return {"dataset": _dataset_name(), "dataset_gen": _dataset_gen, "sources": ["xenium"],
+                "bounds": self._xy_bounds(x, y), "pixel_size": 1.0, "has_boundaries": False,
+                "has_transcripts": False, "images": [], "embedding": "umap"}
+
+    def cells(self, source):
+        x, y = self._umap_xy(source)
+        xy = np.empty(2 * len(x), dtype=np.float32)
+        xy[0::2] = x
+        xy[1::2] = y
+        return ({"n": int(len(x)), "bounds": self._xy_bounds(x, y),
+                 "n_embedded": int(np.isfinite(x).sum()),
+                 "token": f"umap:{_dataset_gen}:{_subset_version}:{source}:{len(x)}"}, {"xy": xy})
+
+    def colors(self, args):
+        args = dict(args)
+        base, corrected = self._split(args.get("source"))
+        args["source"] = base
+        return super().colors(args)
+
+    def boundaries(self, source, kind, x0, y0, x1, y1):
+        return {"n": 0, "truncated": False, "available": False}, {}
+
+    def overlays(self, source, args=None):
+        return {"polygons": [], "lines": []}
+
+    def extra(self, name, args):
+        return None
+
+    def cell_at(self, source, index):
+        df, _ = self._frame(self._split(source)[0])
+        if index < 0 or index >= len(df):
+            return {}
+        return {"index": int(index), "id": str(df.index[index])}
+
+
+_viewer_provider = _ViewerProvider()
+try:
+    import xenium_viewer_api as _viewer_api
+    _viewer_api.register(app.server, _viewer_provider)
+    _viewer_api.register(app.server, _UmapViewerProvider(), prefix="/umap")
+except Exception as _viewer_exc:   # the Plotly view keeps working without the WebGL viewer
+    print(f"  WebGL viewer endpoints unavailable: {_viewer_exc}", flush=True)
+
+
 # ─── Health check endpoint (for Cloud Run / load balancers) ──────────────────
 @app.server.route("/health")
 def health():
@@ -13967,4 +17198,6 @@ if __name__ == "__main__":
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
     _port = int(os.environ.get("PORT", 8050))
     print(f"\nXenium Explorer running at http://localhost:{_port}\n", flush=True)
-    app.run(debug=False, host="0.0.0.0", port=_port)
+    # Bind to localhost by default; set HOST=0.0.0.0 to serve other machines (e.g. in a container).
+    _host = os.environ.get("HOST", "127.0.0.1")
+    app.run(debug=False, host=_host, port=_port)

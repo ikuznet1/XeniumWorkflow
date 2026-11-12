@@ -2,9 +2,11 @@
 
 An interactive web application for visualizing and analyzing 10x Genomics Xenium spatial transcriptomics data. Supports cell clustering, gene expression, morphology overlays, cell type annotation, gene imputation, resegmentation, and ambient RNA correction (SPLIT) — all in a browser-based interface.
 
+Works with standard Xenium panels (a few hundred genes) and with **Xenium Prime 5K** output. A GPU-accelerated **WebGL view** (beta) is available alongside the default Plotly view for large datasets; see [WebGL view](#webgl-view-beta).
+
 ## Cloud Run Deployment
 
-The app can be deployed to **Google Cloud Run** for remote access. A `Dockerfile`, `requirements-cloud.txt`, and `.dockerignore` are provided. Detailed step-by-step instructions are in `deployment_instructions.txt`.
+The app can be deployed to **Google Cloud Run** for remote access. The container files (`Dockerfile`, `requirements-cloud.txt`, `.dockerignore`) are **not currently in this repository**; the commands below assume you supply a `Dockerfile` that installs the Python dependencies, copies `xenium_explorer.py`, `xenium_viewer_api.py`, `assets/` and `functions/`, and starts `python xenium_explorer.py`.
 
 **Quick summary:**
 
@@ -23,8 +25,10 @@ gcloud run deploy xenium-explorer \
   --execution-environment gen2 \
   --add-volume name=data-vol,type=cloud-storage,bucket=YOUR_BUCKET \
   --add-volume-mount volume=data-vol,mount-path=/data \
-  --set-env-vars DATA_DIR=/data/output-XETG...
+  --set-env-vars DATA_DIR=/data/output-XETG...,HOST=0.0.0.0
 ```
+
+The server binds to `127.0.0.1` unless `HOST` is set, so a container must set `HOST=0.0.0.0`.
 
 **Env vars** (all optional locally, required or useful on Cloud Run):
 
@@ -33,8 +37,11 @@ gcloud run deploy xenium-explorer \
 | `DATA_DIR` | Path to Xenium output directory (overrides `sys.argv[1]`) |
 | `XENIUM_CACHE_DIR` | Cache root directory (default: `~/.xenium_explorer_cache`) |
 | `PORT` | Server port (default: 8050; Cloud Run sets this automatically) |
+| `HOST` | Bind address (default: `127.0.0.1`; set `0.0.0.0` in a container or to serve other machines) |
+| `XENIUM_ENABLE_REPL` | Enables the in-app Python REPL, which runs arbitrary code. Unset = disabled; `1` = requests from localhost only; `remote` = any client (trusted networks only) |
+| `XENIUM_RENDERER` | Spatial renderer shown at startup: unset = Plotly; `webgl` = the WebGL view (it can also be switched in the app) |
 
-**Cloud Run limitations:** R/Julia/Rust features (Seurat, RCTD, SpaGE, Baysor, Proseg, SPLIT) are unavailable in the slim container image. CellTypist annotation works. See `deployment_instructions.txt` for a full feature comparison and troubleshooting guide.
+**Cloud Run limitations:** R/Julia/Rust features (Seurat, RCTD, SpaGE, Baysor, Proseg, SPLIT) are unavailable in a Python-only container image. CellTypist annotation works.
 
 ---
 
@@ -84,7 +91,15 @@ python xenium_explorer.py [path/to/output-XETG...]
 python xenium_explorer.py          # auto-detects output-* directory
 ```
 
-Opens at **http://localhost:8050**.
+Opens at **http://localhost:8050**. The server listens on localhost only; set `HOST=0.0.0.0` to reach it from another machine (there is no authentication, so do this on trusted networks only).
+
+Useful start-up variants:
+
+```bash
+XENIUM_RENDERER=webgl python xenium_explorer.py <bundle>     # start in the WebGL view
+XENIUM_ENABLE_REPL=1  python xenium_explorer.py <bundle>     # enable the in-app Python REPL
+python xenium_explorer.py path/to/exported.zarr              # open a store written by "Save as SpatialData"
+```
 
 To stop the server:
 ```bash
@@ -93,19 +108,25 @@ lsof -ti:8050 | xargs kill -9
 
 ## Input Data
 
-Expects a standard **10x Genomics Xenium output directory** containing:
+Expects a standard **10x Genomics Xenium output directory**. Only the first three files are required; everything else is used when present.
 
 | File | Description |
 |------|-------------|
 | `experiment.xenium` | Run metadata (tissue type, panel, pixel size, counts) |
 | `cells.parquet` | Cell centroids, transcript counts, cell/nucleus area |
-| `cell_boundaries.parquet` | Cell polygon vertices |
-| `nucleus_boundaries.parquet` | Nucleus polygon vertices |
 | `cell_feature_matrix.h5` | Sparse gene expression matrix (HDF5) |
-| `transcripts.parquet` | Individual transcript coordinates (used by Baysor/Proseg) |
-| `analysis/umap/gene_expression_2_components/projection.csv` | UMAP coordinates *(optional)* |
-| `analysis/clustering/*/clusters.csv` | Cluster assignments, one file per method *(optional)* |
-| `morphology_focus/morphology_focus_ZZZZ.ome.tif` | Fluorescence z-stack images *(optional)* |
+| `cell_boundaries.parquet` | Cell polygon vertices *(optional)* |
+| `nucleus_boundaries.parquet` | Nucleus polygon vertices *(optional)* |
+| `transcripts.parquet` | Individual transcript coordinates (used by Baysor/Proseg) *(optional)* |
+| `analysis/` or `analysis.tar.gz` | UMAP coordinates (`umap/gene_expression_2_components/projection.csv`) and cluster assignments (`clustering/*/clusters.csv`). Read from the folder if extracted, otherwise straight from the archive *(optional)* |
+| `morphology_focus/` | Morphology images, either `morphology_focus_NNNN.ome.tif` or the newer `chNNNN_<stain>.ome.tif` naming; single-channel and multi-file layouts are both supported *(optional)* |
+| `cells.zarr.zip`, `transcripts.zarr.zip` | Tiled boundaries and transcripts written by Xenium Onboard Analysis; used by the WebGL view *(optional)* |
+
+Without clustering the app starts with no cluster sets (Color By falls back to transcript counts); without a UMAP projection the UMAP is empty until "Rerun UMAP" is used.
+
+**Control features.** Only features of type `Gene Expression` are loaded as genes. Negative-control probes and codewords, unassigned and deprecated codewords, and genomic controls are dropped when the store is first built. On a Xenium Prime 5K run this is the difference between 5,006 genes and 13,780 features.
+
+**Processed deposits (e.g. GEO).** Public deposits often contain only a matrix, a per-cell table and transcripts per section. `functions/geo_to_bundle.py` assembles a loadable bundle from those; see [Standalone Functions](#standalone-functions-functions).
 
 ### SpatialData zarr store
 
@@ -116,6 +137,8 @@ The zarr stores:
 - `cell_boundaries` / `nucleus_boundaries` — GeoDataFrame shapes
 
 Images are still read directly from `morphology_focus/` on demand.
+
+A store built before control-feature filtering was added keeps its original feature list and loads unchanged. Deleting and rebuilding it drops the control features, after which older resegmentation, SpaGE and SPLIT caches built against the old gene list no longer line up and should be regenerated.
 
 ## Features
 
@@ -163,6 +186,32 @@ All color modes work on Xenium, Baysor, and Proseg cells after switching the seg
 
 Click the **📏** button in the bottom-right corner of the spatial map to activate measure mode. Click any two cells to display the Euclidean distance between them in µm. The result appears next to the button. Click the button again to exit measure mode. Cell-click-to-select is suppressed while the tool is active.
 
+### WebGL view (beta)
+
+The Plotly view rebuilds and resends every cell on each recolour, which becomes slow as datasets grow. The WebGL view (deck.gl) keeps cell positions on the GPU and asks the server only for what changes: one value per cell on a recolour, and boundaries, transcripts and image tiles for the current viewport.
+
+Switch with the **Plotly / WebGL (beta)** selector at the bottom left of the spatial panel, or start with `XENIUM_RENDERER=webgl`. Plotly remains the default. Switching back rebuilds the Plotly figures.
+
+What it draws:
+
+- **Cells** for every colour mode, on Xenium, Baysor and Proseg sources and under an active subset, with a legend (click an entry to hide that category) or colour bar. The Colorbar Range inputs apply without a server round trip.
+- **UMAP** in the right-hand panel, from the same cells and colours.
+- **Boundaries** for the viewport (zoom in when asked; the limit is 20,000 polygons per view): Xenium cell (cyan) and nucleus (orange) outlines from the bundle's `cells.zarr.zip`, plus Proseg (green) and Baysor (purple) outlines when a run is loaded. Each checkbox works under any segmentation source, as in the Plotly view.
+- **Transcripts** for genes chosen under *Transcripts (WebGL view)* in the sidebar, read from the bundle's tiled `transcripts.zarr.zip`. Full resolution with a Q ≥ 20 filter when zoomed in; 10x's pre-subsampled levels (no quality scores) when zoomed out, reported in the status line.
+- **Morphology images** read in the browser by HTTP range requests from the pyramidal OME-TIFFs and decoded in web workers, with per-channel colour, the brightness slider as a contrast limit, and opacity. No 5,000 µm viewport limit applies.
+- **ROIs**: choose **Lasso** or **Box** next to the renderer selector and draw; the drawn outline itself becomes the ROI (the Plotly view uses the convex hull of the selected cells). Saved ROIs are drawn as labelled outlines.
+- **Click a cell** to fill the cell-info panel, from either the spatial view or the UMAP. Hovering shows the cell id and its value. Double-click a legend entry to isolate that category.
+- **Ruler**: end points snap to a cell centre when one is hit and are free otherwise.
+- **Overlays**: SpatialData ROI and patch outlines, CellNEST edges with their colour and gray-out options, and RCTD weight pies.
+- **Multiple samples** side by side with separators; boundaries, transcripts, image and UMAP remain primary-sample only, as in the Plotly view.
+- **PNG export**: the **PNG** button next to Pan / Lasso / Box downloads the current view at 2× with legend and scale bar.
+
+Differences from the Plotly view: the Z-Level selector is disabled (the WebGL view reads the focus image); CellNEST arrowheads scale with edge length and edges have no hover text; gray-out dims every non-participating cell. CellNEST edges, RCTD pies, multi-sample display and Baysor/Proseg outlines have so far been tested in this view with synthetic inputs only.
+
+Measured on a Xenium Prime 5K run with 112,551 cells: a recolour transfers about 0.45 MB per view and takes a few milliseconds of server time, against 5–7 MB of JSON per Plotly figure and roughly a second of server time.
+
+Requirements and limits: a browser with WebGL2; the feature is new, so fall back to the Plotly view if something looks wrong. The browser bundle is prebuilt in `assets/`; Node.js is needed only to rebuild it (see [Developing the WebGL viewer](#developing-the-webgl-viewer)).
+
 **Layout:**
 - The plots row and the bottom info bar are separated by a **vertical drag handle** — drag it to resize the panels.
 - The bottom info bar can be **fully collapsed** with the ▼ button (the spatial/UMAP plots expand to fill the space). Click ▲ to restore.
@@ -176,8 +225,8 @@ Select any combination of overlays from the checklist in the sidebar:
 - Xenium nuclei boundaries: orange
 - Baysor/Proseg boundaries: their own separate checkboxes; shown for all reseg cells (no viewport limit)
 
-**Morphology Image** — Fluorescence overlay loaded from OME-TIFF tiles for viewports ≤ 5,000 µm wide.
-- Z-levels 0–3
+**Morphology Image** — Fluorescence overlay loaded from OME-TIFF tiles for viewports ≤ 5,000 µm wide (Plotly view; the WebGL view has no such limit). Pyramidal images are read at the resolution level that matches the zoom.
+- Z-levels 0–3 (Plotly view only)
 - Channels (multi-select):
   | Channel | Marker | Color |
   |---------|--------|-------|
@@ -276,6 +325,8 @@ Configure patch parameters, then click **▶ Prepare Patches** to build the Spat
 
 The ROI and patch grid are displayed as overlays on the spatial plot. Click **✓ Patches look good — proceed** to unlock Step 2, or **⏭ Skip — run on full tissue** to bypass patch setup and run directly on the full slide. Use **↺ Re-build** to clear the cache and re-run with different parameters.
 
+The ROI and the patches are saved in the SpatialData cache store together with the settings that produced them (QV filter, patch width, min transcripts/patch). After a restart, **▶ Prepare Patches** with the same settings restores them in a few seconds; with different settings, or for a store written by an earlier version (which has no record of its settings), the patches are computed again.
+
 **Step 2 — Algorithm selection**
 
 Select the algorithm tab (Baysor or Proseg), configure parameters, and click **Run**. Progress appears in the server log.
@@ -305,6 +356,7 @@ Once complete:
 | Parameter | Flag | Default |
 |-----------|------|---------|
 | Spatial region X/Y (µm) | — | full slide |
+| Prior type | — | nucleus boundaries (alternative: cell boundaries) |
 | Initial voxel size (µm) | `--initial-voxel-size` | 4 |
 | Threads | `--nthreads` | all cores |
 | Components | `--ncomponents` | 10 |
@@ -338,6 +390,8 @@ Click **"Annotate Cells"** in the sidebar to open the annotation modal. Three me
 Results are cached to `~/.xenium_explorer_cache/` and load instantly on subsequent runs.
 
 ### SpaGE Gene Imputation
+
+SpaGE is a git submodule (`SpaGE_repo/`). Fetch it once with `git submodule update --init SpaGE_repo`, or set `SPAGE_REPO` to an existing clone of https://github.com/tabdelaal/SpaGE.
 
 Click **"Impute Genes"** in the sidebar to open the SpaGE imputation modal. Imputes expression of genes not in the Xenium panel using a scRNA-seq reference (Seurat RDS).
 
@@ -453,6 +507,8 @@ The entire panel can be collapsed/expanded with the ▼/▲ button.
 
 **Python REPL** — A `>>> ` prompt at the bottom of the log panel accepts any Python expression or statement and executes it in the app's module namespace, with output appearing in the log. Tab-completion and Up/Down arrow history are supported.
 
+The REPL runs arbitrary code on the server, so it is **disabled unless the app is started with `XENIUM_ENABLE_REPL=1`**, and then accepts requests from the same machine only. `XENIUM_ENABLE_REPL=remote` lifts that restriction; use it only on a network you trust.
+
 ```python
 # Examples
 subset(cluster=3)
@@ -487,8 +543,8 @@ All caches are stored in `~/.xenium_explorer_cache/` and are keyed per dataset.
 | `spage_index.json` | Maps dataset paths to most recent SpaGE cache |
 | `morph_overview_{hash}_z{level}.npz` | Pre-downsampled morphology overview (generated on first load) |
 | `spatialdata_{hash}.zarr` | SpatialData Zarr store for sopa-based patch resegmentation |
-| `baysor_{dataset}_{tag}/` | Baysor output per parameter set; includes `params.json` and `spatialdata_baysor.zarr` (contains expression, clusters, UMAP, imputed genes, and `X_corrected` layer after SPLIT) |
-| `proseg_{dataset}_{tag}/` | Proseg output per parameter set; includes `params.json` and `spatialdata_proseg.zarr` (contains expression, clusters, UMAP, imputed genes, and `X_corrected` layer after SPLIT) |
+| `baysor_{dataset}_{tag}/` or `baysor_{dataset}_{datasethash}_{tag}/` | Baysor output per parameter set (new runs include a hash of the dataset path so bundles with the same folder name do not share runs; older directories still load); includes `params.json` and `spatialdata_baysor.zarr` (contains expression, clusters, UMAP, imputed genes, and `X_corrected` layer after SPLIT) |
+| `proseg_{dataset}_{tag}/` or `proseg_{dataset}_{datasethash}_{tag}/` | Proseg output per parameter set (same naming rule); includes `params.json` and `spatialdata_proseg.zarr` (contains expression, clusters, UMAP, imputed genes, and `X_corrected` layer after SPLIT) |
 
 ## Standalone Functions (`functions/`)
 
@@ -649,6 +705,22 @@ Coordinate offsets are printed per dataset. Cell IDs are prefixed with the label
 | `functions/merge_spatialdata.py` | Merge multiple SpatialData zarr stores into one, offsetting coordinates so datasets don't overlap |
 | `functions/export_to_cellnest.py` | Export SpatialData zarr to CellNEST-ready AnnData `.h5ad` |
 | `functions/migrate_baysor_cache.py` | Migrate old-format Baysor cache directories to current zarr format |
+| `functions/geo_to_bundle.py` | Assemble a loadable bundle from a GEO-style deposit (matrix `.h5`, per-cell table, transcripts), from files on disk or by GEO sample accession |
+
+#### `functions/geo_to_bundle.py` — open a GEO deposit
+
+Public Xenium deposits usually hold a few processed files per section rather than the instrument output. This script writes `experiment.xenium`, `cells.parquet` and `cell_feature_matrix.h5` (plus `transcripts.parquet` when deposited) into a directory the app can open. Every extra column of the per-cell table (cell types, patient, group) is kept and appears in the app.
+
+```bash
+# download one sample's files from GEO, then build the bundle
+python functions/geo_to_bundle.py --gsm GSM10012173 --out_dir rv_section/
+python xenium_explorer.py rv_section/
+
+# or from files already on disk (one section per directory)
+python functions/geo_to_bundle.py --input_dir geo_files/ --out_dir rv_section/
+```
+
+The morphology image is skipped unless `--with_image` is given (it is large, and the download is a single stream). The resulting bundle has no boundaries, clustering or UMAP unless the deposit provides them.
 
 ---
 
@@ -679,6 +751,63 @@ See `environment.yml` (conda) or `requirements.txt` (pip) for the full pinned de
 | `spacexr` | `devtools::install_github('dmcable/spacexr')` |
 | `SPLIT` | `remotes::install_github('bdsc-tds/SPLIT')` |
 
+**WebGL viewer:** deck.gl, Viv, geotiff and an OpenJPEG WebAssembly decoder are bundled into `assets/xenium_viewer.js`, `assets/xenium_image_worker.js` and `assets/openjpegwasm_decode.wasm`. Nothing needs installing to use them.
+
 **External CLI tools:**
 - [Baysor](https://github.com/kharchenkolab/Baysor) — Julia-based resegmentation; binary at `~/.julia/bin/baysor`
 - [Proseg](https://github.com/dcjones/proseg) — Rust-based probabilistic resegmentation; `conda install bioconda::rust-proseg` or `cargo install proseg`
+
+
+---
+
+## Developing the WebGL viewer
+
+The viewer source lives in `viewer_src/` and is bundled with esbuild. Node.js is needed only for this.
+
+```bash
+cd viewer_src
+npm install            # once
+npm run build          # writes ../assets/xenium_viewer.js
+
+# standalone server exposing the viewer's data routes over a bundle, with a bare test page
+python viewer_src/dev_server.py /path/to/xenium_bundle 8070     # http://127.0.0.1:8070/
+
+# tests (headless Chromium via Playwright)
+node test/run.mjs                                  # viewer core against dev_server.py
+node image_test/verify.mjs                         # image layer: decode and placement
+node test/app_smoke.mjs http://127.0.0.1:8050 out/ # the real app, started with XENIUM_RENDERER=webgl
+node test/glue_checks.mjs http://127.0.0.1:8050    # renderer switching, selection and image handling in the real app
+```
+
+| Path | Contents |
+|------|----------|
+| `xenium_viewer_api.py` | Binary data routes under `/viewer/*` (cells, colours, boundaries, transcripts, image byte ranges) and the lazy reader over `cells.zarr.zip` / `transcripts.zarr.zip`. The wire format is documented at the top of the file. |
+| `viewer_src/src/` | Viewer core (`index.js`), viewport loader, selection, colour maps |
+| `viewer_src/src/image/` | Morphology image layer: OME-TIFF pyramids, JPEG 2000 decoding in web workers |
+| `assets/xenium_viewer_dash.js` | Glue between the Dash controls and the viewer (not bundled; edit directly) |
+
+The same routes are registered a second time under `/umap/viewer/*` for the UMAP panel.
+
+---
+
+## Changes that affect results (November 2026)
+
+A review of the code base fixed a number of defects. Most are invisible, but these change numbers or outputs relative to earlier versions:
+
+- **Baysor input** is restricted to gene transcripts with Q ≥ 20. Control and unassigned codewords and low-quality transcripts were previously passed through, so new Baysor segmentations and their counts differ.
+- **SPLIT-corrected counts** are aligned to genes by name. `SPLIT::purify()` returns only the genes shared by the panel and the reference; these columns were previously written as the first *n* panel genes, so whenever the reference lacked a panel gene every later gene was mislabelled and the last columns were zero. Any `X_corrected` layer, corrected export or RDS produced with such a reference (in the app or with `functions/run_split.py`) must be regenerated. A quick test: the alphabetically last panel genes are all zero in an affected matrix.
+- **Proseg input** is restricted to gene transcripts with Q ≥ 20, like Baysor. Low-quality transcripts are dropped with `--min-qv 20` (the `--xenium` preset of Proseg 1.1.9 applies no quality filter), and control, unassigned and deprecated codewords are removed from the input before Proseg reads it (Proseg has no option to exclude features; they were previously used for the segmentation and only left out of the count matrix). A whole-slide run therefore writes a filtered temporary copy of `transcripts.parquet` into the run's cache directory and deletes it afterwards. Cached Proseg runs made earlier still contain these transcripts. Proseg's own default of ignoring transcripts more than 60 µm from any nucleus (`--max-transcript-nucleus-distance`) is unchanged.
+- **Proseg prior "None (unsupervised)"** was removed. Proseg 1.1.9 cannot run without an initial segmentation and stopped with a missing-argument error. A browser session that still holds this value runs with the default nucleus prior and shares that run's cache entry.
+- **Annotation and new resegmentation runs** use measured panel genes only; after a SpaGE write-back, imputed columns were being treated as counts.
+- **Reloading a patch run from cache** without its fast-load files returns the same cells as the live run rather than including overlap duplicates.
+- **Patch-based Baysor/Proseg** keeps a cell whose centroid lies in the overlap between two patches once instead of twice, so patch runs yield fewer cells.
+- **Seam duplicates in patch runs** are removed. Two neighbouring patches segment their shared strip independently, so one cell could still be kept from both when its two centroids fell on either side of the dividing line. After the centroid rule, cells of different patches near such a line are now compared: when two polygons overlap by more than 50% of the smaller one's area, or the centroids are closer than 1.5 µm, only the cell lying deeper inside its own patch is kept (ties: more transcripts). In a 4-patch test region this removed 7 of 1,423 Proseg cells and 8 of 3,474 Baysor cells. The rule is recorded in the run's `params.json`, so reloading from cache gives the same cells. Cached patch runs made earlier are loaded unchanged and still contain these duplicates; re-run them to remove the duplicates.
+- **Prepare Patches after a restart** restores the tissue ROI and the patches from the SpatialData cache store when QV filter, patch width and min transcripts/patch are the ones they were made with (seconds instead of about 10 minutes on a 74-million-transcript slide). A store written by an earlier version has no record of these settings; its patches are computed once more and recorded.
+- **Co-occurrence** scores are 1 higher in log2: the expected count was being doubled, so random mixing now reads about 0 rather than about −1.
+- **Interaction graph and chord diagram** no longer double-count same-type pairs; edge widths and same-type O/E values change.
+- **Rerun UMAP** acts on the segmentation selected in the dropdown. For Baysor/Proseg, a UMAP computed on corrected counts is stored as `split_umap_1/2` and no longer overwrites `umap_1/2`.
+- **SpaGE-imputed genes** are written back into the store and displayed as log1p, like measured genes.
+- **Multi-nucleus cells** are drawn as one outline per nucleus.
+- **RCTD multi mode** returns the first listed type per cell (it previously returned no labels).
+- **ROI set operations** store the exact resulting outline instead of its convex hull.
+- **Load Sample** is refused while a background job is running.

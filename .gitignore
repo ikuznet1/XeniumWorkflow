@@ -10,3 +10,12 @@ XeniumSegmentation.py
 CLAUDE.md
 Post_R3_FINAL_with_counts.rds
 output-XETG00217__0038213__Region_1__20241206__182124
+
+# Viewer build
+viewer_src/node_modules/
+__pycache__/
+
+# Viewer test output
+viewer_src/image_test/out/
+viewer_src/image_test/dist/
+viewer_src/**/*.png

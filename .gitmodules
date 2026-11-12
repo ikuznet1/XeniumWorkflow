@@ -1,0 +1,3 @@
+[submodule "SpaGE_repo"]
+	path = SpaGE_repo
+	url = https://github.com/tabdelaal/SpaGE.git
