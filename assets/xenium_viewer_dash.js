@@ -640,7 +640,7 @@
     toggles = toggles || [];
     var has = function (k) { return toggles.indexOf(k) >= 0; };
     var dataVersion = [datasetVer, subsetVer, baysorDone, prosegDone, source, extraVer || 0].join("|");
-    var colorVersion = [dataVersion, annotDone, spageDone, splitDone, roiDone, nicheDone].join("|");
+    var colorVersion = [dataVersion, annotDone, spageDone, splitDone, roiDone, nicheDone, an.gsVersion].join("|");
     var colormap = COLORMAPS[colorBy] || "viridis";
 
     v.setState({
@@ -662,6 +662,7 @@
       boundaries: { cell: has("cell"), nucleus: has("nucleus"), baysor: has("baysor"), proseg: has("proseg") },
       transcripts: { genes: tool === "xenium" ? (txGenes || []) : [], qv: 20, size: 2 },
       tool: tool_ || "pan",
+      density: densityState(),
     });
     // The lasso highlight and the pending outline go when the Save ROI dialog closes (save,
     // cancel or dismissed), when the ROI set changes, or when a new outline is started.
@@ -738,6 +739,34 @@
     return window.dash_clientside.no_update;
   }
 
+  // Third callback: the transcript-density heat layer (density-store) and the version of
+  // the saved gene sets (a rescored set must be fetched again although Color By is unchanged).
+  var an = { density: null, gsVersion: 0 };
+  function densityState() {
+    var d = an.density || {};
+    return {
+      on: !!(d.on && d.gene), gene: d.gene || null, bin: d.bin || 10,
+      opacity: d.opacity === undefined || d.opacity === null ? 0.7 : d.opacity,
+      max: d.max === undefined || d.max === null || d.max === "" ? null : Number(d.max),
+      version: d.version || 0,
+    };
+  }
+  function analysis(mode, density, gsVersion) {
+    var gsChanged = (gsVersion || 0) !== an.gsVersion;
+    an.density = density || null;
+    an.gsVersion = gsVersion || 0;
+    if (mode === "webgl" && viewer && lastMode === "webgl") {
+      viewer.setState({ density: densityState() });
+      if (gsChanged && cur.colorVersion) {
+        var cv = cur.colorVersion.split("|").slice(0, -1).concat([an.gsVersion]).join("|");
+        cur.colorVersion = cv;
+        viewer.setState({ color: { version: cv } });
+        if (umapViewer) umapViewer.setState({ color: { version: cv } });
+      }
+    }
+    return window.dash_clientside.no_update;
+  }
+
   // "PNG" button: the current view at twice the on-screen resolution, with legend and scale
   // bar. Raster only; a vector figure needs the Plotly renderer (its camera button saves SVG).
   function exportPng() {
@@ -759,6 +788,6 @@
   }
 
   window.dash_clientside = Object.assign({}, window.dash_clientside, {
-    xenium_viewer: { sync: sync, extras: extras, exportPng: exportPng },
+    xenium_viewer: { sync: sync, extras: extras, exportPng: exportPng, analysis: analysis },
   });
 })();

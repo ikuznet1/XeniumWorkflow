@@ -254,8 +254,64 @@ The right-side panel contains additional analysis plots, each in its own tab:
 | **Niche UMAP** | UMAP (or spatial map) colored by spatial niche | W × H; download |
 | **UMAP** | UMAP plot (alternative to sidebar toggle) | W × H; download |
 | **CellNEST CCC** | Cell-cell communication from CellNEST output | See below |
+| **Differential Expression** | Wilcoxon test between two groups of cells: volcano plot and sortable table | See [Differential expression](#differential-expression) |
+| **Gene Sets** | Paste a gene list, score every cell, colour the views by the score | See [Gene-set scores](#gene-set-scores) |
+| **Transcript Density** | Binned 2-D density of the transcripts of a gene as a heat layer under the cells | See [Transcript density](#transcript-density) |
 
 A **download button** (camera icon) appears on hover over each plot; exports as SVG at the current display size.
+
+### Differential expression
+
+**Plots panel → Differential Expression.** Compares the expression of every measured gene between two groups of cells of the active view.
+
+1. Pick **A** and **B**. A group can be:
+   - **Current selection** — the last lasso or box drawn on the tissue, in either renderer (all cells whose centroid lies inside the outline). The Save ROI dialog that a lasso opens can be cancelled; the selection stays available here.
+   - **Group: …** — a selection saved in this tab (type a name, press **Save current selection as group**). Saved groups are outlines, kept per dataset in the cache directory (`de_groups_{hash}.json`), so they also apply to another segmentation of the same tissue. **Delete group in A** removes one.
+   - **ROI: …** — a saved ROI.
+   - **Cluster …** — a cluster of the cluster set selected in the sidebar (for a Baysor/Proseg run: its KMeans clusters; with several samples: per sample, `S0:C3`).
+   - **Cell type (…): …** — a label of the annotation shown under Color By, else of the first annotation available for the active segmentation.
+   - **All other cells** — every cell of the view that is not in the other group.
+2. Press **Run**. The job appears in the Jobs panel and can be cancelled. The status line gives the two group sizes, the number of genes tested and the number with FDR < 0.05.
+3. **Volcano plot**: log2 fold change (A / B) against −log10 FDR; genes with FDR < 0.05 and |log2FC| ≥ 0.5 are coloured (red: higher in A, blue: higher in B) and the strongest are labelled. **Click a point** (or a table row) to select that gene in the sidebar. **Table**: sortable and filterable per column; **Download CSV** saves all genes with a header line describing the comparison.
+
+**Statistics**
+
+- Expression is `log1p(count / library size × 10,000)`, where the library size is the cell's total count over the measured panel genes in the active counts mode.
+- Test: two-sided Wilcoxon rank-sum (Mann–Whitney U) per gene, normal approximation with tie correction and continuity correction. The implementation ranks only the non-zero values of the sparse matrix (all zeros of a gene share one average rank) and is numerically identical to `scipy.stats.mannwhitneyu(method="asymptotic")`; `scanpy.tl.rank_genes_groups(method="wilcoxon", tie_correct=True)` gives the same statistic without the continuity correction.
+- `log2FC = log2((mean_A + 1) / (mean_B + 1))` of the group means of the normalised (not log-transformed) values, i.e. counts per 10,000 with a pseudocount of 1 (the Seurat definition). `% A` / `% B`: percentage of cells with at least one count.
+- FDR: Benjamini–Hochberg over all tested genes.
+- The test respects the **active segmentation**, the **Active Counts** mode (original or SPLIT-corrected) and an active **subset**. **Imputed genes are not tested**: their values are not counts.
+- Groups under **10 cells** are refused. Cells that are in both groups are **removed from B**; the status line says how many.
+
+**Caveats — read before quoting a p-value**
+
+- **Every cell is treated as an independent observation.** Cells of one tissue section are not independent, and with hundreds of thousands of cells almost every gene reaches a tiny p-value; rank genes by effect size (log2FC, % expressing) as well.
+- **Comparisons across samples or replicates** (several samples loaded side by side, or groups that coincide with samples) are **anticonservative**: the variation between samples is ignored. The proper analysis there is a **pseudobulk** test with samples as replicates (e.g. DESeq2 / edgeR on per-sample sums). With several samples loaded the app pools their cells and says so in the status line.
+- **Groups defined from the same expression data** (clusters) are selected to differ, so their p-values are inflated as well ("double dipping").
+- Fold changes of spatial groups also reflect differences in cell-type composition between the regions.
+
+### Gene-set scores
+
+**Plots panel → Gene Sets.** Paste gene names (one per line, or separated by commas / semicolons / spaces), give the set a name and press **Save & score**. The set is saved per dataset in the cache directory (`genesets_{hash}.json`) and appears under **Saved** in the tab and as **Gene set: <name>** under Color By, which is switched to it when the score is ready. **Delete** removes the selected set.
+
+- Names are matched to the measured panel genes exactly, else ignoring case. Genes that are **not found are listed** in the status line; a set with **fewer than 2** genes found is refused. Imputed genes are not used.
+- **Score** per cell = mean of the z-scored log-normalised expression of the set genes − mean of the z-scored expression of a **control set**. Expression is `log1p(count / library size × 10,000)`. As in Seurat `AddModuleScore` / `scanpy.tl.score_genes`, all measured genes are ranked by mean expression and cut into 25 bins, and for every bin that holds a set gene 50 control genes are drawn from that bin (fixed seed, set genes excluded), so the control matches the set's expression level. Unlike those two, each gene is first standardised over the cells of the view (mean 0, sd 1), so that the highest-expressed genes of a set do not dominate its mean; genes without any variance are left out and reported.
+- A score of 0 means "as expected for genes of this expression level"; the views use a **diverging colour scale centred at 0** (blue below, red above) in the spatial view and the UMAP of both renderers. The sidebar **Min / Max** inputs override either end.
+- The score is computed for the **active view** — segmentation, counts mode, subset and, for the Xenium source, all loaded samples together (genes are standardised over all of them) — and recomputed when one of these changes (a fraction of a second to a few seconds).
+- Agreement with scanpy (Prime 5K skin, 112,551 cells): identical scores when both use the same control genes (r = 1.000 without z-scoring); with each implementation's own random draw of control genes r ≈ 0.91–0.99 depending on the set, and r ≈ 0.85–0.96 for the z-scored default.
+
+### Transcript density
+
+**Plots panel → Transcript Density.** Shows where the **transcripts** of a gene (or of all genes) lie, independent of any cell segmentation: a 2-D grid of transcript counts drawn as a heat layer **under the cells**, in both renderers.
+
+1. Pick a gene, or **All genes**, and press **Compute**. The app reads `transcripts.parquet` once for that gene (a registered, cancellable job with progress) and stores the grid in the cache directory; afterwards the gene is available immediately.
+2. **Bin (µm)**: 5, 10, 20 or 50. **Show heat layer**, **Opacity** and **Colour max** control the layer; lowering the sidebar's point opacity makes it easier to see under the cells. The colour bar gives transcripts per bin (0 – the 99.5th percentile of the non-empty bins unless a maximum is entered); empty bins are transparent.
+
+- Transcripts are filtered like the cell-feature matrix: **Q ≥ 20, gene features only** (no control probes or codewords, blank / unassigned / deprecated codewords). The sum of a gene's grid equals the number of its transcripts that pass this filter — including transcripts outside every cell, so it can exceed the gene's total in the count matrix.
+- Bin *i* covers `[i × bin, (i + 1) × bin)` µm from the slide origin in x and in y. Grids are stored at 5 µm; the coarser bin sizes are exact sums of those bins.
+- The parquet file is read one row group at a time with the filter pushed down and two columns decoded (bundles without `transcripts.parquet`: the full-resolution tiles of `transcripts.zarr.zip`), so memory does not grow with the number of transcripts. On the Prime 5K skin bundle (74 M transcripts) a gene takes about 2 s and all genes about 3 s.
+- Only the bins of the current viewport are sent to the browser. When the viewport holds more bins than can be drawn (zoomed out on a large slide at a small bin size) neighbouring bins are **averaged** (not summed), so the values stay "transcripts per bin" and the colours do not change with the zoom; zooming in shows the bins themselves.
+- The layer does not depend on the segmentation, the counts mode or a cell subset. With several samples loaded it shows the primary sample only. It needs the Xenium output directory (not available for a dataset opened from a bare `.zarr`).
 
 ### CellNEST Cell-Cell Communication
 
@@ -582,6 +638,9 @@ All caches are stored in `~/.xenium_explorer_cache/` and are keyed per dataset.
 | `proseg_{dataset}_{tag}/` or `proseg_{dataset}_{datasethash}_{tag}/` | Proseg output per parameter set (same naming rule); includes `params.json` and `spatialdata_proseg.zarr` (contains expression, clusters, UMAP, imputed genes, and `X_corrected` layer after SPLIT) |
 | `baysor_…_{tag}.partial/`, `proseg_…_{tag}.partial/` | Working directory of a Baysor/Proseg run in progress; renamed to the run directory when the run is complete, removed when it fails or is cancelled (one left behind by a killed app is removed by the next run with the same parameters or by Clean Cache) |
 | `cellnest_db/` | Ligand-receptor / signalling database files used by the CellNEST tab |
+| `genesets_{hash}.json` | Gene sets saved in the Gene Sets tab (per dataset) |
+| `de_groups_{hash}.json` | Cell groups (outlines) saved in the Differential Expression tab (per dataset) |
+| `density_{hash}/{gene}__b5um__qv20_genes_v1.npz` | Transcript-density grid of one gene (non-empty 5 µm bins); the name carries the bin size and the version of the transcript filter |
 
 The cache root is `~/.xenium_explorer_cache/` unless `XENIUM_CACHE_DIR` is set; every cache above, including `cellnest_db/`, follows it.
 
@@ -817,6 +876,7 @@ node image_test/verify.mjs                         # image layer: decode and pla
 node test/app_smoke.mjs http://127.0.0.1:8050 out/ # the real app, started with XENIUM_RENDERER=webgl
 node test/glue_checks.mjs http://127.0.0.1:8050    # renderer switching, selection and image handling in the real app
 node test/jobs_panel.mjs http://127.0.0.1:8050 out/ # jobs panel: starts Proseg on cached patches, checks progress, clicks Cancel
+node test/analysis_checks.mjs http://127.0.0.1:8050 out/ # Differential Expression / Gene Sets / Transcript Density tabs in both renderers (lasso → groups → test → gene set → density)
 node test/webgl_fallback.mjs http://127.0.0.1:8050 # automatic fallback to Plotly without WebGL2 (browsers started with WebGL disabled)
 node test/real_results.mjs                         # WebGL against Plotly on real Baysor/Proseg/RCTD/SPLIT/SpaGE results; starts its own app (paths: see the top of the file)
 ```
@@ -857,6 +917,7 @@ A review of the code base fixed a number of defects. Most are invisible, but the
 - **Color by Cluster on a Proseg run loaded from cache** shows the app's KMeans clusters (`cluster_kmeans_10`), as on a run just made. Cache rebuilds had copied Proseg's own `cluster`, `fov` and `centroid_z` columns into the run, and that `cluster` column (Proseg's internal component, a single value in the test runs) was then used for colouring and for `subset(cluster=…)`. Stores that already contain these columns are read without them.
 - **Proseg "Skip — run on full tissue"** now gives one run over the whole region. Once patches existed in a session every Proseg run was patch-based whatever was chosen; the same choice also overrides Baysor's "Use patch-based segmentation" box. Runs made with patches say so in their dropdown label.
 - **Multi-part Proseg cells** keep the part with the largest area as their outline; the part with the most vertices was kept before, which for a few cells per thousand was a small fragment. Outlines, exported shapes and the seam de-duplication of patch runs change for those cells.
+- **Proseg `transcript_counts`** is the row sum of the run's expression matrix. It used to be Proseg's own `population` column (the last state of its sampler), while the matrix is built from the consensus transcript assignment, so the two differed by a transcript or two for some cells. A run loaded from an older cache is corrected on load (and in its zarr store). Filters on transcript counts (`subset(min_transcripts=…)`) can therefore keep or drop a few borderline cells differently than before.
 - **Baysor prior on bundles with integer cell ids**: `-1` / `0` (unassigned) is no longer handed to Baysor as one large prior cell.
 - **Runs with fewer than 4 cells**, or runs whose clustering fails, are kept with all cells in cluster 1 and no UMAP instead of being reported as failed and becoming impossible to load from cache.
 - **A cached run that fails to load** no longer leaves the previously loaded run of the same tool displayed under the newly selected name: the old result is dropped when the new one is selected, and on failure the Segmentation dropdown returns to Xenium.

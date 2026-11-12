@@ -1,10 +1,10 @@
 // Xenium spatial viewer core (deck.gl 9, framework-free).
 // The bundle only defines window.XeniumViewer; nothing touches the DOM until mount().
 import {Deck, OrthographicView} from '@deck.gl/core';
-import {ScatterplotLayer, PathLayer, PolygonLayer, LineLayer} from '@deck.gl/layers';
+import {ScatterplotLayer, PathLayer, PolygonLayer, LineLayer, BitmapLayer} from '@deck.gl/layers';
 import {parseBin, packBin} from './wire.js';
 import {
-  colormapCss, dimUnselected, fillCategorical, fillContinuous, fillUniform, hexToRgb,
+  colormapCss, dimUnselected, fillCategorical, fillContinuous, fillDensity, fillUniform, hexToRgb,
   MISSING_RGB, TX_PALETTE,
 } from './colormap.js';
 import {pointsInPolygon, PointGrid} from './spatial.js';
@@ -16,7 +16,7 @@ const RETRY_MS = 2000; // delay before a failed cells load is retried
 const CELLS_RETRIES = 2; // automatic retries; after that the next state change retries
 const HOVER_ID_MS = 200; // hover dwell before the cell id is looked up
 const CELL_RADIUS_UM = 3; // world-space radius; clamped in pixels by pointSize (see _cellsLayer)
-const NESTED = ['color', 'boundaries', 'transcripts', 'overlays'];
+const NESTED = ['color', 'boundaries', 'transcripts', 'overlays', 'density'];
 // One polygon set per kind, each with its own toggle; colours as in the Plotly view.
 // 'cell' / 'nucleus' are always the original Xenium sets, whatever state.source is.
 const BOUNDARY_STYLE = {
@@ -88,6 +88,9 @@ function defaultState() {
     opacity: 0.8,
     boundaries: {cell: false, nucleus: false, proseg: false, baysor: false},
     transcripts: {genes: [], qv: 20, size: 2},
+    // heat layer of binned transcripts under the cells: one gene ('__all__': every gene),
+    // bin size in µm, colour maximum (null: the server's default), version (cache buster)
+    density: {on: false, gene: null, bin: 10, opacity: 0.7, max: null, version: 0},
     tool: 'pan',
     selected: null,
     overlays: {polygons: [], lines: [], points: []},
@@ -131,7 +134,7 @@ class Viewer {
       (url, signal) => this._fetchBin(url, signal),
       () => this._onRegionChange(name)
     );
-    this._loaders = {tx: mkLoader('tx')};
+    this._loaders = {tx: mkLoader('tx'), density: mkLoader('density')};
     for (const kind of BOUNDARY_KINDS) this._loaders[kind] = mkLoader(kind);
 
     this.deck = new Deck({
@@ -298,6 +301,7 @@ class Viewer {
       color: {...s.color},
       boundaries: {...s.boundaries},
       transcripts: {...s.transcripts},
+      density: {...s.density},
       overlays: {...s.overlays},
       hiddenCategories: s.hiddenCategories.slice(),
     };
@@ -382,8 +386,9 @@ class Viewer {
       this._cancelShape();
     }
     if (has('transcripts')) this._dirty.tx = true;
-    if (has('boundaries') || has('transcripts') || has('source') || has('dataVersion')) this._updateRegions();
-    if (has('transcripts')) this._buildLegend();
+    if (has('density')) this._dirty.density = true;
+    if (has('boundaries') || has('transcripts') || has('density') || has('source') || has('dataVersion')) this._updateRegions();
+    if (has('transcripts') || has('density')) this._buildLegend();
     this._render();
   }
 
@@ -665,6 +670,14 @@ class Viewer {
         x0: b[0], y0: b[1], x1: b[2], y1: b[3], genes: genes.join(','), qv: s.transcripts.qv,
       }),
     });
+    const dn = s.density;
+    this._loaders.density.update(vp, {
+      enabled: !!(dn.on && dn.gene),
+      key: `${s.dataVersion}|${dn.gene}|${dn.bin}|${dn.version}`,
+      url: (b) => this._url('/viewer/extra/density.bin', {
+        gene: dn.gene, bin: dn.bin, x0: b[0], y0: b[1], x1: b[2], y1: b[3],
+      }),
+    });
   }
 
   _onRegionChange(name) {
@@ -672,6 +685,19 @@ class Viewer {
     const L = this._loaders[name];
     this._dirty[name] = true;
     let text = null;
+    if (name === 'density') {
+      if (L.active) {
+        const h = L.info;
+        if (L.error) text = `failed to load transcript density: ${L.error}`;
+        else if (L.loading && !L.data) text = 'loading transcript density…';
+        else if (h && h.available === false) text = 'transcript density not available';
+        else if (h && h.ready === false) text = 'transcript density not computed yet';
+      }
+      this._setStatus(name, text);
+      this._buildLegend();
+      this._render();
+      return;
+    }
     const what = name === 'tx' ? 'transcripts' : BOUNDARY_STYLE[name].label;
     if (L.active) {
       const h = L.info;
@@ -758,6 +784,44 @@ class Viewer {
     });
   }
 
+  /** Colour maximum of the density layer: the state's, else the server's default. */
+  _densityMax() {
+    const d = this._loaders.density.data;
+    const m = this.state.density.max;
+    return Number.isFinite(m) && m > 0 ? m : (d && d.header.vmax) || 1;
+  }
+
+  /** The density response on screen, or null (off, not computed, empty). */
+  _densityData() {
+    const d = this._loaders.density.data;
+    if (!this.state.density.on || !d || !d.header.ready || !d.header.w || !d.header.h || !d.arrays.values) return null;
+    return d;
+  }
+
+  _densityLayer() {
+    const d = this._densityData();
+    if (!d) return null;
+    const {w, h, x0, y0, cell} = d.header;
+    const vmax = this._densityMax();
+    if (!d.image || d.imageMax !== vmax) {
+      // one texel per value; rebuilt only when the data or the colour maximum changes
+      const rgba = new Uint8ClampedArray(4 * w * h);
+      fillDensity(rgba, d.arrays.values, w * h, vmax, 'magma');
+      d.image = new ImageData(rgba, w, h);
+      d.imageMax = vmax;
+    }
+    const op = +this.state.density.opacity;
+    return new BitmapLayer({
+      id: 'xv-density',
+      image: d.image,
+      // [left, bottom, right, top] in µm; row 0 of the grid is the smallest y (top of the view)
+      bounds: [x0, y0 + h * cell, x0 + w * cell, y0],
+      opacity: Number.isFinite(op) ? Math.max(0, Math.min(1, op)) : 0.7,
+      textureParameters: {minFilter: 'nearest', magFilter: 'nearest'},
+      pickable: false,
+    });
+  }
+
   _overlayLayers() {
     const o = this.state.overlays || {};
     const out = [];
@@ -814,6 +878,7 @@ class Viewer {
     if (D.cells) L.cells = this._cellsLayer();
     for (const kind of BOUNDARY_KINDS) if (D[kind]) L[kind] = this._boundaryLayer(kind);
     if (D.tx) L.tx = this._txLayer();
+    if (D.density) L.density = this._densityLayer();
     if (D.overlays) L.overlays = this._overlayLayers();
     this._dirty = {};
     let extra = [];
@@ -824,7 +889,7 @@ class Viewer {
         console.error('[XeniumViewer] extra layers', err);
       }
     }
-    const layers = [...extra, L.cells, L.nucleus, L.cell, L.proseg, L.baysor, L.tx, ...(L.overlays || [])].filter(Boolean);
+    const layers = [...extra, L.density, L.cells, L.nucleus, L.cell, L.proseg, L.baysor, L.tx, ...(L.overlays || [])].filter(Boolean);
     this.deck.setProps({layers, viewState: this.viewState});
   }
 
@@ -920,6 +985,19 @@ class Viewer {
       legend.appendChild(box);
       this._legendKey = col.key;
       if (keep && keep.key === col.key) list.scrollTop = keep.top;
+    }
+    const dens = this._densityData();
+    if (dens) {
+      const box = el('div', 'xv-box');
+      box.dataset.kind = 'density';
+      box.appendChild(el('div', 'xv-title', dens.header.label || 'Transcript density'));
+      const bar = el('div', 'xv-bar');
+      bar.style.background = colormapCss('magma');
+      box.appendChild(bar);
+      const range = el('div', 'xv-range');
+      range.append(el('span', 'xv-min', '0'), el('span', 'xv-max', fmt(this._densityMax())));
+      box.appendChild(range);
+      legend.appendChild(box);
     }
     const genes = (this.state.transcripts.genes || []).filter(Boolean);
     if (genes.length) {
@@ -1291,6 +1369,8 @@ class Viewer {
       });
       boxes.push({title: col.header.label || '', rows});
     }
+    const dens = this._densityData();
+    if (dens) boxes.push({title: dens.header.label || 'Transcript density', range: [0, this._densityMax()], cmap: 'magma'});
     const genes = (this.state.transcripts.genes || []).filter(Boolean);
     if (genes.length) {
       boxes.push({title: this._txTitle(), rows: genes.map((name, i) => ({name, color: TX_PALETTE[i % TX_PALETTE.length]}))});
@@ -1317,7 +1397,7 @@ class Viewer {
       if (box.range) {
         const n = 32, vals = new Float32Array(n), rgba = new Uint8Array(4 * n);
         for (let i = 0; i < n; i++) vals[i] = i / (n - 1);
-        fillContinuous(rgba, vals, n, 0, 1, this._colormap());
+        fillContinuous(rgba, vals, n, 0, 1, box.cmap || this._colormap());
         const grad = g.createLinearGradient(x + PAD, 0, x + W - PAD, 0);
         for (let i = 0; i < n; i++) grad.addColorStop(i / (n - 1), `rgb(${rgba[4 * i]},${rgba[4 * i + 1]},${rgba[4 * i + 2]})`);
         g.fillStyle = grad;
@@ -1438,6 +1518,6 @@ if (typeof window !== 'undefined') {
     util: {parseBin, packBin, pointsInPolygon},
     // The layer classes of THIS bundle's deck.gl copy, for building setExtraLayers() layers.
     // Layers created from another copy of deck.gl must not be mixed in.
-    layers: {ScatterplotLayer, PathLayer, PolygonLayer, LineLayer},
+    layers: {ScatterplotLayer, PathLayer, PolygonLayer, LineLayer, BitmapLayer},
   };
 }

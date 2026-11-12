@@ -31,7 +31,7 @@ BUNDLE_ENV = ["XENIUM_TEST_BUNDLE_SKIN", "XENIUM_TEST_BUNDLE_GEO", "XENIUM_TEST_
 # patching take tens of minutes on a whole 5K slide.
 MODULES = ["test_app_data.py", "test_viewer_store.py", "test_figures.py", "test_viewer_endpoints.py",
            "test_subset.py", "test_roi.py", "test_spatial_analysis.py", "test_save_sdata.py",
-           "test_cache_and_jobs.py"]
+           "test_cache_and_jobs.py", "test_analysis.py"]
 
 
 @pytest.mark.parametrize("var", BUNDLE_ENV)

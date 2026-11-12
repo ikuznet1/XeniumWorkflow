@@ -10,6 +10,9 @@ const STOPS = {
     '#fe9f6d', '#fecf92', '#fcfdbf'],
   cividis: ['#00224e', '#083370', '#35456c', '#4f576c', '#666970', '#7d7c78', '#948e77', '#aea371',
     '#c8b866', '#e5cf52', '#fee838'],
+  // diverging (ColorBrewer RdBu reversed: low blue, middle white, high red), for values centred at 0
+  rdbu: ['#053061', '#2166ac', '#4393c3', '#92c5de', '#d1e5f0', '#f7f7f7', '#fddbc7', '#f4a582',
+    '#d6604d', '#b2182b', '#67001f'],
 };
 
 export const MISSING_RGB = [128, 128, 128];
@@ -96,6 +99,27 @@ export function fillCategorical(rgba, codes, n, colors, hiddenMask) {
   for (let i = 0; i < n; i++) {
     const c = codes[i];
     out[i] = c < k ? pal[c] : missing;
+  }
+}
+
+/**
+ * RGBA image of a density grid: values in (0, max] through `cmap`, 0 / NaN transparent.
+ * @param {Uint8ClampedArray|Uint8Array} rgba 4n bytes
+ */
+export function fillDensity(rgba, values, n, max, cmap = 'magma') {
+  const out = new Uint32Array(rgba.buffer, rgba.byteOffset, n);
+  const lut = colormapLut(cmap);
+  const lut32 = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) lut32[i] = pack(lut[i * 3], lut[i * 3 + 1], lut[i * 3 + 2], 255);
+  const k = max > 0 ? 255.999 / max : 0;
+  for (let i = 0; i < n; i++) {
+    const v = values[i];
+    if (!(v > 0)) {
+      out[i] = 0;
+    } else {
+      const t = v * k;
+      out[i] = lut32[t >= 255 ? 255 : t | 0];
+    }
   }
 }
 
