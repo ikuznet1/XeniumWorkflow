@@ -1,0 +1,85 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Xenium viewer dev harness</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0d1117; color: #e6edf3; font: 12px sans-serif; }
+  #viewer { position: absolute; inset: 0; }
+  #panel { position: absolute; left: 8px; top: 8px; z-index: 10; background: rgba(13,17,23,.85);
+           border: 1px solid #333; border-radius: 6px; padding: 8px; width: 230px; }
+  #panel label { display: block; margin: 4px 0; }
+  #panel input[type=text], #panel select { width: 100%; box-sizing: border-box; }
+  #panel button.on { background: #2f81f7; color: #fff; }
+  #status { color: #f0b429; min-height: 1.2em; margin-top: 4px; }
+  #log { height: 120px; overflow: auto; font: 10px monospace; white-space: pre; border-top: 1px solid #333; margin-top: 6px; }
+</style>
+</head>
+<body>
+<div id="viewer"></div>
+<div id="panel">
+  <label>Colour by <select id="mode"></select></label>
+  <label>Gene <input type="text" id="gene" value="EEF1G"></label>
+  <label><input type="checkbox" id="b-cell"> cell boundaries</label>
+  <label><input type="checkbox" id="b-nucleus"> nucleus boundaries</label>
+  <label>Transcript genes (comma separated) <input type="text" id="tx" placeholder="POSTN,LDHA"></label>
+  <label>Point size <input type="range" id="size" min="1" max="10" step="0.5" value="3"></label>
+  <label>Opacity <input type="range" id="opacity" min="0.1" max="1" step="0.05" value="0.8"></label>
+  <div>
+    <button data-tool="pan" class="on">pan</button>
+    <button data-tool="lasso">lasso</button>
+    <button data-tool="rect">rect</button>
+    <button id="fit">fit</button>
+    <button id="clear">clear sel</button>
+  </div>
+  <div id="status"></div>
+  <div id="log"></div>
+</div>
+<script src="assets/xenium_viewer.js"></script>
+<script>
+  const $ = (id) => document.getElementById(id);
+  const events = (window.events = []);   // every callback, for tests
+  const log = (kind, payload) => {
+    events.push({kind, payload});
+    let text = payload;
+    if (kind === 'select') text = {n: payload.indices.length, polygonVertices: payload.polygon.length};
+    $('log').textContent = `${kind} ${JSON.stringify(text)}\n` + $('log').textContent.slice(0, 4000);
+  };
+  const viewer = (window.viewer = XeniumViewer.mount($('viewer'), {
+    baseUrl: '',
+    onViewport: (vp) => log('viewport', vp),
+    onClick: (info) => {
+      log('click', info);
+      if (info) fetch(`viewer/cell/${info.index}?source=${info.source}`).then((r) => r.json()).then((j) => log('cell', j));
+    },
+    onSelect: (sel) => log('select', sel),
+    onStatus: (text) => { $('status').textContent = text; log('status', text); },
+    onStateChange: (state, keys) => log('state', {keys, hiddenCategories: state.hiddenCategories}),
+  }));
+  const params = new URLSearchParams(location.search);
+  const applyColor = () => viewer.setState({color: {mode: $('mode').value, gene: $('gene').value.trim()}});
+  fetch('viewer/meta').then((r) => r.json()).then((meta) => {
+    log('meta', {dataset: meta.dataset, bounds: meta.bounds});
+    for (const m of meta.color_modes) $('mode').add(new Option(m, m));
+    $('mode').value = params.get('mode') || 'transcript_counts';
+    applyColor();
+  });
+  $('mode').onchange = applyColor;
+  $('gene').onchange = applyColor;
+  const applyBoundaries = () => viewer.setState({boundaries: {cell: $('b-cell').checked, nucleus: $('b-nucleus').checked}});
+  $('b-cell').onchange = applyBoundaries;
+  $('b-nucleus').onchange = applyBoundaries;
+  $('tx').onchange = () => viewer.setState({transcripts: {genes: $('tx').value.split(',').map((g) => g.trim()).filter(Boolean)}});
+  $('size').oninput = () => viewer.setState({pointSize: +$('size').value});
+  $('opacity').oninput = () => viewer.setState({opacity: +$('opacity').value});
+  for (const b of document.querySelectorAll('button[data-tool]')) {
+    b.onclick = () => {
+      viewer.setState({tool: b.dataset.tool});
+      for (const o of document.querySelectorAll('button[data-tool]')) o.classList.toggle('on', o === b);
+    };
+  }
+  $('fit').onclick = () => viewer.fitView();
+  $('clear').onclick = () => viewer.setState({selected: null});
+</script>
+</body>
+</html>

@@ -1,0 +1,26 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Xenium morphology layer test</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; color: #ddd; font: 12px/1.4 -apple-system, Arial, sans-serif; overflow: hidden; }
+  #map { position: absolute; inset: 0; }
+  #panel { position: absolute; top: 8px; left: 8px; z-index: 2; background: rgba(20, 20, 24, .85); padding: 8px 10px; border-radius: 4px; max-width: 330px; }
+  #panel .row { display: flex; align-items: center; gap: 6px; margin: 3px 0; }
+  #panel label { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; width: 120px; }
+  #panel input[type=range] { width: 70px; }
+  #panel input[type=color] { width: 22px; height: 18px; padding: 0; border: 0; background: none; }
+  #status { margin-top: 4px; color: #9ab; white-space: pre; }
+  body.nopanel #panel { display: none; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel"><div id="channels"></div>
+  <div class="row"><label>Opacity</label><input id="opacity" type="range" min="0" max="1" step="0.05" value="1"></div>
+  <div id="status">opening…</div>
+</div>
+<script src="/assets/image_test_app.js"></script>
+</body>
+</html>

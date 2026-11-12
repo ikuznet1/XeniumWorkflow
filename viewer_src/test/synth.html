@@ -1,0 +1,64 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Synthetic 1M-point page (no server)</title>
+<style>html, body { margin: 0; height: 100%; background: #0d1117; } #viewer { position: absolute; inset: 0; }</style>
+</head>
+<body>
+<div id="viewer"></div>
+<script src="../../assets/xenium_viewer.js"></script>
+<script>
+  // Synthesises N cells in memory and answers the viewer's requests through a fake fetch
+  // that speaks the real wire format, so parsing / indexing / colouring are all exercised.
+  const N = +(new URLSearchParams(location.search).get('n') || 1000000);
+  const SIZE = 20000; // µm
+  let seed = 12345;
+  const rnd = () => ((seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0) / 4294967296);
+  const t0 = performance.now();
+  const xy = new Float32Array(2 * N);
+  const values = new Float32Array(N);
+  const values2 = new Float32Array(N);
+  const codes = new Uint16Array(N);
+  const blobs = Array.from({length: 40}, () => [rnd() * SIZE, rnd() * SIZE, 300 + rnd() * 1500]);
+  for (let i = 0; i < N; i++) {
+    const b = blobs[(rnd() * blobs.length) | 0];
+    const r = Math.sqrt(rnd()) * b[2];
+    const a = rnd() * 6.283185307;
+    xy[2 * i] = Math.min(SIZE, Math.max(0, b[0] + r * Math.cos(a)));
+    xy[2 * i + 1] = Math.min(SIZE, Math.max(0, b[1] + r * Math.sin(a)));
+    values[i] = rnd() * 10;
+    values2[i] = xy[2 * i] / SIZE;
+    codes[i] = (rnd() * 30) | 0;
+  }
+  window.synth = {N, xy, genMs: performance.now() - t0};
+  const {packBin} = XeniumViewer.util;
+  const palette = Array.from({length: 30}, (_, i) => '#' + ((i * 2654435761) >>> 8 & 0xffffff).toString(16).padStart(6, '0'));
+  const fakeFetch = async (url) => {
+    const u = new URL(url, 'http://x');
+    let buf;
+    if (u.pathname.endsWith('/cells.bin')) {
+      buf = packBin({n: N, token: 'synth', bounds: [0, 0, SIZE, SIZE]}, {xy});
+    } else if (u.pathname.endsWith('/colors.bin')) {
+      const mode = u.searchParams.get('mode');
+      if (mode === 'cat') {
+        buf = packBin({kind: 'categorical', label: 'synthetic classes', categories: palette.map((_, i) => `class ${i}`), colors: palette}, {codes});
+      } else {
+        buf = packBin({kind: 'continuous', label: mode, min: 0, max: mode === 'x' ? 1 : 10}, {values: mode === 'x' ? values2 : values});
+      }
+    } else {
+      buf = packBin({n: 0, available: false, truncated: false}, {});
+    }
+    return new Response(buf);
+  };
+  window.events = [];
+  window.viewer = XeniumViewer.mount(document.getElementById('viewer'), {
+    fetch: fakeFetch,
+    onSelect: (sel) => window.events.push({kind: 'select', t: performance.now(), payload: sel}),
+    onClick: (info) => window.events.push({kind: 'click', payload: info}),
+    onStatus: (text) => window.events.push({kind: 'status', payload: text}),
+  });
+  window.viewer.setState({color: {mode: 'rand'}});
+</script>
+</body>
+</html>

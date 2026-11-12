@@ -1,0 +1,30 @@
+{
+  "name": "xenium-viewer",
+  "private": true,
+  "version": "0.1.0",
+  "description": "WebGL (deck.gl + Viv) spatial viewer bundle for xenium_explorer.py",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs --with-image",
+    "watch": "node build.mjs --with-image --watch"
+  },
+  "dependencies": {
+    "@cornerstonejs/codec-openjpeg": "^1.3.6",
+    "@deck.gl/core": "^9.4.1",
+    "@deck.gl/extensions": "^9.4.1",
+    "@deck.gl/geo-layers": "^9.4.1",
+    "@deck.gl/layers": "^9.4.1",
+    "@hms-dbmi/viv": "^0.23.0",
+    "@luma.gl/constants": "^9.4.2",
+    "@luma.gl/core": "^9.4.2",
+    "@luma.gl/engine": "^9.4.2",
+    "@luma.gl/shadertools": "^9.4.2",
+    "@luma.gl/webgl": "^9.4.2",
+    "deck.gl": "^9.4.1",
+    "geotiff": "^3.0.5"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "playwright": "^1.65.0"
+  }
+}

@@ -1,0 +1,286 @@
+PASS  0 bundle load without mount is inert  — {"api":"function","canvases":0,"bodyChildren":"DIV","styles":0}
+PASS  0 inert load: no console output, no requests  — {"consoleIssues":[],"requests":[]}
+PASS  0b no console errors/warnings from the bundle (interactive session)  — []
+PASS  1 cells layer holds every cell  — [["xv-cells",112551]]
+PASS  1 screenshot is not blank  — drawn=0.279 distinctColors=1279
+PASS  1 initial view fits data bounds  — {"x0":-252.66216602325494,"y0":-842.2382115125656,"x1":9346.734755897523,"y1":5157.38486468792}
+PASS  1 drawn pixels match the tissue shape rasterised from cells.bin  — {"iou":0.9633958103638368,"occupiedBlocks":4535,"comparedBlocks":13928}
+PASS  2 recolour fetched colors.bin once and cells.bin not at all  — {"before":{"cells":1,"colors":1},"after":{"cells":1,"colors":2}}
+PASS  2 picture changed after recolour  — changed pixels=23.7%
+PASS  2 continuous legend shows label and range  — {"kind":"continuous","title":"EEF1G (log1p)","min":"0","max":"5.44"}
+PASS  2 min/max override recolours without a request  — changed pixels=22.7%
+PASS  2 categorical legend lists every category  — Bin 1,Bin 2,Bin 3,Bin 4,Bin 5,Bin 6,Bin 7,Bin 8
+PASS  2 still a single cells.bin request
+PASS  2 legend click updates hiddenCategories and notifies the host  — {"state":["Bin 8"],"zero":14042,"stateEvents":1,"off":1}
+PASS  2 hidden category cells get alpha 0  — 14042 cells of "Bin 8" (expected 14042)
+PASS  2 picture changed after hiding a category  — changed pixels=5.5%
+PASS  2 hidden cells are not pickable  — cell 0 -> pick 5
+PASS  2 second click shows the category again
+PASS  3 zoomed-out view reports truncation via onStatus and draws no outlines  — {"status":"zoom in to see cell boundaries (112,551 in view)","layers":["xv-cells"],"n":112551}
+PASS  3 boundaries drawn at ~300 µm from binary arrays  — 1576 polygons, status=""
+PASS  3 each outline is centred on its own cell (data alignment)  — median 0.59 µm, p95 1.44 µm
+PASS  3 fetched region is padded beyond the viewport  — [5644,2125,6094,2406]
+PASS  3 outline pixels present only with boundaries on  — outline-coloured px on=28327 off=1262
+PASS  3 small pan reuses the padded region, large pan refetches (cell + nucleus)  — {"r0":5,"r1":5,"r2":7}
+PASS  3 superseded boundary requests are aborted; final data belongs to the latest viewport  — aborted=2 box=[6544,2125,6994,2406]
+PASS  4 transcript point count equals the response header  — header n=25818, layer length=25818
+PASS  4 transcript legend lists the genes  — Transcripts (25,818): {"0":1210,"1":4171,"2":20437}
+PASS  4 full-resolution transcripts at 300 µm (not subsampled)  — level=0
+PASS  4 transcript-coloured pixels on screen  — pixels near gene-0 colour: 864
+PASS  4 zoomed-out transcripts report subsampling via onStatus  — transcripts subsampled (18,274 shown), zoom in for all
+PASS  4 clearing genes removes the layer
+PASS  5 lasso indices equal brute-force point-in-polygon over cells.bin  — 29662 vs 29662 cells, 72 vertices, 4.3 ms
+PASS  5 lasso polygon is reported in µm  — first vertex 7359.36,2382.56 expected 7359.36,2382.56
+PASS  5 dragging in lasso mode does not pan; selection is highlighted
+PASS  5 in-progress lasso shape is drawn  — M700.0 250.0L800.0 300.0L900.0 500.0L750.0 600.0Z
+PASS  5 shape cleared on release
+PASS  5 rectangle selection equals brute force  — 21067 vs 21067 (box test 21067)
+PASS  6 click returns the nearest cell (5 clicks, brute-force check)  — 8066==8066 52069==52069 58349==58349 58635==58635 58718==58718
+PASS  6 dev page fetched /viewer/cell/<index> for the picked cell  — {"cell_area":51.56843937188387,"id":"hjcndeki-1","index":58718,"transcript_counts":404}
+PASS  6 hover tooltip shows the cell index  — cell 58718 · 6
+PASS  6 background click reports null  — nearest cell 2148 µm away
+PASS  6 wheel zooms about the cursor  — zoom x1.96, cursor point moved 0.0000 µm
+PASS  6 onViewport fires debounced with the final viewport in µm  — 1 event(s)
+PASS  6 drag pans the view by the drag distance (minus the recogniser threshold)  — moved 88.0, 35.0 px for a 100, 40 px drag
+PASS  6 a drag does not count as a click
+PASS  6 double-click fits the data bounds
+PASS  6 setViewport restores an exact viewport  — {"x0":5719.018878936768,"y0":2171.794602394104,"x1":6019.018878936768,"y1":2359.294602394104}
+PASS  6 overlay polygon, line and label are drawn  — pink=3841 teal=894 label={"text":"ROI 1","left":"501.333px","top":"168.667px"}
+PASS  6 canvas tracks its container on resize, centre preserved  — [1000,600,1000,600]
+PASS  6 setExtraLayers layers are drawn below the cells  — layers=host-extra,xv-cells magenta px=81509 of 91506 disc px (rest covered by cells)
+PASS  6 dataVersion bump refetches cells.bin + colors.bin once each and keeps the viewport  — {"c0":[1,4],"c1":[2,5]}
+PASS  6 destroy() removes the viewer DOM
+PASS  skin session: no console errors/warnings from the bundle  — {"real":[],"screenshotReadbackWarnings":0}
+PASS  8 tiny dataset: all 23 cells in the layer
+PASS  8 tiny dataset fits its bounds  — bounds cover 94% x 30% of the view
+PASS  8 a dot is drawn at the projected position of the cells  — 23/23 (remainder sit under the dev panel/legend)
+PASS  8 tiny dataset boundaries load at the fitted view  — {"cell":{"n":23,"truncated":false,"available":true,"arrays":[{"name":"start","dtype":"uint32","length":24},{"name":"xy","dtype":"float32","length":1150},{"name":"cell","dtype":"uint32","length":23}]},"tx":{"n":0,"available":true,"level":1,"subsampled":true,"arrays":[]},"status":"transcripts subsampled (0 shown), zoom in for all"}
+PASS  8 tiny session: no console errors/warnings  — []
+PASS  7 1M points render  — first render 99 ms after mount, drawn=0.22
+PASS  7 1M recolour changes the picture
+PASS  7 1M recolour compute < 100 ms  — x:2.9ms cat:3.8ms rand:1.8ms x:2.7ms cat:4.3ms
+PASS  7 1M lasso correct and well under a second  — 445768 cells in 57.3 ms (brute force 368 ms)
+PASS  7 synthetic session: no console errors/warnings  — []
+
+GL backend: metal
+
+NUMBERS {
+ "skin": {
+  "n": 112551,
+  "firstRenderMs": 82.6,
+  "cellsFetchMs": 48.4,
+  "gridIndexMs": 6.5,
+  "recolorMs": 1.2,
+  "drawnFraction": 0.279,
+  "shapeAgreement": {
+   "iou": 0.963,
+   "occupiedBlocks": 4535,
+   "comparedBlocks": 13928
+  },
+  "recolor": {
+   "fetchMs": 3836.4,
+   "computeMs": 1.2,
+   "toFrameMs": 1.9
+  }
+ },
+ "boundaries": {
+  "polygons": 1576,
+  "centroidOffsetMedianUm": 0.587,
+  "p95Um": 1.436,
+  "maxUm": 3.495,
+  "pathType": "open"
+ },
+ "transcripts": {
+  "headerN": 25818,
+  "layerLength": 25818,
+  "level": 0,
+  "subsampled": false,
+  "perGene": {
+   "0": 1210,
+   "1": 4171,
+   "2": 20437
+  }
+ },
+ "lassoSkin": {
+  "selected": 29662,
+  "bruteForce": 29662,
+  "vertices": 72,
+  "ms": 4.3
+ },
+ "rectSkin": {
+  "selected": 21067,
+  "bruteForce": 21067,
+  "strictlyInsideBox": 21067
+ },
+ "picking": [
+  {
+   "click": [
+    893,
+    707
+   ],
+   "got": 8066,
+   "expected": 8066,
+   "distUm": 0.385,
+   "xyOk": true
+  },
+  {
+   "click": [
+    956,
+    688
+   ],
+   "got": 52069,
+   "expected": 52069,
+   "distUm": 0.311,
+   "xyOk": true
+  },
+  {
+   "click": [
+    885,
+    759
+   ],
+   "got": 58349,
+   "expected": 58349,
+   "distUm": 0.273,
+   "xyOk": true
+  },
+  {
+   "click": [
+    678,
+    435
+   ],
+   "got": 58635,
+   "expected": 58635,
+   "distUm": 0.457,
+   "xyOk": true
+  },
+  {
+   "click": [
+    520,
+    249
+   ],
+   "got": 58718,
+   "expected": 58718,
+   "distUm": 0.329,
+   "xyOk": true
+  }
+ ],
+ "tiny": {
+  "n": 23,
+  "bounds": [
+   397.103,
+   287.561,
+   920.432,
+   392.175
+  ],
+  "viewport": {
+   "x0": 381.403,
+   "y0": 166.515,
+   "x1": 936.132,
+   "y1": 513.221
+  },
+  "boundsFractionOfView": [
+   0.943,
+   0.302
+  ],
+  "drawnFraction": 0.034,
+  "dotsFound": 23,
+  "boundaries": {
+   "cell": {
+    "n": 23,
+    "truncated": false,
+    "available": true,
+    "arrays": [
+     {
+      "name": "start",
+      "dtype": "uint32",
+      "length": 24
+     },
+     {
+      "name": "xy",
+      "dtype": "float32",
+      "length": 1150
+     },
+     {
+      "name": "cell",
+      "dtype": "uint32",
+      "length": 23
+     }
+    ]
+   },
+   "tx": {
+    "n": 0,
+    "available": true,
+    "level": 1,
+    "subsampled": true,
+    "arrays": []
+   },
+   "status": "transcripts subsampled (0 shown), zoom in for all"
+  }
+ },
+ "synth1M": {
+  "n": 1000000,
+  "firstRenderMsFromMount": 99.3,
+  "fakeFetchParseMs": 15.6,
+  "gridIndexMs": 15,
+  "firstColorComputeMs": 3.6,
+  "recolor": [
+   {
+    "mode": "x",
+    "totalToFrameMs": 9.6,
+    "computeMs": 2.9,
+    "fakeFetchAndParseMs": 3.6
+   },
+   {
+    "mode": "cat",
+    "totalToFrameMs": 12.7,
+    "computeMs": 3.8,
+    "fakeFetchAndParseMs": 1.7
+   },
+   {
+    "mode": "rand",
+    "totalToFrameMs": 15.4,
+    "computeMs": 1.8,
+    "fakeFetchAndParseMs": 8.9
+   },
+   {
+    "mode": "x",
+    "totalToFrameMs": 27.1,
+    "computeMs": 2.7,
+    "fakeFetchAndParseMs": 6.1
+   },
+   {
+    "mode": "cat",
+    "totalToFrameMs": 8.3,
+    "computeMs": 4.3,
+    "fakeFetchAndParseMs": 1.5
+   }
+  ],
+  "panFrames": {
+   "rafIntervalMedianMs": 16.7,
+   "rafIntervalP95Ms": 16.8,
+   "rafIntervalMaxMs": 16.8,
+   "redrawPlusReadbackMedianMs": 16.2,
+   "redrawPlusReadbackMaxMs": 229.1,
+   "canvas": [
+    1280,
+    800
+   ],
+   "renderer": "ANGLE (Apple, ANGLE Metal Renderer: Apple M3 Max, Unspecified Version)"
+  },
+  "panStepJsMs": 0.055,
+  "lasso": {
+   "selected": 445768,
+   "brute": 445768,
+   "mismatch": 0,
+   "vertices": 120,
+   "selectMs": 57.3,
+   "bruteMs": 368,
+   "mouseupToCallbackMs": 72.9,
+   "recolorAfterSelectMs": 12.4
+  },
+  "pickMsPerLookup": 0.007,
+  "drawnFraction": 0.217
+ }
+}
+
+63/63 checks passed
