@@ -152,6 +152,17 @@ class _Baseline:
         long-lived and not waited for."""
         import re
         deadline = time.time() + timeout
+        # Jobs started through the app's job registry (_job_start) are found there,
+        # with their threads; the name pattern below covers the remaining helpers.
+        for job in self.mod._jobs_list():
+            t = job.thread
+            if t is None or t is threading.current_thread():
+                continue
+            t.join(max(0.0, deadline - time.time()))
+            assert not t.is_alive(), f"job {job.id} ({job.label}) still {job.state} after {timeout:.0f}s"
+        for t in threading.enumerate():
+            if t.name.startswith("xe-job-kill-"):
+                t.join(max(0.0, deadline - time.time()))
         for t in threading.enumerate():
             m = re.match(r"Thread-\d+ \((\w+)\)$", t.name)
             # "run" is contextvars.Context.run, used for jobs that call into rpy2
@@ -164,6 +175,8 @@ class _Baseline:
     def reset(self):
         mod = self.mod
         self.settle()
+        with mod._jobs_lock:
+            mod._jobs.clear()
         if "_df_original" in mod.DATA:
             mod.unsubset()
         for name, snap in self.states.items():

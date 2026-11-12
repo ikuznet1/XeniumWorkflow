@@ -85,7 +85,9 @@ const roiOnly = (await state()).polys;
 await setProp('sdata-show-patches', {value: ['yes']});
 await wait(1500); await idle();
 st = await state();
-px = await pixels('parity_2_sdata.png', [['roi', [82, 183, 136], 50], ['patch', [255, 170, 0], 60]]);
+// Patch outlines are #ffaa00 at 60 % opacity (alpha 153, as in the Plotly figure), so on the
+// #0d1117 background they render as 0.6 * [255, 170, 0] + 0.4 * [13, 17, 23] = [158, 109, 9].
+px = await pixels('parity_2_sdata.png', [['roi', [82, 183, 136], 50], ['patch', [158, 109, 9], 60]]);
 check('2 sdata ROI and patch outlines are fetched and drawn', roiOnly === base0 + 1 && st.polys === base0 + 3 && px.roi > 300 && px.patch > 300 &&
   reqs.slice(n).some((u) => u.includes('sdata_roi=1') && u.includes('sdata_patches=1')), JSON.stringify({base0, roiOnly, polys: st.polys, px}));
 await setProp('sdata-show-roi', {value: []}); await setProp('sdata-show-patches', {value: []});

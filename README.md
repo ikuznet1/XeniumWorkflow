@@ -503,6 +503,35 @@ unsubset()
 
 A gold **⬡ SUBSET ACTIVE** indicator appears in the sidebar with the cell count and a "✕ Clear Subset" button.
 
+A filter that cannot be applied is skipped with a message in the log (`cell_type` without an annotation, an unknown gene, a QC column the dataset does not have). A call in which no filter was applied - only skipped ones, or none given - changes nothing and does not mark a subset as active. Niches computed under a subset exist for the subset's cells only; after `unsubset()` the other cells are shown as **No niche**.
+
+### Jobs panel: progress and Cancel
+
+Every long-running job (Baysor, Proseg, Prepare Patches, cell type annotation, SPLIT, SpaGE, Rerun UMAP, spatial analysis, niches, CellNEST load, Save as SpatialData, loading a cached segmentation run) is listed in a small **Jobs** panel at the bottom right of the window while it runs. The panel floats above the page and above the open dialog, so it is visible next to the sidebar status lines and next to the status line of each dialog (those still work as before). Each row shows the kind of job, its label, the current step, the elapsed time, a progress bar when the fraction done is known, and a **Cancel** button. A click on the panel's header line folds the list away (it sits over the corner of the server log). The panel disappears a few seconds after the last job has ended and does not poll the server while no job is running.
+
+| Job | Progress shown | What Cancel does |
+|-----|----------------|------------------|
+| Baysor | patch *i* of *n*; inside a patch the stage Baysor logs and the percentage of its segmentation iterations (the stages before and after the iterations print no percentage and are shown at fixed marks) | the Baysor (Julia) process and its children are terminated at once |
+| Proseg | patch *i* of *n*; inside a patch the fraction of sampler iterations, read from Proseg's own progress bar (Proseg draws it on a terminal only, so the app runs it on a pseudo-terminal; without one the bar is missing and only the patch count advances) | the Proseg process is terminated at once |
+| Prepare Patches | step 1/3 SpatialData, 2/3 tissue ROI, 3/3 patches | stops after the current step (the sopa call in progress finishes first) |
+| CellTypist / Seurat / RCTD annotation | step text | stops after the current step |
+| SPLIT | step text | stops after the current step (an RCTD run in R cannot be interrupted) |
+| SpaGE | step text; fraction of gene chunks during the imputation itself | stops after the current step / gene chunk |
+| Rerun UMAP, spatial analysis, niches, CellNEST load | step text (steps *k* of *n* for spatial analysis and niches) | stops after the current step |
+| Save as SpatialData | step text | only before the store is written |
+
+How cancelling works, and its limits:
+
+- **External tools** run in their own process group. Cancel sends `SIGTERM` to the group and `SIGKILL` five seconds later to whatever is left, so Julia and any child processes go with it. The tools are also stopped, and their working directories removed, when the app exits or is stopped with Ctrl-C, `SIGTERM` or `SIGHUP`; after `kill -9` of the app a running tool has to be stopped by hand.
+- **Python and R steps cannot be interrupted.** The job checks for a cancel request between steps, so the panel shows *cancelling after the current step…* until the step in progress returns. For RCTD (annotation or SPLIT) on a whole slide that step can take tens of minutes; reading a large Seurat reference, `sopa` reading the Xenium bundle or building patches, and a UMAP fit are other long single steps. `baysor --version`, which the app runs to find Baysor before the segmentation starts (Julia start-up), is also not interrupted.
+- **Nothing half-written is kept.** A Baysor/Proseg run works in `<run directory>.partial` and gets its real name only when it is complete; a cancelled or failed run removes that directory, so it never appears in the Segmentation dropdown and an earlier run with the same parameters stays as it was. Once a job starts writing its result (run directory and zarr store, SPLIT / SpaGE write-back to the SpatialData store, annotation caches) it can no longer be cancelled; the row then reads *writing results — cannot be cancelled now*. A streamed SpaGE result that was cancelled is deleted.
+- A cancelled job reports `✗ Cancelled` in its status line, the same job can be started again straight away, and the loaded dataset is not changed. As before, starting Baysor/Proseg replaces the run that was loaded for that tool, and an annotation run clears that method's previous labels, at the moment the job is started, not when it is cancelled. Intermediate results that are complete and reusable are kept: the SpatialData store, tissue ROI and patches of Prepare Patches, and the RCTD result SPLIT caches before `purify()` (with its labels).
+- Loading another sample is still refused while any job is running, including one that is being cancelled.
+- The bar is the share of the whole job: 90 % for the tool (split evenly over the patches, whatever their size), the rest for the expression matrix, clustering / UMAP and the store. It is not a time estimate.
+- A failed Baysor/Proseg run no longer leaves its partial output in the cache (the tool's messages are in the server log).
+
+From the REPL: `_jobs_list()` returns the registered jobs (`.kind`, `.label`, `.state`, `.step`, `.fraction`, `.elapsed()`, `.thread`, `.procs`), `_job_cancel(job.id)` cancels one.
+
 ### Server Log & Python REPL
 
 The bottom panel is split into two columns:
@@ -551,6 +580,10 @@ All caches are stored in `~/.xenium_explorer_cache/` and are keyed per dataset.
 | `spatialdata_{hash}.zarr` | SpatialData Zarr store for sopa-based patch resegmentation |
 | `baysor_{dataset}_{tag}/` or `baysor_{dataset}_{datasethash}_{tag}/` | Baysor output per parameter set (new runs include a hash of the dataset path so bundles with the same folder name do not share runs; older directories still load); includes `params.json` and `spatialdata_baysor.zarr` (contains expression, clusters, UMAP, imputed genes, and `X_corrected` layer after SPLIT) |
 | `proseg_{dataset}_{tag}/` or `proseg_{dataset}_{datasethash}_{tag}/` | Proseg output per parameter set (same naming rule); includes `params.json` and `spatialdata_proseg.zarr` (contains expression, clusters, UMAP, imputed genes, and `X_corrected` layer after SPLIT) |
+| `baysor_…_{tag}.partial/`, `proseg_…_{tag}.partial/` | Working directory of a Baysor/Proseg run in progress; renamed to the run directory when the run is complete, removed when it fails or is cancelled (one left behind by a killed app is removed by the next run with the same parameters or by Clean Cache) |
+| `cellnest_db/` | Ligand-receptor / signalling database files used by the CellNEST tab |
+
+The cache root is `~/.xenium_explorer_cache/` unless `XENIUM_CACHE_DIR` is set; every cache above, including `cellnest_db/`, follows it.
 
 ## Standalone Functions (`functions/`)
 
@@ -783,6 +816,7 @@ node test/run.mjs                                  # viewer core against dev_ser
 node image_test/verify.mjs                         # image layer: decode and placement
 node test/app_smoke.mjs http://127.0.0.1:8050 out/ # the real app, started with XENIUM_RENDERER=webgl
 node test/glue_checks.mjs http://127.0.0.1:8050    # renderer switching, selection and image handling in the real app
+node test/jobs_panel.mjs http://127.0.0.1:8050 out/ # jobs panel: starts Proseg on cached patches, checks progress, clicks Cancel
 node test/webgl_fallback.mjs http://127.0.0.1:8050 # automatic fallback to Plotly without WebGL2 (browsers started with WebGL disabled)
 node test/real_results.mjs                         # WebGL against Plotly on real Baysor/Proseg/RCTD/SPLIT/SpaGE results; starts its own app (paths: see the top of the file)
 ```
@@ -846,3 +880,10 @@ A review of the code base fixed a number of defects. Most are invisible, but the
 - **Cache: Clean** is refused while a background job is running.
 - **Bind address** is read from `XENIUM_HOST`; `HOST` is ignored. A container that set `HOST=0.0.0.0` must set `XENIUM_HOST=0.0.0.0`.
 - **REPL in local mode** (`XENIUM_ENABLE_REPL=1`) additionally requires a loopback `Host` header and refuses forwarded requests, so it no longer works through a reverse proxy; use `remote` there, on a trusted network.
+
+Behaviour changes that came with the jobs panel (no effect on computed values):
+
+- **Baysor/Proseg run directories** are written as `<name>.partial` and renamed when the run is complete. A failed or cancelled run leaves nothing in the cache (it used to leave the tool's partial output in the run directory, which the Segmentation dropdown could list as a finished run once `segmentation.csv` / `cell-metadata.csv.gz` existed).
+- **The CellNEST database cache** (`cellnest_db/`) follows `XENIUM_CACHE_DIR`. It used to be created in `~/.xenium_explorer_cache/` regardless; with `XENIUM_CACHE_DIR` set, the database files are fetched once more into the new location (or move the directory there).
+- **Baysor and Proseg run in their own process group**, Proseg on a pseudo-terminal (so that it draws the progress bar the panel reads). Their log lines in the server log are unchanged; Proseg's progress-bar redraws are not logged.
+- `subset()` with only skipped filters is a no-op (it used to flag an "N / N cells" subset); **No niche** replaces `Niche nan` in legends; the co-occurrence and enrichment heat maps honour `width` / `height` when called with them.

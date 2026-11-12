@@ -172,3 +172,34 @@ def test_umap_follows_subset(xe, D, raw, expressed_gene):
     assert set(cells.index) == set(keep) & set(raw.umap.index)
     np.testing.assert_allclose(cells["color"].to_numpy(dtype=float),
                                _gene_values(raw, expressed_gene).loc[cells.index].to_numpy(), rtol=1e-5)
+
+
+def test_subset_of_only_skipped_filters_is_not_a_subset(xe, D, raw, capsys):
+    """A filter that cannot be applied (no annotation, unknown gene, missing column)
+    selects nothing; a call made of those alone must not flag 'N of N cells' as a subset."""
+    v0 = xe._subset_version
+    with xe._annot_lock:
+        assert not any(k.startswith("labels_") and v is not None for k, v in xe._annot_state.items())
+    out = xe.subset(cell_type="Alpha")                       # no annotation loaded
+    assert "_df_original" not in D and "_df_to_expr_orig" not in D
+    assert out is D["df"] and len(out) == len(raw.cells) and xe._subset_version == v0
+    xe.subset(gene="__no_such_gene__", min_expr=1.0)
+    xe.subset()
+    assert "_df_original" not in D and xe._subset_version == v0
+    assert "no filter was applied" in capsys.readouterr().out
+    assert xe.update_subset_indicator(0)[0] == {"display": "none"}, "no SUBSET ACTIVE badge"
+
+    # a skipped filter next to an applied one still subsets by the applied one
+    keep = list(raw.cells.index[::2])
+    xe.subset(cell_type="Alpha", cell_ids=keep)
+    assert list(D["df"].index.astype(str)) == keep and "_df_original" in D
+    # ... and an all-skipped call does not disturb an active subset
+    xe.subset(gene="__no_such_gene__", min_expr=1.0)
+    assert list(D["df"].index.astype(str)) == keep
+    xe.unsubset()
+    assert len(D["df"]) == len(raw.cells)
+
+
+def test_subset_matching_every_cell_is_still_a_subset(xe, D, raw):
+    xe.subset(min_transcripts=0)          # applied; happens to keep everything
+    assert "_df_original" in D and len(D["df"]) == len(raw.cells)

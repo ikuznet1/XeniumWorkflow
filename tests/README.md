@@ -51,7 +51,8 @@ cannot be undone cleanly.
 All in-process tests share one imported app, whose state lives in module globals.
 `conftest.py` records a baseline after import and an autouse fixture restores it after
 every test: it waits for background threads the test started, calls `unsubset()`,
-resets the job-state dicts, clears ROIs / labels / niche columns and the caches. A test
+resets the job-state dicts and the job registry, clears ROIs / labels / niche columns
+and the caches. A test
 may therefore mutate the app freely, and tests can run in any order or alone (`-k`).
 
 ## The bundles are never written to
@@ -110,10 +111,11 @@ Unset or missing paths are skipped, never an error.
 | `test_save_sdata.py` | default | Save as SpatialData round trip (table, obs columns, shapes), ROI-only export, export under a subset, reopening the export as the app's dataset |
 | `test_pure_helpers.py` | default | `_patch_owned_mask`, `_patch_seam_dedup_mask`, `_reseg_patch_keep_mask`, transcript filters, expression builders, SPLIT gene re-alignment by name (app and `functions/run_split.py`) - all on synthetic input |
 | `test_cache_and_jobs.py` | default | cached-run listing and cache cleaning on fabricated directories, annotation-cache validity, stale-job guard, dgCMatrix parts |
+| `test_jobs.py` | default | job registry (thread, step, fraction, elapsed time, `_running_jobs`, Load Sample refusal), cancellation of a stub Python job at step boundaries and of a stub tool (`/bin/sh` with sleeping children): process tree gone, SIGKILL after the grace period, no run directory left, an earlier run kept, state reusable; Baysor / Proseg progress parsers; jobs-panel rendering and its interval; no job started outside the registry (AST) |
 | `test_spage.py` | default | `_vectorized_spage` against the per-cell loop of the published algorithm (stand-in principal-vector class; the SpaGE submodule is not required) |
 | `test_patches.py` | default | Prepare Patches through the callbacks (sopa): cache location, quality flag, ROI / patch geometry, restore only for the same request |
 | `test_geo_to_bundle.py` | default | `functions/geo_to_bundle.py` on a synthetic deposit, error cases, and the app opening the result |
-| `test_tools_reseg.py` | `tools` | real Baysor and Proseg runs (single region; Proseg also on patches): input equals an independent read of the region, matrix equals a recount of the tool's output, zarr / params / cache reload consistency |
+| `test_tools_reseg.py` | `tools` | real Baysor and Proseg runs (single region; Proseg also on patches): each tool is first cancelled mid-run (processes gone, nothing left in the cache, state released), then the same request runs to completion; input equals an independent read of the region, matrix equals a recount of the tool's output, zarr / params / cache reload consistency |
 | `test_tools_r.py` | `tools` | sparse matrices to R and back through rpy2, verified on the R side, also from a worker thread |
 | `test_browser.py` | `browser` | wrappers around `viewer_src/test/{app_smoke,glue_checks,run}.mjs` |
 | `test_slow_bundles.py` | `slow` | the bundle-dependent default modules on each larger bundle |
@@ -155,7 +157,10 @@ GB of memory.
   bundle lacks what the test needs (`pytest.skip("bundle has no UMAP projection")`).
 * Background jobs: start them through the callback, then
   `tl.wait_state(state, lock)`; wrap callbacks that spawn writer threads in
-  `with tl.new_threads():`.
+  `with tl.new_threads():`. Jobs are registered: `xe._jobs_list(active_only=True)`
+  gives the running ones with their `.thread`, `.procs`, `.step` and `.fraction`,
+  `xe._job_cancel(job.id)` cancels one. The state reset waits for every registered
+  job and then empties the registry, so a test must let its stub jobs finish.
 * Anything that needs another `DATA_DIR` or environment: `tl.run_in_fresh_app`.
 * A test that exposes a bug stays in the suite as
   `@pytest.mark.xfail(strict=True, reason=...)` until the bug is fixed (strict, so the
@@ -171,6 +176,9 @@ GB of memory.
 * A Baysor run on patches (two more Julia start-ups); the patch merge is unit-tested
   on synthetic layouts and exercised for real with Proseg.
 * CellNEST tabs, multi-sample display (Load / Add Sample) and the callbacks that need
-  `dash.callback_context` (`update_plots`, `delete_roi`, `confirm_patches`).
+  `dash.callback_context` (`update_plots`, `delete_roi`, `confirm_patches`,
+  `cancel_job_clicked` - the Cancel button is clicked for real by
+  `viewer_src/test/jobs_panel.mjs`, which is run by hand against a bundle with cached
+  patches and is not part of the `browser` tier).
 * The standalone scripts in `functions/` other than `geo_to_bundle.py` and the R
   bridge of `run_split.py`.

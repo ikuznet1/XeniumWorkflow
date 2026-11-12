@@ -230,3 +230,46 @@ def test_label_key_is_checked_against_the_active_segmentation(xe, labels):
     with xe._annot_lock:
         xe._annot_state[key] = labels
     assert f("labels_celltypist", alt) == key
+
+
+def test_cells_without_a_niche_are_not_called_nan(xe, D, raw, labels, client):
+    """After unsubset() the cells outside the subset have no niche (NaN): the legend
+    and the viewer categories call them 'No niche', never 'Niche nan'."""
+    keep = list(raw.cells.index[: max(8, 2 * len(raw.cells) // 3)])
+    rest = [c for c in raw.cells.index if c not in set(keep)]
+    assert rest
+    xe.subset(cell_ids=keep)
+    xe.run_niche(1, 2, 3, "labels_celltypist", "xenium")
+    tl.wait_state(xe._niche_state, xe._niche_lock)
+    xe.unsubset()
+    niche = D["df"]["niche"]
+    want = pd.Series(np.where(niche.isna(), "No niche", "Niche " + niche.astype(str)),
+                     index=D["df"].index.astype(str))
+    method = D["cluster_methods"][0] if D["cluster_methods"] else None
+    cells = tl.fig_cells(xe.make_spatial_fig("niche", method, D["gene_names"][0], 3, 0.8, [], None))
+    assert (cells["trace"] == want.loc[cells.index]).all()
+    assert set(cells.loc[rest, "trace"]) == {"No niche"}
+    assert not any("nan" in str(n).lower() for n in set(cells["trace"]))
+    h, a = tl.get_bin(client, "/viewer/colors.bin?mode=niche")
+    assert (np.array(h["categories"])[a["codes"]] == want.to_numpy()).all()
+    names = [t.name for t in xe.make_niche_umap_fig().data]
+    assert not any("nan" in str(n).lower() for n in names)
+    if raw.umap is not None:
+        assert "No niche" in names
+
+
+def test_heatmap_figures_use_the_requested_size(xe):
+    types = ["Alpha", "Beta", "Gamma"]
+    m = np.arange(9, dtype=float).reshape(3, 3)
+    with xe._spatial_lock:
+        xe._spatial_state.update({"status": "done", "result": {
+            "cell_types": types, "cooccurrence": m, "enrichment": -m, "adjacency": m,
+            "freqs": np.full(3, 1 / 3), "niche_labels": None, "umap_coords": None}})
+    for make in (xe.make_cooccurrence_fig, xe.make_enrichment_fig):
+        default = make()
+        assert default.layout.height == 400 and default.layout.width is None
+        sized = make(width=640, height=520)
+        assert (sized.layout.width, sized.layout.height) == (640, 520)
+        only_w = make(width=700)
+        assert (only_w.layout.width, only_w.layout.height) == (700, 400)
+        np.testing.assert_array_equal(np.asarray(sized.data[0].z), np.asarray(default.data[0].z))

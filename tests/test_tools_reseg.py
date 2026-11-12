@@ -186,6 +186,67 @@ def _assert_shown(xe, client, tool, res, gene):
     assert xe.poll_baysor(0, 0)[3] == src if tool == "baysor" else xe.poll_proseg(0, 0)[3] == src
 
 
+# ── cancellation ─────────────────────────────────────────────────────────────
+def _group_pids(pgid):
+    """Live (non-zombie) processes of process group *pgid*."""
+    import subprocess
+    out = subprocess.run(["ps", "-A", "-o", "pid=,pgid=,stat="], capture_output=True, text=True).stdout
+    rows = [ln.split() for ln in out.splitlines()]
+    return [int(r[0]) for r in rows if len(r) >= 3 and int(r[1]) == pgid and not r[2].startswith("Z")]
+
+
+def _cancel_midway(xe, tool, start, midway, cache_dir):
+    """Start a real run through the Run callback, cancel it once *midway(job)* holds, and
+    check what is left: no process, no run directory, a released state. Returns the job."""
+    import time
+    state, lock = ((xe._baysor_state, xe._baysor_lock) if tool == "baysor"
+                   else (xe._proseg_state, xe._proseg_lock))
+    listed_before = [r["value"] for r in xe._list_cached_seg_runs()]
+    entries_before = sorted(os.listdir(cache_dir))
+    gen, df = xe._dataset_gen, xe.DATA["df"]
+    assert start()[0] == f"{tool.capitalize()} starting…"
+    jobs = [j for j in xe._jobs_list(active_only=True) if j.kind == tool]
+    assert len(jobs) == 1, "the run is in the job registry"
+    job = jobs[0]
+    assert tool.capitalize() in xe._running_jobs()
+    deadline = time.time() + RUN_TIMEOUT
+    while not (job.procs and midway(job)):
+        assert job.active(), f"the run ended before it could be cancelled: {job.state} / {state['message']}"
+        assert time.time() < deadline
+        time.sleep(0.02)
+    snap = job.snapshot()
+    leader = job.procs[0].pid
+    pids = _group_pids(leader)
+    assert leader in pids, "the tool runs in its own process group"
+    staged = [e for e in os.listdir(cache_dir) if e.endswith(xe._SEG_STAGE_SUFFIX)]
+    assert len(staged) == 1 and staged[0].startswith(f"{tool}_")
+    assert [r["value"] for r in xe._list_cached_seg_runs()] == listed_before, \
+        "a run in progress is not offered as a cached run"
+
+    t0 = time.time()
+    assert xe._job_cancel(job.id)
+    job.thread.join(120)
+    took = time.time() - t0
+    assert not job.thread.is_alive() and job.state == "cancelled", (job.state, state["message"])
+    assert took < xe._JOB_KILL_GRACE_S + 15, f"cancel took {took:.1f}s"
+    # the process tree is gone
+    deadline = time.time() + 20
+    while _group_pids(leader) and time.time() < deadline:
+        time.sleep(0.1)
+    assert _group_pids(leader) == [], f"processes of the cancelled {tool} run are still alive"
+    # no run directory, nothing new in the cached-run list
+    assert sorted(os.listdir(cache_dir)) == entries_before, "the cancelled run left files in the cache"
+    assert [r["value"] for r in xe._list_cached_seg_runs()] == listed_before
+    # state released (what the poll reports), dataset untouched
+    with lock:
+        assert (state["status"], state["message"], state["result"]) == ("error", "Cancelled", None)
+    assert tool.capitalize() not in xe._running_jobs()
+    assert xe._dataset_gen == gen and xe.DATA["df"] is df
+    poll = xe.poll_baysor(0, 0, "xenium") if tool == "baysor" else xe.poll_proseg(0, 0, "xenium")
+    assert poll[0] == "✗ Cancelled" and poll[1] is True
+    return job, snap
+
+
 # ── Baysor ───────────────────────────────────────────────────────────────────
 @pytest.fixture(scope="module")
 def baysor_run(xe, region):
@@ -203,6 +264,24 @@ def baysor_run(xe, region):
 def baysor(xe, baysor_run):
     _activate(xe, "baysor", baysor_run[0])
     return baysor_run
+
+
+def test_baysor_cancelled_midway_leaves_nothing_and_the_same_run_then_completes(xe, region, cache_dir, request):
+    if not tl.baysor_bin():
+        pytest.skip("Baysor not installed (~/.julia/bin/baysor or $BAYSOR_BIN)")
+    x0, x1, y0, y1 = region
+    start = lambda: xe.run_reseg_modal(
+        1, "baysor", "skip", x0, x1, y0, y1, 6.0, None, 20, 4, [], ["yes"], 0.5,
+        "nucleus", None, None, None, None, None, None, None, None, None, None, None, None)
+    # mid-way: Julia is up and Baysor has logged its first stage
+    job, snap = _cancel_midway(xe, "baysor", start, lambda j: j.step.startswith("Baysor: "), cache_dir)
+    assert 0 < snap["fraction"] < 0.9 and snap["n_procs"] == 1, snap
+    # the same request again, to completion (the module's Baysor run)
+    res, _ = request.getfixturevalue("baysor_run")
+    _activate(xe, "baysor", res)
+    _assert_result_consistent(xe, res, "baysor", region, cache_dir)
+    assert [r["value"] for r in xe._list_cached_seg_runs() if r["value"].startswith("baysor:")] == [f"baysor:{_tag(res)}"]
+    assert not [e for e in os.listdir(cache_dir) if e.endswith(xe._SEG_STAGE_SUFFIX)]
 
 
 def test_baysor_receives_exactly_the_gene_transcripts_of_the_region(baysor, truth, region, xe):
@@ -295,6 +374,34 @@ def proseg_run(xe, region):
 def proseg(xe, proseg_run):
     _activate(xe, "proseg", proseg_run[0])
     return proseg_run
+
+
+def test_proseg_cancelled_midway_leaves_nothing_and_the_same_run_then_completes(xe, region, cache_dir, request):
+    if not tl.proseg_bin():
+        pytest.skip("Proseg not installed (~/.cargo/bin/proseg or $PROSEG_BIN)")
+    # mid-way: the sampler has done between 10 % and 80 % of its iterations (progress
+    # parsed from Proseg's own progress bar)
+    job, snap = _cancel_midway(xe, "proseg", lambda: _proseg_request(xe, *region, patches=False),
+                               lambda j: (j.fraction or 0) >= 0.1 * 0.9, cache_dir)
+    assert 0.09 <= snap["fraction"] < 0.8 and "sampling" in snap["step"], snap
+    # the same request again, to completion (the module's Proseg run)
+    res, _ = request.getfixturevalue("proseg_run")
+    _activate(xe, "proseg", res)
+    # a complete run directory under its real name (the content of the result is the
+    # subject of test_proseg_result_is_consistent)
+    out_dir = res["out_dir"]
+    assert os.path.dirname(os.path.realpath(out_dir)) == os.path.realpath(cache_dir)
+    assert not out_dir.endswith(xe._SEG_STAGE_SUFFIX)
+    params = json.load(open(os.path.join(out_dir, "params.json")))
+    assert params["tool"] == "proseg" and params["n_cells"] == len(res["cells_df"]) > 0
+    assert (params["x_min"], params["x_max"], params["y_min"], params["y_max"]) == region
+    import spatialdata
+    assert res["sdata_path"] == os.path.join(out_dir, "spatialdata_proseg.zarr")
+    table = spatialdata.read_zarr(res["sdata_path"]).tables["table"]
+    assert list(table.obs_names.astype(str)) == list(res["cells_df"].index.astype(str))
+    assert tl.sparse_equal(sp.csr_matrix(table.X), res["expr"])
+    assert f"proseg:{_tag(res)}" in [r["value"] for r in xe._list_cached_seg_runs()]
+    assert not [e for e in os.listdir(cache_dir) if e.endswith(xe._SEG_STAGE_SUFFIX)]
 
 
 def _read_proseg_dir(d):

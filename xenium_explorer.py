@@ -266,22 +266,477 @@ class _DatasetChanged(Exception):
 
 
 def _check_dataset_gen(gen: int) -> None:
-    """Raise _DatasetChanged when the dataset was replaced since *gen* was captured."""
+    """Raise _DatasetChanged when the dataset was replaced since *gen* was captured.
+    Jobs call this right before they publish or write a result, so it is also a
+    cancellation point: _JobCancelled (a _DatasetChanged) when Cancel was requested
+    for the job running in this thread."""
+    _job_check()
     if gen != _dataset_gen:
         raise _DatasetChanged("dataset was replaced while this job was running — result discarded")
 
 
-def _stale_job(gen: int, status: str) -> bool:
+def _stale_job(gen: int, status: str, message=None) -> bool:
     """Guard for a job's _set(): False while the job's dataset is still loaded.
     After a dataset swap an "error" report is dropped (returns True); any other
     status raises _DatasetChanged so the job unwinds through its own error handler
-    instead of writing old-dataset results."""
+    instead of writing old-dataset results.
+
+    Also the job registry's hook into every job: a "running" report is a step
+    boundary, so its *message* becomes the job's step text and a requested Cancel is
+    honoured there (_JobCancelled); the "error" a cancelled job reports while it
+    unwinds is dropped (_job_finish writes "Cancelled" instead)."""
+    job = _job_current()
+    if job is not None:
+        if job.cancel.is_set() and not job.shielded:
+            if status == "error":
+                job.cancel_raised = True
+                return True
+            if status == "running":
+                _job_check()
+        elif status == "running" and message:
+            job.step = str(message)
     if gen == _dataset_gen:
         return False
     if status == "error":
         return True
     _check_dataset_gen(gen)
     return True
+
+
+# ─── Job registry ─────────────────────────────────────────────────────────────
+# Every long-running background job (Baysor, Proseg, patch preparation, annotation,
+# SPLIT, SpaGE, UMAP, spatial analysis, niches, CellNEST load, SpatialData export) is
+# started through _job_start() and is listed here with its thread, its child
+# processes, a step text, an optional fraction done and a cancel flag. The jobs panel
+# (update_jobs_panel) and _running_jobs() read from it.
+#
+# Cancellation is cooperative for Python / R code: the flag is checked at step
+# boundaries (_set("running", …) via _stale_job, _check_dataset_gen, _job_check), so a
+# library or R call that is in progress finishes first. External tools are started
+# with _job_run_process() in their own process group, which Cancel terminates
+# (SIGTERM, then SIGKILL after _JOB_KILL_GRACE_S). Once a job starts to write its
+# result it calls _job_shield(): from there it runs to completion.
+import itertools as _itertools
+import time as _time
+import signal as _signal
+import atexit as _atexit
+
+
+class _JobCancelled(_DatasetChanged):
+    """Raised inside a background job at a cancellation point after Cancel was requested.
+    A _DatasetChanged, so the handlers that let a stale job unwind also let this through."""
+
+
+_JOB_KILL_GRACE_S = 5.0     # SIGTERM → SIGKILL
+_JOB_LINGER_S     = 8.0     # a finished job stays in the panel this long
+_JOB_KEEP         = 50      # finished jobs kept in the registry
+_JOB_ACTIVE       = ("running", "cancelling")
+
+# kind → name used in the "Still running: …" refusal of Load Sample / Clean Cache
+_JOB_KIND_NAMES = {
+    "baysor": "Baysor", "proseg": "Proseg", "annotation": "annotation", "spage": "SpaGE",
+    "patches": "SpatialData / patches", "umap": "UMAP", "split": "SPLIT",
+    "niches": "niches", "spatial": "spatial analysis", "save": "Save as SpatialData",
+    "cellnest": "CellNEST load",
+}
+
+_jobs: dict = {}                       # job id → _Job, in start order
+_jobs_lock = threading.RLock()
+_job_seq = _itertools.count(1)
+_job_local = threading.local()         # .job: the _Job running in this thread
+
+
+class _Job:
+    """One background job. state: running → (cancelling →) done | error | cancelled."""
+
+    def __init__(self, kind: str, label: str, state_dict=None, state_lock=None, name=None):
+        self.id       = f"{kind}-{next(_job_seq)}"
+        self.kind     = kind
+        self.label    = label
+        self.name     = name or _JOB_KIND_NAMES.get(kind, kind)
+        self.started  = _time.time()
+        self.ended    = None
+        self.state    = "running"
+        self.step     = "Starting…"
+        self.fraction = None           # 0..1 when known
+        self.thread   = None
+        self.procs    = []             # live child processes (subprocess.Popen)
+        self.cancel   = threading.Event()
+        self.cancel_raised = False     # the job saw the flag and is unwinding
+        self.cancelled = False         # final outcome, set by _job_finish
+        self.shielded = False          # writing its result: no longer cancellable
+        self.error    = None
+        self.gen      = _dataset_gen
+        self.state_dict = state_dict   # the job kind's status dict (e.g. _baysor_state)
+        self.state_lock = state_lock
+        self.cleanup  = []             # callables(job) run when the job ends
+
+    def elapsed(self) -> float:
+        return (self.ended or _time.time()) - self.started
+
+    def active(self) -> bool:
+        return self.state in _JOB_ACTIVE
+
+    def snapshot(self) -> dict:
+        with _jobs_lock:
+            return {"id": self.id, "kind": self.kind, "label": self.label, "name": self.name,
+                    "state": self.state, "step": self.step, "fraction": self.fraction,
+                    "elapsed": self.elapsed(), "started": self.started, "ended": self.ended,
+                    "n_procs": len(self.procs), "shielded": self.shielded,
+                    "cancellable": self.state == "running" and not self.shielded}
+
+
+def _job_current():
+    """The _Job running in the calling thread, or None."""
+    return getattr(_job_local, "job", None)
+
+
+def _job_check() -> None:
+    """Cancellation point: raise _JobCancelled when Cancel was requested for the job
+    running in this thread (no-op outside a job and once the job is shielded)."""
+    job = _job_current()
+    if job is not None and job.cancel.is_set() and not job.shielded:
+        job.cancel_raised = True
+        raise _JobCancelled("Cancelled")
+
+
+_JOB_KEEP_FRACTION = object()
+
+
+def _job_progress(step=None, fraction=_JOB_KEEP_FRACTION, job=None) -> None:
+    """Report the current step text and / or the fraction done (None: unknown) of the
+    job running in this thread. Never raises; use _job_check() for cancellation."""
+    job = job or _job_current()
+    if job is None:
+        return
+    if step is not None:
+        job.step = str(step)
+    if fraction is not _JOB_KEEP_FRACTION:
+        job.fraction = None if fraction is None else float(min(1.0, max(0.0, fraction)))
+
+
+def _job_step(state: dict, lock, message: str, fraction=_JOB_KEEP_FRACTION) -> None:
+    """Step boundary of a job that keeps its status dict by hand (no _set helper):
+    cancellation point, then the message goes to the dict and to the job."""
+    _job_check()
+    with lock:
+        state["message"] = message
+    _job_progress(message, fraction)
+
+
+def _job_shield(step=None) -> None:
+    """Last cancellation point of a job: called right before it starts to write its
+    result (cache files, zarr write-back, DATA). Raises _JobCancelled when Cancel was
+    already requested; afterwards the job cannot be cancelled and runs to completion,
+    so no half-written result is left behind."""
+    job = _job_current()
+    if job is None:
+        return
+    with _jobs_lock:
+        if job.cancel.is_set() and not job.shielded:
+            job.cancel_raised = True
+            raise _JobCancelled("Cancelled")
+        job.shielded = True
+    if step is not None:
+        job.step = str(step)
+
+
+def _job_on_end(fn) -> None:
+    """Register fn(job) to run when the current job ends (any outcome)."""
+    job = _job_current()
+    if job is not None:
+        job.cleanup.append(fn)
+
+
+def _job_start(kind: str, label: str, target, args=(), kwargs=None, *,
+               state=None, lock=None, name=None, copy_context: bool = False) -> "_Job":
+    """Start *target* in a registered daemon thread and return its _Job.
+
+    state / lock: the job kind's status dict and its lock. When the job ends after a
+    Cancel, the dict is set to status "error" / message "Cancelled", which is what the
+    existing polls treat as "finished, nothing loaded": the state is released and the
+    same job can be started again.
+    copy_context: run inside a copy of the caller's contextvars context (rpy2
+    conversion rules set by the callback, see start_annotation)."""
+    kwargs = kwargs or {}
+    job = _Job(kind, label, state, lock, name)
+    if copy_context:
+        _ctx = contextvars.copy_context()
+        call = lambda: _ctx.run(target, *args, **kwargs)
+    else:
+        call = lambda: target(*args, **kwargs)
+
+    def _job_main():
+        _job_local.job = job
+        try:
+            call()
+        except _JobCancelled:
+            job.cancel_raised = True
+        except _DatasetChanged:
+            pass
+        except BaseException as exc:      # a job without its own handler
+            import traceback
+            traceback.print_exc()
+            job.error = str(exc)[:300] or type(exc).__name__
+        finally:
+            try:
+                _job_finish(job)
+            finally:
+                _job_local.job = None
+
+    job.thread = threading.Thread(target=_job_main, daemon=True, name=f"xe-job-{job.id}")
+    with _jobs_lock:
+        _jobs[job.id] = job
+        _done = [j for j in _jobs.values() if not j.active()]
+        for old in _done[:max(0, len(_done) - _JOB_KEEP)]:
+            _jobs.pop(old.id, None)
+    job.thread.start()
+    return job
+
+
+def _job_finish(job: "_Job") -> None:
+    """End of a job's thread: stop leftover child processes, run its clean-up hooks,
+    release the job kind's state after a cancel and record the final state."""
+    for proc in list(job.procs):
+        _kill_proc_tree(proc)
+    cancel_asked = job.cancel.is_set() and not job.shielded
+    status = None
+    if job.state_dict is not None and job.state_lock is not None:
+        with job.state_lock:
+            status = job.state_dict.get("status")
+            # still "running" / "loading": the job stopped at a cancellation point (or
+            # died); "error": it failed while unwinding. Anything else: it completed.
+            unfinished = status in ("running", "starting", "loading", "error")
+            cancelled = cancel_asked and unfinished
+            if job.gen == _dataset_gen:
+                if cancelled:
+                    job.state_dict["status"]  = "error"
+                    job.state_dict["message"] = "Cancelled"
+                elif job.error and status in ("running", "starting", "loading"):
+                    job.state_dict["status"]  = "error"
+                    job.state_dict["message"] = job.error
+            status = job.state_dict.get("status")
+    else:
+        cancelled = cancel_asked and job.cancel_raised
+    job.cancelled = cancelled
+    for fn in job.cleanup:
+        try:
+            fn(job)
+        except Exception as exc:
+            print(f"  job {job.id}: clean-up failed: {exc}", flush=True)
+    with _jobs_lock:
+        job.ended = _time.time()
+        if cancelled:
+            job.state = "cancelled"
+            job.step  = "Cancelled"
+        elif job.error or status == "error":
+            job.state = "error"
+            if job.state_dict is not None:
+                job.step = str(job.state_dict.get("message") or job.error or "Failed")[:200]
+        else:
+            job.state = "done"
+            job.fraction = 1.0 if job.fraction is not None else None
+    if cancelled:
+        print(f"  {job.label}: cancelled after {job.elapsed():.0f} s", flush=True)
+
+
+def _job_cancel(job_id: str) -> bool:
+    """Request cancellation of a running job. Sets its flag and terminates its child
+    processes (in a helper thread: SIGTERM, SIGKILL after the grace period). Returns
+    False when there is no such running job or it is already writing its result."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job is None or job.state != "running" or job.shielded:
+            return False
+        job.cancel.set()
+        job.state = "cancelling"
+        procs = list(job.procs)
+    print(f"  {job.label}: cancel requested"
+          + (f" — stopping {len(procs)} process(es)" if procs else
+             " — stops after the current step"), flush=True)
+    if procs:
+        threading.Thread(target=lambda: [_kill_proc_tree(p) for p in procs],
+                         daemon=True, name=f"xe-job-kill-{job.id}").start()
+    return True
+
+
+def _jobs_list(active_only: bool = False) -> list:
+    """The registered jobs in start order (finished ones included unless active_only)."""
+    with _jobs_lock:
+        return [j for j in _jobs.values() if j.active() or not active_only]
+
+
+def _jobs_panel_rows(now=None) -> list:
+    """Snapshots of the jobs the panel shows: active ones and those that ended less
+    than _JOB_LINGER_S ago."""
+    now = now or _time.time()
+    with _jobs_lock:
+        return [j.snapshot() for j in _jobs.values()
+                if j.active() or (j.ended and now - j.ended < _JOB_LINGER_S)]
+
+
+def _proc_group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True      # exists but not signalable (macOS: only zombies left)
+
+
+def _kill_proc_tree(proc, grace: float = None) -> None:
+    """Stop *proc* and its children. Processes started by _job_run_process() lead
+    their own process group: the group gets SIGTERM and, for whatever is left after
+    *grace* seconds, SIGKILL (Julia workers, shell wrappers and their children
+    included). Without process groups (Windows) only the process itself is stopped."""
+    grace = _JOB_KILL_GRACE_S if grace is None else grace
+    use_group = hasattr(os, "killpg") and getattr(proc, "_xe_new_group", False)
+
+    def _send(sig):
+        try:
+            if use_group:
+                os.killpg(proc.pid, sig)
+            else:
+                proc.send_signal(sig)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+    def _gone():
+        if proc.poll() is None:
+            return False
+        return not (use_group and _proc_group_alive(proc.pid))
+
+    if _gone():
+        return
+    _send(_signal.SIGTERM)
+    deadline = _time.time() + grace
+    while _time.time() < deadline:
+        if _gone():
+            return
+        _time.sleep(0.05)
+    _send(getattr(_signal, "SIGKILL", _signal.SIGTERM))
+    try:
+        proc.wait(timeout=10)
+    except Exception:
+        pass
+
+
+def _job_run_process(cmd, cwd=None, log_tag: str = "", on_line=None, use_pty: bool = False,
+                     env=None) -> int:
+    """Run an external tool for the current job and return its exit code.
+
+    The process is started in its own session / process group and registered with the
+    job, so Cancel can terminate it together with its children. Output (stdout +
+    stderr) is split at newlines and carriage returns, stripped of ANSI codes and
+    printed as "  [log_tag] line"; on_line(line) sees every line first and returns
+    True to keep it out of the log (progress-bar redraws).
+    use_pty: give the tool a pseudo-terminal, for tools that only draw their progress
+    bar on a terminal (Proseg); falls back to a pipe where there is none.
+    Raises _JobCancelled when the job was cancelled while the tool ran."""
+    import codecs, select
+    job = _job_current()
+    master = None
+    popen_kw = dict(cwd=cwd, stdin=subprocess.DEVNULL, env=env)
+    new_group = hasattr(os, "setsid")
+    if new_group:
+        popen_kw["start_new_session"] = True
+    if use_pty:
+        try:
+            import pty
+            master, slave = pty.openpty()
+        except Exception:
+            master = None
+    with _jobs_lock:
+        # under the lock: a Cancel either sees the process or is seen here
+        try:
+            _job_check()
+            if master is not None:
+                proc = subprocess.Popen(cmd, stdout=slave, stderr=slave, **popen_kw)
+            else:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        **popen_kw)
+        except BaseException:
+            if master is not None:
+                os.close(master)
+                os.close(slave)
+            raise
+        proc._xe_new_group = new_group
+        _job_procs_all.add(proc)
+        if job is not None:
+            job.procs.append(proc)
+    if master is not None:
+        os.close(slave)
+    fd = master if master is not None else proc.stdout.fileno()
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    pending = ""
+
+    def _emit(line):
+        line = _strip_ansi(line).rstrip()
+        if not line:
+            return
+        try:
+            if on_line is not None and on_line(line):
+                return
+        except Exception:
+            pass
+        print(f"  [{log_tag}] {line}", flush=True)
+
+    try:
+        while True:
+            try:
+                ready, _, _ = select.select([fd], [], [], 0.5)
+            except (OSError, ValueError):
+                break
+            if not ready:
+                if proc.poll() is not None:
+                    break       # exited; nothing more buffered
+                continue
+            try:
+                data = os.read(fd, 65536)
+            except OSError:     # pty: EIO once the child side is closed
+                break
+            if not data:
+                break
+            pending += decoder.decode(data)
+            parts = re.split(r"[\r\n]", pending)
+            pending = parts.pop()
+            for part in parts:
+                _emit(part)
+        if pending:
+            _emit(pending)
+        proc.wait()
+    finally:
+        if proc.poll() is None or (new_group and _proc_group_alive(proc.pid)):
+            _kill_proc_tree(proc)
+        with _jobs_lock:
+            _job_procs_all.discard(proc)
+            if job is not None and proc in job.procs:
+                job.procs.remove(proc)
+        try:
+            if master is not None:
+                os.close(master)
+            else:
+                proc.stdout.close()
+        except OSError:
+            pass
+    _job_check()
+    return proc.returncode
+
+
+_job_procs_all: set = set()     # every live tool process (also those started outside a job)
+
+
+def _jobs_kill_all_processes() -> None:
+    """At interpreter exit: tools run in their own session, so Ctrl-C in the terminal
+    no longer reaches them - stop them here."""
+    for proc in list(_job_procs_all):
+        _kill_proc_tree(proc, grace=2.0)
+    for stage in list(_seg_stage_active):     # the runs these tools were working on
+        _seg_stage_discard(stage)
+
+
+_atexit.register(_jobs_kill_all_processes)
 
 
 def _dataset_key() -> str:
@@ -352,6 +807,48 @@ def _seg_run_dir(tool: str, param_tag: str) -> str:
     return os.path.join(CACHE_BASE_DIR, f"{tool}_{_dataset_name()}_{ds_hash}_{param_tag}")
 
 
+# A Baysor/Proseg run works in '<run dir>.partial' and the directory gets its real
+# name only when the run is complete (_seg_stage_commit). A run that fails, is
+# cancelled or dies with the app therefore never leaves a run directory that the
+# cached-run listing (_seg_run_tag does not match the suffix) or a later run with the
+# same parameters could take for a finished one, and a cancelled re-run leaves the
+# earlier result of the same parameters in place.
+_SEG_STAGE_SUFFIX = ".partial"
+
+
+def _seg_stage_dir(final_dir: str) -> str:
+    """Create and return the empty working directory of a run that will be stored
+    in *final_dir* (a stale one left by a killed process is removed first)."""
+    import shutil
+    stage = final_dir.rstrip("/\\") + _SEG_STAGE_SUFFIX
+    shutil.rmtree(stage, ignore_errors=True)
+    os.makedirs(stage)
+    _seg_stage_active.add(stage)
+    return stage
+
+
+def _seg_stage_commit(stage: str, final_dir: str) -> None:
+    """Give a finished run its real directory name, replacing an earlier run with
+    the same parameters."""
+    import shutil
+    if os.path.isdir(final_dir):
+        shutil.rmtree(final_dir)
+    os.rename(stage, final_dir)
+    _seg_stage_active.discard(stage)
+
+
+_seg_stage_active: set = set()    # working directories of the runs in progress
+
+
+def _seg_stage_discard(stage) -> None:
+    """Remove the working directory of a run that did not finish (no-op after commit)."""
+    _seg_stage_active.discard(stage)
+    if stage and stage.endswith(_SEG_STAGE_SUFFIX) and os.path.isdir(stage):
+        import shutil
+        shutil.rmtree(stage, ignore_errors=True)
+        print(f"  Removed unfinished run directory {os.path.basename(stage)}", flush=True)
+
+
 def _cache_path(model_name: str) -> str:
     """Return path for the cached annotation parquet file."""
     safe = model_name.replace(".pkl", "").replace("/", "_")
@@ -409,7 +906,7 @@ def _run_celltypist(model_name: str, labels_key: str = "labels",
 
     def _set(status, message, labels=None):
         with _annot_lock:
-            if _stale_job(_gen, status):
+            if _stale_job(_gen, status, message):
                 return
             _annot_state["status"]  = status
             _annot_state["message"] = message
@@ -534,7 +1031,7 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
 
     def _set(status, message, labels=None):
         with _annot_lock:
-            if _stale_job(_gen, status):
+            if _stale_job(_gen, status, message):
                 return
             _annot_state["status"]  = status
             _annot_state["message"] = message
@@ -780,6 +1277,8 @@ names(._rctd_types) <- rownames(._rctd_res)
             print(f"  RCTD: {len(labels):,} cells → {len(unique_types)} types", flush=True)
 
             _check_dataset_gen(_gen)
+            # last cancellation point: label cache, weight cache and labels go together
+            _job_shield()
             _annot_cache_frame(labels, cache_sig).to_parquet(cache_file)
 
             # ── 8. Extract and cache weight matrix (full mode only) ───────────
@@ -806,6 +1305,8 @@ names(._rctd_types) <- rownames(._rctd_res)
             _set("done", f"Done — {len(unique_types)} cell types in {len(labels):,} cells",
                  labels=labels)
 
+    except _JobCancelled:
+        raise                      # reported by _job_finish, not an error
     except Exception as exc:
         import traceback; traceback.print_exc()
         _set("error", str(exc)[:300])
@@ -836,7 +1337,7 @@ def _run_seurat_annotation(rds_path: str, label_col: str = "Names", labels_key: 
 
     def _set(status, message, labels=None):
         with _annot_lock:
-            if _stale_job(_gen, status):
+            if _stale_job(_gen, status, message):
                 return
             _annot_state["status"]  = status
             _annot_state["message"] = message
@@ -1298,11 +1799,72 @@ def _get_patch_bounds_um():
         return None
 
 
+def _baysor_progress_parser(progress_fn=None):
+    """on_line callback for _job_run_process: turns Baysor 0.7 output into
+    progress_fn(fraction 0..1, text). Baysor logs "[hh:mm:ss] Info: <stage>" lines and
+    redraws a "Progress:  NN%|…" bar (ProgressMeter) for the segmentation iterations;
+    the stages before and after it print no percentage, so they get fixed marks."""
+    stage = {"em": False}
+    marks = (("Loading data", 0.02, "loading data"),
+             ("Estimating noise level", 0.05, "estimating noise level"),
+             ("Clustering molecules", 0.08, "clustering molecules"),
+             ("Initializing algorithm", 0.10, "segmentation iterations"),
+             ("Processing complete", 0.85, "iterations complete"),
+             ("Estimating local colors", 0.88, "estimating local colours"),
+             ("Estimating boundary polygons", 0.92, "estimating boundary polygons"),
+             ("Saving results", 0.95, "saving results"),
+             ("All done", 1.0, "done"))
+
+    def _on_line(line):
+        if progress_fn is None:
+            return False
+        m = re.search(r"Progress:\s+(\d+)%", line)
+        if m:
+            if stage["em"]:
+                pct = int(m.group(1))
+                progress_fn(0.10 + 0.75 * pct / 100.0, f"segmentation iterations {pct}%")
+            return False
+        for key, frac, text in marks:
+            if key in line:
+                stage["em"] = key == "Initializing algorithm"
+                progress_fn(frac, text)
+                break
+        return False
+
+    return _on_line
+
+
+# Share of a Baysor/Proseg job's progress bar given to the tool itself; the rest is
+# the expression matrix, clustering / UMAP and the SpatialData store.
+_TOOL_SHARE = 0.9
+
+_PROSEG_BAR_RE = re.compile(r"^\s*\d+:\d\d:\d\d\s+([#\-]{8,})\s*\|")
+
+
+def _proseg_progress_parser(progress_fn=None):
+    """on_line callback for _job_run_process: Proseg 1.x draws an indicatif bar
+    "hh:mm:ss ####------ | log-likelihood: … | assigned: …" for its sampler iterations,
+    on a terminal only (hence use_pty). The filled share of the bar is the fraction of
+    iterations done; bar redraws are kept out of the server log."""
+    def _on_line(line):
+        m = _PROSEG_BAR_RE.match(line)
+        if not m:
+            return False
+        if progress_fn is not None:
+            bar = m.group(1)
+            frac = bar.count("#") / len(bar)
+            progress_fn(frac, f"sampling {round(100 * frac)}%")
+        return True
+
+    return _on_line
+
+
 def _baysor_run_single(tx_df, patch_dir, baysor_bin, scale, min_mol, use_prior, prior_conf,
-                       scale_std=None,  n_clusters=10):
+                       scale_std=None,  n_clusters=10, progress_fn=None):
     """Run Baysor on tx_df, write outputs to patch_dir.
     Returns (cells_df, cell_bounds_dict, seg_df) or raises on failure.
     cells_df is indexed by string cell_id.
+    progress_fn(fraction, text): progress of this one Baysor process.
     """
     os.makedirs(patch_dir, exist_ok=True)
     tx_csv = os.path.join(patch_dir, "transcripts.csv")
@@ -1332,15 +1894,10 @@ def _baysor_run_single(tx_df, patch_dir, baysor_bin, scale, min_mol, use_prior, 
     if _use_prior:
         cmd += ["--prior-segmentation-confidence", str(prior_conf), f":{_prior_col}"]
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, cwd=patch_dir)
-    for line in proc.stdout:
-        line = _strip_ansi(line).rstrip()
-        if line:
-            print(f"  [baysor] {line}", flush=True)
-    proc.wait()
-    if proc.returncode != 0:
-        raise RuntimeError(f"Baysor exited with code {proc.returncode}")
+    returncode = _job_run_process(cmd, cwd=patch_dir, log_tag="baysor",
+                                  on_line=_baysor_progress_parser(progress_fn))
+    if returncode != 0:
+        raise RuntimeError(f"Baysor exited with code {returncode}")
 
     seg_csv = os.path.join(patch_dir, "segmentation.csv")
     if not os.path.exists(seg_csv):
@@ -1392,10 +1949,11 @@ def _baysor_run_single(tx_df, patch_dir, baysor_bin, scale, min_mol, use_prior, 
 def _proseg_run_single(tx_df, patch_dir, proseg_bin, voxel_size, n_threads, n_samples=None,
                        recorded_samples=None, schedule=None,
                        nuclear_reassign_prob=None, prior_seg_prob=None,
-                       prior_type: str = "nucleus"):
+                       prior_type: str = "nucleus", progress_fn=None):
     """Run Proseg on tx_df (written as parquet), write outputs to patch_dir.
     tx_df may also be the path of an existing transcripts.parquet to use as is.
     Returns (cells_df, cell_bounds_dict, tx_meta_df) or raises on failure.
+    progress_fn(fraction, text): progress of this one Proseg process.
     """
     import gzip
     os.makedirs(patch_dir, exist_ok=True)
@@ -1447,15 +2005,10 @@ def _proseg_run_single(tx_df, patch_dir, proseg_bin, voxel_size, n_threads, n_sa
     if prior_seg_prob is not None:
         cmd += ["--prior-seg-reassignment-prob", str(prior_seg_prob)]
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            text=True, cwd=patch_dir)
-    for line in proc.stdout:
-        line = _strip_ansi(line).rstrip()
-        if line:
-            print(f"  [proseg] {line}", flush=True)
-    proc.wait()
-    if proc.returncode != 0:
-        raise RuntimeError(f"Proseg exited with code {proc.returncode}")
+    returncode = _job_run_process(cmd, cwd=patch_dir, log_tag="proseg", use_pty=True,
+                                  on_line=_proseg_progress_parser(progress_fn))
+    if returncode != 0:
+        raise RuntimeError(f"Proseg exited with code {returncode}")
 
     cell_meta = pd.read_csv(meta_out)
     cells_df = cell_meta.rename(columns={
@@ -2041,7 +2594,7 @@ def _load_cached_baysor(out_dir: str) -> None:
 
     def _set(status, message, result=None):
         with _baysor_lock:
-            if _stale_job(_gen, status):
+            if _stale_job(_gen, status, message):
                 return
             _baysor_state["status"]  = status
             _baysor_state["message"] = message
@@ -2238,6 +2791,8 @@ def _load_cached_baysor(out_dir: str) -> None:
         })
         print(f"Loaded cached Baysor: {n_cells:,} cells, {len(cell_bounds):,} boundaries "
               f"from {os.path.basename(out_dir)}", flush=True)
+    except _JobCancelled:
+        raise
     except Exception as exc:
         import traceback; traceback.print_exc()
         _set("error", str(exc)[:300])
@@ -2294,7 +2849,7 @@ def _load_cached_proseg(out_dir: str) -> None:
 
     def _set(status, message, result=None):
         with _proseg_lock:
-            if _stale_job(_gen, status):
+            if _stale_job(_gen, status, message):
                 return
             _proseg_state["status"]  = status
             _proseg_state["message"] = message
@@ -2613,6 +3168,8 @@ def _load_cached_proseg(out_dir: str) -> None:
         })
         print(f"Loaded cached Proseg: {n_cells:,} cells, {len(cell_bounds):,} boundaries "
               f"from {os.path.basename(out_dir)}", flush=True)
+    except _JobCancelled:
+        raise
     except Exception as exc:
         import traceback; traceback.print_exc()
         _set("error", str(exc)[:300])
@@ -2627,7 +3184,7 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
 
     def _set(status, message, result=None):
         with _baysor_lock:
-            if _stale_job(_gen, status):
+            if _stale_job(_gen, status, message):
                 return
             _baysor_state["status"]  = status
             _baysor_state["message"] = message
@@ -2661,6 +3218,7 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
                   f"using it anyway", flush=True)
         return _timed_out
 
+    out_dir = None      # the run's working directory (see _seg_stage_dir)
     try:
         if not DATA.get("data_dir"):
             _set("error", "Resegmentation needs the original Xenium output directory "
@@ -2699,9 +3257,9 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
         if patch_bounds:
             _param_str += f"_pb{_patch_bounds_tag(patch_bounds)}"
         _param_tag = hashlib.md5(_param_str.encode()).hexdigest()[:8]
-        out_dir = _seg_run_dir("baysor", _param_tag)
-        os.makedirs(out_dir, exist_ok=True)
-        print(f"  Baysor: cache dir = {os.path.basename(out_dir)} ({_param_str})", flush=True)
+        final_dir = _seg_run_dir("baysor", _param_tag)
+        out_dir = _seg_stage_dir(final_dir)
+        print(f"  Baysor: cache dir = {os.path.basename(final_dir)} ({_param_str})", flush=True)
 
         # ── Transcript reader: one region at a time, filtered while reading ──
         _set("running", "Loading transcripts…")
@@ -2782,6 +3340,7 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
 
             for pi, (px0, py0, px1, py1) in enumerate(patch_bounds):
                 _set("running", f"Baysor patch {pi + 1}/{n_patches}…")
+                _job_progress(fraction=_TOOL_SHARE * pi / n_patches)
                 # Read with overlap buffer so cells at edges are fully captured
                 # (clipped to the user's region filter)
                 tx_patch = _load_tx(
@@ -2799,8 +3358,13 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
                 try:
                     cells_i, bounds_i, seg_i = _baysor_run_single(
                         tx_patch, patch_dir, baysor_bin, scale, min_mol, use_prior, prior_conf,
-                        scale_std=scale_std, n_clusters=n_clusters
+                        scale_std=scale_std, n_clusters=n_clusters,
+                        progress_fn=lambda f, t, _pi=pi: _job_progress(
+                            f"Baysor patch {_pi + 1}/{n_patches}: {t}",
+                            _TOOL_SHARE * (_pi + f) / n_patches),
                     )
+                except _DatasetChanged:
+                    raise          # cancelled (or dataset replaced): not a failed patch
                 except Exception as pe:
                     print(f"  Baysor: patch {pi + 1} failed: {pe}", flush=True)
                     continue
@@ -2871,14 +3435,18 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
             try:
                 cells_df, cell_bounds, seg_merged = _baysor_run_single(
                     tx_all, out_dir, baysor_bin, scale, min_mol, _up, prior_conf,
-                    scale_std=scale_std, n_clusters=n_clusters
+                    scale_std=scale_std, n_clusters=n_clusters,
+                    progress_fn=lambda f, t: _job_progress(f"Baysor: {t}", _TOOL_SHARE * f),
                 )
+            except _DatasetChanged:
+                raise
             except Exception as e:
                 _set("error", str(e)[:300])
                 return
 
         # ── Build expression matrix ───────────────────────────────────────
         _set("running", "Building expression matrix…")
+        _job_progress(fraction=_TOOL_SHARE)
         expr_mat = _build_baysor_expr(seg_merged, cells_df)
 
         n_cells = len(cells_df)
@@ -2905,6 +3473,7 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
         if os.path.exists(os.path.join(out_dir, "spage_result.json")):
             os.remove(os.path.join(out_dir, "spage_result.json"))
         _set("running", "Computing UMAP and clusters…")
+        _job_progress(fraction=0.92)
         _compute_reseg_clusters_umap(cells_df, expr_mat,
                                      progress_fn=lambda msg: _set("running", msg))
         # Normalize cell_bounds keys to strings (GeoJSON may produce int keys)
@@ -2912,9 +3481,16 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
         _set("running", "Writing SpatialData zarr…")
         _gene_names = DATA["gene_names"]
         _check_dataset_gen(_gen)
+        # last cancellation point: from here the run is stored and published
+        _job_shield()
+        _job_progress(fraction=0.97)
         zarr_path = _build_reseg_sdata(
             cells_df, cell_bounds, expr_mat, _gene_names, "baysor", out_dir
         )
+        _seg_stage_commit(out_dir, final_dir)
+        if zarr_path:
+            zarr_path = os.path.join(final_dir, os.path.basename(zarr_path))
+        out_dir = final_dir
         _set("done", f"Done — {n_cells:,} cells", result={
             "cells_df":    cells_df,
             "cell_bounds": cell_bounds,
@@ -2925,10 +3501,14 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
         })
         print(f"  Baysor: {n_cells:,} cells segmented", flush=True)
 
+    except _JobCancelled:
+        raise                      # reported by _job_finish
     except Exception as exc:
         import traceback
         traceback.print_exc()
         _set("error", str(exc)[:300])
+    finally:
+        _seg_stage_discard(out_dir)
 
 
 # ─── Proseg segmentation ──────────────────────────────────────────────────────
@@ -2944,7 +3524,7 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
 
     def _set(status, message, result=None):
         with _proseg_lock:
-            if _stale_job(_gen, status):
+            if _stale_job(_gen, status, message):
                 return
             _proseg_state["status"]  = status
             _proseg_state["message"] = message
@@ -2971,6 +3551,7 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
                 pass
         return None
 
+    out_dir = None      # the run's working directory (see _seg_stage_dir)
     try:
         # a stale "none" (option removed from the UI) runs as the default prior and
         # therefore shares the default prior's cache tag
@@ -3028,9 +3609,9 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
         if patch_bounds:
             _param_str += f"_pb{_patch_bounds_tag(patch_bounds)}"
         _param_tag = hashlib.md5(_param_str.encode()).hexdigest()[:8]
-        out_dir = _seg_run_dir("proseg", _param_tag)
-        os.makedirs(out_dir, exist_ok=True)
-        print(f"  Proseg: cache dir = {os.path.basename(out_dir)} ({_param_str})", flush=True)
+        final_dir = _seg_run_dir("proseg", _param_tag)
+        out_dir = _seg_stage_dir(final_dir)
+        print(f"  Proseg: cache dir = {os.path.basename(final_dir)} ({_param_str})", flush=True)
 
         if patch_bounds:
             n_patches = len(patch_bounds)
@@ -3045,6 +3626,7 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
 
             for pi, (px0, py0, px1, py1) in enumerate(patch_bounds):
                 _set("running", f"Proseg patch {pi + 1}/{n_patches}…")
+                _job_progress(fraction=_TOOL_SHARE * pi / n_patches)
                 # One patch at a time (patch bounds are already clipped to the user's region)
                 tx_patch = _load_tx(px0, px1, py0, py1)
                 if len(tx_patch) < 10:
@@ -3059,7 +3641,12 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
                         recorded_samples=recorded_samples, schedule=schedule,
                         nuclear_reassign_prob=nuclear_reassign_prob, prior_seg_prob=prior_seg_prob,
                         prior_type=prior_type,
+                        progress_fn=lambda f, t, _pi=pi: _job_progress(
+                            f"Proseg patch {_pi + 1}/{n_patches}: {t}",
+                            _TOOL_SHARE * (_pi + f) / n_patches),
                     )
+                except _DatasetChanged:
+                    raise          # cancelled (or dataset replaced): not a failed patch
                 except Exception as pe:
                     print(f"  Proseg: patch {pi + 1} failed: {pe}", flush=True)
                     continue
@@ -3149,7 +3736,10 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
                     recorded_samples=recorded_samples, schedule=schedule,
                     nuclear_reassign_prob=nuclear_reassign_prob, prior_seg_prob=prior_seg_prob,
                     prior_type=prior_type,
+                    progress_fn=lambda f, t: _job_progress(f"Proseg: {t}", _TOOL_SHARE * f),
                 )
+            except _DatasetChanged:
+                raise
             except Exception as e:
                 _set("error", str(e)[:300])
                 return
@@ -3160,6 +3750,7 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
 
         # ── Build expression matrix ───────────────────────────────────────
         _set("running", "Building expression matrix…")
+        _job_progress(fraction=_TOOL_SHARE)
         expr_mat = _build_proseg_expr(tx_meta_merged, cells_df)
 
         n_cells = len(cells_df)
@@ -3186,6 +3777,7 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
         if os.path.exists(os.path.join(out_dir, "spage_result.json")):
             os.remove(os.path.join(out_dir, "spage_result.json"))
         _set("running", "Computing UMAP and clusters…")
+        _job_progress(fraction=0.92)
         _compute_reseg_clusters_umap(cells_df, expr_mat,
                                      progress_fn=lambda msg: _set("running", msg))
         # Normalize cell_bounds keys to strings (GeoJSON may produce int keys)
@@ -3193,9 +3785,16 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
         _set("running", "Writing SpatialData zarr…")
         _gene_names = DATA["gene_names"]
         _check_dataset_gen(_gen)
+        # last cancellation point: from here the run is stored and published
+        _job_shield()
+        _job_progress(fraction=0.97)
         zarr_path = _build_reseg_sdata(
             cells_df, cell_bounds, expr_mat, _gene_names, "proseg", out_dir
         )
+        _seg_stage_commit(out_dir, final_dir)
+        if zarr_path:
+            zarr_path = os.path.join(final_dir, os.path.basename(zarr_path))
+        out_dir = final_dir
         # Same string index as the cache-load paths, so plot customdata (str ids)
         # matches for lasso ROIs / ROI metadata in the session that ran Proseg.
         cells_df.index = cells_df.index.astype(str)
@@ -3209,10 +3808,14 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
         })
         print(f"  Proseg: {n_cells:,} cells segmented", flush=True)
 
+    except _JobCancelled:
+        raise                      # reported by _job_finish
     except Exception as exc:
         import traceback
         traceback.print_exc()
         _set("error", str(exc)[:300])
+    finally:
+        _seg_stage_discard(out_dir)
 
 
 # ─── Reseg clustering + UMAP ─────────────────────────────────────────────────
@@ -3621,7 +4224,7 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
 
     def _set(status, message, result=None):
         with _split_lock:
-            if _stale_job(_gen, status):
+            if _stale_job(_gen, status, message):
                 return
             _split_state["status"]  = status
             _split_state["message"] = message
@@ -3958,6 +4561,8 @@ names(._split_rctd_types) <- rownames(._split_rctd_res)
         _split_subset = ((_alt_res is not None and "_cells_df_original" in _alt_res)
                          or (_alt_res is None and "_df_original" in DATA))
         _split_note = ""
+        # Last cancellation point: the store and the in-memory result are updated together
+        _job_shield()
         if _split_subset:
             _split_note = (" (subset active: result kept in memory only, "
                            "the SpatialData store was not changed)")
@@ -4077,6 +4682,8 @@ names(._split_rctd_types) <- rownames(._split_rctd_res)
              result={"n_cells": n_cells, "n_returned": n_corr, "n_changed": n_changed})
         print(f"  SPLIT: done — {_split_msg}{_split_note}", flush=True)
 
+    except _JobCancelled:
+        raise                      # reported by _job_finish, not an error
     except Exception:
         import traceback
         msg = traceback.format_exc()
@@ -4095,7 +4702,7 @@ def _run_reseg_umap() -> None:
 
     def _set(status, message, result=None):
         with _umap_reseg_lock:
-            if _stale_job(_gen, status):
+            if _stale_job(_gen, status, message):
                 return
             _umap_reseg_state["status"]  = status
             _umap_reseg_state["message"] = message
@@ -4259,6 +4866,7 @@ def _run_reseg_umap() -> None:
                                random_state=0).fit_transform(_pca2)
 
             _check_dataset_gen(_gen)
+            _job_shield()   # last cancellation point: DATA["df"] is updated below
             if _sub_mask is not None:
                 # Write NaN for cells SPLIT dropped, UMAP coords for cells it kept.
                 # Use split_umap_1/2 so make_umap_fig can distinguish corrected vs original UMAP.
@@ -4390,6 +4998,7 @@ def _run_reseg_umap() -> None:
             {"umap_1": embedding[:, 0], "umap_2": embedding[:, 1]},
             index=cell_ids,
         )
+        _job_shield()   # last cancellation point: publish, then cache to the run's zarr
         with _umap_reseg_lock:
             _check_dataset_gen(_gen)
             _umap_reseg_state["owner"] = alt_res.get("out_dir")
@@ -4425,6 +5034,8 @@ def _run_reseg_umap() -> None:
             print(f"  Reseg UMAP: cached to zarr", flush=True)
         _set("done", f"Done — {n_cells:,} cells", result=umap_df)
 
+    except _JobCancelled:
+        raise
     except Exception as exc:
         import traceback
         traceback.print_exc()
@@ -4722,12 +5333,23 @@ def _vectorized_spage(spatial_df: pd.DataFrame, rna_df: pd.DataFrame,
             out_zarr, mode='w', shape=(n_spat, n_genes), dtype=np.float32,
             chunks=(min(65536, n_spat), min(GENE_CHUNK, n_genes)),
         )
-        for i in range(0, n_genes, GENE_CHUNK):
-            chunk_genes = genes_to_predict[i:i + GENE_CHUNK]
-            Y      = rna_df[chunk_genes].values.astype(np.float32)
-            Y_nbrs = Y[indices]
-            _z[:, i:i + len(chunk_genes)] = np.einsum("ij,ijk->ik", w, Y_nbrs)
-            del Y, Y_nbrs
+        try:
+            for i in range(0, n_genes, GENE_CHUNK):
+                _job_check()
+                _job_progress(fraction=i / n_genes)
+                chunk_genes = genes_to_predict[i:i + GENE_CHUNK]
+                Y      = rna_df[chunk_genes].values.astype(np.float32)
+                Y_nbrs = Y[indices]
+                _z[:, i:i + len(chunk_genes)] = np.einsum("ij,ijk->ik", w, Y_nbrs)
+                del Y, Y_nbrs
+            _job_shield()
+        except _JobCancelled:
+            # an array without the 'genes' attribute is not loaded as a result, but
+            # it can be many GB: do not leave it in the cache
+            import shutil as _sh_z
+            del _z
+            _sh_z.rmtree(out_zarr, ignore_errors=True)
+            raise
         _z.attrs['genes'] = genes_to_predict   # written last — marks completion
         del w, indices
         return None   # caller owns the zarr; use result_path/result_genes for lookup
@@ -4735,6 +5357,8 @@ def _vectorized_spage(spatial_df: pd.DataFrame, rna_df: pd.DataFrame,
     # ── In-memory path (small result) ──────────────────────────────────────────
     chunks = []
     for i in range(0, n_genes, GENE_CHUNK):
+        _job_check()
+        _job_progress(fraction=i / n_genes)
         chunk_genes = genes_to_predict[i:i + GENE_CHUNK]
         Y      = rna_df[chunk_genes].values.astype(np.float32)  # (n_rna, chunk)
         Y_nbrs = Y[indices]                                      # (n_spat, 50, chunk)
@@ -4764,7 +5388,7 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
 
     def _set(status, message, result=None):
         with _spage_lock:
-            if _stale_job(_gen, status):
+            if _stale_job(_gen, status, message):
                 return
             _spage_state["status"]  = status
             _spage_state["message"] = message
@@ -5119,6 +5743,10 @@ writeLines(colnames(mat_sub), "{cells_file}")
 
         # ── Cache to parquet ──────────────────────────────────────────────
         _set("running", "Saving imputed results…")
+        # Last cancellation point. The cache file, the run's result reference, the
+        # zarr table (deleted, then rewritten) and DATA are written as one unit.
+        _job_shield()
+        _job_progress(fraction=None)
         imp_df.to_parquet(cache_file)
         if _alt_res is None:
             _spage_index_update(cache_file, _ds_key)
@@ -5315,6 +5943,8 @@ writeLines(colnames(mat_sub), "{cells_file}")
         _set("done", f"Done — {len(imp_df.columns):,} genes imputed",
              result=imp_df if _alt_res is None else None)
 
+    except _JobCancelled:
+        raise                      # reported by _job_finish; the finally below still runs
     except Exception as exc:
         import traceback
         traceback.print_exc()
@@ -5415,6 +6045,11 @@ def subset(cluster=None, cell_type=None,
     df            = DATA.get("_df_original", DATA["df"])
     _df_to_expr_o = DATA.get("_df_to_expr_orig", DATA["df_to_expr"])
     mask = pd.Series(True, index=df.index)
+    # Set once a filter has really been applied (to the Xenium cells or to a loaded
+    # Baysor/Proseg run). Filters that are skipped - no annotation, unknown gene,
+    # missing column - select nothing: a call made of those alone changes nothing
+    # and must not flag an "N of N" subset as active.
+    _applied = False
 
     # ── Cluster filter ────────────────────────────────────────────────────
     if cluster is not None:
@@ -5428,6 +6063,7 @@ def subset(cluster=None, cell_type=None,
         vals = [cluster] if not isinstance(cluster, (list, tuple)) else list(cluster)
         vals = [int(v) for v in vals]
         mask &= df[col].isin(vals)
+        _applied = True
 
     # ── Cell type filter ──────────────────────────────────────────────────
     if cell_type is not None:
@@ -5452,6 +6088,7 @@ def subset(cluster=None, cell_type=None,
         else:
             vals = [cell_type] if isinstance(cell_type, str) else list(cell_type)
             mask &= labels.reindex(df.index.astype(str)).isin(vals)
+            _applied = True
 
     # ── Gene expression filter ────────────────────────────────────────────
     if gene is not None and (min_expr is not None or max_expr is not None):
@@ -5466,6 +6103,7 @@ def subset(cluster=None, cell_type=None,
                 index=df.index)
             if min_expr is not None: mask &= expr_vals >= min_expr
             if max_expr is not None: mask &= expr_vals <= max_expr
+            _applied = True
         else:
             print(f"  subset: gene '{gene}' not found - skipping gene filter", flush=True)
 
@@ -5480,41 +6118,27 @@ def subset(cluster=None, cell_type=None,
             continue
         if _lo is not None: mask &= df[_ncol] >= _lo
         if _hi is not None: mask &= df[_ncol] <= _hi
+        _applied = True
 
     # ── Explicit cell IDs ─────────────────────────────────────────────────
     if cell_ids is not None:
         mask &= df.index.isin(cell_ids)
+        _applied = True
 
     df_sub = df[mask]
 
-    # Mask built without error: save the originals (first subset call) and switch
-    if "_df_original" not in DATA:
-        DATA["_df_original"]      = df
-        DATA["_df_to_expr_orig"]  = _df_to_expr_o
-
-    # Update active data
-    DATA["df"] = df_sub
-
-    # Rebuild df_to_expr for the subset (map subset row → expr matrix row)
-    orig_to_expr = DATA["_df_to_expr_orig"]
-    orig_pos     = {cid: i for i, cid in enumerate(df.index)}
-    DATA["df_to_expr"] = np.array(
-        [orig_to_expr[orig_pos[cid]] for cid in df_sub.index], dtype=np.int64
-    )
-
-    # ── Reseg path (Baysor / Proseg) ──────────────────────────────────────
+    # ── Reseg path (Baysor / Proseg): build the masks ─────────────────────
     # Every loaded run is filtered, not only one of them: both tools can hold a
     # result at once and the Segmentation dropdown decides which one is displayed.
+    # Nothing is changed in this loop; the masks are applied further down.
+    _reseg_plans = []
     for _tool, _alt_res in _loaded_reseg_results():
 
-        # Save originals on first subset
-        if "_cells_df_original" not in _alt_res:
-            _alt_res["_cells_df_original"] = _alt_res["cells_df"]
-            _alt_res["_expr_original"]      = _alt_res["expr"]
-            _alt_res["_corrected_original"] = _alt_res.get("split_corrected_expr")
-
-        bdf   = _alt_res["_cells_df_original"]
+        _b_first = "_cells_df_original" not in _alt_res      # no subset active yet
+        bdf        = _alt_res["cells_df"] if _b_first else _alt_res["_cells_df_original"]
+        _bexpr_all = _alt_res["expr"]     if _b_first else _alt_res["_expr_original"]
         bmask = pd.Series(True, index=bdf.index)
+        _b_applied = False
 
         # Cluster filter — reseg cluster column names start with "cluster"
         if cluster is not None:
@@ -5523,6 +6147,7 @@ def subset(cluster=None, cell_type=None,
             if _bcol is not None:
                 _bvals_str = [str(cluster)] if not isinstance(cluster, (list, tuple)) else [str(v) for v in cluster]
                 bmask &= bdf[_bcol].astype(str).isin(_bvals_str)
+                _b_applied = True
             else:
                 print(f"  subset reseg: no cluster column in cells_df — skipping cluster filter", flush=True)
 
@@ -5539,29 +6164,65 @@ def subset(cluster=None, cell_type=None,
             else:
                 _bct_vals = [cell_type] if isinstance(cell_type, str) else list(cell_type)
                 bmask &= _blabels.reindex(bdf.index.astype(str)).isin(_bct_vals)
+                _b_applied = True
 
         # Gene expression filter — reseg uses its own expr matrix
         if gene is not None and (min_expr is not None or max_expr is not None):
             if gene in DATA["gene_names"]:
                 _gidx    = DATA["gene_names"].index(gene)
-                _braw    = _alt_res["_expr_original"].getcol(_gidx).toarray().ravel()
+                _braw    = _bexpr_all.getcol(_gidx).toarray().ravel()
                 _bgexpr  = pd.Series(np.log1p(_braw), index=bdf.index)
                 if min_expr is not None: bmask &= _bgexpr >= min_expr
                 if max_expr is not None: bmask &= _bgexpr <= max_expr
+                _b_applied = True
             else:
                 print(f"  subset reseg: gene '{gene}' not in reseg expr — skipping gene filter", flush=True)
 
         # QC filters
-        if min_transcripts  is not None and "transcript_counts" in bdf.columns: bmask &= bdf["transcript_counts"] >= min_transcripts
-        if max_transcripts  is not None and "transcript_counts" in bdf.columns: bmask &= bdf["transcript_counts"] <= max_transcripts
-        if min_cell_area    is not None and "cell_area"         in bdf.columns: bmask &= bdf["cell_area"]         >= min_cell_area
-        if max_cell_area    is not None and "cell_area"         in bdf.columns: bmask &= bdf["cell_area"]         <= max_cell_area
-        if min_nucleus_area is not None and "nucleus_area"      in bdf.columns: bmask &= bdf["nucleus_area"]      >= min_nucleus_area
-        if max_nucleus_area is not None and "nucleus_area"      in bdf.columns: bmask &= bdf["nucleus_area"]      <= max_nucleus_area
+        for _bcol_q, _blo, _bhi in (("transcript_counts", min_transcripts, max_transcripts),
+                                    ("cell_area", min_cell_area, max_cell_area),
+                                    ("nucleus_area", min_nucleus_area, max_nucleus_area)):
+            if (_blo is None and _bhi is None) or _bcol_q not in bdf.columns:
+                continue
+            if _blo is not None: bmask &= bdf[_bcol_q] >= _blo
+            if _bhi is not None: bmask &= bdf[_bcol_q] <= _bhi
+            _b_applied = True
 
         # Explicit cell IDs
         if cell_ids is not None:
             bmask &= bdf.index.isin(cell_ids)
+            _b_applied = True
+
+        _reseg_plans.append((_tool, _alt_res, bdf, bmask))
+        _applied = _applied or _b_applied
+
+    if not _applied:
+        print("  subset: no filter was applied (none given, or all were skipped) — "
+              "the displayed cells are unchanged", flush=True)
+        return DATA["df"]
+
+    # Masks built without error: save the originals (first subset call) and switch
+    if "_df_original" not in DATA:
+        DATA["_df_original"]      = df
+        DATA["_df_to_expr_orig"]  = _df_to_expr_o
+
+    # Update active data
+    DATA["df"] = df_sub
+
+    # Rebuild df_to_expr for the subset (map subset row → expr matrix row)
+    orig_to_expr = DATA["_df_to_expr_orig"]
+    orig_pos     = {cid: i for i, cid in enumerate(df.index)}
+    DATA["df_to_expr"] = np.array(
+        [orig_to_expr[orig_pos[cid]] for cid in df_sub.index], dtype=np.int64
+    )
+
+    # ── Reseg path: apply the masks ───────────────────────────────────────
+    for _tool, _alt_res, bdf, bmask in _reseg_plans:
+        # Save originals on first subset
+        if "_cells_df_original" not in _alt_res:
+            _alt_res["_cells_df_original"] = _alt_res["cells_df"]
+            _alt_res["_expr_original"]      = _alt_res["expr"]
+            _alt_res["_corrected_original"] = _alt_res.get("split_corrected_expr")
 
         _kept_pos = np.where(bmask.values)[0]
         _bdf_sub  = bdf.iloc[_kept_pos]
@@ -5752,6 +6413,7 @@ def _run_spatial_analysis(label_key, n_neighbors, alt_res):
             _spatial_state["status"] = "running"
             _spatial_state["message"] = "Building neighbor graph…"
             _spatial_state["result"] = None
+        _job_progress("Building neighbor graph…", 0.0)
 
         # Get cells and coordinates
         if alt_res is not None:
@@ -5794,8 +6456,8 @@ def _run_spatial_analysis(label_key, n_neighbors, alt_res):
         label_int = np.array([label_to_idx[l] for l in labels_arr], dtype=np.int32)
         n_types = len(cell_types)
 
-        with _spatial_lock:
-            _spatial_state["message"] = f"Computing nearest neighbors (k={n_neighbors})…"
+        _job_step(_spatial_state, _spatial_lock,
+                  f"Computing nearest neighbors (k={n_neighbors})…", 1 / 5)
 
         from sklearn.neighbors import NearestNeighbors
         nn = NearestNeighbors(n_neighbors=min(n_neighbors + 1, len(coords_valid)), algorithm="ball_tree")
@@ -5804,21 +6466,18 @@ def _run_spatial_analysis(label_key, n_neighbors, alt_res):
         # Remove self (first neighbor is usually self)
         neighbor_indices = neighbor_indices[:, 1:]
 
-        with _spatial_lock:
-            _spatial_state["message"] = "Computing neighbor type matrix…"
+        _job_step(_spatial_state, _spatial_lock, "Computing neighbor type matrix…", 2 / 5)
 
         # Build raw count matrix ONCE (vectorized), reuse for all analyses
         raw_matrix = _build_raw_neighbor_matrix(label_int, neighbor_indices, n_types)
         counts = np.bincount(label_int, minlength=n_types).astype(np.float64)
         freqs = counts / counts.sum()
 
-        with _spatial_lock:
-            _spatial_state["message"] = "Computing co-occurrence…"
+        _job_step(_spatial_state, _spatial_lock, "Computing co-occurrence…", 3 / 5)
 
         cooccurrence = _compute_cooccurrence_from_raw(raw_matrix, freqs)
 
-        with _spatial_lock:
-            _spatial_state["message"] = "Computing enrichment…"
+        _job_step(_spatial_state, _spatial_lock, "Computing enrichment…", 4 / 5)
 
         enrichment = _compute_enrichment_from_raw(raw_matrix, counts, freqs)
 
@@ -5857,6 +6516,23 @@ def _run_spatial_analysis(label_key, n_neighbors, alt_res):
                 _spatial_state["message"] = f"Error: {e}\n{traceback.format_exc()}"
 
 
+_NICHE_NONE = "N/A"     # a cell without a niche (outside the subset niches were computed on)
+
+
+def _niche_str(values) -> "pd.Series":
+    """The niche column as strings for display; cells without a niche (NaN after
+    unsubset(), or a store written while some cells had none) become _NICHE_NONE
+    instead of the string "nan"."""
+    s = values if isinstance(values, pd.Series) else pd.Series(values)
+    out = s.astype(object).where(s.notna(), _NICHE_NONE).astype(str)
+    return out.where(~out.isin(["nan", "NaN", "None", "<NA>", ""]), _NICHE_NONE)
+
+
+def _niche_name(niche: str) -> str:
+    """Legend entry of a niche value returned by _niche_str()."""
+    return "No niche" if niche == _NICHE_NONE else f"Niche {niche}"
+
+
 def _run_spatial_niches(n_clusters: int, n_neighbors: int, label_key: str | None,
                         alt_res) -> None:
     """Background thread: compute spatial niches via BuildNicheAssay-style KMeans."""
@@ -5880,8 +6556,8 @@ def _run_spatial_niches(n_clusters: int, n_neighbors: int, label_key: str | None
         n_cells = len(coords)
         k = min(n_neighbors + 1, n_cells)
 
-        with _niche_lock:
-            _niche_state["message"] = f"Finding {n_neighbors} neighbors for {n_cells:,} cells…"
+        _job_step(_niche_state, _niche_lock,
+                  f"Finding {n_neighbors} neighbors for {n_cells:,} cells…", 0.0)
 
         nn = NearestNeighbors(n_neighbors=k, algorithm="ball_tree", n_jobs=-1)
         nn.fit(coords)
@@ -5910,8 +6586,8 @@ def _run_spatial_niches(n_clusters: int, n_neighbors: int, label_key: str | None
             ct_to_idx = {ct: i for i, ct in enumerate(cell_types)}
             label_arr = aligned.map(ct_to_idx).values  # int array
 
-            with _niche_lock:
-                _niche_state["message"] = "Building neighborhood composition matrix…"
+            _job_step(_niche_state, _niche_lock,
+                      "Building neighborhood composition matrix…", 1 / 3)
 
             n_types = len(cell_types)
             composition = np.zeros((n_cells, n_types), dtype=np.float32)
@@ -5930,14 +6606,15 @@ def _run_spatial_niches(n_clusters: int, n_neighbors: int, label_key: str | None
             composition = (coords - coords.mean(axis=0)) / (coords.std(axis=0) + 1e-8)
             cell_types = None
 
-        with _niche_lock:
-            _niche_state["message"] = f"KMeans clustering into {n_clusters} niches…"
+        _job_step(_niche_state, _niche_lock,
+                  f"KMeans clustering into {n_clusters} niches…", 2 / 3)
 
         km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
         niche_labels = km.fit_predict(composition).astype(str)
 
         # Write niche column to cells_df
         _check_dataset_gen(_gen)
+        _job_shield()   # last cancellation point: the niche column is written below
         cells_df = cells_df.copy()
         cells_df["niche"] = niche_labels
 
@@ -5978,6 +6655,8 @@ def _run_spatial_niches(n_clusters: int, n_neighbors: int, label_key: str | None
             _check_dataset_gen(_gen)
             _niche_state["status"] = "done"
             _niche_state["message"] = f"Done — {n_clusters} niches computed for {n_cells:,} cells"
+    except _JobCancelled:
+        raise
     except Exception as exc:
         import traceback
         traceback.print_exc()
@@ -6068,13 +6747,10 @@ def run_spage(rds_path: str, genes_file: str = None, n_pv: int = 50,
         _spage_state.update({"status": "running", "message": "Starting…", "result": None})
     _spage_repl_pending = True
 
-    import contextvars
-    ctx = contextvars.copy_context()
-    threading.Thread(
-        target=lambda: ctx.run(_run_spage_imputation, rds_path, n_pv, genes_input,
-                               seg_source, use_corrected=use_corrected),
-        daemon=True,
-    ).start()
+    _job_start("spage", "SpaGE imputation", _run_spage_imputation,
+               args=(rds_path, n_pv, genes_input, seg_source),
+               kwargs=dict(use_corrected=use_corrected),
+               state=_spage_state, lock=_spage_lock, copy_context=True)
 
 
 # ─── Morphology image overlay ─────────────────────────────────────────────────
@@ -7819,7 +8495,7 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
 
         if color_by == "niche":
             if "niche" in bdf.columns:
-                niche_vals = bdf["niche"].astype(str)
+                niche_vals = _niche_str(bdf["niche"])
                 unique_niches = sorted(niche_vals.unique(), key=lambda v: (0, int(v)) if v.isdigit() else (1, v))
                 cmap = {n: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, n in enumerate(unique_niches)}
                 traces = []
@@ -7828,7 +8504,7 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                     traces.append(go.Scattergl(
                         x=x[mask], y=y[mask], mode="markers",
                         marker=dict(size=size, color=cmap[n], opacity=opacity),
-                        name=f"Niche {n}", legendgroup=n, showlegend=True,
+                        name=_niche_name(n), legendgroup=n, showlegend=True,
                         text=_ids_arr[mask], customdata=_ids_arr[mask],
                         hovertemplate="<b>%{text}</b><extra>Niche " + n + "</extra>",
                     ))
@@ -8028,7 +8704,7 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                 all_niche_vals = []
                 for edf in all_dfs:
                     if "niche" in edf.columns:
-                        all_niche_vals.extend(edf["niche"].astype(str).tolist())
+                        all_niche_vals.extend(_niche_str(edf["niche"]).tolist())
                     else:
                         all_niche_vals.extend(["N/A"] * len(edf))
                 arr_niche = np.array(all_niche_vals)
@@ -8043,7 +8719,7 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                     traces.append(go.Scattergl(
                         x=arr_x[mask], y=arr_y[mask], mode="markers",
                         marker=dict(size=size, color=ncmap[_n], opacity=opacity),
-                        name=f"Niche {_n}", legendgroup=_n, showlegend=True,
+                        name=_niche_name(_n), legendgroup=_n, showlegend=True,
                         text=arr_ids[mask].tolist(),
                         customdata=arr_ids[mask].tolist(),
                         hovertemplate="<b>%{text}</b><extra>Niche " + _n + "</extra>",
@@ -8187,7 +8863,7 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                     color_by = "transcript_counts"
             if color_by == "niche":
                 if "niche" in df.columns:
-                    _niche_vals = df["niche"].astype(str)
+                    _niche_vals = _niche_str(df["niche"])
                     _unique_niches = sorted(_niche_vals.unique(), key=lambda v: (0, int(v)) if v.isdigit() else (1, v))
                     _ncmap = {n: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, n in enumerate(_unique_niches)}
                     traces = []
@@ -8197,7 +8873,7 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                         traces.append(go.Scattergl(
                             x=x[_nmask], y=y[_nmask], mode="markers",
                             marker=dict(size=size, color=_ncmap[_n], opacity=opacity),
-                            name=f"Niche {_n}", legendgroup=_n, showlegend=True,
+                            name=_niche_name(_n), legendgroup=_n, showlegend=True,
                             text=np.array(_nids)[_nmask].tolist(),
                             customdata=np.array(_nids)[_nmask].tolist(),
                             hovertemplate="<b>%{text}</b><extra>Niche " + _n + "</extra>",
@@ -8484,11 +9160,13 @@ def make_cooccurrence_fig(zmin=None, zmax=None, width=None, height=None):
         paper_bgcolor=CARD_BG, plot_bgcolor=PLOT_BG,
         font=dict(color=TEXT, size=10),
         margin=dict(l=120, r=20, t=30, b=120),
-        height=max(400, 30 * n),
+        height=int(height) if height else max(400, 30 * n),
         xaxis=dict(tickangle=-45, gridcolor=BORDER, linecolor=BORDER),
         yaxis=dict(gridcolor=BORDER, linecolor=BORDER),
         title=dict(text="Co-occurrence (log2 observed/expected)", font=dict(color=TEXT, size=12), x=0.5),
     )
+    if width:
+        fig.update_layout(width=int(width))
     return fig
 
 
@@ -8517,11 +9195,13 @@ def make_enrichment_fig(zmin=None, zmax=None, width=None, height=None):
         paper_bgcolor=CARD_BG, plot_bgcolor=PLOT_BG,
         font=dict(color=TEXT, size=10),
         margin=dict(l=120, r=20, t=30, b=120),
-        height=max(400, 30 * n),
+        height=int(height) if height else max(400, 30 * n),
         xaxis=dict(tickangle=-45, gridcolor=BORDER, linecolor=BORDER),
         yaxis=dict(gridcolor=BORDER, linecolor=BORDER),
         title=dict(text="Neighborhood Enrichment (log2 observed/expected)", font=dict(color=TEXT, size=12), x=0.5),
     )
+    if width:
+        fig.update_layout(width=int(width))
     return fig
 
 
@@ -8747,7 +9427,7 @@ def make_niche_umap_fig(width=None, height=None, baysor_active=False, proseg_act
         axis_labels = ("X (µm)", "Y (µm)")
     else:
         return _make_placeholder_fig("No UMAP coordinates available.")
-    niche_arr = df["niche"].values.astype(str)
+    niche_arr = _niche_str(df["niche"]).values
     valid_mask = ~(np.isnan(xu) | np.isnan(yu))
     xu = xu[valid_mask]
     yu = yu[valid_mask]
@@ -8761,8 +9441,8 @@ def make_niche_umap_fig(width=None, height=None, baysor_active=False, proseg_act
             x=xu[mask], y=yu[mask],
             mode="markers",
             marker=dict(size=3, color=color, opacity=0.7),
-            name=f"Niche {niche}",
-            hovertemplate=f"Niche {niche}<extra></extra>",
+            name=_niche_name(niche),
+            hovertemplate=f"{_niche_name(niche)}<extra></extra>",
         ))
     fig = go.Figure(traces)
     layout_kw = dict(
@@ -8972,7 +9652,7 @@ def make_umap_fig(color_by, method, gene, size, opacity,
         if color_by == "niche":
             bdf = alt_res["cells_df"]
             if "niche" in bdf.columns:
-                _nv = bdf["niche"].reindex(udf.index).astype(str)
+                _nv = _niche_str(bdf["niche"].reindex(udf.index))
                 _un = sorted(_nv.unique(), key=lambda v: (0, int(v)) if v.isdigit() else (1, v))
                 _nm = {n: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, n in enumerate(_un)}
                 traces = []
@@ -9101,7 +9781,7 @@ def make_umap_fig(color_by, method, gene, size, opacity,
 
         if color_by == "niche":
             if "niche" in df.columns:
-                _nv = df["niche"].astype(str)
+                _nv = _niche_str(df["niche"])
                 _un = sorted(_nv.unique(), key=lambda v: (0, int(v)) if v.isdigit() else (1, v))
                 _nm = {n: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, n in enumerate(_un)}
                 traces = []
@@ -9271,9 +9951,12 @@ def _load_cellnest_data(folder: str, dataset_name: str, strip_suffix: str = ""):
         bc_path  = os.path.join(folder, "metadata", dataset_name,
                                 f"cell_barcode_{dataset_name}.csv")
 
+        _job_progress("Reading CellNEST tables…")
         ccc_df  = pd.read_csv(ccc_path)
         lr_freq = pd.read_csv(freq_path)
         barcodes = pd.read_csv(bc_path, header=None)[0].tolist()
+        _job_check()
+        _job_progress("Matching cells and annotations…")
 
         # Load CellNEST's own coordinate file (one row per cell, no header)
         coord_path = os.path.join(folder, "metadata", dataset_name,
@@ -9364,6 +10047,7 @@ def _load_cellnest_data(folder: str, dataset_name: str, strip_suffix: str = ""):
         if annot_series:
             print(f"[CellNEST] Joined annotation-state labels: {[k for k,_ in annot_series]}", flush=True)
 
+        _job_check()   # last cancellation point
         with _cellnest_lock:
             if _gen != _dataset_gen:
                 # another sample was loaded meanwhile: these results are not its results
@@ -9380,6 +10064,8 @@ def _load_cellnest_data(folder: str, dataset_name: str, strip_suffix: str = ""):
             }
             _cellnest_state["status"] = "done"
             _cellnest_state["message"] = f"Loaded {len(ccc_df):,} interactions"
+    except _JobCancelled:
+        raise
     except Exception as exc:
         with _cellnest_lock:
             if _gen == _dataset_gen:
@@ -10152,7 +10838,7 @@ def _cellnest_overlay_traces(lr_pair, top_n=100, edge_width=1, color_by="lr_pair
 
 # ─── CellNEST downstream TF helpers ──────────────────────────────────────────
 
-_CELLNEST_DB_CACHE = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache", "cellnest_db")
+_CELLNEST_DB_CACHE = os.path.join(CACHE_BASE_DIR, "cellnest_db")
 _CELLNEST_DB_URLS = {
     "ppi":    "https://raw.githubusercontent.com/schwartzlab-methods/CellNEST/main/database/human_signaling_ppi.csv",
     "tf":     "https://raw.githubusercontent.com/schwartzlab-methods/CellNEST/main/database/human_tf_target.csv",
@@ -10301,6 +10987,8 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
         with _save_sdata_lock:
             _save_sdata_state["status"]  = status
             _save_sdata_state["message"] = msg
+        if status == "running":
+            _job_progress(msg)
 
     try:
         import spatialdata as sd
@@ -10468,6 +11156,8 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
         n_cells = out_tbl.n_obs if out_tbl is not None else 0
         print(f"  save_spatialdata: done → {save_path} ({n_cells:,} cells)", flush=True)
         _set("done", f"Saved to {save_path}")
+    except _JobCancelled:
+        raise
     except Exception as exc:
         import traceback; traceback.print_exc()
         _set("error", str(exc)[:300])
@@ -11005,8 +11695,11 @@ def _clean_cache_for_dataset() -> str:
         # Match files/dirs that contain the dataset tag, and the Baysor/Proseg run
         # directories of this dataset (exact name + dataset identity, not a substring:
         # 'run1' must not match 'baysor_run10_…')
+        # (a '.partial' working directory left by a killed run counts as its run directory)
+        _run_entry = (entry[:-len(_SEG_STAGE_SUFFIX)] if entry.endswith(_SEG_STAGE_SUFFIX)
+                      else entry)
         if tag in entry or (os.path.isdir(full) and (
-                _seg_run_tag(entry, "baysor") or _seg_run_tag(entry, "proseg"))):
+                _seg_run_tag(_run_entry, "baysor") or _seg_run_tag(_run_entry, "proseg"))):
             try:
                 if os.path.isdir(full):
                     shutil.rmtree(full)
@@ -11058,7 +11751,7 @@ def to_spatialdata(qv_threshold: int = 20, force: bool = False) -> None:
 
         def _set(status, message, sdata=None):
             with _sdata_lock:
-                if _stale_job(_gen, status):
+                if _stale_job(_gen, status, message):
                     return
                 _sdata_state["status"]  = status
                 _sdata_state["message"] = message
@@ -11075,6 +11768,7 @@ def to_spatialdata(qv_threshold: int = 20, force: bool = False) -> None:
                               "SpatialData patch setup is not available.")
                 return
             _set("running", "Importing sopa…")
+            _job_progress(fraction=0.0)
             try:
                 import sopa, sopa.io, spatialdata
             except ImportError as e:
@@ -11155,12 +11849,15 @@ def to_spatialdata(qv_threshold: int = 20, force: bool = False) -> None:
             _sdata_version += 1
             _set("done", msg, sdata=sdata)
 
+        except _JobCancelled:
+            raise
         except Exception as exc:
             import traceback
             traceback.print_exc()
             _set("error", str(exc)[:300])
 
-    threading.Thread(target=_run, daemon=True).start()
+    _job_start("patches", "Prepare patches 1/3: SpatialData", _run,
+               state=_sdata_state, lock=_sdata_lock)
     print("  to_spatialdata: started in background…", flush=True)
 
 
@@ -11315,6 +12012,7 @@ def segment_tissue_roi() -> None:
                 _check_dataset_gen(_gen)
                 _sdata_state["status"]  = "running"
                 _sdata_state["message"] = "Segmenting tissue ROI…"
+            _job_progress("Segmenting tissue ROI…", 1 / 3)
             _cached_roi = (_sdata_roi_key(sdata) is not None
                            and _sdata_disk_shapes_hash(sdata, _sdata_roi_key(sdata)) is not None)
             if _cached_roi:
@@ -11341,6 +12039,8 @@ def segment_tissue_roi() -> None:
                     # status must leave "running" or the poll never re-enables the buttons
                     _sdata_state["status"]  = "error"
                     _sdata_state["message"] = "No tissue ROI found - use Skip, or Re-build and retry"
+        except _JobCancelled:
+            raise
         except Exception as exc:
             import traceback
             traceback.print_exc()
@@ -11349,7 +12049,8 @@ def segment_tissue_roi() -> None:
                     _sdata_state["status"]  = "error"
                     _sdata_state["message"] = str(exc)[:300]
 
-    threading.Thread(target=_run, daemon=True).start()
+    _job_start("patches", "Prepare patches 2/3: tissue ROI", _run,
+               state=_sdata_state, lock=_sdata_lock)
 
 
 def create_patches(width_um: float = 1000.0, min_transcripts: int = 10) -> None:
@@ -11377,6 +12078,7 @@ def create_patches(width_um: float = 1000.0, min_transcripts: int = 10) -> None:
                 _sdata_state["status"]  = "running"
                 _sdata_state["message"] = "Creating transcript patches…"
                 _qv = _sdata_state.get("qv")
+            _job_progress("Creating transcript patches…", 2 / 3)
             print(f"  create_patches: width={width_um}µm, min_tx={min_transcripts}…", flush=True)
             # Patches saved in the cache store by an earlier session with the same
             # settings: use them instead of repeating sopa's pass over every transcript
@@ -11429,6 +12131,8 @@ def create_patches(width_um: float = 1000.0, min_transcripts: int = 10) -> None:
                     _check_dataset_gen(_gen)
                     _sdata_state["status"]  = "error"
                     _sdata_state["message"] = "No patch shapes produced"
+        except _JobCancelled:
+            raise
         except Exception as exc:
             import traceback
             traceback.print_exc()
@@ -11437,7 +12141,8 @@ def create_patches(width_um: float = 1000.0, min_transcripts: int = 10) -> None:
                     _sdata_state["status"]  = "error"
                     _sdata_state["message"] = str(exc)[:300]
 
-    threading.Thread(target=_run, daemon=True).start()
+    _job_start("patches", "Prepare patches 3/3: transcript patches", _run,
+               state=_sdata_state, lock=_sdata_lock)
 
 
 def _sdata_transform_to_um(gdf):
@@ -11964,6 +12669,102 @@ _REPL_MODE         = os.environ.get("XENIUM_ENABLE_REPL", "").strip().lower()
 _REPL_ENABLED      = _REPL_MODE in ("1", "true", "yes", "on", "remote")
 _REPL_ALLOW_REMOTE = _REPL_MODE == "remote"
 
+# ─── Jobs panel (rendering) ───────────────────────────────────────────────────
+_JOBS_PANEL_STYLE = {
+    "position": "fixed", "right": "12px", "bottom": "12px", "width": "340px",
+    "maxHeight": "60vh", "overflowY": "auto", "zIndex": 2000,   # above dbc.Modal (1055)
+    "backgroundColor": PANEL_BG, "border": f"1px solid {BORDER}", "borderRadius": "6px",
+    "boxShadow": "0 4px 16px rgba(0,0,0,0.5)", "padding": "8px 10px",
+    "fontSize": "11px", "color": TEXT,
+}
+_JOBS_PANEL_HIDDEN = {"display": "none"}
+_JOB_OK_COLOR, _JOB_BAD_COLOR = "#3fb950", "#f85149"
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    s = int(max(0, seconds))
+    h, rem = divmod(s, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _job_row(row: dict):
+    """One job of the jobs panel: kind, label, elapsed time, step, progress bar
+    (when a fraction is known) and Cancel."""
+    state = row["state"]
+    if state == "running" and row["cancellable"]:
+        action = html.Button(
+            "Cancel", id={"type": "job-cancel-btn", "job": row["id"]}, n_clicks=0,
+            title="Stop this job. External tools are terminated; Python / R steps stop "
+                  "after the current step.",
+            style={"fontSize": "10px", "padding": "1px 8px", "cursor": "pointer",
+                   "backgroundColor": CARD_BG, "color": TEXT,
+                   "border": f"1px solid {BORDER}", "borderRadius": "4px"})
+    elif state == "running":
+        action = html.Span("writing results — cannot be cancelled now",
+                           style={"color": MUTED, "fontStyle": "italic"})
+    elif state == "cancelling":
+        action = html.Span("stopping the tool…" if row["n_procs"]
+                           else "cancelling after the current step…",
+                           style={"color": "#d29922", "fontStyle": "italic"})
+    elif state == "done":
+        action = html.Span("✓ done", style={"color": _JOB_OK_COLOR})
+    elif state == "cancelled":
+        action = html.Span("✗ cancelled", style={"color": MUTED})
+    else:
+        action = html.Span("✗ failed", style={"color": _JOB_BAD_COLOR})
+
+    parts = [
+        html.Div([
+            html.Span(row["kind"], style={
+                "backgroundColor": CARD_BG, "border": f"1px solid {BORDER}",
+                "borderRadius": "8px", "padding": "0 6px", "marginRight": "6px",
+                "color": ACCENT, "fontSize": "10px", "whiteSpace": "nowrap"}),
+            html.Span(row["label"], title=row["label"], style={
+                "flex": "1", "minWidth": "0", "overflow": "hidden",
+                "textOverflow": "ellipsis", "whiteSpace": "nowrap", "fontWeight": "600"}),
+            html.Span(_fmt_elapsed(row["elapsed"]), className="job-elapsed",
+                      style={"marginLeft": "8px", "color": MUTED,
+                             "fontVariantNumeric": "tabular-nums"}),
+        ], style={"display": "flex", "alignItems": "center"}),
+        html.Div(row["step"], title=row["step"], className="job-step", style={
+            "color": MUTED, "marginTop": "2px", "overflow": "hidden",
+            "textOverflow": "ellipsis", "whiteSpace": "nowrap"}),
+    ]
+    frac = row["fraction"]
+    if frac is not None and state in _JOB_ACTIVE:
+        # one decimal below 10 %: a whole-slide run of many patches moves slowly
+        pct = f"{100 * frac:.1f}" if frac < 0.0995 else f"{100 * frac:.0f}"
+        parts.append(html.Div([
+            html.Div(html.Div(className="job-progress-fill", style={
+                "width": f"{100 * frac:.1f}%", "height": "100%", "backgroundColor": ACCENT,
+                "borderRadius": "3px", "transition": "width 0.4s"}),
+                className="job-progress", **{"data-fraction": f"{frac:.3f}"},
+                style={"flex": "1", "height": "6px", "backgroundColor": BORDER,
+                       "borderRadius": "3px", "overflow": "hidden"}),
+            html.Span(f"{pct}%", style={"marginLeft": "6px", "color": MUTED, "width": "34px",
+                                        "textAlign": "right",
+                                        "fontVariantNumeric": "tabular-nums"}),
+        ], style={"display": "flex", "alignItems": "center", "marginTop": "4px"}))
+    parts.append(html.Div(action, style={"marginTop": "4px", "textAlign": "right"}))
+    return html.Div(parts, className="job-row", **{"data-job": row["id"], "data-state": state},
+                    style={"padding": "6px 0", "borderTop": f"1px solid {BORDER}"})
+
+
+def _jobs_panel_summary(rows: list) -> list:
+    """Header line of the panel (the <summary>: a click on it folds the rows away)."""
+    n_active = sum(r["state"] in _JOB_ACTIVE for r in rows)
+    return [
+        html.Span("Jobs", style={"fontWeight": "600", "color": TEXT}),
+        html.Span(f"{n_active} running" if n_active else "finished",
+                  style={"marginLeft": "8px", "color": MUTED}),
+    ]
+
+
+def _jobs_panel_children(rows: list) -> list:
+    return [_job_row(r) for r in rows]
+
+
 # Spatial renderer shown at startup: "plotly" (default) or "webgl" (deck.gl view, beta).
 _DEFAULT_RENDERER = ("webgl" if os.environ.get("XENIUM_RENDERER", "").strip().lower() == "webgl"
                      else "plotly")
@@ -11996,6 +12797,14 @@ app.layout = html.Div([
     dcc.Interval(id="morph-hires-poll", interval=400, n_intervals=0, disabled=True),
     # Fires once after 500 ms to guarantee initial plot render in Dash 4
     dcc.Interval(id="startup-trigger", interval=500, max_intervals=1),
+    # Jobs panel: floats above the page and the modals; its interval runs only while
+    # a job is listed (see update_jobs_panel / wake_jobs_poll)
+    dcc.Interval(id="jobs-poll", interval=1000, disabled=True),
+    html.Details([
+        html.Summary(id="jobs-panel-summary", title="Click to fold / unfold the job list",
+                     style={"cursor": "pointer", "paddingBottom": "2px"}),
+        html.Div(id="jobs-panel-rows"),
+    ], id="jobs-panel", open=True, style=_JOBS_PANEL_HIDDEN),
 
     # ── Resegmentation modal ─────────────────────────────────────────────────────
     dbc.Modal([
@@ -14144,9 +14953,9 @@ def load_cellnest(n_clicks, folder, dataset, strip_suffix):
         _cellnest_state["status"] = "loading"
         _cellnest_state["message"] = "Loading…"
         _cellnest_state["data"]   = None
-    t = _thr.Thread(target=_load_cellnest_data,
-                    args=(folder.strip(), dataset, strip_suffix or ""), daemon=True)
-    t.start()
+    _job_start("cellnest", f"CellNEST load: {dataset}", _load_cellnest_data,
+               args=(folder.strip(), dataset, strip_suffix or ""),
+               state=_cellnest_state, lock=_cellnest_lock)
     return "Loading…", False   # enable poll interval
 
 
@@ -14512,39 +15321,29 @@ def start_annotation(n_clicks, source, model_name, rds_path, label_col,
         _annot_state.update({"status": "running", "message": "Starting…",
                               labels_key: None, mode_labels_key: None})
 
+    _job_kw = dict(state=_annot_state, lock=_annot_lock)
     if source == "seurat":
-        ctx = contextvars.copy_context()
-        threading.Thread(
-            target=lambda: ctx.run(
-                _run_seurat_annotation, rds_path or "", label_col or "Names",
-                labels_key=labels_key, expr_override=expr_override,
-                cell_ids_override=cell_ids_override, cache_sig=cache_sig,
-            ),
-            daemon=True,
-        ).start()
+        _job_start("annotation", "Annotation: Seurat kNN", _run_seurat_annotation,
+                   args=(rds_path or "", label_col or "Names"),
+                   kwargs=dict(labels_key=labels_key, expr_override=expr_override,
+                               cell_ids_override=cell_ids_override, cache_sig=cache_sig),
+                   copy_context=True, **_job_kw)
     elif source == "rctd":
-        ctx = contextvars.copy_context()
-        threading.Thread(
-            target=lambda: ctx.run(
-                _run_rctd_annotation,
-                rds_path or "", label_col or "Names",
-                rctd_mode or "full", int(rctd_cores or 4),
-                labels_key=labels_key, expr_override=expr_override,
-                cell_ids_override=cell_ids_override,
-                umi_min=int(rctd_umi_min or 20),
-                umi_min_sigma=int(rctd_umi_min_sigma or 100),
-                mode_labels_key=mode_labels_key, cache_sig=cache_sig,
-            ),
-            daemon=True,
-        ).start()
+        _job_start("annotation", f"Annotation: RCTD ({rctd_mode or 'full'})", _run_rctd_annotation,
+                   args=(rds_path or "", label_col or "Names",
+                         rctd_mode or "full", int(rctd_cores or 4)),
+                   kwargs=dict(labels_key=labels_key, expr_override=expr_override,
+                               cell_ids_override=cell_ids_override,
+                               umi_min=int(rctd_umi_min or 20),
+                               umi_min_sigma=int(rctd_umi_min_sigma or 100),
+                               mode_labels_key=mode_labels_key, cache_sig=cache_sig),
+                   copy_context=True, **_job_kw)
     else:
-        threading.Thread(
-            target=_run_celltypist,
-            args=(model_name,),
-            kwargs={"labels_key": labels_key, "expr_override": expr_override,
-                    "cell_ids_override": cell_ids_override, "cache_sig": cache_sig},
-            daemon=True,
-        ).start()
+        _job_start("annotation", f"Annotation: CellTypist ({model_name})", _run_celltypist,
+                   args=(model_name,),
+                   kwargs={"labels_key": labels_key, "expr_override": expr_override,
+                           "cell_ids_override": cell_ids_override, "cache_sig": cache_sig},
+                   **_job_kw)
     return False, "Starting…", True, "Starting…"
 
 
@@ -14929,14 +15728,13 @@ def run_reseg_modal(n_clicks, algo, patches_confirmed,
         region = {k: v for k, v in
                   dict(x_min=bxmin, x_max=bxmax, y_min=bymin, y_max=bymax).items()
                   if v is not None}
-        threading.Thread(
-            target=_run_baysor,
-            args=(scale, min_mol, use_prior_bool, prior_conf),
-            kwargs=dict(**region, scale_std=scale_std, n_clusters=n_clusters,
-                        use_patches=use_patches,
-                        prior_type=bprior_type or "nucleus"),
-            daemon=True,
-        ).start()
+        _job_start("baysor", "Baysor segmentation" + (" (region)" if region else ""),
+                   _run_baysor,
+                   args=(scale, min_mol, use_prior_bool, prior_conf),
+                   kwargs=dict(**region, scale_std=scale_std, n_clusters=n_clusters,
+                               use_patches=use_patches,
+                               prior_type=bprior_type or "nucleus"),
+                   state=_baysor_state, lock=_baysor_lock)
         return "Baysor starting…", False, False, no_update
     else:  # proseg
         with _proseg_lock:
@@ -14947,19 +15745,18 @@ def run_reseg_modal(n_clicks, algo, patches_confirmed,
         region = {k: v for k, v in
                   dict(x_min=pxmin, x_max=pxmax, y_min=pymin, y_max=pymax).items()
                   if v is not None}
-        threading.Thread(
-            target=_run_proseg,
-            kwargs=dict(voxel_size=pvoxel, n_threads=pthreads,
-                        n_samples=int(psamples) if psamples else 10,
-                        recorded_samples=int(precorded_samples) if precorded_samples else None,
-                        schedule=pschedule.strip() if pschedule else None,
-                        nuclear_reassign_prob=float(pnuclear_prob) if pnuclear_prob is not None else None,
-                        prior_seg_prob=float(pprior_seg_prob) if pprior_seg_prob is not None else None,
-                        prior_type=pprior_type or "nucleus",
-                        use_patches=not skip_patches,
-                        **region),
-            daemon=True,
-        ).start()
+        _job_start("proseg", "Proseg segmentation" + (" (region)" if region else ""),
+                   _run_proseg,
+                   kwargs=dict(voxel_size=pvoxel, n_threads=pthreads,
+                               n_samples=int(psamples) if psamples else 10,
+                               recorded_samples=int(precorded_samples) if precorded_samples else None,
+                               schedule=pschedule.strip() if pschedule else None,
+                               nuclear_reassign_prob=float(pnuclear_prob) if pnuclear_prob is not None else None,
+                               prior_seg_prob=float(pprior_seg_prob) if pprior_seg_prob is not None else None,
+                               prior_type=pprior_type or "nucleus",
+                               use_patches=not skip_patches,
+                               **region),
+                   state=_proseg_state, lock=_proseg_lock)
         return "Proseg starting…", False, no_update, False
 
 
@@ -15002,7 +15799,8 @@ def start_reseg_umap(_, counts_mode, seg_source):
                                   "_xenium_bumped": False,
                                   "seg_source": seg_source or "xenium",
                                   "counts_mode": counts_mode or "original"})
-    threading.Thread(target=_run_reseg_umap, daemon=True).start()
+    _job_start("umap", "Rerun UMAP", _run_reseg_umap,
+               state=_umap_reseg_state, lock=_umap_reseg_lock)
     return False, "Starting UMAP…", True
 
 
@@ -15205,7 +16003,8 @@ def load_seg_run_from_cache(seg_value, baysor_ver, proseg_ver):
         print(f"  {tool.capitalize()}: busy — select the cached run again when the "
               f"current {'load' if busy_dir else 'run'} has finished", flush=True)
         return (no_update, no_update, back) + poll_on[1:]
-    threading.Thread(target=loader, args=(out_dir,), daemon=True).start()
+    _job_start(tool, f"Load cached {tool.capitalize()} run [{param_tag}]", loader,
+               args=(out_dir,), state=state, lock=lock)
     return (no_update, no_update) + poll_on
 
 
@@ -15238,11 +16037,9 @@ def start_spage(n_clicks, rds_path, n_pv, genes_input, seg_source):
     genes_str = genes_input or ""
     seg_src = seg_source or "xenium"
     # Copy the current contextvars context so rpy2 conversion rules are available in the thread
-    ctx = contextvars.copy_context()
-    threading.Thread(
-        target=lambda: ctx.run(_run_spage_imputation, rds_path, n_pv, genes_str, seg_src),
-        daemon=True,
-    ).start()
+    _job_start("spage", "SpaGE imputation", _run_spage_imputation,
+               args=(rds_path, n_pv, genes_str, seg_src),
+               state=_spage_state, lock=_spage_lock, copy_context=True)
     _start_msg = "Starting SpaGE…"
     if _active_counts_mode == "corrected":
         # SpaGE always imputes from the original counts (see _run_spage_imputation)
@@ -15941,8 +16738,13 @@ def _is_zarr_store(path: str) -> bool:
 
 
 def _running_jobs() -> list:
-    """Names of the background jobs that are running right now."""
+    """Names of the background jobs that are running right now: the active jobs of
+    the registry, plus any job kind whose status dict is already claimed (a callback
+    sets "running" just before it starts the job's thread)."""
     busy = []
+    for job in _jobs_list(active_only=True):
+        if job.name not in busy:
+            busy.append(job.name)
     for name, lock, state in (
             ("Baysor", _baysor_lock, _baysor_state), ("Proseg", _proseg_lock, _proseg_state),
             ("annotation", _annot_lock, _annot_state), ("SpaGE", _spage_lock, _spage_state),
@@ -15953,9 +16755,69 @@ def _running_jobs() -> list:
             ("Save as SpatialData", _save_sdata_lock, _save_sdata_state),
             ("CellNEST load", _cellnest_lock, _cellnest_state)):
         with lock:
-            if state.get("status") in ("running", "starting", "loading"):
+            if state.get("status") in ("running", "starting", "loading") and name not in busy:
                 busy.append(name)
     return busy
+
+
+# ─── Jobs panel callbacks ─────────────────────────────────────────────────────
+
+@app.callback(
+    Output("jobs-panel-rows",    "children"),
+    Output("jobs-panel-summary", "children"),
+    Output("jobs-panel",         "style"),
+    Output("jobs-poll",          "disabled"),
+    Input("jobs-poll",           "n_intervals"),
+)
+def update_jobs_panel(_):
+    """Redraw the jobs panel. The interval that drives it switches itself off when
+    no job is running (and none ended in the last few seconds)."""
+    rows = _jobs_panel_rows()
+    if not rows:
+        return [], [], _JOBS_PANEL_HIDDEN, True
+    return _jobs_panel_children(rows), _jobs_panel_summary(rows), _JOBS_PANEL_STYLE, False
+
+
+@app.callback(
+    Output("jobs-poll", "disabled", allow_duplicate=True),
+    Input("annot-poll",      "disabled"),
+    Input("baysor-poll",     "disabled"),
+    Input("proseg-poll",     "disabled"),
+    Input("spage-poll",      "disabled"),
+    Input("split-poll",      "disabled"),
+    Input("cellnest-poll",   "disabled"),
+    Input("niche-poll",      "disabled"),
+    Input("umap-reseg-poll", "disabled"),
+    Input("spatial-poll",    "disabled"),
+    Input("sdata-poll",      "disabled"),
+    Input("save-sdata-poll", "disabled"),
+    Input("spage-repl-poll", "n_intervals"),
+    State("jobs-poll",       "disabled"),
+    prevent_initial_call=True,
+)
+def wake_jobs_poll(_a, _b, _p, _sg, _sp, _c, _n, _u, _s, _sd, _sv, _repl, poll_disabled):
+    """Switch the jobs-panel interval on when a job starts: every Start button
+    enables its own status poll, and the always-on REPL poll picks up jobs started
+    from the REPL or from another browser tab."""
+    if _jobs_panel_rows() and poll_disabled:
+        return False
+    return no_update
+
+
+@app.callback(
+    Output("jobs-panel-rows", "children", allow_duplicate=True),
+    Input({"type": "job-cancel-btn", "job": ALL}, "n_clicks"),
+    prevent_initial_call=True,
+)
+def cancel_job_clicked(n_clicks_list):
+    """Cancel button of a job row."""
+    triggered = callback_context.triggered_id
+    # the panel is redrawn every second: new buttons arrive with n_clicks == 0
+    if triggered is None or not any(n_clicks_list) \
+            or not callback_context.triggered[0].get("value"):
+        raise dash.exceptions.PreventUpdate
+    _job_cancel(triggered["job"])
+    return _jobs_panel_children(_jobs_panel_rows())
 
 
 @app.callback(
@@ -16279,7 +17141,9 @@ def start_save_sdata(n_clicks, out_dir, fname, roi_only_val, seg_source):
         if _save_sdata_state["status"] == "running":
             return "Already saving…", False, True
         _save_sdata_state.update({"status": "running", "message": f"Writing to {save_path}…"})
-    threading.Thread(target=_save_sdata_to_disk, args=(save_path, seg_source, roi_only), daemon=True).start()
+    _job_start("save", f"Save as SpatialData: {os.path.basename(save_path.rstrip('/'))}",
+               _save_sdata_to_disk, args=(save_path, seg_source, roi_only),
+               state=_save_sdata_state, lock=_save_sdata_lock)
     return f"Writing to {save_path}…", False, True
 
 
@@ -16353,14 +17217,10 @@ def run_split(n_clicks, rds_path, label_col, max_cores, min_umi, min_umi_sigma, 
     min_umi       = int(min_umi or 10)
     min_umi_sigma = int(min_umi_sigma or 100)
     do_purify_singlets = bool(purify_singlets)
-    import contextvars
-    _ctx = contextvars.copy_context()
-    threading.Thread(
-        target=_ctx.run,
-        args=(_run_split_correction, rds_path, label_col, max_cores, seg_source,
-              min_umi, min_umi_sigma, do_purify_singlets),
-        daemon=True,
-    ).start()
+    _job_start("split", "SPLIT correction", _run_split_correction,
+               args=(rds_path, label_col, max_cores, seg_source,
+                     min_umi, min_umi_sigma, do_purify_singlets),
+               state=_split_state, lock=_split_lock, copy_context=True)
     return "Starting SPLIT correction…", False, True
 
 
@@ -16531,13 +17391,9 @@ def run_niche(n_clicks, n_clusters, n_neighbors, label_key, seg_source):
         _niche_state["status"]  = "starting"
         _niche_state["message"] = "Starting…"
 
-    ctx = contextvars.copy_context()
-    t = threading.Thread(
-        target=ctx.run,
-        args=(_run_spatial_niches, n_clusters, n_neighbors, label_key, alt_res),
-        daemon=True,
-    )
-    t.start()
+    _job_start("niches", f"Spatial niches (k={n_clusters})", _run_spatial_niches,
+               args=(n_clusters, n_neighbors, label_key, alt_res),
+               state=_niche_state, lock=_niche_lock, copy_context=True)
     return True, False, "Starting niche computation…"
 
 
@@ -16610,8 +17466,9 @@ def run_spatial_analysis(n_clicks, label_key, n_neighbors, seg_source):
     if label_key is None:
         return (False, True,
                 f"No annotation for the active {tool} segmentation — run annotation first.")
-    t = threading.Thread(target=_run_spatial_analysis, args=(label_key, n_neighbors, alt_res), daemon=True)
-    t.start()
+    _job_start("spatial", "Spatial analysis", _run_spatial_analysis,
+               args=(label_key, n_neighbors, alt_res),
+               state=_spatial_state, lock=_spatial_lock)
     return True, False, "Running…"
 
 
@@ -17351,10 +18208,10 @@ class _ViewerProvider:
 
         if mode == "niche":
             if "niche" in df.columns:
-                vals = df["niche"].astype(str)
-                order = sorted(vals.unique(), key=lambda v: (0, int(v)) if v.isdigit() else (1, v))
+                vals = _niche_str(df["niche"])
+                order =sorted(vals.unique(), key=lambda v: (0, int(v)) if v.isdigit() else (1, v))
                 return self._categorical(vals.values, "Niche", order=order,
-                                         names={n: f"Niche {n}" for n in order})
+                                         names={n: _niche_name(n) for n in order})
             mode = "transcript_counts"
 
         if mode.startswith("roi_"):
@@ -17413,11 +18270,11 @@ class _ViewerProvider:
 
         if mode == "niche":
             labels = np.concatenate([
-                edf["niche"].astype(str).values if "niche" in edf.columns
-                else np.full(len(edf), "N/A", dtype=object) for edf in dfs])
+                _niche_str(edf["niche"]).values if "niche" in edf.columns
+                else np.full(len(edf), _NICHE_NONE, dtype=object) for edf in dfs])
             order = sorted(set(labels), key=lambda v: (0, int(v)) if v.isdigit() else (1, v))
             return self._categorical(labels, "Niche", order=order,
-                                     names={n: f"Niche {n}" for n in order})
+                                     names={n: _niche_name(n) for n in order})
 
         if mode.startswith("cell_type:"):
             with _annot_lock:
@@ -17897,4 +18754,16 @@ if __name__ == "__main__":
               f"the bind address (e.g. XENIUM_HOST=0.0.0.0 in a container).", flush=True)
     print(f"\nXenium Explorer running at http://localhost:{_port} "
           f"(bound to {_host}:{_port})\n", flush=True)
+    # Baysor / Proseg run in their own session (so Cancel can stop the whole process
+    # tree) and no longer receive the terminal's SIGHUP / a `kill` of this process:
+    # stop them here, then let the signal take its default course.
+    def _stop_tools_and_exit(signum, _frame):
+        _jobs_kill_all_processes()
+        _signal.signal(signum, _signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for _signame in ("SIGTERM", "SIGHUP"):
+        if hasattr(_signal, _signame):
+            _signal.signal(getattr(_signal, _signame), _stop_tools_and_exit)
+
     app.run(debug=False, host=_host, port=_port)

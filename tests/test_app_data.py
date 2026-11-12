@@ -43,8 +43,6 @@ def test_cache_helpers_resolve_under_the_cache_root(xe, cache_dir):
     assert run.startswith(f"baysor_{name}_") and run.endswith("_deadbeef") and run != f"baysor_{name}_deadbeef"
 
 
-@pytest.mark.xfail(strict=True, reason="_CELLNEST_DB_CACHE is built from ~/.xenium_explorer_cache "
-                                       "instead of CACHE_BASE_DIR, so XENIUM_CACHE_DIR does not move it")
 def test_no_module_constant_points_into_the_home_cache(xe):
     home_cache = os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache")
     leaks = {k: v for k, v in vars(xe).items()
