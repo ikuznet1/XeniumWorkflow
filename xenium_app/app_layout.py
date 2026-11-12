@@ -5,7 +5,7 @@ import dash
 from dash import dcc, html
 import dash_bootstrap_components as dbc
 
-from . import compat, core, ui, dataview, morph, analysis, sdata_store, startup
+from . import compat, core, ui, dataview, morph, analysis, stats, sdata_store, startup
 
 
 with core._spage_lock:
@@ -383,6 +383,9 @@ sidebar = html.Div([
         labelStyle={"display":"block","cursor":"pointer","marginBottom":"2px"},
         style={"fontSize":"0.82rem"},
     ),
+    # with several samples: which of them carry SPLIT-corrected counts
+    html.Div(id="counts-mode-note", style={"fontSize": "10px", "color": core.MUTED, "lineHeight": "1.35",
+                                           "marginTop": "2px"}),
 
     html.Hr(style={"borderColor": core.BORDER, "margin": "14px 0"}),
     ui.ctrl_label("ROI Annotations"),
@@ -492,6 +495,14 @@ app.layout = html.Div([
     dcc.Store(id="density-done", data=0),
     dcc.Store(id="density-store", data={"on": False}),   # {on, gene, bin, opacity, max, version}
     dcc.Interval(id="density-poll", interval=700, disabled=True),
+    # sample design / composition / Moran's I / ligand-receptor scores
+    dcc.Store(id="design-version", data=0),
+    dcc.Store(id="comp-version", data=0),
+    dcc.Store(id="moran-done", data=0),
+    dcc.Interval(id="moran-poll", interval=700, disabled=True),
+    dcc.Store(id="lr-done", data=0),
+    dcc.Interval(id="lr-poll", interval=700, disabled=True),
+    stats._design_modal(),
     dcc.Store(id="counts-mode-store", data="original"),
     dcc.Store(id="roi-done",          data=0),
     dcc.Store(id="roi-pending",       data=None),
@@ -1607,9 +1618,11 @@ dbc.Modal([
                                               config={"displayModeBar": "hover", "toImageButtonOptions": {"format": "svg", "filename": "xenium_abundance"}},
                                               style={"width": "100%", "height": "100%"}),
                                              id="abundance-plot-container",
-                                             style={"flex": "1", "minHeight": "0"}),
+                                             style={"flex": "1", "minHeight": "240px"}),
                                     ui._plot_dim_controls("abundance"),
-                                ], style={"display": "flex", "flexDirection": "column", "flex": "1", "minHeight": "0"})]),
+                                    stats._composition_section(),
+                                ], style={"display": "flex", "flexDirection": "column", "flex": "1", "minHeight": "0",
+                                          "overflowY": "auto"})]),
                         dbc.Tab(label="Co-occurrence", tab_id="tab-cooccurrence",
                                 label_style={"fontSize": "12px", "padding": "4px 12px"},
                                 children=[html.Div([
@@ -1837,9 +1850,11 @@ dbc.Modal([
                                              style={"flex": "1", "minHeight": "0"}),
                                     ui._plot_dim_controls("roi-area"),
                                 ], style={"display": "flex", "flexDirection": "column", "flex": "1", "minHeight": "0"})]),
-                        analysis._de_tab(),
+                        analysis._de_tab(stats._pb_controls()),
                         analysis._geneset_tab(),
                         analysis._density_tab(),
+                        stats._moran_tab(),
+                        stats._lr_tab(),
                     ]),
                 ], id="umap-panel", style={"display": "none"}),
             ], id="plots-row", style={"display": "flex", "flex": "1", "gap": "10px", "minHeight": "0"}),

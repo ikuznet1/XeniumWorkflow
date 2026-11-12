@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 
+import os
+
 import pytest
 
 import xe_testlib as tl
@@ -83,6 +85,8 @@ def test_repl_callable_directly_still_refuses_when_disabled(xe):
 def enabled_runs(tmp_path_factory):
     """The probe run once per enabled mode, the two app processes side by side."""
     from concurrent.futures import ThreadPoolExecutor
+    if not os.path.exists(os.path.join(str(tl.TINY_BUNDLE), "experiment.xenium")):
+        pytest.skip(f"no Xenium bundle at {tl.TINY_BUNDLE}")      # as the xe fixture does
     before = tl.bundle_snapshot(tl.TINY_BUNDLE)
 
     def run(mode):

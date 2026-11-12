@@ -591,7 +591,8 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                     if di == 0:
                         lbl_series = primary_labels
                     else:
-                        lbl_series = dataview.EXTRA_DATASETS[di - 1].get("_cell_type_labels")
+                        lbl_series = dataview._extra_cell_type_labels(
+                            dataview.EXTRA_DATASETS[di - 1], _method)[0]
                     if lbl_series is not None:
                         aligned = lbl_series.reindex(edf.index).fillna("Unknown")
                         all_labels_list.extend(aligned.tolist())
@@ -623,28 +624,24 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
 
             elif color_by == "gene":
                 # Collect expression per dataset
+                # SPLIT-corrected counts only when every sample has them: one colour
+                # scale never mixes corrected and original values
+                _mc = dataview._multi_use_corrected(use_corrected)
                 all_vals = []
                 for di, edf in enumerate(all_dfs):
                     if di == 0:
-                        _v0 = dataview._xenium_gene_values(gene)     # None: not in this sample
-                        all_vals.append(_v0 if _v0 is not None and len(_v0) == len(edf)
-                                        else np.zeros(len(edf)))
+                        _v0 = dataview._xenium_gene_values(gene, _mc)   # None: not in this sample
                     else:
-                        eds = dataview.EXTRA_DATASETS[di - 1]
-                        g_idx = eds.get("gene_name_to_idx", {}).get(gene)
-                        if g_idx is not None:
-                            raw  = _csc_view(eds, "expr")[:, g_idx].toarray().flatten()
-                            idx_ = eds["df_to_expr"]
-                            vals_i = np.where(idx_ >= 0, raw[np.clip(idx_, 0, len(raw) - 1)], 0.0)
-                            all_vals.append(np.log1p(vals_i))
-                        else:
-                            all_vals.append(np.zeros(len(edf)))
+                        _v0 = dataview._extra_gene_values(dataview.EXTRA_DATASETS[di - 1], gene, _mc)
+                    all_vals.append(_v0 if _v0 is not None and len(_v0) == len(edf)
+                                    else np.zeros(len(edf)))
                 vals_combined = np.concatenate(all_vals)
                 traces = [go.Scattergl(
                     x=x_combined, y=y_combined, mode="markers",
                     marker=dict(size=size, color=vals_combined, colorscale="Plasma", opacity=opacity,
                                 showscale=True,
-                                colorbar=dict(title=f"{gene}<br>(log1p)", thickness=12, len=0.5, x=1.02),
+                                colorbar=dict(title=f"{gene}<br>(log1p{', SPLIT-corrected' if _mc else ''})",
+                                              thickness=12, len=0.5, x=1.02),
                                 **_cbar_kwargs()),
                     text=ids_combined, customdata=ids_combined,
                     hovertemplate="<b>%{text}</b><br>" + gene + ": %{marker.color:.2f}<extra></extra>",
@@ -855,11 +852,12 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
     title_text = "Spatial View" + source_label + boundary_status + extra_title
 
     # Transcript density: an SVG heat layer, which plotly.js draws below the WebGL markers
-    _dens = analysis._density_heatmap_trace(density, relayout) if density else None
-    if _dens is not None:
+    _dens = analysis._density_heatmap_traces(density, relayout) if density else []
+    if _dens:
         if any(getattr(getattr(t, "marker", None), "showscale", False) for t in traces):
-            _dens.colorbar.x = 1.12          # beside the cells' own colour bar
-        traces = [_dens] + list(traces)
+            for _dt in _dens:
+                _dt.colorbar.x = 1.12        # beside the cells' own colour bar
+        traces = list(_dens) + list(traces)
     fig = go.Figure(data=traces)
     if morph_image:
         fig.update_layout(images=[morph_image])

@@ -6,7 +6,7 @@ import dash
 from dash import Input, Output, State, ClientsideFunction
 import time as _time
 
-from . import core, jobs, dataview, analysis, regions, app_layout, cb_spatial
+from . import core, jobs, dataview, analysis, stats, regions, app_layout, cb_spatial
 
 
 # ─── Analysis callbacks: differential expression ──────────────────────────────
@@ -179,11 +179,37 @@ def de_delete_group(n_clicks, group_a, version):
     State("cluster-method", "value"),
     State("color-by",    "value"),
     State("counts-mode-store", "data"),
+    State("de-mode",           "value"),
+    State("de-pb-population",  "value"),
+    State("de-pb-min-cells",   "value"),
+    State("de-pb-min-count",   "value"),
+    State("de-pb-shrink",      "value"),
     prevent_initial_call=True,
 )
-def run_de(n_clicks, group_a, group_b, seg_source, method, color_by, counts_mode):
+def run_de(n_clicks, group_a, group_b, seg_source, method, color_by, counts_mode,
+           mode="cells", population=None, min_cells=None, min_count=None, shrink=None):
     if not n_clicks:
         raise dash.exceptions.PreventUpdate
+    if mode == "pseudobulk":
+        if not population:
+            return False, True, "Pick the cell population to sum the counts over."
+        # rpy2 conversion rules for this thread, so the job's context copy carries them
+        try:
+            import rpy2.robjects.conversion as _rconv
+            import rpy2.robjects as _ro_mod
+            _rconv.set_conversion(_ro_mod.default_converter)
+        except Exception as exc:
+            return False, True, f"rpy2 / R is not available ({exc}). " + stats._PB_INSTALL_HINT
+        if not _an_job_claim(analysis._de_state, analysis._de_lock):
+            return True, False, "A differential expression run is already in progress."
+        jobs._job_start("de", "Pseudobulk differential expression", stats._run_pseudobulk_de,
+                   args=(population, seg_source or "xenium", method, color_by,
+                         counts_mode == "corrected",
+                         stats._PB_MIN_CELLS if min_cells is None else min_cells,
+                         stats._PB_MIN_COUNT if min_count is None else min_count,
+                         "on" in (shrink if shrink is not None else ["on"])),
+                   state=analysis._de_state, lock=analysis._de_lock, copy_context=True)
+        return True, False, "Running…"
     if not group_a or not group_b:
         return False, True, "Pick a group for A and for B."
     if group_a == group_b:
@@ -278,6 +304,10 @@ def download_de_table(n_clicks):
         raise dash.exceptions.PreventUpdate
     t = res["table"].sort_values(["padj", "pval"], kind="stable").drop(columns=["neg_log10_padj"])
     _safe = lambda v: re.sub(r"[^A-Za-z0-9_.-]+", "_", str(v))[:40]
+    if res.get("kind") == "pseudobulk":
+        return dict(content=stats._pb_csv_header(res) + t.to_csv(index=False),
+                    filename=f"pseudobulk_{_safe(res['population'])}_{_safe(res['label_a'])}_vs_"
+                             f"{_safe(res['label_b'])}.csv")
     header = (f"# A: {res['label_a']} (n={res['n_a']}); B: {res['label_b']} (n={res['n_b']}); "
               f"counts: {'SPLIT-corrected' if res['corrected'] else 'original'}; "
               f"segmentation: {res['seg_source']}; Wilcoxon rank-sum on log1p(CP10K), cells as "
@@ -439,7 +469,7 @@ def run_density(n_clicks, gene):
         raise dash.exceptions.PreventUpdate
     if not gene:
         return False, True, "Pick a gene (or 'All genes')."
-    if not core.DATA.get("data_dir"):
+    if not any(s["data_dir"] for s in analysis._density_samples()):
         return False, True, ("Transcript density needs the Xenium output directory "
                              "(transcripts.parquet); this dataset was loaded from a .zarr.")
     if gene != analysis._DENSITY_ALL and gene not in set(dataview._panel_gene_names()):
@@ -480,25 +510,42 @@ def poll_density(_, done_ver):
     Input("density-max",     "value"),
     Input("density-done",    "data"),
     Input("dataset-version", "data"),
+    Input("extra-datasets-version", "data"),
 )
-def update_density_store(enable, gene, bin_um, opacity, vmax, done_ver, ds_version):
-    """What both renderers draw as the heat layer: {on, gene, bin, opacity, max, version}."""
+def update_density_store(enable, gene, bin_um, opacity, vmax, done_ver, ds_version, extra_ver=0):
+    """What both renderers draw as the heat layer: {on, gene, bin, opacity, max, version}.
+    With several samples the layer is on as soon as one of them has a grid; the hint
+    names the samples that have none yet."""
     want = "on" in (enable or []) and bool(gene)
-    ready = bool(gene) and analysis._density_ready(gene)
+    st = analysis._density_status(gene) if gene else {"ready": [], "missing": [], "unavailable": []}
+    ready = bool(st["ready"])
+    multi = len(analysis._density_samples()) > 1
     hint = ""
     if gene and not ready:
         hint = "No grid for this gene yet: press Compute."
     elif gene and ready:
-        g = analysis._density_grid(gene, bin_um or 10)
         name = "all genes" if gene == analysis._DENSITY_ALL else gene
-        hint = (f"{name}: {g['total']:,} transcripts (Q ≥ 20) in {int((g['grid'] > 0).sum()):,} "
-                f"non-empty {g['bin']:g} µm bins; colour scale 0 – "
-                f"{(vmax if vmax else g['vmax']):g} transcripts per bin"
+        if not multi:
+            g = analysis._density_grid(gene, bin_um or 10)
+            total, n_bins, b, auto = g["total"], int((g["grid"] > 0).sum()), g["bin"], g["vmax"]
+        else:
+            wins = analysis._density_windows(gene, bin_um or 10, max_cells=10 ** 12)
+            total, b, auto = wins["total"], wins["bin"], wins["vmax"]
+            n_bins = int(sum(int((p["values"] > 0).sum()) for p in wins["parts"]))
+        hint = (f"{name}: {total:,} transcripts (Q ≥ 20) in {n_bins:,} "
+                f"non-empty {b:g} µm bins; colour scale 0 – "
+                f"{(vmax if vmax else auto):g} transcripts per bin"
                 f"{'' if vmax else ' (99.5th percentile)'}.")
+        if multi:
+            hint += f" Samples drawn: {', '.join(st['ready'])} (one colour scale)."
+            if st["missing"]:
+                hint += f" No grid yet for {', '.join(st['missing'])}: press Compute."
+            if st["unavailable"]:
+                hint += f" {', '.join(st['unavailable'])} loaded from a .zarr: no transcripts."
     return ({"on": bool(want and ready), "gene": gene, "bin": bin_um or 10,
              "opacity": 0.7 if opacity is None else opacity,
              "max": vmax if vmax else None,
-             "version": f"{ds_version}|{done_ver}"}, hint)
+             "version": f"{ds_version}|{done_ver}" + (f"|{extra_ver}" if extra_ver else "")}, hint)
 
 
 # The heat layer and the gene-set colours in the WebGL view (the Plotly view gets both

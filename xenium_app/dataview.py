@@ -99,6 +99,88 @@ def _sample_separator_xs() -> list:
     return xs
 
 
+def _ds_key(ds: dict) -> str:
+    """Identity of a dataset dict (DATA or an extra sample): its Xenium output directory,
+    or the .zarr path for a sample loaded from a SpatialData store."""
+    return str(ds.get("data_dir") or ds.get("sdata_path") or f"mem:{id(ds)}")
+
+
+def _ds_name(ds: dict) -> str:
+    """Short display name of a dataset dict: the last path component of its key."""
+    key = _ds_key(ds)
+    return os.path.basename(key.rstrip("/")) or key
+
+
+def _ds_corrected(ds: dict):
+    """The SPLIT-corrected count matrix of a dataset dict when it can be used beside its
+    original matrix (one row per row of "expr"), else None."""
+    m, e = ds.get("split_corrected_expr"), ds.get("expr")
+    if m is None or e is None or not hasattr(m, "shape"):
+        return None
+    if m.shape[0] != e.shape[0] and not (ds is core.DATA and m.shape[0] == len(ds["df"])):
+        return None
+    return m
+
+
+def _corrected_status() -> dict:
+    """Which samples of the Xenium view carry SPLIT-corrected counts: {labels, have,
+    missing (labels without them), all, any}. Corrected counts are shown and tested only
+    when every loaded sample has them (never a mix of corrected and original values in
+    one colour scale or one test)."""
+    dsets = [core.DATA] + list(EXTRA_DATASETS)
+    have = [_ds_corrected(ds) is not None for ds in dsets]
+    labels = [f"S{i}" for i in range(len(dsets))]
+    return {"labels": labels, "have": have,
+            "missing": [l for l, h in zip(labels, have) if not h],
+            "all": all(have), "any": any(have)}
+
+
+def _multi_use_corrected(use_corrected: bool) -> bool:
+    """Counts the multi-sample Xenium view uses: corrected only when asked for and every
+    sample has them."""
+    return bool(use_corrected) and _corrected_status()["all"]
+
+
+def _extra_gene_values(eds: dict, gene, use_corrected: bool = False):
+    """log1p counts of *gene* for the cells of an extra sample (original or, when asked
+    for and present, its SPLIT-corrected matrix); None when the sample lacks the gene."""
+    g_idx = (eds.get("gene_name_to_idx") or {}).get(gene)
+    if g_idx is None or eds.get("expr") is None:
+        return None
+    key = "split_corrected_expr" if (use_corrected and _ds_corrected(eds) is not None) else "expr"
+    m = figures._csc_view(eds, key)
+    if g_idx >= m.shape[1]:
+        return None
+    raw = m[:, g_idx].toarray().ravel()
+    idx_ = eds.get("df_to_expr")
+    idx_ = np.arange(len(eds["df"])) if idx_ is None else np.asarray(idx_)
+    return np.log1p(np.where(idx_ >= 0, raw[np.clip(idx_, 0, len(raw) - 1)], 0.0))
+
+
+def _extra_cell_type_labels(eds: dict, method=None):
+    """(labels, source) of an extra sample's cells for an annotation *method*: the labels
+    attached to the sample (eds["_cell_type_labels_by_method"][method], filled from the
+    annotation cache when the sample is added), else the obs column cell_type_<method>
+    of a store written by Save as SpatialData, else the method-independent
+    eds["_cell_type_labels"] / obs column cell_type. (None, None) when it has none."""
+    by = eds.get("_cell_type_labels_by_method") or {}
+    df = eds["df"]
+
+    def _col(name):
+        s = df[name].astype(object)
+        return s.where(s.notna() & ~s.isin(["", "nan", "<NA>"]), np.nan)
+
+    if method and by.get(method) is not None:
+        return by[method], f"{method} (annotation cache)"
+    if method and f"cell_type_{method}" in df.columns:
+        return _col(f"cell_type_{method}"), f"cell_type_{method} (stored column)"
+    if eds.get("_cell_type_labels") is not None:
+        return eds["_cell_type_labels"], eds.get("_cell_type_labels_source") or "sample labels"
+    if "cell_type" in df.columns:
+        return _col("cell_type"), "cell_type (stored column)"
+    return None, None
+
+
 # ─── Data helpers ─────────────────────────────────────────────────────────────
 def get_gene_expression(gene: str) -> np.ndarray:
     """log1p expression for *gene*, aligned to DATA['df'] row order.

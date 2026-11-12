@@ -34,6 +34,6 @@ sopa>=2.2
 # ── Optional features ────────────────────────────────────────────────────────
 celltypist>=1.6    # CellTypist cell-type annotation
 umap-learn>=0.5    # UMAP recomputation on reseg cells
-rpy2>=3.5          # Seurat / RCTD / SpaGE / SPLIT (requires R >= 4.3 on PATH)
+rpy2>=3.5          # Seurat / RCTD / SpaGE / SPLIT / pseudobulk DE with DESeq2 or edgeR (requires R >= 4.3 on PATH)
 matplotlib>=3.8    # functions/compare_cellnest.py only
 seaborn>=0.13      # functions/compare_cellnest.py only

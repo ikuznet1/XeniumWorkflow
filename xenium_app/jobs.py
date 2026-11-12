@@ -94,6 +94,7 @@ _JOB_KIND_NAMES = {
     "niches": "niches", "spatial": "spatial analysis", "save": "Save as SpatialData",
     "cellnest": "CellNEST load", "de": "differential expression",
     "geneset": "gene-set scoring", "density": "transcript density",
+    "moran": "spatially variable genes", "lr": "ligand-receptor scoring",
 }
 
 _jobs: dict = {}                       # job id → _Job, in start order

@@ -1,0 +1,104 @@
+name: tests
+
+# Default pytest tier (pytest.ini: -m "not slow and not tools and not browser").
+# No R, Baysor, Proseg, node or network access is needed by the tests themselves.
+#
+# Not run here: the viewer tests in viewer_src/test/*.mjs (the "browser" tier). They are
+# Playwright end-to-end tests that need a WebGL-capable Chromium and, for all but one
+# check, the 7 GB Xenium Prime human skin bundle, which is not in the repository.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The in-process tests need the fixture bundle below. Without it they are skipped
+  # (conftest.py: "no Xenium bundle at ..."), so its absence fails the job.
+  REQUIRE_FIXTURE: "true"
+  FIXTURE: tests/data/prime_mouse_ileum_tiny
+  # Optional packages of requirements.txt that the default tier does not import.
+  # rpy2 needs R; the others are only used by features the default tier does not run.
+  NOT_NEEDED: celltypist|umap-learn|rpy2|matplotlib|seaborn
+
+jobs:
+  pytest:
+    name: pytest (default tier)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            tests/requirements-test.txt
+            .github/workflows/tests.yml
+
+      - name: Install dependencies
+        run: |
+          grep -vE "^(${NOT_NEEDED})([^A-Za-z0-9_-]|\$)" requirements.txt > "$RUNNER_TEMP/requirements-ci.txt"
+          python -m pip install --upgrade pip
+          python -m pip install -r "$RUNNER_TEMP/requirements-ci.txt" -r tests/requirements-test.txt
+          python -m pip list
+
+      - name: Check for the fixture bundle
+        id: fixture
+        run: |
+          if [ -f "$FIXTURE/experiment.xenium" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "Fixture bundle found at $FIXTURE."
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            msg="Fixture bundle $FIXTURE is not in this checkout: every test that needs a Xenium bundle is skipped, so this run covers only a small part of the suite."
+            if [ "$REQUIRE_FIXTURE" = "true" ]; then
+              echo "::error title=Fixture bundle missing::$msg"
+              exit 1
+            fi
+            echo "::warning title=Fixture bundle missing::$msg"
+          fi
+
+      - name: Run pytest
+        env:
+          FIXTURE_PRESENT: ${{ steps.fixture.outputs.present }}
+        run: |
+          set -o pipefail
+          args=()
+          if [ "$FIXTURE_PRESENT" != "true" ]; then
+            # These two start a second app process on the fixture and end in an error
+            # (FileNotFoundError) instead of a skip when it is absent. Everything else
+            # skips by itself. Drop this once tests/xe_testlib.py skips in that case.
+            args+=(--deselect tests/test_repl.py::test_repl_enabled_is_loopback_only
+                   --deselect tests/test_repl.py::test_repl_remote_mode_is_explicit_opt_in)
+          fi
+          python -m pytest "${args[@]}" --junitxml="$RUNNER_TEMP/junit.xml" 2>&1 | tee "$RUNNER_TEMP/pytest.log"
+
+      - name: Summary
+        if: always()
+        env:
+          FIXTURE_PRESENT: ${{ steps.fixture.outputs.present }}
+        run: |
+          {
+            echo "### pytest (default tier)"
+            echo
+            if [ "$FIXTURE_PRESENT" != "true" ]; then
+              echo "> **Fixture bundle \`$FIXTURE\` missing: tests that need a bundle were skipped.**"
+              echo
+            fi
+            echo '```'
+            if [ -f "$RUNNER_TEMP/pytest.log" ]; then tail -n 1 "$RUNNER_TEMP/pytest.log"; else echo "pytest did not run"; fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -6,7 +6,7 @@ from dash import no_update
 import dash
 from dash import Input, Output, State, callback_context, ALL
 
-from . import core, jobs, annotation, split, spatial, figures, analysis, regions, app_layout
+from . import core, jobs, dataview, annotation, split, spatial, figures, analysis, regions, app_layout
 
 
 # ─── SPLIT correction callbacks ───────────────────────────────────────────────
@@ -131,11 +131,12 @@ def sync_counts_mode(value):
      Input("baysor-done",     "data"),
      Input("proseg-done",     "data"),
      Input("startup-trigger", "n_intervals"),
-     Input("dataset-version", "data")],
+     Input("dataset-version", "data"),
+     Input("extra-datasets-version", "data")],
     State("counts-mode", "value"),
     prevent_initial_call=True,
 )
-def update_counts_options(_, seg_source, _bd, _pd, _startup, _ds_version, current_value):
+def update_counts_options(_, seg_source, _bd, _pd, _startup, _ds_version, _extra_ver, current_value):
     _tool = core._seg_tool(seg_source)
     with core._baysor_lock:
         bres = core._baysor_state["result"] if core._baysor_state["status"] == "done" else None
@@ -151,6 +152,10 @@ def update_counts_options(_, seg_source, _bd, _pd, _startup, _ds_version, curren
         has_corrected = alt_res.get("split_corrected_expr") is not None
     else:
         has_corrected = core.DATA.get("split_corrected_expr") is not None
+        # several samples: corrected counts only when every sample has them (never a mix
+        # of corrected and original values in one colour scale or one test)
+        if dataview.EXTRA_DATASETS:
+            has_corrected = dataview._corrected_status()["all"]
     options = [
         {"label": " Original",        "value": "original"},
         {"label": " SPLIT Corrected", "value": "corrected", "disabled": not has_corrected},

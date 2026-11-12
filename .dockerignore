@@ -1,0 +1,16 @@
+# Allow-list: nothing enters the build context unless it is named here, so data
+# bundles, caches, .git, tests and the viewer sources can never end up in the image.
+*
+
+!requirements-cloud.txt
+!LICENSE
+!xenium_explorer.py
+!xenium_viewer_api.py
+!xenium_app
+!assets
+!functions
+
+**/__pycache__
+**/*.pyc
+**/.DS_Store
+functions/output

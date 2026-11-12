@@ -68,6 +68,40 @@ def _reset_morph_caches() -> None:
     _morph_hires_queue.clear()
 
 
+class _TiffTiles:
+    """The tiles of one level of a tifffile ZarrTiffStore, under either of its APIs.
+
+    tifffile < 2025.5.21 hands out a MutableMapping: the array metadata is the JSON at
+    store[".zarray"] and store.get("c.y.x") is a decoded tile. From 2025.5.21 on the store
+    is a zarr v3 Store (async, no item access), which zarr.open() reads directly; a tile
+    is then read through the zarr array."""
+
+    def __init__(self, store):
+        import json
+        self._store, self._arr = store, None
+        try:
+            meta = json.loads(store[".zarray"])
+            self.shape, self.chunks = tuple(meta["shape"]), list(meta["chunks"])
+            self.dtype = np.dtype(meta["dtype"])
+        except Exception:
+            import zarr as zarr_mod
+            arr = zarr_mod.open(store, mode="r")
+            if not hasattr(arr, "chunks"):
+                raise TypeError("ZarrTiffStore holds a group, not one image level")
+            self._arr = arr
+            self.shape, self.chunks, self.dtype = tuple(arr.shape), list(arr.chunks), np.dtype(arr.dtype)
+
+    def tile(self, idx):
+        """The tile with chunk indices *idx* as a 2-D array (None: not stored). A tile at
+        the image edge may be smaller than the chunk size under the zarr v3 API."""
+        if self._arr is None:
+            raw = self._store.get(".".join(str(int(i)) for i in idx))
+            return None if raw is None else np.asarray(raw).reshape(self.chunks[-2], self.chunks[-1])
+        sel = tuple(slice(int(i) * c, (int(i) + 1) * c) for i, c in zip(idx, self.chunks))
+        out = np.asarray(self._arr[sel])
+        return out.reshape(out.shape[-2], out.shape[-1])
+
+
 class _ZarrTiffArray:
     """Thin array adapter over tifffile's ZarrTiffStore.
 
@@ -80,18 +114,17 @@ class _ZarrTiffArray:
     """
 
     def __init__(self, store):
-        import json
-        meta = json.loads(store[".zarray"])
-        self.shape   = tuple(meta["shape"])   # (n_ch, H, W)
-        self._csize  = meta["chunks"]         # [1, tile_h, tile_w]
+        tiles = _TiffTiles(store)
+        self.shape   = tiles.shape            # (n_ch, H, W)
+        self._csize  = tiles.chunks           # [1, tile_h, tile_w]
         # Single-channel images (e.g. DAPI-only morphology_focus) are 2-D (H, W):
         # present them as (1, H, W) so callers keep the (C, H, W) contract.
         self._2d     = len(self.shape) == 2
         if self._2d:
             self.shape  = (1, *self.shape)
             self._csize = [1, *self._csize]
-        self._dtype  = np.dtype(meta["dtype"])
-        self._store  = store
+        self._dtype  = tiles.dtype
+        self._store  = tiles
         self._pyr    = {}                     # c_idx -> [(factor, store, (Hl, Wl), (cy, cx))]
 
     def __getitem__(self, idx):
@@ -129,15 +162,16 @@ class _ZarrTiffArray:
                 _f, lstore, (Hl, Wl), (cyl, cxl) = best
                 ys_l = np.minimum(ys_idx * Hl // H, Hl - 1)
                 xs_l = np.minimum(xs_idx * Wl // W, Wl - 1)
-                return self._gather(lstore, lambda by, bx: f"{by}.{bx}", cyl, cxl, ys_l, xs_l)
+                return self._gather(lstore, lambda by, bx: (by, bx), cyl, cxl, ys_l, xs_l)
 
-        key_fn = ((lambda by, bx: f"{by}.{bx}") if self._2d
-                  else (lambda by, bx: f"{c_idx}.{by}.{bx}"))
+        key_fn = ((lambda by, bx: (by, bx)) if self._2d
+                  else (lambda by, bx: (c_idx, by, bx)))
         return self._gather(self._store, key_fn, cy, cx, ys_idx, xs_idx)
 
     def _gather(self, store, key_fn, cy, cx, ys_idx, xs_idx):
-        """Assemble out[i, j] = image[ys_idx[i], xs_idx[j]] from the tiles of *store*
-        (ys_idx / xs_idx are sorted pixel indices; only tiles they touch are decoded)."""
+        """Assemble out[i, j] = image[ys_idx[i], xs_idx[j]] from the tiles of *store* (a
+        _TiffTiles; key_fn gives a tile's chunk indices). ys_idx / xs_idx are sorted pixel
+        indices; only tiles they touch are decoded."""
         out = np.zeros((len(ys_idx), len(xs_idx)), dtype=self._dtype)
         for bcy in range(int(ys_idx[0]) // cy, int(ys_idx[-1]) // cy + 1):
             ylo, yhi = np.searchsorted(ys_idx, [bcy * cy, (bcy + 1) * cy])
@@ -147,10 +181,9 @@ class _ZarrTiffArray:
                 xlo, xhi = np.searchsorted(xs_idx, [bcx * cx, (bcx + 1) * cx])
                 if xlo == xhi:
                     continue   # stride skips this tile entirely
-                raw = store.get(key_fn(bcy, bcx))
-                if raw is None:
+                tile = store.tile(key_fn(bcy, bcx))
+                if tile is None:
                     continue
-                tile = np.asarray(raw).reshape(cy, cx)
                 out[ylo:yhi, xlo:xhi] = tile[np.ix_(ys_idx[ylo:yhi] - bcy * cy,
                                                     xs_idx[xlo:xhi] - bcx * cx)]
         return out
@@ -158,7 +191,6 @@ class _ZarrTiffArray:
     def attach_pyramid(self, c_idx, tif):
         """Register the reduced-resolution levels of *tif* (a TiffFile whose first series is
         the 2-D plane of channel *c_idx*) for use by zoomed-out reads. No-op if it has none."""
-        import json
         try:
             series = tif.series[0]
             _, H, W = self.shape
@@ -166,12 +198,11 @@ class _ZarrTiffArray:
                 return
             levels = []
             for li in range(1, len(series.levels)):
-                lstore = tif.aszarr(level=li)
-                meta = json.loads(lstore[".zarray"])
-                if len(meta["shape"]) != 2 or np.dtype(meta["dtype"]) != self._dtype:
+                lstore = _TiffTiles(tif.aszarr(level=li))
+                if len(lstore.shape) != 2 or lstore.dtype != self._dtype:
                     return
-                Hl, Wl = meta["shape"]
-                levels.append((H / Hl, lstore, (Hl, Wl), tuple(meta["chunks"])))
+                Hl, Wl = lstore.shape
+                levels.append((H / Hl, lstore, (Hl, Wl), tuple(lstore.chunks)))
             self._pyr[c_idx] = levels
         except Exception:
             self._pyr.pop(c_idx, None)

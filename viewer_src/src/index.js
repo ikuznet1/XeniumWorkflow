@@ -794,32 +794,49 @@ class Viewer {
   /** The density response on screen, or null (off, not computed, empty). */
   _densityData() {
     const d = this._loaders.density.data;
-    if (!this.state.density.on || !d || !d.header.ready || !d.header.w || !d.header.h || !d.arrays.values) return null;
+    if (!this.state.density.on || !d || !d.header.ready || !d.arrays.values) return null;
+    if (!this._densityParts(d).length) return null;
     return d;
+  }
+
+  /**
+   * The grids of a density response: one per sample of the view (`header.parts`, each
+   * with its own origin and its slice of `values`), or the single grid of a response
+   * without parts. Empty grids are left out.
+   */
+  _densityParts(d) {
+    const h = d.header;
+    const parts = Array.isArray(h.parts) ? h.parts : [{w: h.w, h: h.h, x0: h.x0, y0: h.y0, cell: h.cell, offset: 0}];
+    return parts.filter((p) => p.w > 0 && p.h > 0);
   }
 
   _densityLayer() {
     const d = this._densityData();
     if (!d) return null;
-    const {w, h, x0, y0, cell} = d.header;
     const vmax = this._densityMax();
-    if (!d.image || d.imageMax !== vmax) {
+    const parts = this._densityParts(d);
+    if (!d.images || d.imageMax !== vmax) {
       // one texel per value; rebuilt only when the data or the colour maximum changes
-      const rgba = new Uint8ClampedArray(4 * w * h);
-      fillDensity(rgba, d.arrays.values, w * h, vmax, 'magma');
-      d.image = new ImageData(rgba, w, h);
+      d.images = parts.map((p) => {
+        const n = p.w * p.h;
+        const rgba = new Uint8ClampedArray(4 * n);
+        const off = p.offset || 0;
+        fillDensity(rgba, d.arrays.values.subarray(off, off + n), n, vmax, 'magma');
+        return new ImageData(rgba, p.w, p.h);
+      });
       d.imageMax = vmax;
     }
     const op = +this.state.density.opacity;
-    return new BitmapLayer({
-      id: 'xv-density',
-      image: d.image,
+    // the first grid keeps the id 'xv-density'; further samples are 'xv-density-1', ...
+    return parts.map((p, k) => new BitmapLayer({
+      id: k ? `xv-density-${k}` : 'xv-density',
+      image: d.images[k],
       // [left, bottom, right, top] in µm; row 0 of the grid is the smallest y (top of the view)
-      bounds: [x0, y0 + h * cell, x0 + w * cell, y0],
+      bounds: [p.x0, p.y0 + p.h * p.cell, p.x0 + p.w * p.cell, p.y0],
       opacity: Number.isFinite(op) ? Math.max(0, Math.min(1, op)) : 0.7,
       textureParameters: {minFilter: 'nearest', magFilter: 'nearest'},
       pickable: false,
-    });
+    }));
   }
 
   _overlayLayers() {
@@ -889,7 +906,7 @@ class Viewer {
         console.error('[XeniumViewer] extra layers', err);
       }
     }
-    const layers = [...extra, L.density, L.cells, L.nucleus, L.cell, L.proseg, L.baysor, L.tx, ...(L.overlays || [])].filter(Boolean);
+    const layers = [...extra, ...(L.density || []), L.cells, L.nucleus, L.cell, L.proseg, L.baysor, L.tx, ...(L.overlays || [])].filter(Boolean);
     this.deck.setProps({layers, viewState: this.viewState});
   }
 

@@ -7,7 +7,7 @@ from dash import html, Input, Output, State, callback_context, ALL
 
 from . import (
     core, jobs, caching, ui, loading, dataview, annotation, spage, morph, figures, analysis,
-    sdata_store, regions, app_layout,
+    stats, sdata_store, regions, app_layout,
 )
 
 
@@ -501,6 +501,7 @@ def load_sample(n_clicks, picked_path, custom_path, ds_version, roi_done,
         # Re-run autoloads for the new dataset
         regions._auto_load_rois()
         analysis._an_autoload()
+        stats._stats_reset()
         annotation._annot_autoload()
         sdata_store._sdata_autoload()
         spage._spage_autoload()
@@ -557,6 +558,16 @@ def add_sample(n_clicks, picked_path, custom_path, extra_ver):
         new_min_x  = new_data["df"]["x_centroid"].min()
         x_offset   = last_max_x - new_min_x + 500.0
         new_data["x_offset"] = x_offset
+        # cell types of the new sample: annotations cached for it (it was annotated as
+        # the primary dataset before) by method; a store written by Save as SpatialData
+        # carries them as cell_type_<method> columns (dataview._extra_cell_type_labels)
+        try:
+            _by = annotation._annot_cached_labels(dataview._ds_key(new_data))
+            if _by:
+                new_data["_cell_type_labels_by_method"] = _by
+                print(f"  Extra sample: cached annotations found for {', '.join(sorted(_by))}", flush=True)
+        except Exception as _lab_exc:
+            print(f"  Extra sample: annotation cache not read: {_lab_exc}", flush=True)
         dataview.EXTRA_DATASETS.append(new_data)
         n_total = 1 + len(dataview.EXTRA_DATASETS)
         status_msg = f"{n_total} samples loaded"

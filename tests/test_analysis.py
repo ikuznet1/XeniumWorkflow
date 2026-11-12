@@ -174,7 +174,9 @@ def test_de_rank_sums_on_two_matrices_with_ties_in_many_chunks(xe):
         vb = np.concatenate([v[g == 2] for v, g in zip(vals, grp)])
         if np.ptp(np.concatenate([va, vb])) == 0:
             continue
-        u_ref, p_ref = stats.mannwhitneyu(va, vb, alternative="two-sided", method="asymptotic")
+        # (float64 for the reference: scipy >= 1.17 computes in the input's precision)
+        u_ref, p_ref = stats.mannwhitneyu(va.astype(np.float64), vb.astype(np.float64),
+                                          alternative="two-sided", method="asymptotic")
         assert u[j] == pytest.approx(u_ref, abs=1e-6)
         assert log10p[j] == pytest.approx(np.log10(p_ref), abs=1e-7)
         assert r["nnz_a"][j] == (va > 0).sum() and r["nnz_b"][j] == (vb > 0).sum()

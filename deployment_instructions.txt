@@ -1,0 +1,222 @@
+XENIUM EXPLORER ON GOOGLE CLOUD RUN
+===================================
+
+Files: Dockerfile, .dockerignore, requirements-cloud.txt (repository root).
+Placeholders used below - replace every one of them:
+  PROJECT_ID   Google Cloud project          REGION    e.g. the region of your bucket
+  REPO         Artifact Registry repository   BUCKET    Cloud Storage bucket with the data
+  BUNDLE       folder name of the Xenium output bundle inside the bucket
+  SERVICE_ACCOUNT, USER_EMAIL
+
+
+0. READ THIS FIRST - SECURITY
+-----------------------------
+* THE APP HAS NO LOGIN. Anyone who can reach its port can read the dataset, start jobs
+  and write to the cache. Always deploy with --no-allow-unauthenticated and give
+  roles/run.invoker only to named users or groups (or put Identity-Aware Proxy in
+  front). Never use --allow-unauthenticated.
+* NEVER SET XENIUM_ENABLE_REPL on the service or in the image. That variable turns on
+  the in-app Python REPL, which executes arbitrary Python in the server process: with
+  it set, everybody who can open the page can run code as the service account, read
+  the mounted bucket and reach whatever that account can reach. The image leaves it
+  unset; with it unset the REPL refuses every request.
+* The image sets XENIUM_HOST=0.0.0.0. The app otherwise binds to 127.0.0.1, which the
+  Cloud Run front end cannot reach. Listening on all interfaces is acceptable only
+  because the container port is not public by itself: traffic arrives solely through
+  the service's ingress, and that ingress must demand authentication (previous point).
+  If you run the image elsewhere (plain Docker, a VM), publish the port on loopback
+  only (docker run -p 127.0.0.1:8080:8080 ...) or put an authenticating proxy in front.
+* Give the service its own service account with access to the one data bucket and
+  nothing else.
+
+
+1. WHAT THE IMAGE CONTAINS AND WHAT IT CANNOT DO
+------------------------------------------------
+python:3.11-slim, the packages of requirements-cloud.txt, xenium_explorer.py,
+xenium_viewer_api.py, xenium_app/, assets/ (including the built WebGL viewer) and
+functions/. It runs as the unprivileged user "app" (uid 10001). No test data, no .git,
+no viewer sources.
+
+Not installed, and therefore not available in the container:
+  R and rpy2        Seurat kNN annotation, RCTD annotation, SpaGE imputation,
+                    SPLIT ambient-RNA correction, and the functions/ scripts that read
+                    or write .rds files
+  Baysor (Julia)    Baysor resegmentation
+  Proseg (Rust)     Proseg resegmentation
+  sopa              "Prepare Patches" in the Resegment dialog
+  SpaGE_repo        the SpaGE submodule (it needs R for the reference anyway)
+Results of those tools that are already in the cache or the bundle are still shown.
+Available: both spatial views (Plotly and WebGL), clustering / UMAP rerun, CellTypist
+annotation (downloads its models from the internet on first use into the container's
+home directory, i.e. into memory - see section 5), the spatial analyses, differential
+expression, gene-set scoring, transcript density, Save as SpatialData.
+
+
+2. ONE PROCESS, ONE INSTANCE
+----------------------------
+The app holds the loaded dataset, the job registry and every result in the memory of a
+single Python process and runs its jobs in background threads of that process. So:
+* The container starts exactly one process: `python xenium_explorer.py` (requests are
+  served from threads). Do not replace this with a multi-worker server such as
+  `gunicorn -w 4`: each worker would load its own copy of the data and they would not
+  see each other's jobs or results. The repository has no WSGI entry module at present;
+  if one is added, it must be run with one worker and several threads.
+* --max-instances 1 : a second instance would be a second, unrelated copy of the app.
+* --min-instances 0 or 1 : with 0 the instance is stopped when idle and all in-memory
+  state (and running jobs) is lost; the next request waits for the dataset to load
+  again. Use 1 for a working session and set it back to 0 afterwards to stop paying.
+* --concurrency : the number of simultaneous HTTP requests, not users. One browser tab
+  already sends several in parallel (callbacks, polling, viewer tiles), so 1 is too low
+  with a single instance (requests would queue or get 429). Use about 40.
+* --no-cpu-throttling : required, because jobs keep running in background threads
+  after the request that started them has returned.
+* All users share the same state: one person's subset, annotation or dataset switch is
+  seen by everyone. Treat a service as a single-user (or single-group) session.
+
+
+3. BUILD AND PUSH
+-----------------
+Cloud Run needs a linux/amd64 image.
+
+  gcloud artifacts repositories create REPO --repository-format=docker \
+      --location=REGION --project=PROJECT_ID          # once
+
+  # either build in the cloud ...
+  gcloud builds submit --project=PROJECT_ID \
+      --tag REGION-docker.pkg.dev/PROJECT_ID/REPO/xenium-explorer:latest .
+
+  # ... or locally (on Apple Silicon the --platform flag is essential)
+  docker build --platform linux/amd64 \
+      -t REGION-docker.pkg.dev/PROJECT_ID/REPO/xenium-explorer:latest .
+  gcloud auth configure-docker REGION-docker.pkg.dev
+  docker push REGION-docker.pkg.dev/PROJECT_ID/REPO/xenium-explorer:latest
+
+
+4. GETTING THE DATA IN
+----------------------
+DATA_DIR must point at a Xenium output bundle (the folder with experiment.xenium) or at
+a .zarr store written by "Save as SpatialData".
+
+IMPORTANT: on first load of a bundle the app writes spatialdata_xenium.zarr INTO the
+bundle folder (about a minute for a few hundred thousand cells) and reads it on every
+later start. So either
+  (a) open the bundle once on your own machine and upload the folder including
+      spatialdata_xenium.zarr (recommended: fast start, the mount can be read-only), or
+  (b) mount the bucket read-write and let the first start create it (slow: thousands of
+      small objects written through Cloud Storage FUSE; raise the startup probe).
+With a read-only mount and no spatialdata_xenium.zarr the app fails at start-up.
+
+Option A - Cloud Storage FUSE volume (recommended; needs --execution-environment gen2)
+
+  gcloud storage rsync -r ./BUNDLE gs://BUCKET/BUNDLE
+
+  gcloud iam service-accounts create SERVICE_ACCOUNT --project=PROJECT_ID
+  gcloud storage buckets add-iam-policy-binding gs://BUCKET \
+      --member=serviceAccount:SERVICE_ACCOUNT@PROJECT_ID.iam.gserviceaccount.com \
+      --role=roles/storage.objectViewer      # objectUser if the mount must be writable
+
+  gcloud run deploy xenium-explorer \
+      --project=PROJECT_ID --region=REGION \
+      --image=REGION-docker.pkg.dev/PROJECT_ID/REPO/xenium-explorer:latest \
+      --service-account=SERVICE_ACCOUNT@PROJECT_ID.iam.gserviceaccount.com \
+      --no-allow-unauthenticated \
+      --execution-environment=gen2 \
+      --memory=16Gi --cpu=4 --no-cpu-throttling \
+      --min-instances=0 --max-instances=1 --concurrency=40 \
+      --timeout=3600 \
+      --add-volume=name=data,type=cloud-storage,bucket=BUCKET,readonly=true \
+      --add-volume-mount=volume=data,mount-path=/data \
+      --set-env-vars=DATA_DIR=/data/BUNDLE \
+      --startup-probe=httpGet.path=/health,httpGet.port=8080,periodSeconds=10,failureThreshold=60,timeoutSeconds=5
+
+  XENIUM_HOST, PORT and XENIUM_CACHE_DIR come from the image; do not override PORT.
+  The startup probe above allows 10 minutes for the dataset to load (/health answers
+  "ok" only once the app is up); if gcloud rejects the probe values, lower them to
+  what it allows. The container runs as uid 10001: if the mounted files turn out not
+  to be readable (or, for a writable mount, writable) by it, add
+  mount-options="uid=10001;gid=10001" to the --add-volume flag. Reading through FUSE is slower than local disk: the
+  first load and the first image / transcript views are the slow parts.
+
+Option B - bake the data into the image
+  Only for small bundles (say below 2 GB) and only in a private registry: the data is
+  then in every copy of the image. Write a second Dockerfile:
+
+      FROM REGION-docker.pkg.dev/PROJECT_ID/REPO/xenium-explorer:latest
+      COPY --chown=app:app BUNDLE/ /data/BUNDLE/
+      ENV DATA_DIR=/data/BUNDLE
+
+  build it from a folder that holds the bundle (the repository's .dockerignore excludes
+  all data on purpose) and deploy it without the --add-volume flags. Include
+  spatialdata_xenium.zarr in the bundle, otherwise it is generated at every cold start.
+  The data then lives in the instance's in-memory filesystem and counts against
+  --memory.
+
+
+5. CACHE
+--------
+XENIUM_CACHE_DIR is /cache in the image. On Cloud Run the container filesystem is an
+in-memory filesystem: everything written to /cache (and to /tmp and the home directory,
+e.g. CellTypist models) uses the instance's RAM and is gone when the instance stops.
+For a cache that survives, mount a volume there (the bucket must be writable by the
+service account, roles/storage.objectUser):
+
+      --add-volume=name=cache,type=cloud-storage,bucket=BUCKET-cache \
+      --add-volume-mount=volume=cache,mount-path=/cache
+
+Cloud Storage FUSE is not a POSIX filesystem (no file locking, slow renames of folders,
+slow with many small files); the zarr stores the app caches consist of many small
+files. If cache speed matters, use a Filestore / NFS volume instead (type=nfs, needs a
+VPC connection). Use a separate bucket or prefix for the cache, not the data bucket
+root. Without a volume, add the expected cache size to --memory.
+
+
+6. SIZING
+---------
+Memory is the limit that matters; the whole dataset is held in RAM.
+  dataset                                   --memory   --cpu
+  standard panel, up to ~250 k cells        8Gi        2-4
+  standard panel, larger / several samples  16Gi       4
+  Xenium Prime 5K, ~100 k cells             16Gi       4
+  Xenium Prime 5K, larger                   32Gi       8
+These are starting points, not measurements on Cloud Run: watch the memory graph of
+the first session and adjust. Cloud Run ties the largest allowed memory to the number
+of CPUs (gcloud rejects a pair that is not allowed and says why). Add the size of
+anything kept in the
+in-memory filesystem (section 5, option B). --timeout=3600 is the maximum length of a
+single request (the page's long-lived connections); background jobs are not bound by
+it but stop when the instance does.
+
+
+7. GRANT ACCESS AND OPEN THE APP
+--------------------------------
+  gcloud run services add-iam-policy-binding xenium-explorer \
+      --project=PROJECT_ID --region=REGION \
+      --member=user:USER_EMAIL --role=roles/run.invoker
+
+A browser cannot send the identity token that Cloud Run IAM expects, so open the app
+in one of two ways:
+  * personal use: `gcloud run services proxy xenium-explorer --project=PROJECT_ID
+    --region=REGION --port=8080`, then browse to http://localhost:8080 (the proxy adds
+    your credentials);
+  * a group: enable Identity-Aware Proxy for the service (or an HTTPS load balancer
+    with IAP) and grant the group access there.
+
+Check: `curl -H "Authorization: Bearer $(gcloud auth print-identity-token)" SERVICE_URL/health`
+prints ok; the same request without the header must be rejected (403).
+
+
+8. LOCAL TEST OF THE IMAGE
+--------------------------
+  docker run --rm -p 127.0.0.1:8080:8080 \
+      -v /absolute/path/to/BUNDLE:/data/BUNDLE -e DATA_DIR=/data/BUNDLE \
+      xenium-explorer
+  curl http://127.0.0.1:8080/health        # ok
+
+The bundle folder must be writable by uid 10001 unless it already contains
+spatialdata_xenium.zarr. Mount a copy, not your only copy.
+
+
+9. STOPPING / REMOVING
+----------------------
+  gcloud run services update xenium-explorer --min-instances=0 ...   # stop paying when idle
+  gcloud run services delete xenium-explorer --project=PROJECT_ID --region=REGION

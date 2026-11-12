@@ -84,11 +84,16 @@ def _an_samples(seg_source="xenium", use_corrected: bool = False) -> list:
     (matrix row of each df row, -1: none), gni (gene → matrix column), genes (measured
     panel genes present in the matrix; imputed genes are left out, their values are not
     counts), x_offset (µm the sample is shifted by in the view), corrected (the matrix
-    is the SPLIT-corrected one), label."""
+    is the SPLIT-corrected one), label, ds (the dataset dict the sample comes from: DATA
+    or an extra sample), key / name (its identity and display name).
+
+    With several samples, SPLIT-corrected counts are used only when every sample has
+    them (dataview._corrected_status); otherwise all samples give their original counts,
+    so one test or colour scale never mixes the two."""
     alt = _an_alt_res(seg_source)
     out = []
 
-    def _add(label, df, holder, key, rows, gni, panel, x_off):
+    def _add(label, df, holder, key, rows, gni, panel, x_off, ds=None):
         m = holder.get(key)
         if m is None or not sp.issparse(m):
             return
@@ -100,9 +105,11 @@ def _an_samples(seg_source="xenium", use_corrected: bool = False) -> list:
         if len(rows) != len(df) or (len(rows) and rows.max() >= csc.shape[0]):
             return
         genes = [g for g in panel if g in gni and gni[g] < csc.shape[1]]
+        ds = core.DATA if ds is None else ds
         out.append({"label": label, "df": df, "csc": csc, "rows": rows, "gni": gni,
                     "genes": genes, "x_offset": float(x_off or 0.0),
-                    "corrected": key == "split_corrected_expr"})
+                    "corrected": key == "split_corrected_expr",
+                    "ds": ds, "key": dataview._ds_key(ds), "name": dataview._ds_name(ds)})
 
     if alt is not None:
         df = alt["cells_df"]
@@ -115,11 +122,11 @@ def _an_samples(seg_source="xenium", use_corrected: bool = False) -> list:
 
     df = core.DATA["df"]
     extras = list(dataview.EXTRA_DATASETS)
+    # several samples side by side: corrected counts only when every sample has them
+    use_corr = (dataview._multi_use_corrected(use_corrected) if extras
+                else bool(use_corrected) and core.DATA.get("split_corrected_expr") is not None)
     if core.DATA.get("expr") is not None:
-        # several samples side by side are shown with original counts only
-        key = ("split_corrected_expr"
-               if use_corrected and not extras and core.DATA.get("split_corrected_expr") is not None
-               else "expr")
+        key = "split_corrected_expr" if use_corr else "expr"
         d2e = core.DATA.get("df_to_expr")
         d2e = np.arange(len(df)) if d2e is None else np.asarray(d2e)
         rows = d2e
@@ -131,9 +138,10 @@ def _an_samples(seg_source="xenium", use_corrected: bool = False) -> list:
         if eds.get("expr") is None:
             continue
         d2e = eds.get("df_to_expr")
-        _add(f"S{i + 1}", eds["df"], eds, "expr",
+        _add(f"S{i + 1}", eds["df"], eds, "split_corrected_expr" if use_corr else "expr",
              np.arange(len(eds["df"])) if d2e is None else d2e,
-             eds.get("gene_name_to_idx", {}), _ds_panel_genes(eds), eds.get("x_offset", 0.0))
+             eds.get("gene_name_to_idx", {}), _ds_panel_genes(eds), eds.get("x_offset", 0.0),
+             ds=eds)
     return out
 
 
@@ -219,7 +227,7 @@ def _an_cluster_labels(samples, method, use_corrected, alt) -> list:
             pref = [c for c in cands if ("split" in c) == bool(use_corrected)]
             col = (pref or cands or [None])[0]
         else:
-            ds = core.DATA if di == 0 else dataview.EXTRA_DATASETS[di - 1]
+            ds = s.get("ds") or core.DATA
             cm = ds.get("cluster_methods") or []
             col = f"clust__{method if method in cm else (cm or [method])[0]}"
         if col is None or col not in df.columns:
@@ -262,15 +270,17 @@ def _an_celltype_labels(samples, annot_method, alt) -> list:
                 labels = core._annot_state.get(lkey)
             if labels is not None:
                 lab = labels.reindex(pd.Index(df.index.astype(str)))
-        elif di == 0:
+        elif s.get("ds", core.DATA) is core.DATA:
             with core._annot_lock:
                 labels = core._annot_state.get(f"labels_{annot_method}")
             if labels is not None:
                 lab = labels.reindex(df.index.astype(str))
         else:
-            labels = dataview.EXTRA_DATASETS[di - 1].get("_cell_type_labels")
+            labels, _src = dataview._extra_cell_type_labels(s["ds"], annot_method)
             if labels is not None:
                 lab = labels.reindex(df.index)
+                if lab.isna().all() and len(lab):      # labels keyed by str ids
+                    lab = pd.Series(labels.reindex(df.index.astype(str)).to_numpy(), index=df.index)
         if lab is None:
             out.append(None)
         else:
@@ -639,9 +649,13 @@ def make_de_volcano_fig(width=None, height=None):
     if not res:
         return figures._make_placeholder_fig("No differential expression computed yet.")
     t = res["table"]
-    y = np.minimum(t["neg_log10_padj"].to_numpy(), 300.0)
-    sig = (t["padj"].to_numpy() < 0.05) & (np.abs(t["log2fc"].to_numpy()) >= 0.5)
-    up = sig & (t["log2fc"].to_numpy() > 0)
+    # a pseudobulk result names the fold-change column it plots (shrunken when available);
+    # genes without an adjusted p-value (DESeq2 independent filtering) are not drawn
+    lfc = res.get("lfc_col", "log2fc")
+    y = np.minimum(t["neg_log10_padj"].to_numpy(dtype=float), 300.0)
+    x = t[lfc].to_numpy(dtype=float)
+    sig = (t["padj"].to_numpy(dtype=float) < 0.05) & (np.abs(x) >= 0.5)
+    up = sig & (x > 0)
     dn = sig & ~up
     traces = []
     for mask, name, color in ((~sig, "not significant", "#6e7681"),
@@ -649,7 +663,7 @@ def make_de_volcano_fig(width=None, height=None):
                               (dn, f"higher in B ({int(dn.sum()):,})", "#58a6ff")):
         sub = t[mask]
         traces.append(go.Scattergl(
-            x=sub["log2fc"], y=y[mask], mode="markers", name=name,
+            x=x[mask], y=y[mask], mode="markers", name=name,
             marker=dict(size=5, color=color, opacity=0.8),
             text=sub["gene"], customdata=sub["gene"],
             hovertemplate="<b>%{text}</b><br>log2FC %{x:.2f}<br>−log10 FDR %{y:.1f}<extra></extra>"))
@@ -657,7 +671,7 @@ def make_de_volcano_fig(width=None, height=None):
     lab = pd.concat([t[up].nlargest(8, "neg_log10_padj"), t[dn].nlargest(8, "neg_log10_padj")])
     fig = go.Figure(traces)
     for _, r in lab.iterrows():
-        fig.add_annotation(x=r["log2fc"], y=min(r["neg_log10_padj"], 300.0), text=r["gene"],
+        fig.add_annotation(x=r[lfc], y=min(r["neg_log10_padj"], 300.0), text=r["gene"],
                            showarrow=False, yshift=9, font=dict(size=10, color=core.TEXT))
     fig.add_hline(y=-np.log10(0.05), line=dict(color=core.MUTED, width=1, dash="dot"))
     for xv in (-0.5, 0.5):
@@ -665,9 +679,11 @@ def make_de_volcano_fig(width=None, height=None):
     fig.update_layout(
         paper_bgcolor=core.CARD_BG, plot_bgcolor=core.CARD_BG, font=dict(color=core.TEXT, size=11),
         margin=dict(l=50, r=10, t=30, b=40),
-        title=dict(text=f"A: {res['label_a']} ({res['n_a']:,})  vs  B: {res['label_b']} ({res['n_b']:,})",
+        title=dict(text=res.get("title") or
+                   f"A: {res['label_a']} ({res['n_a']:,})  vs  B: {res['label_b']} ({res['n_b']:,})",
                    font=dict(size=12), x=0.01),
-        xaxis=dict(title="log2 fold change (A / B)", gridcolor=core.BORDER, zerolinecolor=core.BORDER),
+        xaxis=dict(title=res.get("lfc_title") or "log2 fold change (A / B)",
+                   gridcolor=core.BORDER, zerolinecolor=core.BORDER),
         yaxis=dict(title="−log10 FDR", gridcolor=core.BORDER, zerolinecolor=core.BORDER),
         legend=dict(orientation="h", y=-0.2, font=dict(size=10)),
         uirevision=f"de-{res.get('seconds')}",
@@ -684,6 +700,16 @@ def _de_table_records(res) -> list:
     if not res:
         return []
     t = res["table"].sort_values(["padj", "pval"], kind="stable")
+    _g3 = lambda v: None if not np.isfinite(v) else float(f"{v:.3g}")
+    if res.get("kind") == "pseudobulk":
+        out = pd.DataFrame({"gene": t["gene"], "log2fc": t["log2fc"].round(3)})
+        if "log2fc_shrunk" in t.columns:
+            out["log2fc_shrunk"] = t["log2fc_shrunk"].round(3)
+        out["base_mean"] = t["base_mean"].round(1)
+        out["mean_a"], out["mean_b"] = t["mean_a"].round(1), t["mean_b"].round(1)
+        out["stat"] = t["stat"].round(2)
+        out["pval"], out["padj"] = t["pval"].map(_g3), t["padj"].map(_g3)
+        return out.astype(object).where(out.notna(), None).to_dict("records")
     out = pd.DataFrame({
         "gene": t["gene"],
         "log2fc": t["log2fc"].round(3),
@@ -694,6 +720,21 @@ def _de_table_records(res) -> list:
         "padj": t["padj"].map(lambda v: float(f"{v:.3g}")),
     })
     return out.to_dict("records")
+
+
+def _de_table_columns(res=None) -> list:
+    """Columns of the result table: of the cell-level Wilcoxon test, or of a pseudobulk
+    result (which names its test statistic and its fold-change columns)."""
+    _col = lambda cid, name: {"id": cid, "name": name, "type": "text" if cid == "gene" else "numeric"}
+    if res and res.get("kind") == "pseudobulk":
+        cols = [_col("gene", "Gene"), _col("log2fc", "log2FC")]
+        if "log2fc_shrunk" in res["table"].columns:
+            cols.append(_col("log2fc_shrunk", f"log2FC ({res.get('shrink') or 'shrunk'})"))
+        return cols + [_col("base_mean", "Base mean"), _col("mean_a", "Mean A"), _col("mean_b", "Mean B"),
+                       _col("stat", res.get("stat_name") or "stat"), _col("pval", "p"), _col("padj", "FDR")]
+    return [_col("gene", "Gene"), _col("log2fc", "log2FC"), _col("pct_a", "% A"),
+            _col("pct_b", "% B"), _col("mean_a", "Mean A"), _col("mean_b", "Mean B"),
+            _col("z", "z"), _col("pval", "p"), _col("padj", "FDR")]
 
 
 # ── gene-set scores ───────────────────────────────────────────────────────────
@@ -973,9 +1014,27 @@ def _run_geneset_score(name, seg_source, use_corrected) -> None:
 
 
 # ── transcript density ────────────────────────────────────────────────────────
-def _density_cache_file(gene: str) -> str:
-    """Cache file of a gene's base grid: <cache>/density_<dataset>/<gene>__b<bin>um__<filter>.npz"""
-    d = os.path.join(core.CACHE_BASE_DIR, f"density_{_an_dataset_tag()}")
+def _density_samples() -> list:
+    """The samples of the Xenium view a density grid is drawn for: the primary one and the
+    extra samples beside it, each with the µm it is shifted by. One dict per sample:
+    label, ds (dataset dict), data_dir (None: loaded from a .zarr, no transcripts),
+    x_offset."""
+    extras = list(dataview.EXTRA_DATASETS)
+    out = [{"label": "S0" if extras else "xenium", "ds": core.DATA,
+            "data_dir": core.DATA.get("data_dir"), "x_offset": 0.0}]
+    for i, eds in enumerate(extras):
+        out.append({"label": f"S{i + 1}", "ds": eds, "data_dir": eds.get("data_dir"),
+                    "x_offset": float(eds.get("x_offset", 0.0))})
+    return out
+
+
+def _density_cache_file(gene: str, ds=None) -> str:
+    """Cache file of a gene's base grid: <cache>/density_<dataset>/<gene>__b<bin>um__<filter>.npz
+    (*ds*: the dataset dict of an extra sample; each sample has its own directory, so a
+    grid computed for a sample is found again whether it is loaded as primary or extra)."""
+    tag = (_an_dataset_tag() if ds is None or ds is core.DATA
+           else hashlib.md5(dataview._ds_key(ds).encode()).hexdigest()[:8])
+    d = os.path.join(core.CACHE_BASE_DIR, f"density_{tag}")
     if gene == _DENSITY_ALL:
         stem = "ALL_GENES"
     else:
@@ -1117,12 +1176,27 @@ def _density_ready(gene) -> bool:
     return bool(gene) and core.DATA.get("data_dir") is not None and os.path.exists(_density_cache_file(gene))
 
 
-def _density_grid(gene: str, bin_um) -> "dict | None":
+def _density_status(gene) -> dict:
+    """Per sample of the view, whether *gene*'s grid exists: {ready, missing (has
+    transcripts, no grid yet), unavailable (loaded from a .zarr)} as lists of labels."""
+    out = {"ready": [], "missing": [], "unavailable": []}
+    for smp in _density_samples():
+        if not smp["data_dir"]:
+            out["unavailable"].append(smp["label"])
+        elif gene and os.path.exists(_density_cache_file(gene, smp["ds"])):
+            out["ready"].append(smp["label"])
+        else:
+            out["missing"].append(smp["label"])
+    return out
+
+
+def _density_grid(gene: str, bin_um, ds=None) -> "dict | None":
     """Dense grid of a cached gene at *bin_um* (a multiple of the base bin): {grid
     (int64, rows = y bins, cols = x bins), ix0, iy0 (bin index of grid[0, 0]), bin,
     total, vmax (99.5th percentile of the non-empty bins: default colour maximum)}.
-    None when the gene's grid has not been computed yet."""
-    path = _density_cache_file(gene)
+    None when the gene's grid has not been computed yet. *ds*: an extra sample (its
+    grid is in that sample's own µm, without the view offset)."""
+    path = _density_cache_file(gene, ds)
     k = max(1, int(round(float(bin_um) / _DENSITY_BASE_UM)))
     mkey = (path, k)
     with _density_mem_lock:
@@ -1148,40 +1222,118 @@ def _density_grid(gene: str, bin_um) -> "dict | None":
                     "vmax": float(max(1.0, np.percentile(nzv, 99.5))) if len(nzv) else 1.0})
     with _density_mem_lock:
         _density_mem[mkey] = out
-        while len(_density_mem) > 6:
-            _density_mem.popitem(last=False)
+        _density_mem_trim()
     return out
 
 
-def _density_window(gene, bin_um, x0=None, y0=None, x1=None, y1=None,
-                    max_cells: int = _DENSITY_MAX_CELLS) -> "dict | None":
-    """The part of a gene's grid that covers the box (µm; None: everything), for a heat
-    layer: {values (float32 2-D, transcripts per bin), x0, y0 (µm of the corner of
-    values[0, 0]), cell (µm per value), bin, vmax, total, coarsened}. When the box
-    holds more than *max_cells* bins, f × f bins are averaged into one value, so the
-    values stay "transcripts per bin" and the colour scale does not move with the zoom."""
-    g = _density_grid(gene, bin_um)
-    if g is None:
-        return None
-    b, grid = g["bin"], g["grid"]
-    h, w = grid.shape
+def _density_mem_trim() -> None:
+    """Keep the grids of a few (gene, bin) pairs for every sample of the view. Call
+    inside _density_mem_lock."""
+    keep = max(6, 3 * (1 + len(dataview.EXTRA_DATASETS)) + 2)
+    while len(_density_mem) > keep:
+        _density_mem.popitem(last=False)
+
+
+def _density_box_slice(g: dict, x0=None, y0=None, x1=None, y1=None) -> tuple:
+    """(r0, r1, c0, c1): the rows / columns of grid *g* that cover the box (µm of the
+    grid's own sample; None: everything)."""
+    b = g["bin"]
+    h, w = g["grid"].shape
     c0, r0, c1, r1 = 0, 0, w, h
     if x0 is not None and w:
         c0 = int(np.clip(np.floor(x0 / b) - g["ix0"], 0, w))
         c1 = int(np.clip(np.floor(x1 / b) - g["ix0"] + 1, c0, w))
         r0 = int(np.clip(np.floor(y0 / b) - g["iy0"], 0, h))
         r1 = int(np.clip(np.floor(y1 / b) - g["iy0"] + 1, r0, h))
+    return r0, r1, c0, c1
+
+
+def _density_window(gene, bin_um, x0=None, y0=None, x1=None, y1=None,
+                    max_cells: int = _DENSITY_MAX_CELLS, ds=None, x_offset: float = 0.0,
+                    factor=None) -> "dict | None":
+    """The part of a gene's grid that covers the box (µm; None: everything), for a heat
+    layer: {values (float32 2-D, transcripts per bin), x0, y0 (µm of the corner of
+    values[0, 0]), cell (µm per value), bin, vmax, total, coarsened}. When the box
+    holds more than *max_cells* bins, f × f bins are averaged into one value, so the
+    values stay "transcripts per bin" and the colour scale does not move with the zoom.
+
+    *ds* / *x_offset*: the grid of an extra sample, drawn *x_offset* µm to the right; the
+    box and the returned x0 are in view coordinates (the grid itself is not resampled:
+    its bin edges stay multiples of the bin size in the sample's own µm). *factor*
+    fixes f (used to coarsen all samples of a view alike)."""
+    g = _density_grid(gene, bin_um, ds)
+    if g is None:
+        return None
+    b, grid = g["bin"], g["grid"]
+    off = float(x_offset or 0.0)
+    r0, r1, c0, c1 = _density_box_slice(g, None if x0 is None else x0 - off, y0,
+                                        None if x1 is None else x1 - off, y1)
     sub = grid[r0:r1, c0:c1]
-    f = 1
-    while (sub.shape[0] // f + 1) * (sub.shape[1] // f + 1) > max_cells:
-        f += 1
+    f = int(factor or 1)
+    if factor is None:
+        while (sub.shape[0] // f + 1) * (sub.shape[1] // f + 1) > max_cells:
+            f += 1
     if f > 1 and sub.size:
         ph, pw = -sub.shape[0] % f, -sub.shape[1] % f
         sub = np.pad(sub, ((0, ph), (0, pw)))
         sub = sub.reshape(sub.shape[0] // f, f, sub.shape[1] // f, f).sum(axis=(1, 3)) / float(f * f)
     return {"values": np.ascontiguousarray(sub, dtype=np.float32),
-            "x0": (g["ix0"] + c0) * b, "y0": (g["iy0"] + r0) * b, "cell": b * f, "bin": b,
+            "x0": (g["ix0"] + c0) * b + off, "y0": (g["iy0"] + r0) * b, "cell": b * f, "bin": b,
             "vmax": g["vmax"], "total": g["total"], "coarsened": f > 1}
+
+
+def _density_windows(gene, bin_um, x0=None, y0=None, x1=None, y1=None,
+                     max_cells: int = _DENSITY_MAX_CELLS) -> "dict | None":
+    """_density_window for every sample of the view that has a grid of *gene*: {parts
+    (one window per sample, each at its sample's offset, with its label), bin, vmax,
+    total, coarsened, labels, missing, unavailable}. All parts share one coarsening
+    factor and one colour maximum (99.5th percentile of the non-empty bins of all
+    samples together), so the samples can be compared by eye. None when no sample has
+    a grid. With a single sample this is that sample's _density_window."""
+    smps = _density_samples()
+    st = _density_status(gene)
+    grids = []
+    for smp in smps:
+        if smp["label"] in st["ready"]:
+            g = _density_grid(gene, bin_um, smp["ds"])
+            if g is not None:
+                grids.append((smp, g))
+    if not grids:
+        return None
+    f = 1
+    while True:
+        n = 0
+        for smp, g in grids:
+            off = smp["x_offset"]
+            r0, r1, c0, c1 = _density_box_slice(g, None if x0 is None else x0 - off, y0,
+                                                None if x1 is None else x1 - off, y1)
+            if r1 > r0 and c1 > c0:
+                n += ((r1 - r0) // f + 1) * ((c1 - c0) // f + 1)
+        if n <= max_cells:
+            break
+        f += 1
+    parts = []
+    for smp, g in grids:
+        win = _density_window(gene, bin_um, x0, y0, x1, y1, ds=smp["ds"],
+                              x_offset=smp["x_offset"], factor=f)
+        win["label"] = smp["label"]
+        parts.append(win)
+    if len(grids) == 1:
+        vmax = grids[0][1]["vmax"]
+    else:
+        vkey = ("vmax", tuple(_density_cache_file(gene, smp["ds"]) for smp, _ in grids), grids[0][1]["bin"])
+        with _density_mem_lock:
+            vmax = _density_mem.get(vkey)
+        if vmax is None:
+            nz = np.concatenate([g["grid"][g["grid"] > 0] for _, g in grids])
+            vmax = float(max(1.0, np.percentile(nz, 99.5))) if len(nz) else 1.0
+            with _density_mem_lock:
+                _density_mem[vkey] = vmax
+                _density_mem_trim()
+    return {"parts": parts, "bin": grids[0][1]["bin"], "vmax": vmax,
+            "total": int(sum(g["total"] for _, g in grids)), "coarsened": f > 1,
+            "labels": [smp["label"] for smp, _ in grids],
+            "missing": st["missing"], "unavailable": st["unavailable"]}
 
 
 def _density_label(gene, bin_um) -> str:
@@ -1190,10 +1342,17 @@ def _density_label(gene, bin_um) -> str:
 
 
 def _density_heatmap_trace(spec: dict, relayout=None):
-    """Plotly heat layer of the transcript density for the current viewport (drawn below
-    the WebGL cell markers), or None when it is off / not computed."""
+    """The first of _density_heatmap_traces (the only one with a single sample), or None."""
+    traces = _density_heatmap_traces(spec, relayout)
+    return traces[0] if traces else None
+
+
+def _density_heatmap_traces(spec: dict, relayout=None) -> list:
+    """Plotly heat layers of the transcript density for the current viewport (drawn below
+    the WebGL cell markers): one per sample that has a grid, each at its sample's offset,
+    all on one colour scale. Empty when the layer is off / not computed."""
     if not spec or not spec.get("on") or not spec.get("gene"):
-        return None
+        return []
     box = [None] * 4
     r = relayout or {}
     try:
@@ -1203,22 +1362,28 @@ def _density_heatmap_trace(spec: dict, relayout=None):
         box = [min(xa, xb) - px, min(-ya, -yb) - py, max(xa, xb) + px, max(-ya, -yb) + py]
     except (KeyError, TypeError, ValueError):
         pass
-    win = _density_window(spec["gene"], spec.get("bin") or 10, *box, max_cells=160_000)
-    if win is None or not win["values"].size:
-        return None
-    z = win["values"].astype(float)
-    z[z <= 0] = np.nan                      # empty bins stay transparent
-    z = z[::-1]                             # plot y = -µm: last row first
-    c = win["cell"]
-    vmax = spec.get("max") or win["vmax"]
-    return go.Heatmap(
-        z=z, x0=win["x0"] + c / 2, dx=c, y0=-(win["y0"] + (z.shape[0] - 0.5) * c), dy=c,
-        colorscale="Magma", zmin=0, zmax=vmax,
-        opacity=float(spec.get("opacity") if spec.get("opacity") is not None else 0.7),
-        hoverinfo="skip", name="transcript density", showlegend=False,
-        colorbar=dict(title=_density_label(spec["gene"], win["bin"]).replace(": ", ":<br>")
-                      .replace(" per ", "<br>per "), thickness=12, len=0.4, x=1.02, y=0.2),
-    )
+    wins = _density_windows(spec["gene"], spec.get("bin") or 10, *box, max_cells=160_000)
+    if wins is None:
+        return []
+    vmax = spec.get("max") or wins["vmax"]
+    traces = []
+    for win in wins["parts"]:
+        if not win["values"].size:
+            continue
+        z = win["values"].astype(float)
+        z[z <= 0] = np.nan                      # empty bins stay transparent
+        z = z[::-1]                             # plot y = -µm: last row first
+        c = win["cell"]
+        traces.append(go.Heatmap(
+            z=z, x0=win["x0"] + c / 2, dx=c, y0=-(win["y0"] + (z.shape[0] - 0.5) * c), dy=c,
+            colorscale="Magma", zmin=0, zmax=vmax,
+            opacity=float(spec.get("opacity") if spec.get("opacity") is not None else 0.7),
+            hoverinfo="skip", name="transcript density", showlegend=False,
+            showscale=not traces,               # one colour bar for all samples
+            colorbar=dict(title=_density_label(spec["gene"], win["bin"]).replace(": ", ":<br>")
+                          .replace(" per ", "<br>per "), thickness=12, len=0.4, x=1.02, y=0.2),
+        ))
+    return traces
 
 
 def _run_density(genes, _unused=None) -> None:
@@ -1233,29 +1398,37 @@ def _run_density(genes, _unused=None) -> None:
             _density_state["message"] = message
 
     try:
-        data_dir = core.DATA.get("data_dir")
-        if not data_dir:
+        # every sample of the view that has its transcripts (a sample loaded from a .zarr
+        # has none): one grid per sample and gene, in that sample's own cache directory
+        smps = _density_samples()
+        todo = [s for s in smps if s["data_dir"]]
+        skipped = [s["label"] for s in smps if not s["data_dir"]]
+        if not todo:
             _set("error", "Transcript density needs the Xenium output directory "
                           "(transcripts.parquet); this dataset was loaded from a .zarr.")
             return
+        multi = len(smps) > 1
         _t0 = _time.time()
         msgs = []
-        for gi, gene in enumerate(genes):
+        steps = [(smp, gene) for smp in todo for gene in genes]
+        for si, (smp, gene) in enumerate(steps):
             name = "all genes" if gene == _DENSITY_ALL else gene
-            path = _density_cache_file(gene)
+            path = _density_cache_file(gene, smp["ds"])
             if os.path.exists(path):
                 continue
-            _set("running", f"Binning transcripts of {name}…")
+            _set("running", f"Binning transcripts of {name}" + (f" ({smp['label']})…" if multi else "…"))
             scan = _density_scan(
-                data_dir, gene,
-                progress=lambda f, _gi=gi: jobs._job_progress(fraction=(_gi + f) / len(genes)))
+                smp["data_dir"], gene,
+                progress=lambda f, _si=si: jobs._job_progress(fraction=(_si + f) / len(steps)))
             jobs._check_dataset_gen(_gen)
             _density_write(path, scan, gene)
-            msgs.append(f"{name}: {scan['total']:,} transcripts")
+            msgs.append(f"{name}{' (' + smp['label'] + ')' if multi else ''}: {scan['total']:,} transcripts")
         with _density_lock:
             _density_state["version"] += 1
+        _skip = (f" No transcripts for {', '.join(skipped)} (loaded from a .zarr): no grid there."
+                 if skipped else "")
         _set("done", ("Binned " + "; ".join(msgs) + f" ({_time.time() - _t0:.1f} s)." if msgs
-                      else "Grid loaded from the cache."))
+                      else "Grid loaded from the cache.") + _skip)
     except jobs._JobCancelled:
         raise
     except jobs._DatasetChanged:
@@ -1291,39 +1464,56 @@ _GS_NOTE = ("Score per cell = mean of the z-scored log-normalised expression of 
             "active segmentation, counts mode and subset; recomputed when these change.")
 _DENSITY_NOTE = ("Transcripts (not cells) per bin over the whole tissue: quality Q ≥ 20, gene "
                  "features only, the same filter the cell-feature matrix uses. The grid is read "
-                 "from transcripts.parquet once per gene and kept in the cache directory. It does "
-                 "not depend on the segmentation or on a cell subset; with several samples it shows "
-                 "the primary sample.")
+                 "from transcripts.parquet once per gene and sample and kept in the cache directory. "
+                 "It does not depend on the segmentation or on a cell subset. With several samples "
+                 "each sample's grid is drawn at that sample's position, on one colour scale; a "
+                 "sample loaded from a .zarr has no transcripts and no grid.")
 
 
 _DE_REST_OPTION = {"label": "All other cells", "value": "rest"}
 
 
-def _de_tab():
-    _col = lambda cid, name: {"id": cid, "name": name, "type": "text" if cid == "gene" else "numeric"}
+def _de_tab(pseudobulk_controls=None):
+    """The Differential Expression tab. *pseudobulk_controls*: the rows shown instead of
+    the two group pickers in the "Pseudobulk across samples" mode (stats._pb_controls)."""
     return dbc.Tab(label="Differential Expression", tab_id="tab-de",
                    label_style={"fontSize": "12px", "padding": "4px 12px"},
                    children=[html.Div([
         html.Div([
-            html.Span("A:", style=_AN_LABEL_STYLE),
-            dcc.Dropdown(id="de-group-a", options=[dict(_DE_REST_OPTION)], value=None, placeholder="Group A…",
-                         style={"flex": "1", "minWidth": "150px", "fontSize": "11px"}),
-            html.Span("B:", style=_AN_LABEL_STYLE),
-            dcc.Dropdown(id="de-group-b", options=[dict(_DE_REST_OPTION)], value="rest", placeholder="Group B…",
-                         style={"flex": "1", "minWidth": "150px", "fontSize": "11px"}),
+            html.Span("Test:", style=_AN_LABEL_STYLE),
+            dcc.RadioItems(id="de-mode", value="cells", inline=True,
+                           options=[{"label": " Cells (Wilcoxon)", "value": "cells"},
+                                    {"label": " Pseudobulk across samples", "value": "pseudobulk"}],
+                           inputStyle={"marginRight": "3px"},
+                           labelStyle={"marginRight": "12px", "cursor": "pointer", "fontSize": "11px",
+                                       "color": core.TEXT},
+                           style={"flex": "1"}),
             dbc.Button("Run", id="de-run-btn", color="primary", size="sm", n_clicks=0,
                        style={"fontSize": "11px", "padding": "2px 12px"}),
         ], style=_AN_ROW_STYLE),
         html.Div([
-            html.Span(id="de-selection-info", children="No current selection.", style=_AN_LABEL_STYLE),
-            dcc.Input(id="de-group-name", type="text", placeholder="Group name", debounce=False,
-                      style={**_AN_INPUT_STYLE, "width": "130px"}),
-            dbc.Button("Save current selection as group", id="de-save-group-btn", color="secondary",
-                       size="sm", n_clicks=0, style={"fontSize": "11px", "padding": "2px 8px"}),
-            dbc.Button("Delete group in A", id="de-delete-group-btn", color="secondary", outline=True,
-                       size="sm", n_clicks=0, style={"fontSize": "11px", "padding": "2px 8px"}),
-        ], style=_AN_ROW_STYLE),
-        html.Div(id="de-status", style=_AN_STATUS_STYLE),
+            html.Div([
+                html.Span("A:", style=_AN_LABEL_STYLE),
+                dcc.Dropdown(id="de-group-a", options=[dict(_DE_REST_OPTION)], value=None, placeholder="Group A…",
+                             style={"flex": "1", "minWidth": "150px", "fontSize": "11px"}),
+                html.Span("B:", style=_AN_LABEL_STYLE),
+                dcc.Dropdown(id="de-group-b", options=[dict(_DE_REST_OPTION)], value="rest", placeholder="Group B…",
+                             style={"flex": "1", "minWidth": "150px", "fontSize": "11px"}),
+            ], style=_AN_ROW_STYLE),
+            html.Div([
+                html.Span(id="de-selection-info", children="No current selection.", style=_AN_LABEL_STYLE),
+                dcc.Input(id="de-group-name", type="text", placeholder="Group name", debounce=False,
+                          style={**_AN_INPUT_STYLE, "width": "130px"}),
+                dbc.Button("Save current selection as group", id="de-save-group-btn", color="secondary",
+                           size="sm", n_clicks=0, style={"fontSize": "11px", "padding": "2px 8px"}),
+                dbc.Button("Delete group in A", id="de-delete-group-btn", color="secondary", outline=True,
+                           size="sm", n_clicks=0, style={"fontSize": "11px", "padding": "2px 8px"}),
+            ], style=_AN_ROW_STYLE),
+        ], id="de-cells-controls", style={"flexShrink": "0"}),
+        html.Div(pseudobulk_controls or [], id="de-pb-controls",
+                 style={"display": "none", "flexShrink": "0"}),
+        html.Div(id="de-status", style={**_AN_STATUS_STYLE, "whiteSpace": "pre-wrap"}),
+        html.Div(id="de-pb-samples", style={"padding": "0 8px", "flexShrink": "0"}),
         html.Div(_DE_CAVEAT, id="de-caveat", style=_AN_NOTE_STYLE),
         html.Div([
             html.Div(dcc.Graph(id="de-volcano-plot", responsive=True,
@@ -1334,10 +1524,7 @@ def _de_tab():
                      id="de-plot-container", style={"flex": "1", "minWidth": "0", "minHeight": "260px"}),
             html.Div([
                 dash_table.DataTable(
-                    id="de-table", data=[],
-                    columns=[_col("gene", "Gene"), _col("log2fc", "log2FC"), _col("pct_a", "% A"),
-                             _col("pct_b", "% B"), _col("mean_a", "Mean A"), _col("mean_b", "Mean B"),
-                             _col("z", "z"), _col("pval", "p"), _col("padj", "FDR")],
+                    id="de-table", data=[], columns=_de_table_columns(),
                     sort_action="native", filter_action="native", page_size=12,
                     style_table={"overflowX": "auto"},
                     style_header={"backgroundColor": core.CARD_BG, "color": core.TEXT, "fontWeight": "600",

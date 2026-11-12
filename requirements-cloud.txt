@@ -1,0 +1,38 @@
+# Xenium Explorer - runtime requirements of the container image (see Dockerfile).
+# Python 3.11. Python-only: nothing here needs R, Julia or Rust.
+#
+# Left out on purpose (compare requirements.txt):
+#   rpy2                - needs R: Seurat / RCTD annotation, SpaGE imputation, SPLIT
+#   sopa                - only used by "Prepare Patches" in the Resegment dialog, which
+#                         is of no use without the Baysor / Proseg binaries
+#   matplotlib, seaborn - functions/compare_cellnest.py only
+#   pytest              - tests are not in the image
+
+# Web framework
+dash>=4.0
+dash-bootstrap-components>=2.0
+plotly>=6.0
+
+# Core data / science
+numpy>=2.0
+pandas>=2.2
+scipy>=1.13
+scikit-learn>=1.5
+h5py>=3.10
+pyarrow>=15.0
+
+# Image / file I/O
+Pillow>=10.0
+tifffile>=2024.1
+imagecodecs>=2024.1
+zarr>=3.0
+
+# AnnData / SpatialData (the app converts a bundle to spatialdata_xenium.zarr on first load)
+anndata>=0.10
+geopandas>=1.0
+shapely>=2.0
+spatialdata>=0.7
+
+# Optional features that work without R
+celltypist>=1.6     # CellTypist annotation (downloads its models on first use)
+umap-learn>=0.5     # Rerun UMAP

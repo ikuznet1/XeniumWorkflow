@@ -159,7 +159,7 @@ class _ViewerProvider:
                 return meta, arr
             mode = "transcript_counts"
         if extras:
-            return self._colors_multi(mode, method, gene, df, extras)
+            return self._colors_multi(mode, method, gene, df, extras, corrected)
 
         if mode == "cluster":
             if alt is None:
@@ -243,10 +243,10 @@ class _ViewerProvider:
             return self._continuous(np.log1p(raw), "Transcript Counts (log1p)", "viridis")
         return self._continuous(raw, core.QC_METRICS.get(col, col), core.COLORSCALES.get(col, "Viridis").lower())
 
-    def _colors_multi(self, mode, method, gene, df, extras):
+    def _colors_multi(self, mode, method, gene, df, extras, corrected=False):
         """Colours for the primary sample followed by the extra ones, with the per-mode
         rules of make_spatial_fig's multi-sample branch (cluster names prefixed per
-        sample, original counts only)."""
+        sample; SPLIT-corrected counts only when every sample has them)."""
         dsets = [core.DATA] + list(extras)
         dfs = [df] + [e["df"] for e in extras]
         if mode == "cluster" and not core.DATA.get("cluster_methods"):
@@ -273,31 +273,27 @@ class _ViewerProvider:
                                      names={n: spatial._niche_name(n) for n in order})
 
         if mode.startswith("cell_type:"):
+            _m = mode.split(':', 1)[1]
             with core._annot_lock:
-                primary = core._annot_state.get(f"labels_{mode.split(':', 1)[1]}")
+                primary = core._annot_state.get(f"labels_{_m}")
             parts = []
             for di, edf in enumerate(dfs):
-                lbl = primary if di == 0 else extras[di - 1].get("_cell_type_labels")
+                lbl = primary if di == 0 else dataview._extra_cell_type_labels(extras[di - 1], _m)[0]
                 parts.append(lbl.reindex(edf.index).fillna("Unknown").astype(str).values
                              if lbl is not None else np.full(len(edf), "Unknown", dtype=object))
             return self._categorical(np.concatenate(parts), "Cell type")
 
         if mode == "gene":
             parts = []
+            # corrected counts only when every sample has them (as make_spatial_fig)
+            mc = dataview._multi_use_corrected(corrected)
             for di, edf in enumerate(dfs):
-                vals = None
-                if di == 0:
-                    vals = dataview._xenium_gene_values(gene)
-                else:
-                    eds = extras[di - 1]
-                    g_idx = eds.get("gene_name_to_idx", {}).get(gene)
-                    if g_idx is not None:
-                        raw = figures._csc_view(eds, "expr")[:, g_idx].toarray().flatten()
-                        idx_ = eds["df_to_expr"]
-                        vals = np.log1p(np.where(idx_ >= 0, raw[np.clip(idx_, 0, len(raw) - 1)], 0.0))
+                vals = (dataview._xenium_gene_values(gene, mc) if di == 0
+                        else dataview._extra_gene_values(extras[di - 1], gene, mc))
                 parts.append(np.asarray(vals, dtype=float) if vals is not None and len(vals) == len(edf)
                              else np.zeros(len(edf)))
-            return self._continuous(np.concatenate(parts), f"{gene} (log1p)")
+            return self._continuous(np.concatenate(parts),
+                                    f"{gene} (log1p{', SPLIT-corrected' if mc else ''})")
 
         if mode.startswith("roi_") and any(mode in edf.columns for edf in dfs):
             vals = pd.concat([
@@ -513,19 +509,33 @@ class _ViewerProvider:
             box = [float(args[k]) for k in ("x0", "y0", "x1", "y1")]
         except (KeyError, TypeError, ValueError):
             return {"available": False, "ready": False, "w": 0, "h": 0}, {}
-        if not gene or not core.DATA.get("data_dir"):
-            return {"available": bool(core.DATA.get("data_dir")), "ready": False, "w": 0, "h": 0}, {}
-        win = analysis._density_window(gene, bin_um, *box)
-        if win is None:
+        # One grid per sample of the view (the primary one and the extra samples beside
+        # it), each at its sample's offset: `parts` lists them, `values` holds them one
+        # after the other. w / h / x0 / y0 / cell repeat the first non-empty part (all
+        # there is with a single sample).
+        have_dir = any(s["data_dir"] for s in analysis._density_samples())
+        if not gene or not have_dir:
+            return {"available": have_dir, "ready": False, "w": 0, "h": 0}, {}
+        wins = analysis._density_windows(gene, bin_um, *box)
+        if wins is None:
             return {"available": True, "ready": False, "w": 0, "h": 0}, {}
-        v = win["values"]
-        return ({"available": True, "ready": True, "h": int(v.shape[0]), "w": int(v.shape[1]),
-                 "x0": float(win["x0"]), "y0": float(win["y0"]), "cell": float(win["cell"]),
-                 "bin": float(win["bin"]), "vmax": float(win["vmax"]), "total": int(win["total"]),
-                 "coarsened": bool(win["coarsened"]),
+        parts, vals, pos = [], [], 0
+        for win in wins["parts"]:
+            v = win["values"]
+            parts.append({"h": int(v.shape[0]), "w": int(v.shape[1]), "x0": float(win["x0"]),
+                          "y0": float(win["y0"]), "cell": float(win["cell"]), "offset": pos,
+                          "label": win["label"]})
+            vals.append(v.ravel())
+            pos += v.size
+        first = next((p for p in parts if p["w"] and p["h"]), parts[0])
+        return ({"available": True, "ready": True, "h": first["h"], "w": first["w"],
+                 "x0": first["x0"], "y0": first["y0"], "cell": first["cell"], "parts": parts,
+                 "bin": float(wins["bin"]), "vmax": float(wins["vmax"]), "total": int(wins["total"]),
+                 "coarsened": bool(wins["coarsened"]),
                  # (zooming in then fetches the bins themselves, see RegionLoader.refinable)
-                 "subsampled": bool(win["coarsened"]), "label": analysis._density_label(gene, win["bin"])},
-                {"values": v.ravel()})
+                 "subsampled": bool(wins["coarsened"]),
+                 "label": analysis._density_label(gene, wins["bin"])},
+                {"values": np.concatenate(vals) if len(vals) > 1 else vals[0]})
 
     def _pies(self, args):
         """RCTD weights of the cells in the box, for the weight pies the Plotly view draws

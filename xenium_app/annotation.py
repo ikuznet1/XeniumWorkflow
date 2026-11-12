@@ -831,3 +831,44 @@ def _annot_autoload() -> None:
             print(f"  Annotation: auto-loaded RCTD weights ({weights_df.shape[1]} types) from {name}", flush=True)
         except Exception as exc:
             print(f"  Annotation: weight auto-load failed for {name}: {exc}", flush=True)
+
+
+def _annot_cached_labels(dataset_key: str) -> dict:
+    """{method: labels} found in the annotation cache for another dataset (an extra
+    sample added beside the primary one): per method the most recently written cache
+    file of a Xenium-segmentation run, as _annot_autoload picks it for the primary
+    dataset. Labels are indexed by cell id (str). Empty when the sample was never
+    annotated with this cache directory."""
+    import glob
+    if not dataset_key:
+        return {}
+    tag = hashlib.md5(str(dataset_key).encode()).hexdigest()[:8]
+    files = [f for f in glob.glob(os.path.join(core.CACHE_BASE_DIR, f"*_{tag}.parquet"))
+             if not os.path.basename(f).startswith(("labels_", "spage_", "spatialdata_"))
+             and not os.path.basename(f).endswith("_weights.parquet")
+             and not re.search(r"_n\d+_[0-9a-f]{8}_labels_", os.path.basename(f))]
+    files.sort(key=lambda f: (os.path.getmtime(f), os.path.basename(f)))
+    out = {}
+    for fpath in files:
+        name = os.path.basename(fpath)
+        stem = name[:-(len(tag) + 1 + len(".parquet"))]
+        pos = stem.rfind("_labels_")
+        if pos >= 0:
+            key = stem[pos + 1:]
+        elif name.startswith("rctd_"):
+            key = "labels_rctd"
+        elif name.startswith("seurat_"):
+            key = "labels_seurat"
+        else:
+            key = "labels_celltypist"
+        parts = key.split("_")
+        if len(parts) < 2 or parts[1] not in core._ANNOT_METHODS or "baysor" in parts or "proseg" in parts:
+            continue                      # labels of a Baysor / Proseg run: other cells
+        try:
+            labels = pd.read_parquet(fpath)["label"].astype(str)
+            labels.index = labels.index.astype(str)
+        except Exception as e:
+            print(f"  Annotation cache: could not read {name}: {e}", flush=True)
+            continue
+        out[parts[1]] = labels            # later (newer) files replace earlier ones
+    return out

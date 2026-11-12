@@ -18,18 +18,19 @@ MODULES = (
     # 1. libraries
     "core", "jobs", "caching", "ui", "loading", "dataview", "annotation", "reseg",
     "clustering", "split", "spage", "subsetting", "spatial", "morph", "figures",
-    "analysis", "cellnest", "sdata_store", "regions",
+    "analysis", "cellnest", "sdata_store", "regions", "stats",
     # 2. import-time work
     "startup", "app_layout", "cb_plots", "cb_tools", "cb_reseg", "cb_spage", "cb_data",
-    "cb_spatial", "cb_analysis", "viewer_provider",
+    "cb_spatial", "cb_analysis", "cb_stats", "viewer_provider",
 )
 
 from . import compat  # noqa: E402,F401
 from . import (  # noqa: E402,F401
     core, jobs, caching, ui, loading, dataview, annotation, reseg, clustering, split,
     spage, subsetting, spatial, morph, figures, analysis, cellnest, sdata_store, regions,
+    stats,
 )
 from . import (  # noqa: E402,F401
     startup, app_layout, cb_plots, cb_tools, cb_reseg, cb_spage, cb_data, cb_spatial,
-    cb_analysis, viewer_provider,
+    cb_analysis, cb_stats, viewer_provider,
 )

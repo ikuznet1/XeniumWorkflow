@@ -6,7 +6,14 @@ Works with standard Xenium panels (a few hundred genes) and with **Xenium Prime 
 
 ## Cloud Run Deployment
 
-The app can be deployed to **Google Cloud Run** for remote access. The container files (`Dockerfile`, `requirements-cloud.txt`, `.dockerignore`) are **not currently in this repository**; the commands below assume you supply a `Dockerfile` that installs the Python dependencies, copies `xenium_explorer.py`, the `xenium_app/` package, `xenium_viewer_api.py`, `assets/` and `functions/`, and starts `python xenium_explorer.py`.
+The app can be deployed to **Google Cloud Run** for remote access. The container files are in the repository root: `Dockerfile`, `.dockerignore`, `requirements-cloud.txt` and `deployment_instructions.txt` (the step-by-step guide). **The image has not been built or tested yet** — treat the files as a starting point and check a first build before relying on it.
+
+- The image is **Python-only**: no R / rpy2, Baysor, Proseg or sopa. Seurat and RCTD annotation, SpaGE, SPLIT, pseudobulk differential expression (DESeq2 / edgeR), resegmentation and **Prepare Patches** are therefore unavailable there; CellTypist annotation and the Python analyses work.
+- The container runs as a **non-root** user.
+- Deploy with `--no-allow-unauthenticated --max-instances 1 --no-cpu-throttling`: the app keeps its state in one process and runs background jobs between requests, and it has no login of its own.
+- **Never set `XENIUM_ENABLE_REPL`** on a deployed service: the REPL runs arbitrary code.
+- On first load the app writes `spatialdata_xenium.zarr` **into the bundle directory**: mount the bucket read-write, or upload a bundle in which that store was already generated locally.
+- The cache (`XENIUM_CACHE_DIR`) is **ephemeral** unless a volume is mounted for it: annotations, density grids, saved groups and segmentation runs are lost when the instance stops.
 
 **Quick summary:**
 
@@ -21,7 +28,7 @@ gcloud builds submit --tag gcr.io/YOUR_PROJECT/xenium-explorer
 gcloud run deploy xenium-explorer \
   --image gcr.io/YOUR_PROJECT/xenium-explorer \
   --memory 8Gi --cpu 4 --timeout 3600 \
-  --max-instances 1 --concurrency 1 \
+  --no-allow-unauthenticated --max-instances 1 --no-cpu-throttling \
   --execution-environment gen2 \
   --add-volume name=data-vol,type=cloud-storage,bucket=YOUR_BUCKET \
   --add-volume-mount volume=data-vol,mount-path=/data \
@@ -41,7 +48,11 @@ The server binds to `127.0.0.1` unless `XENIUM_HOST` is set, so a container must
 | `XENIUM_ENABLE_REPL` | Enables the in-app Python REPL, which runs arbitrary code. Unset = disabled; `1` = requests made from this machine to `localhost` / `127.0.0.1` / `[::1]` only (not through a reverse proxy); `remote` = any client (trusted networks only) |
 | `XENIUM_RENDERER` | Spatial renderer shown at startup: unset = Plotly; `webgl` = the WebGL view (it can also be switched in the app) |
 
-**Cloud Run limitations:** R/Julia/Rust features (Seurat, RCTD, SpaGE, Baysor, Proseg, SPLIT) are unavailable in a Python-only container image. CellTypist annotation works.
+**Cloud Run limitations:** R/Julia/Rust features (Seurat, RCTD, SpaGE, Baysor, Proseg, SPLIT, pseudobulk DESeq2 / edgeR) and Prepare Patches (sopa) are unavailable in the Python-only container image. CellTypist annotation works.
+
+## Continuous integration
+
+`.github/workflows/tests.yml` runs the **default pytest tier** on every push and pull request to `main` (Python 3.11, Ubuntu). The `tools`, `browser` and `slow` tiers are not run in CI (they need Baysor / Proseg / R, a browser with WebGL, or large bundles). If the fixture bundle (`tests/data/prime_mouse_ileum_tiny/`) is not in the checkout, the tests that need it are skipped with a warning.
 
 ---
 
@@ -246,7 +257,7 @@ The right-side panel contains additional analysis plots, each in its own tab:
 
 | Tab | Content | Controls |
 |-----|---------|---------|
-| **Cell Type Abundance** | Bar chart of cell type proportions | W × H dimension inputs; download button (SVG) |
+| **Cell Type Abundance** | Bar chart of cell type proportions; below it, per-sample proportions and a test between conditions | W × H; see [Composition between conditions](#composition-between-conditions) |
 | **Co-occurrence** | Spatial co-occurrence score heatmap | Colorbar min/max, W × H; download |
 | **Neighborhood Enrichment** | Neighborhood enrichment heatmap: log2 of the fraction of a cell type's neighbours that are of each type over that type's overall frequency (0 = random mixing) | Colorbar min/max, W × H; download |
 | **Interaction Graph** | Node-edge graph of cell type contacts | O/E normalize toggle, W × H; download |
@@ -254,9 +265,11 @@ The right-side panel contains additional analysis plots, each in its own tab:
 | **Niche UMAP** | UMAP (or spatial map) colored by spatial niche | W × H; download |
 | **UMAP** | UMAP plot (alternative to sidebar toggle) | W × H; download |
 | **CellNEST CCC** | Cell-cell communication from CellNEST output | See below |
-| **Differential Expression** | Wilcoxon test between two groups of cells: volcano plot and sortable table | See [Differential expression](#differential-expression) |
+| **Differential Expression** | Wilcoxon test between two groups of cells, or pseudobulk DESeq2 between conditions across samples: volcano plot and sortable table | See [Differential expression](#differential-expression) and [Pseudobulk differential expression across samples](#pseudobulk-differential-expression-across-samples) |
 | **Gene Sets** | Paste a gene list, score every cell, colour the views by the score | See [Gene-set scores](#gene-set-scores) |
 | **Transcript Density** | Binned 2-D density of the transcripts of a gene as a heat layer under the cells | See [Transcript density](#transcript-density) |
+| **Spatial Genes** | Moran's I of every gene on a spatial neighbour graph: sortable table | See [Spatially variable genes (Moran's I)](#spatially-variable-genes-morans-i) |
+| **Ligand–Receptor** | Ligand–receptor scores between neighbouring cell types with a permutation p-value: dot plot and table | See [Ligand–receptor scores](#ligandreceptor-scores) |
 
 A **download button** (camera icon) appears on hover over each plot; exports as SVG at the current display size.
 
@@ -286,9 +299,55 @@ A **download button** (camera icon) appears on hover over each plot; exports as 
 **Caveats — read before quoting a p-value**
 
 - **Every cell is treated as an independent observation.** Cells of one tissue section are not independent, and with hundreds of thousands of cells almost every gene reaches a tiny p-value; rank genes by effect size (log2FC, % expressing) as well.
-- **Comparisons across samples or replicates** (several samples loaded side by side, or groups that coincide with samples) are **anticonservative**: the variation between samples is ignored. The proper analysis there is a **pseudobulk** test with samples as replicates (e.g. DESeq2 / edgeR on per-sample sums). With several samples loaded the app pools their cells and says so in the status line.
+- **Comparisons across samples or replicates** (several samples loaded side by side, or groups that coincide with samples) are **anticonservative**: the variation between samples is ignored. The proper analysis there is a **pseudobulk** test with samples as replicates: switch **Test** to *Pseudobulk across samples* (next section). With several samples loaded the cell-level test pools their cells and says so in the status line.
 - **Groups defined from the same expression data** (clusters) are selected to differ, so their p-values are inflated as well ("double dipping").
 - Fold changes of spatial groups also reflect differences in cell-type composition between the regions.
+
+### Samples and conditions
+
+Tests that compare **samples** (pseudobulk differential expression, composition) share one assignment: every loaded sample (the primary one, `S0`, and those added with **+ Add sample**, `S1`, `S2`, …) is in **condition A**, in **condition B**, or **excluded**, optionally with a **pairing / batch** label (a patient, a slide, a run). **Samples & conditions…** in either tab opens the editor; the two conditions can be named. The assignment is kept per sample for the session (it is not written to disk) and is cleared when another dataset is loaded.
+
+A batch label adds a batch term to the model (`~ batch + condition`). It must be given to every included sample or to none, and it must not be confounded with the condition (each label in one condition only, or one label per sample): such a design is refused with the reason.
+
+**Cell types of added samples.** Annotation runs on the primary sample only. An added sample gets cell types from (1) the annotation cache, if that sample was annotated earlier as the primary dataset with the same cache directory (per method, the most recent Xenium-segmentation run), or (2) the `cell_type_<method>` columns of a store written by **Save as SpatialData**. A sample without labels for the chosen method is left out of cell-type populations and composition tests, and named. *Behaviour change:* added samples that have such labels are now coloured by cell type in both renderers (they were always "Unknown").
+
+### Pseudobulk differential expression across samples
+
+**Plots panel → Differential Expression → Test: Pseudobulk across samples.** The samples, not the cells, are the observations.
+
+1. Assign the samples to the two conditions (**Samples & conditions…**).
+2. Pick the **cells** whose counts are summed: all cells, a cell type, a cluster, a ROI class (all its ROIs — draw one per sample), a single ROI, a saved group or the current selection.
+3. **Run**. The result uses the same volcano plot, table and **Download CSV** as the cell-level test; title, status line and CSV header name the method, the design and the samples. A table under the status line lists, per sample, the cells summed, the library size and the size factor.
+
+- **Counts**: the raw integer counts of the chosen cells are summed per sample over the measured panel genes. Imputed genes are never used. **The original counts are always used, also when Active Counts is "SPLIT Corrected"** (the status line says so): SPLIT-corrected counts are modified, non-integer values, which a count model must not be given.
+- **Model**: **DESeq2** through rpy2 — design `~ condition`, or `~ batch + condition` with batch labels; Wald test; independent filtering at alpha 0.05; log2 fold change **A / B**. The table gives the unshrunken (MLE) log2FC and, with **Shrink log2FC** ticked, the **apeglm**-shrunken one (DESeq2's `normal` prior when apeglm is not installed; the column and the volcano axis name the estimator, or say "unshrunken"). If DESeq2's dispersion trend cannot be fitted the gene-wise estimates are used and the status line says so.
+- **Without DESeq2**: **edgeR**'s quasi-likelihood F-test is used when edgeR is installed, and the result is labelled as such. With neither package the run is refused with the install hint (`BiocManager::install(c("DESeq2", "apeglm"))`). There is no fallback to a t-test.
+- **Refusals and warnings**: a condition with **fewer than 2 samples is refused**; with fewer than 3 the status line warns that the variance estimates are unreliable. A sample contributing fewer than **Min. cells / sample** (default 10) is dropped and named. Genes with a total count below **Min. total count / gene** (default 10) are not tested and counted in the status line, as are genes DESeq2 leaves without an adjusted p-value (they are not drawn in the volcano).
+- A Baysor / Proseg run is a single sample: pseudobulk needs the Xenium segmentation with several samples loaded.
+- **Validation**: on fabricated six-sample data and on six sub-bundles of the Prime 5K skin section the log2FC, p-values, adjusted p-values and apeglm-shrunken log2FC equal those of DESeq2 run directly in R on the same matrix (largest relative difference 3 × 10⁻¹³; 4,226 genes); likewise for the batch design and for the edgeR path.
+
+**Caveats**
+
+- **Replicates must be biological replicates.** Regions of one tissue section, or serial sections of one block, are pseudo-replicates: their dispersion is far too small and the p-values mean nothing.
+- With 2–3 samples per condition power is low and a single odd sample decides the result; look at the per-sample table.
+- **Cluster ids** are per sample: "cluster 3 in every sample" is the same population only if the samples were clustered together. Prefer cell types.
+- Fold changes of a population defined by a ROI also reflect its cell-type composition.
+
+### Composition between conditions
+
+**Plots panel → Cell Type Abundance → Composition between conditions.** Tests whether the **proportion** of each cell type (or cluster, or spatial niche) differs between conditions A and B, with the same sample assignment.
+
+- **Compute** shows, for every sample that has the labels, the proportion of each category: a plot with **one point per sample**, grouped and coloured by condition (bars: condition means; `*`: FDR < 0.05), a table (test results and each sample's proportion) and **Download CSV** (adds the cell counts).
+- **Method (propeller-style, Phipson et al. 2022)**: per-sample proportions are **logit**-transformed (0.5 pseudocount per category, as `speckle`) or **arcsine-square-root**-transformed; a linear model (`~ condition`, or `~ batch + condition`) is fitted per category and tested with a **moderated t-test** — limma-style empirical Bayes shrinkage of the category variances towards a common prior (non-robust, no trend), implemented in Python. **Welch's t-test** on the same transformed values is given beside it (it ignores batch labels). Benjamini–Hochberg FDR over the categories.
+- **With fewer than 3 samples in a condition no test is run** — the tab says so and shows the proportions only. With one sample its proportions are shown.
+- **Validation**: Welch's t, its degrees of freedom and p-value equal `scipy.stats.ttest_ind(equal_var=False)`; the moderated t, its p-value, the prior variance and the prior and total degrees of freedom equal `limma::lmFit` + `eBayes(robust = FALSE)` on the same transformed proportions (relative difference < 10⁻⁵), with and without a batch term. `speckle::propeller` itself was not installed: its default uses `robust = TRUE`, which can differ when one category's variance is an outlier. A quasi-binomial / beta-binomial GLM is not implemented.
+
+**Caveats**
+
+- **Proportions are compositional**: they sum to 1 in each sample, so a real expansion of one type lowers the proportions of all the others. The tests of the categories are not independent, and a "decrease" may be the shadow of another type's increase.
+- With 3–5 samples per condition only large shifts are detectable, and the empirical Bayes prior is estimated from as many variances as there are categories (a dozen): treat the moderated p-values as approximate and compare with Welch's.
+- Proportions depend on the tissue area sampled and on the segmentation; cells without a label are left out of the denominator.
+- Cluster and niche ids are comparable across samples only when the samples were clustered together (niches are computed for the primary sample only).
 
 ### Gene-set scores
 
@@ -304,14 +363,55 @@ A **download button** (camera icon) appears on hover over each plot; exports as 
 
 **Plots panel → Transcript Density.** Shows where the **transcripts** of a gene (or of all genes) lie, independent of any cell segmentation: a 2-D grid of transcript counts drawn as a heat layer **under the cells**, in both renderers.
 
-1. Pick a gene, or **All genes**, and press **Compute**. The app reads `transcripts.parquet` once for that gene (a registered, cancellable job with progress) and stores the grid in the cache directory; afterwards the gene is available immediately.
+1. Pick a gene, or **All genes**, and press **Compute**. The app reads `transcripts.parquet` once for that gene and for every loaded sample (a registered, cancellable job with progress) and stores the grids in the cache directory; afterwards the gene is available immediately.
 2. **Bin (µm)**: 5, 10, 20 or 50. **Show heat layer**, **Opacity** and **Colour max** control the layer; lowering the sidebar's point opacity makes it easier to see under the cells. The colour bar gives transcripts per bin (0 – the 99.5th percentile of the non-empty bins unless a maximum is entered); empty bins are transparent.
 
 - Transcripts are filtered like the cell-feature matrix: **Q ≥ 20, gene features only** (no control probes or codewords, blank / unassigned / deprecated codewords). The sum of a gene's grid equals the number of its transcripts that pass this filter — including transcripts outside every cell, so it can exceed the gene's total in the count matrix.
 - Bin *i* covers `[i × bin, (i + 1) × bin)` µm from the slide origin in x and in y. Grids are stored at 5 µm; the coarser bin sizes are exact sums of those bins.
 - The parquet file is read one row group at a time with the filter pushed down and two columns decoded (bundles without `transcripts.parquet`: the full-resolution tiles of `transcripts.zarr.zip`), so memory does not grow with the number of transcripts. On the Prime 5K skin bundle (74 M transcripts) a gene takes about 2 s and all genes about 3 s.
 - Only the bins of the current viewport are sent to the browser. When the viewport holds more bins than can be drawn (zoomed out on a large slide at a small bin size) neighbouring bins are **averaged** (not summed), so the values stay "transcripts per bin" and the colours do not change with the zoom; zooming in shows the bins themselves.
-- The layer does not depend on the segmentation, the counts mode or a cell subset. With several samples loaded it shows the primary sample only. It needs the Xenium output directory (not available for a dataset opened from a bare `.zarr`).
+- The layer does not depend on the segmentation, the counts mode or a cell subset. It needs the Xenium output directory (not available for a dataset opened from a bare `.zarr`).
+- **Several samples**: every sample has its own grid, cached in its own directory (`density_{hash of that sample}/`, so a grid is found again whether the sample is loaded as primary or added). Each grid is drawn at its sample's position in the combined view, in both renderers, on **one colour scale** (the 99.5th percentile of the non-empty bins of all samples together) and with one colour bar. The grids are not resampled: bin edges stay multiples of the bin size in each sample's own coordinates. A sample added after Compute has no grid until Compute is pressed again, and a sample loaded from a `.zarr` has none; the hint line names both. *Behaviour change:* the layer used to show the primary sample only.
+
+### Spatially variable genes (Moran's I)
+
+**Plots panel → Spatial Genes → Run.** Ranks the measured genes by spatial autocorrelation.
+
+- **Graph**: the **k nearest neighbours** of every cell centroid (k = 6 by default), built for this analysis; weights are **row-standardised** (each neighbour weighs 1/k; the graph is not symmetrised).
+- **Statistic**: Moran's I of `log1p(count / library size × 10,000)` per gene. **z-score and two-sided p-value** from the analytic mean (−1/(n−1)) and variance of I under the **normality assumption** (Cliff & Ord), **Benjamini–Hochberg FDR** over the tested genes of a sample. Genes not detected in any cell are not tested.
+- Computed for the **active view** (segmentation, counts mode, subset) and **per sample** when several are loaded (each on its own graph; the table has a Sample column). A registered, cancellable job with progress.
+- The table is sorted by I and can be filtered; a click on a row selects the gene in the sidebar; **Download CSV** writes all genes.
+- **Cost**: the count matrix stays sparse and genes are processed in dense blocks of 64 MB. Prime 5K skin (112,551 cells × 5,006 genes, 33 M non-zeros): **5.5 s**, about 0.3 GB above the loaded dataset.
+- **Validation**: I, z and p equal the textbook dense formulas on fabricated data and on the fixture bundle, and `spdep::moran.test(randomisation = FALSE)` on a k-nearest-neighbour `listw` (relative difference < 2 × 10⁻⁶, the precision of the float32 size factors). squidpy / esda were not installed and were not compared.
+
+**Caveats**
+
+- With tens of thousands of cells **almost every expressed gene is "significant"** (4,051 of 5,006 on the skin section): rank by I, not by the p-value. The normality assumption is rough for sparse counts.
+- I measures autocorrelation at the scale of the k neighbours. A marker of a cell type that sits in clusters scores high for that reason alone; it does not separate "spatial pattern within a cell type" from "cell-type pattern".
+- Segmentation spill-over between touching cells raises I for highly expressed genes.
+
+### Ligand–receptor scores
+
+**Plots panel → Ligand–Receptor.** Scores ligand–receptor pairs between cell types that are neighbours in the tissue, without CellNEST.
+
+- **Pair list**: **no database is bundled and none is downloaded.** Upload a CSV (or paste lines) of `ligand,receptor` gene symbols — a header row naming a *ligand…* and a *receptor…* column picks those columns of a wider table — or press **Use pairs of loaded CellNEST results** to take the pairs present in results you loaded in the CellNEST CCC tab. (The files CellNEST's own code caches are a signalling-PPI and a TF-target table, not a ligand–receptor list, and are not used.)
+- **Only pairs with both genes measured on the panel are scored**; the status line gives the number scored and not scored. Multi-subunit complexes are not modelled: each line is one ligand gene and one receptor gene.
+- **Groups**: a cell-type annotation or the active cluster set. Cells of all loaded samples are pooled; the neighbour graph and the permutations stay within each sample. Unlabelled cells are left out; a group needs 10 cells.
+- **Score** (CellPhoneDB-style) for sender type S, receiver type R and pair L → R: the mean of (mean log-normalised L in the cells of S) and (mean log-normalised R in the cells of R).
+- **Spatial restriction**: a directed type pair is scored only if the two types are **neighbours**: at least 20 adjacent cell pairs in the k-nearest-neighbour graph of the centroids (k = 6 by default; a pair of cells counts once). The table gives the number of adjacent pairs. A combination is tested only if L is detected in ≥ 10 % of the cells of S and R in ≥ 10 % of the cells of R.
+- **p-value**: the cell-type labels are permuted (fixed seed 0; 200 permutations by default, up to 10,000) and the score recomputed; p = (1 + permutations with a score ≥ observed) / (1 + permutations). **Benjamini–Hochberg FDR** over all tested combinations. A registered job: progress per permutation, **Cancel** stops it at once.
+- **Output**: a dot plot (sender → receiver × pair; colour = score, size = −log10 FDR) of the pairs with the smallest FDR, a sortable table and **Download CSV**.
+- **Cost** (Prime 5K skin, 112,551 cells, 13 types): 60-pair list (48 on the panel) 0.9 s with 200 permutations and 3 s with 1,000; 1,500 pairs 17 s with 200 permutations.
+- **Validation**: on fabricated tissue with a planted interaction (ligand in type A, receptor in the adjacent type B) the pair is recovered for A → B only, a uniformly expressed pair is not significant anywhere, and a type pair that does not touch is not scored; the permutation p-value equals a plain re-implementation; results are identical for a fixed seed.
+
+**Caveats — this is not evidence of signalling**
+
+- A significant score says that the ligand is expressed **specifically** in one type and the receptor specifically in a neighbouring type, relative to shuffled labels. It does not show that the protein is made, secreted, bound or signalling. Marker genes of two adjacent types are "significant" whatever their function: on the skin section 1,924 of 3,458 tested combinations of **random gene pairs** had FDR < 0.05.
+- The smallest possible p-value is 1 / (1 + permutations) (0.005 at 200): with few permutations many combinations tie at that floor.
+- The spatial information enters only through which type pairs are scored; the means are over all cells of a type, not only those at the interface.
+- Segmentation spill-over between touching cells of two types inflates both means.
+- A targeted panel holds a fraction of any ligand–receptor resource; absence of a pair from the result means "not measured" as often as "not expressed".
+
 
 ### CellNEST Cell-Cell Communication
 
@@ -517,6 +617,8 @@ Click **▶ Run SPLIT** to start. Progress is streamed to the server log. When c
 **SpaGE on corrected counts:** not available inside the app. The Impute Genes dialog and `run_spage()` always use the original counts (`run_spage(use_corrected=True)` prints why and runs nothing), because the app stores imputed genes as plain `[imp]` columns and a corrected-input run would overwrite them under the same name. Use the standalone script instead: `python functions/impute.py <store.zarr> <ref.rds> --use_corrected` reads the `X_corrected` layer, writes a new store, and lists the genes in `adata.uns["split_corrected_imputed_genes"]`; when that store is opened in the app they are labelled `[corr+imp]`.
 
 **SPLIT under an active `subset()`:** the corrected counts, clusters and UMAP of the subset are kept in memory for the session and are **not** written to the store (the status line says so); an earlier correction of the whole dataset stays in the store and keeps its rows for the cells outside the subset. Run SPLIT without a subset to store its result.
+
+**Several samples.** SPLIT runs on the primary sample; an added sample carries corrected counts only if its own store already holds them (the `X_corrected` layer written by an earlier SPLIT run on that sample, or a store exported by Save as SpatialData). Corrected and original counts are never mixed in one colour scale or one test: with several samples loaded, **"SPLIT Corrected" is available only when every sample has corrected counts**, and then applies to all of them (gene colours in both renderers, cell-level differential expression, gene-set scores, Moran's I, ligand–receptor scores). Otherwise the option is disabled, the original counts are used for all samples, and a note under Active Counts names the samples that lack corrected counts. Pseudobulk differential expression always uses the original counts. *Behaviour change:* corrected counts used to be ignored whenever several samples were loaded, while the option stayed selectable.
 
 ### Save as SpatialData
 
@@ -839,7 +941,7 @@ See `environment.yml` (conda) or `requirements.txt` (pip) for the full pinned de
 | `spatialdata`, `sopa` | Patch-based resegmentation workflow |
 | `celltypist` | CellTypist cell-type annotation |
 | `umap-learn` | UMAP recomputation on reseg cells |
-| `rpy2` + R ≥ 4.3 | Seurat label transfer, SpaGE, RCTD, SPLIT |
+| `rpy2` + R ≥ 4.3 | Seurat label transfer, SpaGE, RCTD, SPLIT, pseudobulk differential expression |
 
 **R packages** (via rpy2):
 
@@ -848,6 +950,7 @@ See `environment.yml` (conda) or `requirements.txt` (pip) for the full pinned de
 | `SeuratObject`, `Matrix` | CRAN / Bioconductor |
 | `spacexr` | `devtools::install_github('dmcable/spacexr')` |
 | `SPLIT` | `remotes::install_github('bdsc-tds/SPLIT')` |
+| `DESeq2` (optional `apeglm`), or `edgeR` | Bioconductor: `BiocManager::install(c("DESeq2", "apeglm"))` — pseudobulk differential expression only |
 
 **WebGL viewer:** deck.gl, Viv, geotiff and an OpenJPEG WebAssembly decoder are bundled into `assets/xenium_viewer.js`, `assets/xenium_image_worker.js` and `assets/openjpegwasm_decode.wasm`. Nothing needs installing to use them.
 
@@ -880,11 +983,12 @@ or the command line, builds the Dash app and registers the callbacks.
 | `morph` | morphology image overlay of the Plotly view |
 | `figures` | Plotly figure builders (spatial map, UMAP, analysis plots) |
 | `analysis` | differential expression, gene-set scores, transcript density |
+| `stats` | sample → condition design, pseudobulk differential expression (DESeq2 / edgeR), composition test, Moran's I, ligand–receptor scores |
 | `cellnest` | CellNEST loading, filters and plots |
 | `sdata_store` | SpatialData / sopa backend: cache store, Save as SpatialData, tissue ROI and patches |
 | `startup` | the import-time work: locate and load the dataset, autoload cached results |
 | `app_layout` | the Dash `app` and its layout |
-| `cb_plots`, `cb_tools`, `cb_reseg`, `cb_spage`, `cb_data`, `cb_spatial`, `cb_analysis` | the callbacks, by feature |
+| `cb_plots`, `cb_tools`, `cb_reseg`, `cb_spage`, `cb_data`, `cb_spatial`, `cb_analysis`, `cb_stats` | the callbacks, by feature |
 | `viewer_provider` | data provider for `xenium_viewer_api.py` (WebGL view) and `/health` |
 | `compat` | the single namespace over all modules (below) |
 
@@ -922,6 +1026,7 @@ node test/app_smoke.mjs http://127.0.0.1:8050 out/ # the real app, started with 
 node test/glue_checks.mjs http://127.0.0.1:8050    # renderer switching, selection and image handling in the real app
 node test/jobs_panel.mjs http://127.0.0.1:8050 out/ # jobs panel: starts Proseg on cached patches, checks progress, clicks Cancel
 node test/analysis_checks.mjs http://127.0.0.1:8050 out/ # Differential Expression / Gene Sets / Transcript Density tabs in both renderers (lasso → groups → test → gene set → density)
+XS_SAMPLES=/bundle2,/bundle3,/bundle4 node test/stats_checks.mjs http://127.0.0.1:8050 out/ # several samples: design editor, pseudobulk DE, composition, density of added samples in both renderers, Moran's I, ligand-receptor (see the top of the file)
 node test/webgl_fallback.mjs http://127.0.0.1:8050 # automatic fallback to Plotly without WebGL2 (browsers started with WebGL disabled)
 node test/real_results.mjs                         # WebGL against Plotly on real Baysor/Proseg/RCTD/SPLIT/SpaGE results; starts its own app (paths: see the top of the file)
 ```
@@ -983,6 +1088,10 @@ A review of the code base fixed a number of defects. Most are invisible, but the
 - **RCTD weight pies in the Plotly view** are drawn. Their wedges were sent as SVG arcs, which plotly.js does not draw, so each wedge was an invisible zero-area line.
 - **Side-by-side samples (Plotly view)**: Color by Cluster no longer fails when an added sample has no cluster sets (its cells form one group, e.g. `S1:C0`); the dotted separator sits midway in the gap between two samples instead of inside the first one when the added sample's coordinates do not start at 0; clicking a cell of an added sample fills the cell-info panel instead of reporting the cell as not found.
 - **Unavailable colours** are handled the same way in both views (see [WebGL view](#webgl-view-beta)): a gene missing from the dataset no longer raises an error in the Plotly view, and the WebGL view shows grey **No annotation** cells where it used to show transcript counts.
+- **SPLIT-corrected counts with several samples** are used when every loaded sample has them and for no sample otherwise; "SPLIT Corrected" is disabled in the second case, with a note naming the samples without them. They were ignored for all samples before, while the option stayed selectable.
+- **Transcript density with several samples** draws a grid for every sample that has transcripts, on one colour scale; it showed the primary sample only.
+- **Cell types of added samples** are read from the annotation cache or from the `cell_type_<method>` columns of an exported store; added samples were always drawn as "Unknown".
+- **Morphology overlay with tifffile ≥ 2025.5.21** works again (the Plotly view reported "morphology images not found": tifffile's Zarr store changed its interface).
 - **Cache: Clean** is refused while a background job is running.
 - **Bind address** is read from `XENIUM_HOST`; `HOST` is ignored. A container that set `HOST=0.0.0.0` must set `XENIUM_HOST=0.0.0.0`.
 - **REPL in local mode** (`XENIUM_ENABLE_REPL=1`) additionally requires a loopback `Host` header and refuses forwarded requests, so it no longer works through a reverse proxy; use `remote` there, on a trusted network.
