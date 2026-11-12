@@ -25,10 +25,10 @@ gcloud run deploy xenium-explorer \
   --execution-environment gen2 \
   --add-volume name=data-vol,type=cloud-storage,bucket=YOUR_BUCKET \
   --add-volume-mount volume=data-vol,mount-path=/data \
-  --set-env-vars DATA_DIR=/data/output-XETG...,HOST=0.0.0.0
+  --set-env-vars DATA_DIR=/data/output-XETG...,XENIUM_HOST=0.0.0.0
 ```
 
-The server binds to `127.0.0.1` unless `HOST` is set, so a container must set `HOST=0.0.0.0`.
+The server binds to `127.0.0.1` unless `XENIUM_HOST` is set, so a container must set `XENIUM_HOST=0.0.0.0`. (The generic `HOST` variable is not read: shells such as tcsh and conda compiler packages export it for other purposes.)
 
 **Env vars** (all optional locally, required or useful on Cloud Run):
 
@@ -37,8 +37,8 @@ The server binds to `127.0.0.1` unless `HOST` is set, so a container must set `H
 | `DATA_DIR` | Path to Xenium output directory (overrides `sys.argv[1]`) |
 | `XENIUM_CACHE_DIR` | Cache root directory (default: `~/.xenium_explorer_cache`) |
 | `PORT` | Server port (default: 8050; Cloud Run sets this automatically) |
-| `HOST` | Bind address (default: `127.0.0.1`; set `0.0.0.0` in a container or to serve other machines) |
-| `XENIUM_ENABLE_REPL` | Enables the in-app Python REPL, which runs arbitrary code. Unset = disabled; `1` = requests from localhost only; `remote` = any client (trusted networks only) |
+| `XENIUM_HOST` | Bind address (default: `127.0.0.1`; set `0.0.0.0` in a container or to serve other machines). The address in use is printed at start-up |
+| `XENIUM_ENABLE_REPL` | Enables the in-app Python REPL, which runs arbitrary code. Unset = disabled; `1` = requests made from this machine to `localhost` / `127.0.0.1` / `[::1]` only (not through a reverse proxy); `remote` = any client (trusted networks only) |
 | `XENIUM_RENDERER` | Spatial renderer shown at startup: unset = Plotly; `webgl` = the WebGL view (it can also be switched in the app) |
 
 **Cloud Run limitations:** R/Julia/Rust features (Seurat, RCTD, SpaGE, Baysor, Proseg, SPLIT) are unavailable in a Python-only container image. CellTypist annotation works.
@@ -91,7 +91,7 @@ python xenium_explorer.py [path/to/output-XETG...]
 python xenium_explorer.py          # auto-detects output-* directory
 ```
 
-Opens at **http://localhost:8050**. The server listens on localhost only; set `HOST=0.0.0.0` to reach it from another machine (there is no authentication, so do this on trusted networks only).
+Opens at **http://localhost:8050**. The server listens on localhost only; set `XENIUM_HOST=0.0.0.0` to reach it from another machine (there is no authentication, so do this on trusted networks only).
 
 Useful start-up variants:
 
@@ -164,7 +164,7 @@ A gold **⬡ SUBSET ACTIVE** banner appears below the tissue info when a cell su
 
 **Color modes** (Color By dropdown in sidebar):
 - **Cluster** — Categorical coloring by clustering method; multiple methods supported via a secondary dropdown. For Baysor/Proseg cells, KMeans clusters (`cluster_kmeans_10`) are computed automatically after resegmentation. After running SPLIT, a `cluster_split_10` column (KMeans on corrected counts) also appears in the dropdown.
-- **Gene Expression** — Continuous coloring by log1p expression; supports panel genes, SpaGE-imputed genes (marked `[imp]`), and genes imputed on corrected counts (marked `[corr+imp]`). The "Active Counts" toggle transparently switches the expression source between original and SPLIT-corrected matrices.
+- **Gene Expression** — Continuous coloring by log1p expression; supports panel genes and SpaGE-imputed genes (marked `[imp]`; `[corr+imp]` for genes that `functions/impute.py --use_corrected` imputed from SPLIT-corrected counts). The "Active Counts" toggle switches the expression source of the measured genes between the original and the SPLIT-corrected matrix; imputed genes have one set of values and are shown unchanged in both modes.
 - **Cell Type** — Categorical coloring by annotation result (enabled after running annotation)
 - **Transcript Counts** — log1p(transcript count), Viridis colorscale
 - **Cell Area / Nucleus Area** — Cell size QC metrics, Plasma/Cividis colorscales
@@ -246,7 +246,7 @@ The right-side panel contains additional analysis plots, each in its own tab:
 |-----|---------|---------|
 | **Cell Type Abundance** | Bar chart of cell type proportions | W × H dimension inputs; download button (SVG) |
 | **Co-occurrence** | Spatial co-occurrence score heatmap | Colorbar min/max, W × H; download |
-| **Neighborhood Enrichment** | Neighborhood enrichment Z-score heatmap | Colorbar min/max, W × H; download |
+| **Neighborhood Enrichment** | Neighborhood enrichment heatmap: log2 of the fraction of a cell type's neighbours that are of each type over that type's overall frequency (0 = random mixing) | Colorbar min/max, W × H; download |
 | **Interaction Graph** | Node-edge graph of cell type contacts | O/E normalize toggle, W × H; download |
 | **Chord Diagram** | Chord diagram of cell type contacts | O/E normalize toggle, W × H; download |
 | **Niche UMAP** | UMAP (or spatial map) colored by spatial niche | W × H; download |
@@ -323,7 +323,7 @@ Configure patch parameters, then click **▶ Prepare Patches** to build the Spat
 | Patch width (µm) | 1200 |
 | Min transcripts/patch | 10 |
 
-The ROI and patch grid are displayed as overlays on the spatial plot. Click **✓ Patches look good — proceed** to unlock Step 2, or **⏭ Skip — run on full tissue** to bypass patch setup and run directly on the full slide. Use **↺ Re-build** to clear the cache and re-run with different parameters.
+The ROI and patch grid are displayed as overlays on the spatial plot. Click **✓ Patches look good — proceed** to unlock Step 2, or **⏭ Skip — run on full tissue** to bypass patch setup and run directly on the full slide: Baysor and Proseg then make one run over the whole region even when patches from earlier in the session exist (a run made with patches shows "N patches" in its Segmentation dropdown label). Use **↺ Re-build** to clear the cache and re-run with different parameters.
 
 The ROI and the patches are saved in the SpatialData cache store together with the settings that produced them (QV filter, patch width, min transcripts/patch). After a restart, **▶ Prepare Patches** with the same settings restores them in a few seconds; with different settings, or for a store written by an earlier version (which has no record of its settings), the patches are computed again.
 
@@ -398,7 +398,9 @@ Click **"Impute Genes"** in the sidebar to open the SpaGE imputation modal. Impu
 **GUI (modal):**
 - **Reference RDS** — Path to Seurat object
 - **n_pv** — Number of principal vectors for cross-dataset alignment (10–100, default 50)
-- **Genes to impute** — Comma- or newline-separated gene list; leave blank to auto-select top-200 highly variable genes from the reference
+- **Genes to impute** — Comma- or newline-separated gene list; leave blank to auto-select the 200 genes with the highest variance among all reference genes that are not in the panel
+
+SpaGE always imputes from the **original** counts of the active segmentation, also when Active Counts is set to "SPLIT Corrected" (the status line says so). To impute from SPLIT-corrected counts use `functions/impute.py --use_corrected`, which writes a separate store.
 
 **REPL (programmatic):**
 ```python
@@ -449,12 +451,14 @@ Click **▶ Run SPLIT** to start. Progress is streamed to the server log. When c
 - Corrected counts are persisted in the `X_corrected` layer of the active SpatialData zarr and reload automatically on the next launch
 
 **Active Counts toggle behavior:**
-- **Original** — all expression lookups use the raw Xenium/Baysor/Proseg count matrix; `[imp]` genes from SpaGE are shown
-- **SPLIT Corrected** — expression lookups use the corrected matrix; `[corr+imp]` genes (imputed on corrected counts via SpaGE) are shown instead
+- **Original** — all expression lookups use the raw Xenium/Baysor/Proseg count matrix
+- **SPLIT Corrected** — measured genes are read from the corrected matrix. SpaGE-imputed genes have no corrected values: they show the same imputed values as under "Original"
 - The "SPLIT Corrected" option is greyed out (disabled) whenever no corrected matrix is available — either in memory or in the active zarr's `X_corrected` layer. It re-enables automatically once the corrected data is loaded (e.g., after selecting a Baysor/Proseg run that has a previously-run SPLIT result stored in zarr)
 - Switching segmentation sources resets the toggle to "Original" if no corrected data exists for that source
 
-**SpaGE on corrected counts:** Run SpaGE while "SPLIT Corrected" is active to impute genes using the corrected expression matrix. Resulting genes are marked `[corr+imp]` and stored in `adata.uns["split_corrected_imputed_genes"]` in the zarr.
+**SpaGE on corrected counts:** not available inside the app. The Impute Genes dialog and `run_spage()` always use the original counts (`run_spage(use_corrected=True)` prints why and runs nothing), because the app stores imputed genes as plain `[imp]` columns and a corrected-input run would overwrite them under the same name. Use the standalone script instead: `python functions/impute.py <store.zarr> <ref.rds> --use_corrected` reads the `X_corrected` layer, writes a new store, and lists the genes in `adata.uns["split_corrected_imputed_genes"]`; when that store is opened in the app they are labelled `[corr+imp]`.
+
+**SPLIT under an active `subset()`:** the corrected counts, clusters and UMAP of the subset are kept in memory for the session and are **not** written to the store (the status line says so); an earlier correction of the whole dataset stays in the store and keeps its rows for the cells outside the subset. Run SPLIT without a subset to store its result.
 
 ### Save as SpatialData
 
@@ -507,7 +511,7 @@ The entire panel can be collapsed/expanded with the ▼/▲ button.
 
 **Python REPL** — A `>>> ` prompt at the bottom of the log panel accepts any Python expression or statement and executes it in the app's module namespace, with output appearing in the log. Tab-completion and Up/Down arrow history are supported.
 
-The REPL runs arbitrary code on the server, so it is **disabled unless the app is started with `XENIUM_ENABLE_REPL=1`**, and then accepts requests from the same machine only. `XENIUM_ENABLE_REPL=remote` lifts that restriction; use it only on a network you trust.
+The REPL runs arbitrary code on the server, so it is **disabled unless the app is started with `XENIUM_ENABLE_REPL=1`**, and then accepts requests from the same machine only: the connection must come from a loopback address, the page must have been opened as `localhost`, `127.0.0.1` or `[::1]` (the request's `Host` header is checked, which stops a web page that re-binds its own hostname to 127.0.0.1), and requests carrying `X-Forwarded-For` / `Forwarded` headers are refused, so the REPL does not work through a reverse proxy in this mode. `XENIUM_ENABLE_REPL=remote` lifts these restrictions; use it only on a network you trust.
 
 ```python
 # Examples
@@ -591,7 +595,7 @@ python functions/impute.py /data/xenium.zarr /refs/heart_ref.rds \
     --genes_file /data/genes.txt --output /data/xenium_imputed.zarr
 ```
 
-Output is a full SpatialData zarr with imputed gene columns appended to the AnnData table. `adata.var["is_imputed"]` marks imputed genes; `adata.uns["imputed_genes"]` lists them.
+Output is a full SpatialData zarr with imputed gene columns appended to the AnnData table under their plain gene names (as the app writes them). `adata.var["is_imputed"]` marks imputed genes; `adata.uns["imputed_genes"]` lists them. With `--use_corrected` the `X_corrected` layer (SPLIT) is the input and the genes are listed in `adata.uns["split_corrected_imputed_genes"]` instead. Without a gene list, the 200 genes with the highest variance among all non-panel reference genes are imputed.
 
 ---
 
@@ -811,3 +815,27 @@ A review of the code base fixed a number of defects. Most are invisible, but the
 - **RCTD multi mode** returns the first listed type per cell (it previously returned no labels).
 - **ROI set operations** store the exact resulting outline instead of its convex hull.
 - **Load Sample** is refused while a background job is running.
+- **Neighbourhood enrichment** values are lower by log2(k), k being the Neighbours setting (3.32 at the default 10). Each row was divided by the number of cells of the source type instead of by its number of neighbour pairs, so every pair looked enriched and the values changed with k. The heatmap is now log2 of P(neighbour is B | cell is A) over the frequency of B, and reads about 0 under random mixing.
+- **Color by Cluster on a Proseg run loaded from cache** shows the app's KMeans clusters (`cluster_kmeans_10`), as on a run just made. Cache rebuilds had copied Proseg's own `cluster`, `fov` and `centroid_z` columns into the run, and that `cluster` column (Proseg's internal component, a single value in the test runs) was then used for colouring and for `subset(cluster=…)`. Stores that already contain these columns are read without them.
+- **Proseg "Skip — run on full tissue"** now gives one run over the whole region. Once patches existed in a session every Proseg run was patch-based whatever was chosen; the same choice also overrides Baysor's "Use patch-based segmentation" box. Runs made with patches say so in their dropdown label.
+- **Multi-part Proseg cells** keep the part with the largest area as their outline; the part with the most vertices was kept before, which for a few cells per thousand was a small fragment. Outlines, exported shapes and the seam de-duplication of patch runs change for those cells.
+- **Baysor prior on bundles with integer cell ids**: `-1` / `0` (unassigned) is no longer handed to Baysor as one large prior cell.
+- **Runs with fewer than 4 cells**, or runs whose clustering fails, are kept with all cells in cluster 1 and no UMAP instead of being reported as failed and becoming impossible to load from cache.
+- **A cached run that fails to load** no longer leaves the previously loaded run of the same tool displayed under the newly selected name: the old result is dropped when the new one is selected, and on failure the Segmentation dropdown returns to Xenium.
+- **Rerun UMAP on a Baysor/Proseg run** uses measured panel genes only. After SpaGE the run's matrix also holds imputed columns, which were being normalised and embedded as counts.
+- **SpaGE auto-selection** ("top-200 highly variable genes") ranks all reference genes outside the panel by variance. Only the first 2000 of them in the reference's row order were considered before, so the gene set generally differs; results cached under the old selection are not reused.
+- **SpaGE always imputes from the original counts.** The documented "SpaGE on SPLIT-corrected counts" never existed in the Impute Genes dialog, and the REPL form stored its result as ordinary `[imp]` genes, replacing earlier ones. `run_spage(use_corrected=True)` is now refused; `functions/impute.py --use_corrected` remains the way to do it.
+- **Imputed genes under "SPLIT Corrected"** show their imputed values in every session. After a restart they showed all zeros, because the stored corrected layer has empty padding columns for them.
+- **Imputed-gene colour scale** is log1p on every path. Genes served from the SpaGE cache instead of the store (subset active, no store, streamed results of large datasets) were shown untransformed, under a colour bar labelled log1p.
+- **`functions/impute.py`** writes imputed genes under their plain names with `var["is_imputed"]`, as the app does; it used to name them `GENE [imp]` / `GENE [corr+imp]`, which the app listed as `GENE [imp] [imp]` and could not look up. Stores with the old names are read under the plain names.
+- **Annotation, RCTD, SPLIT and SpaGE caches** are tied to the reference file's path, size and modification time, not only its name. An edited reference, or another file with the same name, is computed afresh instead of returning the old labels; existing caches are not found once and are recomputed. SPLIT's own RCTD run no longer shares a cache file with an annotation-dialog RCTD run that has the same UMI thresholds.
+- **RCTD annotations at start-up**: labels made on a Baysor/Proseg run from the annotation dialog are restored (they were loaded under a name nothing read). When several cached RCTD runs exist for one dataset, the most recently written one is used, and the RCTD weights (pie charts) are taken only from that same run; weights were not restored at all before.
+- **SPLIT under an active `subset()`** no longer rewrites the store: it replaced a stored whole-dataset correction with zero rows for every cell outside the subset. The subset result is kept in memory, and an existing whole-dataset correction keeps its rows for the other cells.
+- **SPLIT status line** reports the number of cells whose counts changed and how many of the submitted cells RCTD classified, instead of the number of cells submitted.
+- **Save as SpatialData** exports `split_umap_1/2` (and a re-run `umap_1/2`), and leaves cells without a SPLIT cluster, ROI or niche without a value. They were written as members of a group called `Unknown`.
+- **`subset()` / `unsubset()`** apply to every loaded Baysor/Proseg run, not only to Proseg when both tools hold a result. Area filters on a bundle without area columns are skipped with a message, and a filter that fails no longer leaves the app marked "SUBSET ACTIVE".
+- **Spatial niches computed under a subset** are kept after `unsubset()` (cells outside the subset have no niche).
+- **Load Sample** removes the extra side-by-side samples and the CellNEST results of the previous dataset.
+- **Cache: Clean** is refused while a background job is running.
+- **Bind address** is read from `XENIUM_HOST`; `HOST` is ignored. A container that set `HOST=0.0.0.0` must set `XENIUM_HOST=0.0.0.0`.
+- **REPL in local mode** (`XENIUM_ENABLE_REPL=1`) additionally requires a loopback `Host` header and refuses forwarded requests, so it no longer works through a reverse proxy; use `remote` there, on a trusted network.

@@ -14,10 +14,12 @@ dependencies:
   - scipy>=1.13
   - scikit-learn>=1.5
   - h5py>=3.10
+  - pyarrow>=15.0
 
   # Image / file I/O
   - pillow>=10.0
   - tifffile>=2024.1
+  - imagecodecs>=2024.1   # JPEG 2000 decoding of morphology OME-TIFFs
   - zarr>=3.0          # zarr v3 API; v2 is NOT compatible
 
   # Geospatial (required for zarr generation and boundary overlays)
@@ -30,6 +32,10 @@ dependencies:
 
   # UMAP recomputation
   - umap-learn>=0.5
+
+  # functions/compare_cellnest.py only
+  - matplotlib>=3.8
+  - seaborn>=0.13
 
   # Resegmentation tools (bioconda)
   - rust-proseg        # proseg CLI

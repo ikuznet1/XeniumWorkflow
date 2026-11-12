@@ -336,6 +336,21 @@ def _cache_path(model_name: str) -> str:
     return os.path.join(cache_dir, f"{safe}_{tag}.parquet")
 
 
+def _ref_file_tag(path: str) -> str:
+    """Short identity of a reference file for cache keys: hash of its absolute path,
+    size and modification time. A reference that was edited and saved under the same
+    name, or another file with the same basename elsewhere, gets a different tag, so
+    its cached labels are not served for it. (Caches written before this tag existed
+    are simply not found once.)"""
+    try:
+        _p = os.path.abspath(os.path.expanduser(path))
+        _st = os.stat(_p)
+        _ident = f"{_p}|{_st.st_size}|{_st.st_mtime_ns}"
+    except OSError:
+        _ident = str(path)
+    return "f" + hashlib.md5(_ident.encode()).hexdigest()[:8]
+
+
 def _annot_cache_valid(cached, cell_ids_override, cache_sig, allow_subset=False) -> bool:
     """Is a cached annotation parquet usable for the given resegmented cells?
     Xenium caches (cell_ids_override None) are always accepted. Reseg caches carry
@@ -509,7 +524,8 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
         import rpy2.robjects.conversion as _rconv
         import rpy2.robjects as _ro_mod
         _rconv.set_conversion(_ro_mod.default_converter)
-        cache_key  = f"rctd_{os.path.basename(rds_path)}_{label_col}_{mode}_umi{umi_min}_sig{umi_min_sigma}_{_key_for_cache}"
+        cache_key  = (f"rctd_{os.path.basename(rds_path)}_{_ref_file_tag(rds_path)}_{label_col}_{mode}"
+                      f"_umi{umi_min}_sig{umi_min_sigma}_{_key_for_cache}")
         cache_file = _cache_path(cache_key)
         if os.path.exists(cache_file):
             # an empty label file (failed earlier run) is not a usable cache
@@ -801,12 +817,15 @@ def _run_seurat_annotation(rds_path: str, label_col: str = "Names", labels_key: 
             if labels is not None:
                 _annot_state[labels_key] = labels
 
+    tmpdir = None        # MatrixMarket export of the reference; removed in the finally
+    _r_loaded = False    # the reference was put into R's global env
     try:
         # inside the try so a missing rpy2 reports an error instead of a stuck "running"
         import rpy2.robjects.conversion as _rconv
         import rpy2.robjects as _ro_mod
         _rconv.set_conversion(_ro_mod.default_converter)
-        cache_key = f"seurat_{os.path.basename(rds_path)}_{label_col}_{labels_key}"
+        cache_key = (f"seurat_{os.path.basename(rds_path)}_{_ref_file_tag(rds_path)}"
+                     f"_{label_col}_{labels_key}")
         cache_file = _cache_path(cache_key)
         if os.path.exists(cache_file):
             _set("running", "Loading cached annotation…")
@@ -867,6 +886,7 @@ def _run_seurat_annotation(rds_path: str, label_col: str = "Names", labels_key: 
             importr("Matrix")
 
             _set("running", "Reading reference gene list…")
+            _r_loaded = True
             ro.r.assign("._annot_rds_tmp", rds)
             mat_r = ro.r("SeuratObject::LayerData(._annot_rds_tmp[['RNA']], layer='data')")
             ref_genes_all = list(ro.r['rownames'](mat_r))
@@ -996,6 +1016,23 @@ rm(._annot_mat, ._annot_genes, ._annot_dir, ._annot_rds_tmp, mat_sub)
     except Exception as exc:
         import traceback
         _set("error", f"{exc}\n{traceback.format_exc()[-300:]}")
+    finally:
+        # The exported reference sub-matrix can be several GB; early returns and
+        # errors would also leave the whole Seurat object in R's global env.
+        if tmpdir:
+            import shutil as _sh_annot
+            _sh_annot.rmtree(tmpdir, ignore_errors=True)
+        if _r_loaded:
+            try:
+                import rpy2.robjects as _ro_fin
+                from rpy2.rinterface_lib import openrlib as _orl_fin
+                with _orl_fin.rlock:
+                    _ro_fin.r('suppressWarnings(rm(list = intersect(c("._annot_mat", '
+                              '"._annot_genes", "._annot_dir", "._annot_rds_tmp", "mat_sub"), '
+                              'ls(all.names = TRUE, envir = globalenv())), envir = globalenv())); '
+                              'invisible(gc())')
+            except Exception:
+                pass
 
 
 # Control / non-gene feature-name prefixes (used when transcripts.parquet has no is_gene column)
@@ -1316,7 +1353,7 @@ def _baysor_run_single(tx_df, patch_dir, baysor_bin, scale, min_mol, use_prior, 
             if gtype == "Polygon":
                 ring = geom["coordinates"][0]
             elif gtype == "MultiPolygon":
-                ring = max((poly[0] for poly in geom["coordinates"]), key=len)
+                ring = _largest_ring([poly[0] for poly in geom["coordinates"]])
             else:
                 continue
             vx = np.array([p[0] for p in ring], dtype=np.float32)
@@ -1422,7 +1459,7 @@ def _proseg_run_single(tx_df, patch_dir, proseg_bin, voxel_size, n_threads, n_sa
                 rings = [poly[0] for poly in geom["coordinates"]]
             else:
                 continue
-            ring = max(rings, key=len)
+            ring = _largest_ring(rings)
             vx = np.array([p[0] for p in ring], dtype=np.float32)
             vy = np.array([p[1] for p in ring], dtype=np.float32)
             cell_bounds[cid] = (vx, vy)
@@ -1435,6 +1472,25 @@ def _proseg_run_single(tx_df, patch_dir, proseg_bin, voxel_size, n_threads, n_sa
             pass
 
     return cells_df, cell_bounds, tx_meta_df
+
+
+def _largest_ring(rings):
+    """Exterior ring enclosing the largest area (shoelace formula) among the parts of
+    a multi-part cell. The ring with the most vertices is not always the largest part."""
+    rings = [r for r in rings if r is not None and len(r)]
+    if not rings:
+        return []
+    if len(rings) == 1:
+        return rings[0]
+
+    def _area(r):
+        a = np.asarray(r, dtype=np.float64)
+        if a.ndim != 2 or a.shape[0] < 3:
+            return 0.0
+        x, y = a[:, 0], a[:, 1]
+        return 0.5 * abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+
+    return max(rings, key=lambda r: (_area(r), len(r)))
 
 
 def _read_proseg_tx_meta(path):
@@ -1515,6 +1571,24 @@ def _build_proseg_expr(tx_meta_df, cells_df):
     return mat
 
 
+# Proseg's own cell-metadata columns that earlier cache rebuilds copied into the run's
+# zarr obs. `cluster` is Proseg's internal component id, not the app's KMeans cluster.
+_RESEG_FOREIGN_OBS = frozenset({"cluster", "fov", "centroid_z"})
+
+
+def _reseg_cluster_cols(columns) -> list:
+    """Cluster columns the app itself computed for a Baysor/Proseg run
+    (cluster_kmeans_*, cluster_split_*), in column order; a bare `cluster` is not one."""
+    return [c for c in columns if str(c).startswith("cluster_")]
+
+
+def _reseg_display_cluster_col(columns):
+    """Column used for "Color by Cluster" / the cluster filter on a reseg run: the
+    original-count clusters first, the SPLIT clusters only when nothing else exists."""
+    _cc = _reseg_cluster_cols(columns)
+    return next((c for c in _cc if "split" not in str(c)), _cc[0] if _cc else None)
+
+
 def _load_zarr_obs_into_df(zarr_path: str, cells_df: pd.DataFrame) -> None:
     """Read obs columns from a SpatialData zarr and merge any missing ones into cells_df in-place."""
     try:
@@ -1545,6 +1619,8 @@ def _load_zarr_obs_into_df(zarr_path: str, cells_df: pd.DataFrame) -> None:
                 return
         for _col in _obs.keys():
             if _col in {"__categories", "_index"} or _col == _idx_key:
+                continue
+            if _col in _RESEG_FOREIGN_OBS:
                 continue
             if _col not in cells_df.columns:
                 try:
@@ -1778,6 +1854,8 @@ def _fast_load_reseg_zarr(zarr_path: str):
     for _col in _obs.keys():
         if _col in {"__categories", "_index"} or _col == _idx_key:
             continue
+        if _col in _RESEG_FOREIGN_OBS:
+            continue
         try:
             _df_data[_col] = _obs[_col][:]
         except Exception:
@@ -1969,7 +2047,7 @@ def _load_cached_baysor(out_dir: str) -> None:
                 cells_df, expr_mat, _baysor_corr, _baysor_corr_imp, cell_bounds = \
                     _fast_load_reseg_zarr(zarr_path_fast)
                 n_cells = len(cells_df)
-                _has_cluster = any(c.startswith("cluster") for c in cells_df.columns)
+                _has_cluster = bool(_reseg_cluster_cols(cells_df.columns))
                 if ("umap_1" not in cells_df.columns or not _has_cluster) and expr_mat is not None:
                     _set("running", f"Computing UMAP and clusters for {n_cells:,} cells (one-time)…")
                     _compute_reseg_clusters_umap(cells_df, expr_mat,
@@ -2097,7 +2175,7 @@ def _load_cached_baysor(out_dir: str) -> None:
             print(f"  Baysor cache: loaded obs cols from zarr: {_zarr_obs_cols}", flush=True)
 
             # If cluster/UMAP still missing (very old cache or ID mismatch), compute and write back
-            _has_cluster = any(c.startswith("cluster") for c in cells_df.columns)
+            _has_cluster = bool(_reseg_cluster_cols(cells_df.columns))
             if ("umap_1" not in cells_df.columns or not _has_cluster) and expr_mat is not None:
                 _set("running", f"Computing UMAP and clusters for {n_cells:,} cells (one-time migration)…")
                 _compute_reseg_clusters_umap(cells_df, expr_mat,
@@ -2175,7 +2253,7 @@ def _load_proseg_patch_boundaries(out_dir: str, patch_names: list) -> dict:
                         _rings = [_p[0] for _p in _geom["coordinates"]]
                     else:
                         _rings = [_geom.get("coordinates", [[]])[0]]
-                    _coords = max(_rings, key=len) if _rings else []
+                    _coords = _largest_ring(_rings)
                     if _coords:
                         cell_bounds[_gid] = ([c[0] for c in _coords], [c[1] for c in _coords])
             except Exception as _pe:
@@ -2222,7 +2300,7 @@ def _load_cached_proseg(out_dir: str) -> None:
                 cells_df, expr_mat, _proseg_corr, _proseg_corr_imp, cell_bounds = \
                     _fast_load_reseg_zarr(zarr_path_fast)
                 n_cells = len(cells_df)
-                _has_cluster = any(c.startswith("cluster") for c in cells_df.columns)
+                _has_cluster = bool(_reseg_cluster_cols(cells_df.columns))
                 if ("umap_1" not in cells_df.columns or not _has_cluster) and expr_mat is not None:
                     _set("running", f"Computing UMAP and clusters for {n_cells:,} cells (one-time)…")
                     _compute_reseg_clusters_umap(cells_df, expr_mat,
@@ -2379,6 +2457,10 @@ def _load_cached_proseg(out_dir: str) -> None:
         if "cell_id" in cells_df.columns:
             cells_df = cells_df.set_index("cell_id")
         cells_df.index = cells_df.index.astype(str)
+        # Same columns as the live run (_proseg_run_single): Proseg's own `cluster`,
+        # `fov`, `centroid_z` … are not carried into the result or its zarr.
+        cells_df = cells_df[[c for c in ("x_centroid", "y_centroid", "transcript_counts",
+                                         "cell_area", "_patch") if c in cells_df.columns]]
         # Patch run: sopa patches overlap, and the live run gave each cell of an overlap
         # to one patch only - keep the cells the live run kept.
         # Cell boundaries from the polygon files come first: the patch merge uses them
@@ -2426,7 +2508,7 @@ def _load_cached_proseg(out_dir: str) -> None:
                                 rings = [poly[0] for poly in geom["coordinates"]]
                             else:
                                 rings = [geom.get("coordinates", [[]])[0]]
-                            coords = max(rings, key=len) if rings else []
+                            coords = _largest_ring(rings)
                             if coords:
                                 cell_bounds[cid] = ([c[0] for c in coords], [c[1] for c in coords])
                         break
@@ -2456,7 +2538,7 @@ def _load_cached_proseg(out_dir: str) -> None:
             print(f"  Proseg cache: loaded obs cols from zarr: {_zarr_obs_cols_p}", flush=True)
 
             # If cluster/UMAP still missing (very old cache or ID mismatch), compute and write back
-            _has_cluster_p = any(c.startswith("cluster") for c in cells_df.columns)
+            _has_cluster_p = bool(_reseg_cluster_cols(cells_df.columns))
             if ("umap_1" not in cells_df.columns or not _has_cluster_p) and expr_mat is not None:
                 _set("running", f"Computing UMAP and clusters for {n_cells:,} cells (one-time migration)…")
                 _compute_reseg_clusters_umap(cells_df, expr_mat,
@@ -2533,14 +2615,25 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
     ]
 
     def _find_baysor():
+        # `baysor --version` starts Julia: seconds when idle, far longer on a loaded
+        # machine or a cold disk cache, so the probe gets a generous limit. A candidate
+        # that does not exist fails immediately (FileNotFoundError), so the limit is
+        # only ever waited out by a binary that is really there.
+        _timed_out = None
         for candidate in BAYSOR_CANDIDATES:
             try:
-                r = subprocess.run([candidate, "--version"], capture_output=True, timeout=10)
+                r = subprocess.run([candidate, "--version"], capture_output=True, timeout=180)
                 if r.returncode == 0:
                     return candidate
-            except (FileNotFoundError, subprocess.TimeoutExpired):
+            except (FileNotFoundError, PermissionError, NotADirectoryError):
                 pass
-        return None
+            except subprocess.TimeoutExpired:
+                _timed_out = _timed_out or candidate
+        if _timed_out:
+            # present but slow to answer: use it rather than report "not found"
+            print(f"  Baysor: '{_timed_out} --version' did not answer within 180 s; "
+                  f"using it anyway", flush=True)
+        return _timed_out
 
     try:
         if not DATA.get("data_dir"):
@@ -2623,6 +2716,9 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
             # consistent within one Baysor run, so they are numbered per loaded region.
             _cid = _as_str_cat(tx["cell_id"])
             _bad = pd.Index(_cid.cat.categories.astype(str)).isin(_unassigned)
+            # Older bundles store integer cell ids with -1 (or 0) for "unassigned"
+            if pd.api.types.is_numeric_dtype(_cid.cat.categories.dtype):
+                _bad = _bad | (np.asarray(_cid.cat.categories, dtype="float64") <= 0)
             _lut = np.zeros(len(_bad) + 1, dtype="int64")      # last slot: code -1 (null)
             _lut[:-1][~_bad] = np.arange(1, int((~_bad).sum()) + 1)
             tx["cell_id"] = _lut[_cid.cat.codes.to_numpy()]
@@ -2815,8 +2911,9 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
                 recorded_samples=None, schedule=None,
                 nuclear_reassign_prob=None, prior_seg_prob=None,
                 x_min=None, x_max=None, y_min=None, y_max=None,
-                prior_type: str = "nucleus") -> None:
-    """Background thread: run Proseg resegmentation, using sopa patches if available."""
+                prior_type: str = "nucleus", use_patches: bool = True) -> None:
+    """Background thread: run Proseg resegmentation, using sopa patches if available
+    (use_patches=False: one run on the whole region even when patches exist)."""
     _gen = _dataset_gen
 
     def _set(status, message, result=None):
@@ -2877,7 +2974,7 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
             return tx
 
         # ── Check for sopa patches (first: the patch layout is part of the cache tag) ──
-        patch_bounds = _get_patch_bounds_um()
+        patch_bounds = _get_patch_bounds_um() if use_patches else None
         if patch_bounds and any(v is not None for v in [x_min, x_max, y_min, y_max]):
             filtered = []
             for px0, py0, px1, py1 in patch_bounds:
@@ -3111,17 +3208,51 @@ def _compute_reseg_clusters_umap(cells_df: pd.DataFrame, expr_mat,
                                   progress_fn=None) -> None:
     """Compute KMeans clustering and UMAP for reseg cells in-place on cells_df.
     Adds columns: cluster_kmeans_10, umap_1, umap_2.
-    Also updates _umap_reseg_state so the UMAP scatter plot works immediately."""
+    Also updates _umap_reseg_state so the UMAP scatter plot works immediately.
+
+    Never discards a finished segmentation: with too few cells to embed, or when the
+    clustering itself fails, every cell gets cluster 1 and an empty (NaN) embedding."""
     if expr_mat is None:
         return
 
+    def _trivial(reason):
+        print(f"  Reseg: no clustering/UMAP for {len(cells_df):,} cell(s) ({reason}) — "
+              f"all cells in cluster 1, no embedding", flush=True)
+        cells_df["cluster_kmeans_10"] = 1
+        cells_df["umap_1"] = np.nan
+        cells_df["umap_2"] = np.nan
+
+    if len(cells_df) < 4:
+        _trivial("fewer than 4 cells")
+        return
+    try:
+        _compute_reseg_clusters_umap_impl(cells_df, expr_mat, progress_fn)
+    except _DatasetChanged:
+        raise
+    except Exception as _cl_err:
+        import traceback as _tb_cl
+        _tb_cl.print_exc()
+        _trivial(f"failed: {_cl_err}")
+
+
+def _reseg_measured_expr(expr_mat):
+    """Columns of a Baysor/Proseg matrix that hold measured counts. A run's matrix is
+    [panel genes | genes SpaGE imputed for this run]; the panel genes come first."""
+    _n = min(expr_mat.shape[1], len(_panel_gene_names()))
+    return expr_mat if _n == expr_mat.shape[1] else expr_mat[:, :_n]
+
+
+def _compute_reseg_clusters_umap_impl(cells_df: pd.DataFrame, expr_mat,
+                                       progress_fn=None) -> None:
     from sklearn.decomposition import TruncatedSVD
 
     n_cells = len(cells_df)
     if progress_fn:
         progress_fn(f"Normalising {n_cells:,} cells for UMAP/clustering…")
 
-    mat = expr_mat[:, :len(DATA["gene_names"])].astype("float32").tocsr()
+    # len(_panel_gene_names()), not len(DATA["gene_names"]): the latter also counts
+    # genes imputed for the Xenium cells
+    mat = _reseg_measured_expr(expr_mat).astype("float32").tocsr()
     row_sums = np.asarray(mat.sum(axis=1)).flatten()
     row_sums[row_sums == 0] = 1.0
     mat = sp.diags(1e4 / row_sums).dot(mat).tocsr()
@@ -3164,7 +3295,7 @@ def _compute_reseg_clusters_umap(cells_df: pd.DataFrame, expr_mat,
             umap_coords = np.full((n_cells, 2), np.nan)
         else:
             from sklearn.manifold import TSNE
-            perp = min(30, max(5, n_cells // 10))
+            perp = max(1, min(30, max(5, n_cells // 10), n_cells - 1))   # must be < n_cells
             umap_coords = TSNE(n_components=2, perplexity=perp, random_state=42).fit_transform(pca_coords)
 
     cells_df["umap_1"] = umap_coords[:, 0]
@@ -3637,8 +3768,12 @@ rownames(._split_coords) <- colnames(._split_counts_mat)
                     (_alt_res is None and "_df_original" in DATA):
                 _cells_extra = (f"_n{len(cell_ids)}_"
                                 + hashlib.md5("\n".join(cell_ids).encode()).hexdigest()[:8])
-            _rctd_cache_key  = (f"rctd_{os.path.basename(rds_path)}_{label_col}_doublet"
-                                f"_umi{min_umi}_sig{min_umi_sigma}{_cells_extra}_{_rctd_lkey}")
+            # "_cmi5pp": SPLIT's RCTD configuration (CELL_MIN_INSTANCE=5 plus
+            # run_post_process_RCTD) differs from the annotation modal's doublet run,
+            # so the two do not share a cache file even with equal UMI thresholds.
+            _rctd_cache_key  = (f"rctd_{os.path.basename(rds_path)}_{_ref_file_tag(rds_path)}"
+                                f"_{label_col}_doublet"
+                                f"_umi{min_umi}_sig{min_umi_sigma}_cmi5pp{_cells_extra}_{_rctd_lkey}")
             _rctd_cache_file = _cache_path(_rctd_cache_key)
             _rctd_obj_file   = _rctd_cache_file.replace(".parquet", "_rctd_obj.rds")
 
@@ -3653,7 +3788,9 @@ rownames(._split_coords) <- colnames(._split_counts_mat)
                     _sample = _split_labels_cached.index
                     _overlap = int(_sample.isin(set(cell_ids)).sum())
                     if len(_sample) > 0 and _overlap == len(_sample):
-                        ro.r(f'._split_rctd <- readRDS("{_rctd_obj_file}")')
+                        # path passed as a value (it contains the reference's file name)
+                        ro.globalenv["._split_rctd_path"] = _rctd_obj_file
+                        ro.r('._split_rctd <- readRDS(._split_rctd_path); rm(._split_rctd_path)')
                         _split_labels = _split_labels_cached
                         _rctd_from_cache = True
                         _set("running", "RCTD loaded from cache, running SPLIT::purify()…")
@@ -3684,7 +3821,8 @@ cat("  SPLIT R: detected cores =", parallel::detectCores(),
                 # integer codes (which would show numbers instead of cell type names).
                 _check_dataset_gen(_gen)
                 try:
-                    ro.r(f'saveRDS(._split_rctd, "{_rctd_obj_file}")')
+                    ro.globalenv["._split_rctd_path"] = _rctd_obj_file
+                    ro.r('saveRDS(._split_rctd, ._split_rctd_path); rm(._split_rctd_path)')
                     ro.r("""
 ._split_rctd_res   <- ._split_rctd@results$results_df
 ._split_rctd_types <- as.character(._split_rctd_res$first_type)
@@ -3773,8 +3911,34 @@ names(._split_rctd_types) <- rownames(._split_rctd_res)
         print(f"  [SPLIT] after cluster+umap: cols={[c for c in cells_df.columns if 'split' in c]}, "
               f"has_split_umap={'split_umap_1' in cells_df.columns}", flush=True)
 
+        # Cells whose counts SPLIT actually changed (for the status message): of the
+        # cells submitted, RCTD keeps n_corr, and purify() alters only part of those.
+        n_changed = None
+        try:
+            _cpos = pd.Index(cells_df.index.astype(str)).get_indexer(
+                [str(c) for c in corrected_cell_ids])
+            if (len(_cpos) == corrected_mat.shape[0] and (_cpos >= 0).all()
+                    and expr_panel.shape[1] == corrected_mat.shape[1]):
+                _cdiff = corrected_mat - sp_.csr_matrix(expr_panel)[_cpos, :].astype(corrected_mat.dtype)
+                n_changed = int((np.asarray(abs(_cdiff).sum(axis=1)).ravel() > 1e-6).sum())
+                del _cdiff
+        except Exception as _nce:
+            print(f"  SPLIT: could not count changed cells: {_nce}", flush=True)
+
         # ── 11. Write to zarr ────────────────────────────────────────────────
-        if sdata_path and os.path.isdir(sdata_path):
+        # Not under an active subset(): the store holds one X_corrected row and one
+        # cluster / UMAP value per cell of the whole dataset, and writing a subset
+        # run would replace an earlier full-dataset correction with zero rows.
+        _split_subset = ((_alt_res is not None and "_cells_df_original" in _alt_res)
+                         or (_alt_res is None and "_df_original" in DATA))
+        _split_note = ""
+        if _split_subset:
+            _split_note = (" (subset active: result kept in memory only, "
+                           "the SpatialData store was not changed)")
+            print("  SPLIT: subset() is active — corrected counts are kept in memory and "
+                  "NOT written to the SpatialData store (run SPLIT without a subset to "
+                  "store them)", flush=True)
+        elif sdata_path and os.path.isdir(sdata_path):
             _set("running", "Writing corrected counts to SpatialData zarr…")
             _split_write_zarr(sdata_path, corrected_mat, cells_df, list(panel_genes),
                               corrected_cell_ids=corrected_cell_ids)
@@ -3825,9 +3989,17 @@ names(._split_rctd_types) <- rownames(._split_rctd_res)
                     _opos = _orig_df.index.get_indexer(cells_df.index)
                     if len(_opos) == corrected_mat.shape[0] and (_opos >= 0).all():
                         _coo = corrected_mat.tocoo()
-                        _alt_res["_corrected_original"] = sp_.csr_matrix(
+                        _full_new = sp_.csr_matrix(
                             (_coo.data, (_opos[_coo.row], _coo.col)),
                             shape=(len(_orig_df), corrected_mat.shape[1]))
+                        # An earlier full-run correction keeps its rows outside the subset
+                        _full_old = _alt_res.get("_corrected_original")
+                        if _full_old is not None and _full_old.shape == _full_new.shape:
+                            _keep = np.ones(len(_orig_df), dtype=np.float32)
+                            _keep[_opos] = 0.0
+                            _full_new = (sp_.diags(_keep).dot(sp_.csr_matrix(_full_old))
+                                         + _full_new).tocsr()
+                        _alt_res["_corrected_original"] = _full_new
                         for col in ["cluster_split_10", "split_umap_1", "split_umap_2"]:
                             if col in cells_df.columns:
                                 _orig_df[col] = cells_df[col].reindex(_orig_df.index).values
@@ -3839,6 +4011,16 @@ names(._split_rctd_types) <- rownames(._split_rctd_res)
                 corrected_mat = sp_.csr_matrix(
                     (_coo.data, (_x_d2e[_coo.row], _coo.col)),
                     shape=(DATA["expr"].shape[0], corrected_mat.shape[1]))
+                # An earlier correction of the whole dataset keeps its rows for the
+                # cells this (subset) run did not cover, instead of turning to zero.
+                _prev_corr = DATA.get("split_corrected_expr")
+                if _prev_corr is not None and _prev_corr.shape[0] == corrected_mat.shape[0] \
+                        and _prev_corr.shape[1] >= corrected_mat.shape[1]:
+                    _keep = np.ones(corrected_mat.shape[0], dtype=np.float32)
+                    _keep[_x_d2e] = 0.0
+                    corrected_mat = (sp_.diags(_keep).dot(
+                        sp_.csr_matrix(_prev_corr)[:, :corrected_mat.shape[1]])
+                        + corrected_mat).tocsr()
             DATA["split_corrected_expr"] = corrected_mat
             DATA["split_corrected_cell_ids"] = corrected_cell_ids
             DATA["split_panel_genes"] = list(panel_genes)
@@ -3858,8 +4040,16 @@ names(._split_rctd_types) <- rownames(._split_rctd_res)
                     print(f"  [SPLIT] WARNING: {col} NOT in cells_df — skipping", flush=True)
             _umap_df_cache.clear()  # split_umap_1/2 added; invalidate cached UMAP df
 
-        _set("done", f"SPLIT complete — {n_cells:,} cells corrected", result={"n_cells": n_cells})
-        print(f"  SPLIT: done — {n_cells:,} cells corrected", flush=True)
+        # n_cells = cells submitted; n_corr = cells RCTD kept (returned by purify());
+        # n_changed = cells whose counts differ from the input
+        if n_changed is not None:
+            _split_msg = (f"{n_changed:,} cells corrected "
+                          f"({n_corr:,} of {n_cells:,} submitted cells classified by RCTD)")
+        else:
+            _split_msg = f"{n_corr:,} of {n_cells:,} submitted cells returned by SPLIT"
+        _set("done", f"SPLIT complete — {_split_msg}{_split_note}",
+             result={"n_cells": n_cells, "n_returned": n_corr, "n_changed": n_changed})
+        print(f"  SPLIT: done — {_split_msg}{_split_note}", flush=True)
 
     except Exception:
         import traceback
@@ -4116,11 +4306,13 @@ def _run_reseg_umap() -> None:
             else:
                 # No corrected cells found at all — fall back to uncorrected
                 print(f"  Reseg UMAP: no corrected cells found — using uncorrected", flush=True)
-                expr = alt_res["expr"]
+                expr = _reseg_measured_expr(alt_res["expr"])
                 _src_label = "reseg"
                 cell_ids = _all_cell_ids
         else:
-            expr = alt_res["expr"]
+            # measured panel genes only: after SpaGE the run's matrix also holds
+            # dense imputed columns, which are not counts
+            expr = _reseg_measured_expr(alt_res["expr"])
             cell_ids = _all_cell_ids
         n_cells = expr.shape[0]
         _set("running", f"Normalising {n_cells:,} {_src_label} cells…")
@@ -4229,7 +4421,9 @@ def _spage_index_path() -> str:
 
 
 def _spage_cache_path(rds_path: str, genes_key: str) -> str:
-    tag = hashlib.md5((rds_path + _dataset_key() + genes_key).encode()).hexdigest()[:12]
+    # _ref_file_tag: an edited reference (same path, new size / mtime) is a new key
+    tag = hashlib.md5((rds_path + _ref_file_tag(rds_path) + _dataset_key()
+                       + genes_key).encode()).hexdigest()[:12]
     return os.path.join(_spage_cache_dir(), f"spage_{tag}.parquet")
 
 
@@ -4259,13 +4453,32 @@ def _annot_autoload() -> None:
                     and not os.path.basename(f).endswith("_weights.parquet")
                     # SPLIT's RCTD labels of a subset() run cover only part of the cells
                     and not re.search(r"_n\d+_[0-9a-f]{8}_labels_", os.path.basename(f))]
-    weight_files = [f for f in glob.glob(pattern)
-                    if os.path.basename(f).endswith("_weights.parquet")]
+    # weight side-cars are named <labels file stem>_weights.parquet, i.e. the dataset
+    # tag is not at the end of their name (the labels pattern never matched them)
+    weight_files = glob.glob(os.path.join(cache_dir, f"*_{tag}_weights.parquet"))
     if not label_files and not weight_files:
         return
-    # Sort by modification time (newest last) so the most recent annotation wins
-    # when multiple cache files map to the same labels_key.
-    label_files.sort(key=lambda f: os.path.getmtime(f))
+    # Several cache files can map to the same labels key (RCTD runs with another
+    # reference, mode or UMI threshold; SPLIT's own RCTD run). The rule: per key, the
+    # most recently written file wins (ties broken by file name, so the outcome does
+    # not depend on directory order), and the RCTD weights are taken only from the
+    # side-car of that same file - never from another run.
+    _order = lambda f: (os.path.getmtime(f), os.path.basename(f))
+    label_files.sort(key=_order)
+    _RCTD_MODES = ("full", "doublet", "multi")
+
+    def _generic_key(key: str):
+        """labels_rctd_<mode>[_<tool>_<tag>] or labels_rctd[_<tool>_<tag>]_<mode>
+        → the key the figures read (labels_rctd[_<tool>_<tag>]); None for other keys."""
+        p = key.split("_")
+        if len(p) >= 3 and p[1] == "rctd" and p[2] in _RCTD_MODES:
+            return "_".join(p[:2] + p[3:])
+        if len(p) >= 3 and p[1] == "rctd" and p[-1] in _RCTD_MODES:
+            return "_".join(p[:-1])
+        return None
+
+    _winner: dict = {}      # labels key → cache file whose labels it now holds
+    _n_cand: dict = {}
     loaded = 0
     for fpath in label_files:
         name = os.path.basename(fpath)
@@ -4286,28 +4499,32 @@ def _annot_autoload() -> None:
             cached       = pd.read_parquet(fpath)
             labels       = cached["label"].astype(str)
             labels.index = labels.index.astype(str)
-            # For RCTD mode-specific keys (e.g. "labels_rctd_doublet"), also set the
+            # For RCTD mode-specific keys (e.g. "labels_rctd_doublet", or
+            # "labels_rctd_baysor_<tag>_doublet" from the annotation modal), also set the
             # generic key (e.g. "labels_rctd") so make_spatial_fig keeps working after restart.
-            parts = labels_key.split("_")
-            if len(parts) >= 3 and parts[2] in ("full", "doublet", "multi"):
-                generic_key = "_".join(parts[:2] + parts[3:])
-            else:
-                generic_key = None
+            generic_key = _generic_key(labels_key)
             with _annot_lock:
                 _annot_state[labels_key] = labels
                 if generic_key:
                     _annot_state[generic_key] = labels
+                for _k in (labels_key, generic_key):
+                    if _k:
+                        _winner[_k] = fpath
+                        _n_cand[_k] = _n_cand.get(_k, 0) + 1
                 _annot_state["status"]   = "done"
                 _annot_state["message"]  = f"Auto-loaded ({_ANNOT_METHODS[method]})"
             print(f"  Annotation: auto-loaded {method} ({len(labels.unique())} types) from {name}", flush=True)
             loaded += 1
         except Exception as exc:
             print(f"  Annotation: auto-load failed for {name}: {exc}", flush=True)
+    for _k, _n in sorted(_n_cand.items()):
+        if _n > 1:
+            print(f"  Annotation: {_n} cached runs provide '{_k}' - using the most recent, "
+                  f"{os.path.basename(_winner[_k])}", flush=True)
+    weight_files.sort(key=_order)
     for fpath in weight_files:
         name = os.path.basename(fpath)
         try:
-            weights_df = pd.read_parquet(fpath)
-            weights_df.index = weights_df.index.astype(str)
             # Parse labels_key from weights filename (strip "_weights.parquet" then "_{tag}")
             w_name_stem = name[:-(len("_weights.parquet"))]
             w_name_stem2 = w_name_stem[:-(len(tag) + 1)]
@@ -4316,16 +4533,17 @@ def _annot_autoload() -> None:
                 wlabels_key = w_name_stem2[w_lk_pos + 1:]
             else:
                 wlabels_key = "labels_rctd"
-            weights_key = f"rctd_weights_{wlabels_key}"
-            w_parts = wlabels_key.split("_")
-            if len(w_parts) >= 3 and w_parts[2] in ("full", "doublet", "multi"):
-                generic_wkey = f"rctd_weights_{'_'.join(w_parts[:2] + w_parts[3:])}"
-            else:
-                generic_wkey = None
+            # Only for the keys whose labels came from this file's own run
+            _own_labels = fpath[:-len("_weights.parquet")] + ".parquet"
+            _targets = [k for k in (wlabels_key, _generic_key(wlabels_key))
+                        if k and _winner.get(k) == _own_labels]
+            if not _targets:
+                continue
+            weights_df = pd.read_parquet(fpath)
+            weights_df.index = weights_df.index.astype(str)
             with _annot_lock:
-                _annot_state[weights_key] = weights_df
-                if generic_wkey:
-                    _annot_state[generic_wkey] = weights_df
+                for _k in _targets:
+                    _annot_state[f"rctd_weights_{_k}"] = weights_df
             print(f"  Annotation: auto-loaded RCTD weights ({weights_df.shape[1]} types) from {name}", flush=True)
         except Exception as exc:
             print(f"  Annotation: weight auto-load failed for {name}: {exc}", flush=True)
@@ -4507,10 +4725,16 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
     """Background thread: run SpaGE gene imputation and store results.
     When seg_source is a Baysor/Proseg run, imputes against reseg cells and writes
     back to the reseg SpatialData zarr (alt_res['sdata_path']).
-    When use_corrected=True, uses SPLIT-corrected counts as the spatial input."""
+
+    The spatial input is always the original counts. use_corrected=True (SPLIT-
+    corrected counts as input) is refused: the app stores imputed genes as plain
+    '[imp]' columns of X, so such a run would be indistinguishable from - and would
+    overwrite - an imputation from the original counts. functions/impute.py
+    --use_corrected does this into a separate store and records the provenance."""
     _redirect_rpy2_console()
     _gen = _dataset_gen
     _ds_key = _dataset_key()   # the dataset this job belongs to (for the cache index)
+    _r_ref_loaded = False      # reference objects were put into R's global env
 
     def _set(status, message, result=None):
         with _spage_lock:
@@ -4536,6 +4760,14 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
         # Dash callbacks run in threads where the rpy2 ContextVar may be unset.
         _rconv.set_conversion(ro.default_converter)
 
+        if use_corrected:
+            _set("error", "SpaGE on SPLIT-corrected counts is not available in the app "
+                          "(imputed genes are stored as '[imp]' columns computed from the "
+                          "original counts). Use functions/impute.py --use_corrected, which "
+                          "writes a separate store and marks the genes as imputed from "
+                          "corrected counts.")
+            return
+
         # ── Determine active reseg (if any) ──────────────────────────────
         _alt_res = None
         if seg_source and _seg_tool(seg_source) != "xenium":
@@ -4554,7 +4786,10 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
         with openrlib.rlock:
             importr("SeuratObject")
             importr("Matrix")
-            ro.r(f'seurat_ref <- readRDS("{rds_path}")')
+            # The path is passed as a value, never pasted into R source (a quote or
+            # backslash in it would break the parse or run as code)
+            _r_ref_loaded = True
+            ro.globalenv["seurat_ref"] = importr("base").readRDS(rds_path)
             ro.r('rna_ref    <- seurat_ref[["RNA"]]')
             ro.r('rna_mat_data <- SeuratObject::LayerData(rna_ref, layer="data")')
             ro.r('rna_genes  <- rownames(rna_mat_data)')
@@ -4575,11 +4810,32 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
 
         # ── Determine genes_to_predict ───────────────────────────────────
         auto_hvg = not (genes_input and genes_input.strip())
+        _auto_top = None
         if auto_hvg:
-            # Will pick top-200 HVG after loading reference matrix
+            # Top-200 genes by variance over ALL non-panel genes of the reference
+            # (computed in R on the sparse matrix, in blocks of cells). Before, only
+            # the first 2000 non-panel genes in the reference's row order were
+            # candidates, so the choice depended on that order. "auto200v2": results
+            # cached under the old selection are not reused.
             predict_candidates = [g for g in rna_genes_all if g not in xenium_genes]
-            genes_needed = shared_genes + predict_candidates[:2000]
-            genes_key = "auto200"
+            genes_key = "auto200v2"
+            _set("running", f"Ranking {len(predict_candidates):,} reference genes by variance…")
+            try:
+                with openrlib.rlock:
+                    ro.globalenv[".spage_cand"] = ro.StrVector(predict_candidates)
+                    _auto_top = [str(g) for g in ro.r(_SPAGE_HVG_R)]
+                    ro.r('rm(.spage_cand)')
+            except Exception as _hve:
+                print(f"  SpaGE: variance ranking over the whole reference failed ({_hve}) — "
+                      f"falling back to the first 2000 non-panel genes as candidates", flush=True)
+                _auto_top = None
+            if _auto_top:
+                genes_needed = shared_genes + _auto_top
+                print(f"  SpaGE: auto-selected {len(_auto_top)} highly variable genes out of "
+                      f"{len(predict_candidates):,} non-panel reference genes", flush=True)
+            else:
+                genes_needed = shared_genes + predict_candidates[:2000]
+                genes_key = "auto200"
         else:
             requested = [g.strip() for line in genes_input.replace(",", "\n").split("\n")
                          for g in [line.strip()] if g]
@@ -4720,7 +4976,9 @@ writeLines(colnames(mat_sub), "{cells_file}")
         del mat_sp  # sparse copy no longer needed
 
         # HVG selection for auto mode
-        if auto_hvg:
+        if auto_hvg and _auto_top:
+            genes_to_predict = [g for g in _auto_top if g in rna_genes_sub]
+        elif auto_hvg:
             predict_pool = [g for g in rna_genes_sub if g not in xenium_genes]
             var_scores = rna_df[predict_pool].var(axis=0)
             genes_to_predict = var_scores.nlargest(200).index.tolist()
@@ -4873,6 +5131,10 @@ writeLines(colnames(mat_sub), "{cells_file}")
                 import shutil as _sh_w
                 _sdata_w = _sd_w.read_zarr(sdata_path)
                 _adata_w = _sdata_w.tables["table"]
+                # 'GENE [imp]' var names of an older functions/impute.py store → plain
+                # names, so a re-imputed gene replaces its column instead of adding a
+                # second one (the rewritten table then uses the plain names)
+                _plain_imputed_var_names(_adata_w)
                 # Imputed rows follow the cells the run saw; the table has its own
                 # row order. Pair them by cell id and write only a complete match
                 # (under a subset() the result stays in the SpaGE cache only).
@@ -4924,7 +5186,13 @@ writeLines(colnames(mat_sub), "{cells_file}")
                                 (_v.shape[0], _n_new), dtype=_v.dtype)]).tocsr()
                             for _k, _v in _adata_w.layers.items()},
                 )
-                _adata_new.uns["imputed_genes"] = list(_adata_w.uns.get("imputed_genes", [])) + _new_genes
+                _adata_new.uns["imputed_genes"] = list(dict.fromkeys(
+                    list(_adata_w.uns.get("imputed_genes", [])) + _new_genes + _re_genes))
+                # a column re-imputed here now holds values from the original counts
+                if len(_adata_w.uns.get("split_corrected_imputed_genes", [])):
+                    _adata_new.uns["split_corrected_imputed_genes"] = [
+                        g for g in _adata_w.uns["split_corrected_imputed_genes"]
+                        if g not in _re_genes]
                 _sdata_w.tables["table"] = _adata_new
                 # The table on disk has to be deleted before it can be rewritten:
                 # keep a copy (and the root metadata) to put back if the write fails.
@@ -5012,6 +5280,10 @@ writeLines(colnames(mat_sub), "{cells_file}")
                         DATA["expr"]             = sp.csr_matrix(adata_new.X)
                         DATA["expr_csc"]         = DATA["expr"].tocsc()
                         DATA["gene_var"]         = adata_new.var
+                        if DATA.get("split_corrected_imputed_genes"):
+                            DATA["split_corrected_imputed_genes"] = [
+                                str(g) for g in
+                                adata_new.uns.get("split_corrected_imputed_genes", [])]
                         _gene_expr_cache.clear()
 
         _set("done", f"Done — {len(imp_df.columns):,} genes imputed",
@@ -5021,9 +5293,55 @@ writeLines(colnames(mat_sub), "{cells_file}")
         import traceback
         traceback.print_exc()
         _set("error", str(exc)[:300])
+    finally:
+        # Cached-result returns and errors leave before the rm() above: without this
+        # the multi-GB reference would stay in the R heap for the life of the process.
+        if _r_ref_loaded:
+            try:
+                import rpy2.robjects as _ro_fin
+                from rpy2.rinterface_lib import openrlib as _orl_fin
+                with _orl_fin.rlock:
+                    _ro_fin.r('suppressWarnings(rm(list = intersect(c("seurat_ref", "rna_ref", '
+                              '"rna_mat_data", "mat_sub", "rna_genes", "genes_needed", ".spage_cand"), '
+                              'ls(all.names = TRUE, envir = globalenv())), envir = globalenv())); '
+                              'invisible(gc())')
+            except Exception:
+                pass
+
+
+# R: the 200 highest-variance genes among .spage_cand (rows of rna_mat_data), with the
+# row sums accumulated over blocks of cells so that no second copy of the matrix is made.
+_SPAGE_HVG_R = """
+local({
+  m <- rna_mat_data; n <- ncol(m)
+  s1 <- numeric(nrow(m)); s2 <- numeric(nrow(m))
+  for (j0 in seq(1L, n, by = 20000L)) {
+    b  <- m[, j0:min(n, j0 + 19999L), drop = FALSE]
+    s1 <- s1 + Matrix::rowSums(b)
+    s2 <- s2 + Matrix::rowSums(b * b)
+  }
+  v <- (s2 - s1 * s1 / n) / max(n - 1, 1)
+  names(v) <- rownames(m)
+  cand <- .spage_cand[.spage_cand %in% names(v)]
+  v <- v[cand]
+  cand[order(-v)[seq_len(min(200L, length(cand)))]]
+})
+"""
 
 
 # ─── Subset / unsubset ────────────────────────────────────────────────────────
+
+def _loaded_reseg_results() -> list:
+    """[(tool, result dict)] for every Baysor/Proseg run that is loaded right now."""
+    out = []
+    with _proseg_lock:
+        if _proseg_state.get("result") is not None:
+            out.append(("proseg", _proseg_state["result"]))
+    with _baysor_lock:
+        if _baysor_state.get("result") is not None:
+            out.append(("baysor", _baysor_state["result"]))
+    return out
+
 
 def subset(cluster=None, cell_type=None,
            gene=None, min_expr=None, max_expr=None,
@@ -5066,12 +5384,10 @@ def subset(cluster=None, cell_type=None,
     """
     global _subset_version
 
-    # Save originals on first subset call
-    if "_df_original" not in DATA:
-        DATA["_df_original"]      = DATA["df"]
-        DATA["_df_to_expr_orig"]  = DATA["df_to_expr"]
-
-    df   = DATA["_df_original"]
+    # The originals are stored in DATA only once the mask has been built (below): a
+    # filter that raises must not leave the app flagged as "SUBSET ACTIVE".
+    df            = DATA.get("_df_original", DATA["df"])
+    _df_to_expr_o = DATA.get("_df_to_expr_orig", DATA["df_to_expr"])
     mask = pd.Series(True, index=df.index)
 
     # ── Cluster filter ────────────────────────────────────────────────────
@@ -5081,6 +5397,8 @@ def subset(cluster=None, cell_type=None,
         if _method is None:
             raise ValueError("No cluster sets are available for this dataset.")
         col  = f"clust__{_method}"
+        if col not in df.columns:
+            raise ValueError(f"Unknown clustering method {_method!r}; available: {list(_cm)}")
         vals = [cluster] if not isinstance(cluster, (list, tuple)) else list(cluster)
         vals = [int(v) for v in vals]
         mask &= df[col].isin(vals)
@@ -5116,7 +5434,7 @@ def subset(cluster=None, cell_type=None,
         _base = gene[:-6] if gene.endswith(" [imp]") else gene
         if _base in DATA["gene_name_to_idx"]:
             _raw = DATA["expr_csc"][:, DATA["gene_name_to_idx"][_base]].toarray().ravel()
-            _idx = DATA["_df_to_expr_orig"]
+            _idx = _df_to_expr_o
             expr_vals = pd.Series(
                 np.log1p(np.where(_idx >= 0, _raw[np.clip(_idx, 0, len(_raw) - 1)], 0.0)),
                 index=df.index)
@@ -5126,18 +5444,27 @@ def subset(cluster=None, cell_type=None,
             print(f"  subset: gene '{gene}' not found - skipping gene filter", flush=True)
 
     # ── Numeric range filters ─────────────────────────────────────────────
-    if min_transcripts  is not None: mask &= df["transcript_counts"] >= min_transcripts
-    if max_transcripts  is not None: mask &= df["transcript_counts"] <= max_transcripts
-    if min_cell_area    is not None: mask &= df["cell_area"]          >= min_cell_area
-    if max_cell_area    is not None: mask &= df["cell_area"]          <= max_cell_area
-    if min_nucleus_area is not None: mask &= df["nucleus_area"]       >= min_nucleus_area
-    if max_nucleus_area is not None: mask &= df["nucleus_area"]       <= max_nucleus_area
+    for _ncol, _lo, _hi in (("transcript_counts", min_transcripts, max_transcripts),
+                            ("cell_area", min_cell_area, max_cell_area),
+                            ("nucleus_area", min_nucleus_area, max_nucleus_area)):
+        if _lo is None and _hi is None:
+            continue
+        if _ncol not in df.columns:
+            print(f"  subset: this dataset has no '{_ncol}' column - skipping that filter", flush=True)
+            continue
+        if _lo is not None: mask &= df[_ncol] >= _lo
+        if _hi is not None: mask &= df[_ncol] <= _hi
 
     # ── Explicit cell IDs ─────────────────────────────────────────────────
     if cell_ids is not None:
         mask &= df.index.isin(cell_ids)
 
     df_sub = df[mask]
+
+    # Mask built without error: save the originals (first subset call) and switch
+    if "_df_original" not in DATA:
+        DATA["_df_original"]      = df
+        DATA["_df_to_expr_orig"]  = _df_to_expr_o
 
     # Update active data
     DATA["df"] = df_sub
@@ -5150,14 +5477,9 @@ def subset(cluster=None, cell_type=None,
     )
 
     # ── Reseg path (Baysor / Proseg) ──────────────────────────────────────
-    with _proseg_lock:
-        _pres = _proseg_state["result"] if _proseg_state["status"] == "done" else None
-    with _baysor_lock:
-        _bres = _baysor_state["result"] if not _pres and _baysor_state["status"] == "done" else None
-    _alt_res = _pres or _bres
-
-    if _alt_res is not None:
-        _tool = "proseg" if _pres else "baysor"
+    # Every loaded run is filtered, not only one of them: both tools can hold a
+    # result at once and the Segmentation dropdown decides which one is displayed.
+    for _tool, _alt_res in _loaded_reseg_results():
 
         # Save originals on first subset
         if "_cells_df_original" not in _alt_res:
@@ -5170,10 +5492,11 @@ def subset(cluster=None, cell_type=None,
 
         # Cluster filter — reseg cluster column names start with "cluster"
         if cluster is not None:
-            _bcols = [c for c in bdf.columns if c.startswith("cluster")]
-            if _bcols:
+            # the column "Color by Cluster" shows (cluster_kmeans_*), never a bare `cluster`
+            _bcol = _reseg_display_cluster_col(bdf.columns)
+            if _bcol is not None:
                 _bvals_str = [str(cluster)] if not isinstance(cluster, (list, tuple)) else [str(v) for v in cluster]
-                bmask &= bdf[_bcols[0]].astype(str).isin(_bvals_str)
+                bmask &= bdf[_bcol].astype(str).isin(_bvals_str)
             else:
                 print(f"  subset reseg: no cluster column in cells_df — skipping cluster filter", flush=True)
 
@@ -5242,12 +5565,9 @@ def unsubset():
     DATA["df_to_expr"] = DATA.pop("_df_to_expr_orig")
 
     # Restore reseg originals if subset was applied there too
-    with _proseg_lock:
-        _pres = _proseg_state["result"] if _proseg_state["status"] == "done" else None
-    with _baysor_lock:
-        _bres = _baysor_state["result"] if not _pres and _baysor_state["status"] == "done" else None
-    _alt_res = _pres or _bres
-    if _alt_res is not None and "_cells_df_original" in _alt_res:
+    for _tool, _alt_res in _loaded_reseg_results():
+        if "_cells_df_original" not in _alt_res:
+            continue
         _alt_res["cells_df"] = _alt_res.pop("_cells_df_original")
         _alt_res["expr"]     = _alt_res.pop("_expr_original")
         _orig_corr = _alt_res.pop("_corrected_original")
@@ -5257,7 +5577,7 @@ def unsubset():
               and _alt_res["split_corrected_expr"].shape[0] != len(_alt_res["cells_df"])):
             # Corrected matrix sized to the subset cannot be paired with the full cells_df
             _alt_res["split_corrected_expr"] = None
-            print("  unsubset: dropped SPLIT-corrected counts computed on the subset "
+            print(f"  unsubset: dropped {_tool} SPLIT-corrected counts computed on the subset "
                   "(re-run SPLIT on the full dataset)", flush=True)
 
     _umap_df_cache.clear()
@@ -5383,10 +5703,14 @@ def _compute_cooccurrence_from_raw(raw_matrix, freqs):
 
 
 def _compute_enrichment_from_raw(raw_matrix, row_counts, freqs):
-    """Compute log2 neighborhood enrichment matrix from pre-built raw counts."""
+    """Compute log2 neighborhood enrichment matrix from pre-built raw counts:
+    log2( P(neighbour is b | cell is a) / freq_b ), which is 0 under random mixing.
+    (row_counts, the number of cells per source type, is kept for the signature only.)"""
     matrix = raw_matrix.copy()
-    # Normalize rows by count of source type
-    safe_row = np.where(row_counts > 0, row_counts, 1)
+    # Normalize each row by its own number of (cell, neighbour) pairs - not by the
+    # number of source cells, which left every value too high by log2(k)
+    row_pairs = raw_matrix.sum(axis=1)
+    safe_row = np.where(row_pairs > 0, row_pairs, 1)
     matrix /= safe_row[:, None]
     # Normalize cols by global frequency of target type
     safe_freq = np.where(freqs > 0, freqs, 1e-9)
@@ -5590,10 +5914,22 @@ def _run_spatial_niches(n_clusters: int, n_neighbors: int, label_key: str | None
         _check_dataset_gen(_gen)
         cells_df = cells_df.copy()
         cells_df["niche"] = niche_labels
+
+        def _niche_into_full(full_df):
+            # subset() active: unsubset() restores this frame, so it gets the labels
+            # too (by cell id; cells outside the subset have no niche)
+            if full_df is not None:
+                full_df["niche"] = cells_df["niche"].reindex(full_df.index).values
+
         if alt_res is not None:
             alt_res["cells_df"] = cells_df
+            _niche_into_full(alt_res.get("_cells_df_original"))
         else:
-            DATA["df"]["niche"] = niche_labels
+            if "_df_original" in DATA:
+                _niche_into_full(DATA["_df_original"])
+                DATA["df"] = cells_df          # the subset slice itself is not written to
+            else:
+                DATA["df"]["niche"] = niche_labels
             _umap_df_cache.clear()   # cached dropna() copies lack the new column
 
         # Print proportion table if cell types available
@@ -5641,9 +5977,10 @@ def run_spage(rds_path: str, genes_file: str = None, n_pv: int = 50,
     n_pv : int
         Number of principal vectors for cross-dataset alignment (default 50).
     use_corrected : bool, optional
-        If True, use SPLIT-corrected counts as input. Defaults to the current
-        Active Counts mode (True when "SPLIT Corrected" is selected in the UI).
-        Set explicitly to override.
+        Not supported in the app: imputation always uses the original counts,
+        whatever the Active Counts mode. Passing True prints why and does nothing;
+        use functions/impute.py --use_corrected to impute from SPLIT-corrected
+        counts into a separate store.
 
     Example
     -------
@@ -5659,11 +5996,17 @@ def run_spage(rds_path: str, genes_file: str = None, n_pv: int = 50,
             print("  SpaGE is already running.", flush=True)
             return
 
-    # Default use_corrected to the current Active Counts mode
-    if use_corrected is None:
-        use_corrected = (_active_counts_mode == "corrected")
     if use_corrected:
-        print("  SpaGE: will use SPLIT-corrected counts as input", flush=True)
+        print("  SpaGE: use_corrected=True is not supported in the app - imputed genes are "
+              "stored as '[imp]' columns computed from the original counts, and a run on "
+              "corrected counts would overwrite them under the same name.\n"
+              "  Use functions/impute.py --use_corrected (writes a separate store and marks "
+              "the genes as imputed from corrected counts). Nothing was run.", flush=True)
+        return
+    if use_corrected is None and _active_counts_mode == "corrected":
+        print("  SpaGE: Active Counts is 'SPLIT Corrected', but imputation uses the "
+              "original counts", flush=True)
+    use_corrected = False
 
     # Detect active reseg so imputation runs against the right cells
     seg_source = None
@@ -6695,6 +7038,53 @@ def _build_xenium_sdata(data_dir: str) -> None:
     print("  spatialdata_xenium.zarr generation complete.", flush=True)
 
 
+_IMPUTED_SUFFIX_RE = re.compile(r" \[(corr\+imp|imp)\]$")
+
+
+def _plain_imputed_var_names(adata) -> int:
+    """Stores written by older versions of functions/impute.py name imputed genes
+    'GENE [imp]' / 'GENE [corr+imp]'. The app's convention is the plain gene name plus
+    var['is_imputed'] (the suffix is only a dropdown label), so such names are renamed
+    in the in-memory table: plain name, is_imputed=True, and the '[corr+imp]' genes
+    listed in uns['split_corrected_imputed_genes']. A suffixed name whose plain form
+    is already a column is left as it is. Returns the number of renamed genes."""
+    names = [str(g) for g in adata.var_names]
+    if not any(n.endswith("imp]") for n in names):
+        return 0
+    taken = {n for n in names if not _IMPUTED_SUFFIX_RE.search(n)}
+    new_names, renamed, corr = [], [], []
+    for n in names:
+        m = _IMPUTED_SUFFIX_RE.search(n)
+        base = n[:m.start()] if m else None
+        if base and base not in taken:
+            taken.add(base)
+            renamed.append(base)
+            if m.group(1) == "corr+imp":
+                corr.append(base)
+            n = base
+        new_names.append(n)
+    if not renamed:
+        return 0
+    _iname = adata.var.index.name
+    adata.var_names = new_names
+    adata.var.index.name = _iname
+    if "is_imputed" not in adata.var.columns:
+        adata.var["is_imputed"] = False
+    adata.var["is_imputed"] = adata.var["is_imputed"].fillna(False).astype(bool)
+    adata.var.loc[renamed, "is_imputed"] = True
+    _strip = lambda g: _IMPUTED_SUFFIX_RE.sub("", str(g))
+    _corr_all = list(dict.fromkeys(
+        [_strip(g) for g in adata.uns.get("split_corrected_imputed_genes", [])] + corr))
+    _raw_all = [g for g in dict.fromkeys(
+        [_strip(g) for g in adata.uns.get("imputed_genes", [])]
+        + [g for g in renamed if g not in corr]) if g not in _corr_all]
+    adata.uns["split_corrected_imputed_genes"] = _corr_all
+    adata.uns["imputed_genes"] = _raw_all
+    print(f"  Imputed genes: {len(renamed)} var name(s) with an ' [imp]' / ' [corr+imp]' suffix "
+          f"(older functions/impute.py output) are read under their plain names", flush=True)
+    return len(renamed)
+
+
 def _load_from_xenium_sdata(zarr_path: str, data_dir: str) -> dict:
     """Load DATA dict from a spatialdata_xenium.zarr store."""
     try:
@@ -6705,6 +7095,7 @@ def _load_from_xenium_sdata(zarr_path: str, data_dir: str) -> dict:
     print(f"  Loading from spatialdata_xenium.zarr…", flush=True)
     sdata = spatialdata.read_zarr(zarr_path)
     adata = sdata.tables["table"]
+    _plain_imputed_var_names(adata)
 
     gene_names       = list(adata.var_names)
     gene_name_to_idx = {g: i for i, g in enumerate(gene_names)}
@@ -6729,11 +7120,14 @@ def _load_from_xenium_sdata(zarr_path: str, data_dir: str) -> dict:
     # obs columns added later through the low-level zarr API (SPLIT clusters /
     # UMAP) are not in the table's column-order, so read_zarr does not return them.
     _load_zarr_obs_into_df(zarr_path, obs_df)
-    if "cluster_split_10" in obs_df.columns:
-        # stored as plain strings with "" for cells SPLIT dropped
-        _cs = obs_df["cluster_split_10"].astype(str)
-        obs_df["cluster_split_10"] = pd.array(
-            [v if v not in ("", "nan", "<NA>") else pd.NA for v in _cs], dtype="string")
+    for _nacol in [c for c in obs_df.columns
+                   if c == "cluster_split_10" or c == "niche" or str(c).startswith("roi_")]:
+        # stored as plain strings with "" for cells without a value (dropped by
+        # SPLIT, outside every ROI, outside the subset the niches were computed on)
+        _cs = obs_df[_nacol].astype(str)
+        if _nacol == "cluster_split_10" or _cs.isin(["", "nan", "<NA>"]).any():
+            obs_df[_nacol] = pd.array(
+                [v if v not in ("", "nan", "<NA>") else pd.NA for v in _cs], dtype="string")
     cluster_methods = list(adata.uns.get("cluster_methods", []))
     print(f"  Done: {n:,} cells | {len(gene_names)} genes | {len(cluster_methods)} cluster sets", flush=True)
 
@@ -6903,6 +7297,9 @@ def get_gene_expression(gene: str) -> np.ndarray:
                 result = res[base].reindex(_ridx).fillna(0).values.astype(np.float64)
             else:
                 result = res[base].values.astype(np.float64)
+            # log1p like every other path (write-back column above, _get_expr_values):
+            # the same imputed gene must not change scale with the path that serves it
+            result = np.log1p(np.clip(result, 0, None))
             _gene_cache_put(_cache_key, result)
             return result
         if res_path and base in res_genes:
@@ -6919,6 +7316,7 @@ def get_gene_expression(gene: str) -> np.ndarray:
                     # streamed under another subset(): rows cannot be matched to cells
                     raise ValueError(f"result has {len(result):,} rows for "
                                      f"{len(DATA['df']):,} cells — re-run SpaGE")
+                result = np.log1p(np.clip(result, 0, None))   # same scale as the other paths
                 _gene_cache_put(_cache_key, result)
                 return result
             except Exception as _sge:
@@ -7180,6 +7578,17 @@ def _get_expr_values(gene: str, alt_res=None, use_corrected: bool = False) -> "n
         _corr = _csc_view(DATA, "split_corrected_expr") if use_corrected else None
         expr = _corr if _corr is not None else DATA.get("expr_csc")# or DATA.get("expr")
         gni  = DATA.get("gene_name_to_idx", {})
+    if use_corrected and is_imputed_gene:
+        # Imputed genes are stored in X only: X_corrected has no values for them (a
+        # store reloaded from disk carries all-zero padding columns there, which must
+        # not be shown as expression). A gene imputed from corrected counts
+        # (functions/impute.py --use_corrected) is read from its X column; any other
+        # imputed gene has no corrected values - the caller shows the original ones.
+        _corr_imp = (alt_res.get("split_corrected_imputed_genes", []) if alt_res is not None
+                     else DATA.get("split_corrected_imputed_genes", [])) or []
+        if lookup not in _corr_imp:
+            return None
+        expr = _csc_view(alt_res, "expr") if alt_res is not None else DATA.get("expr_csc")
     if expr is not None and lookup in gni:
         idx = gni[lookup]
         if idx < expr.shape[1]:
@@ -7361,7 +7770,7 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
         elif color_by == "cluster":
             # Look for any cluster column in cells_df (added after UMAP/clustering on reseg cells)
             # When corrected counts are active, prefer cluster_split_* columns
-            _cluster_cols = [c for c in bdf.columns if c.startswith("cluster")]
+            _cluster_cols = _reseg_cluster_cols(bdf.columns)
             if use_corrected:
                 cluster_col = next((c for c in _cluster_cols if "split" in c), None) or next(iter(_cluster_cols), None)
             else:
@@ -7418,6 +7827,10 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
 
         elif color_by == "gene":
             vals = _get_expr_values(gene, alt_res, use_corrected=use_corrected)
+            if vals is None and use_corrected:
+                # imputed gene: no corrected values exist, show the original ones
+                # (as the Xenium path does)
+                vals = _get_expr_values(gene, alt_res, use_corrected=False)
             if vals is not None:
                 traces = [go.Scattergl(
                     x=x, y=y, mode="markers",
@@ -8478,6 +8891,8 @@ def make_umap_fig(color_by, method, gene, size, opacity,
 
         if color_by == "gene":
             vals = _get_expr_values(gene, alt_res, use_corrected=use_corrected)
+            if vals is None and use_corrected:
+                vals = _get_expr_values(gene, alt_res, use_corrected=False)   # see make_spatial_fig
             if vals is not None and len(vals) == len(_bdf):
                 vals = _al(vals)
             if vals is not None:
@@ -8513,7 +8928,7 @@ def make_umap_fig(color_by, method, gene, size, opacity,
 
         if color_by == "cluster" and not color_by.startswith("cell_type:") and color_by != "gene":
             bdf = alt_res["cells_df"]
-            _all_cluster_cols = [c for c in bdf.columns if c.startswith("cluster")]
+            _all_cluster_cols = _reseg_cluster_cols(bdf.columns)
             if use_corrected:
                 _cluster_col = next((c for c in _all_cluster_cols if "split" in c), None) or next(iter(_all_cluster_cols), None)
             else:
@@ -8780,6 +9195,7 @@ def _plot_range_and_dim_controls(prefix: str):
 def _load_cellnest_data(folder: str, dataset_name: str, strip_suffix: str = ""):
     """Load CellNEST output files in a background thread and store in _cellnest_state."""
     import os, traceback
+    _gen = _dataset_gen
     try:
         with _cellnest_lock:
             _cellnest_state["status"] = "loading"
@@ -8886,6 +9302,10 @@ def _load_cellnest_data(folder: str, dataset_name: str, strip_suffix: str = ""):
             print(f"[CellNEST] Joined annotation-state labels: {[k for k,_ in annot_series]}", flush=True)
 
         with _cellnest_lock:
+            if _gen != _dataset_gen:
+                # another sample was loaded meanwhile: these results are not its results
+                print("[CellNEST] dataset was replaced while loading - result discarded", flush=True)
+                return
             _cellnest_state["data"] = {
                 "ccc_df": ccc_df,
                 "lr_freq": lr_freq,
@@ -8899,8 +9319,9 @@ def _load_cellnest_data(folder: str, dataset_name: str, strip_suffix: str = ""):
             _cellnest_state["message"] = f"Loaded {len(ccc_df):,} interactions"
     except Exception as exc:
         with _cellnest_lock:
-            _cellnest_state["status"] = "error"
-            _cellnest_state["message"] = f"Error: {exc}"
+            if _gen == _dataset_gen:
+                _cellnest_state["status"] = "error"
+                _cellnest_state["message"] = f"Error: {exc}"
         print(f"[CellNEST] load error: {traceback.format_exc()}", flush=True)
 
 
@@ -9893,11 +10314,39 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
                     return zarr_cell_ids.map(series.to_dict()).fillna("Unknown").tolist()
                 return series.reindex(tbl.obs.index.astype(str)).fillna("Unknown").tolist()
 
+            def _align(series: "pd.Series") -> "pd.Series":
+                series = series.copy()
+                series.index = series.index.astype(str)
+                series = series[~series.index.duplicated(keep="first")]
+                _keys = zarr_cell_ids.values if has_cell_id else tbl.obs.index.astype(str)
+                return series.reindex(_keys)
+
+            def _map_na(series: "pd.Series") -> list:
+                """As _map, but a cell without a value stays without one ("" in the
+                store, read back as missing) instead of joining a group "Unknown"."""
+                _al = _align(series.dropna().astype(str))
+                return _al.where(_al.notna(), "").tolist()
+
             if cells_df is not None:
-                # Cluster columns
+                # Cluster / niche / ROI columns: cells SPLIT dropped, cells outside
+                # every ROI and cells outside the subset have no value
                 for method in cluster_methods:
                     if method in cells_df.columns:
-                        tbl.obs[method] = _map(cells_df[method])
+                        tbl.obs[method] = _map_na(cells_df[method])
+                # Embeddings computed in this session (Rerun UMAP, SPLIT UMAP) and any
+                # other numeric per-cell column the re-read table does not carry
+                for _ncol in cells_df.columns:
+                    _always = _ncol in ("umap_1", "umap_2", "split_umap_1", "split_umap_2")
+                    if not _always and (_ncol in tbl.obs.columns or _ncol in cluster_methods
+                                        or str(_ncol).startswith("_")):
+                        continue
+                    if not pd.api.types.is_numeric_dtype(cells_df[_ncol]) \
+                            or pd.api.types.is_bool_dtype(cells_df[_ncol]):
+                        continue
+                    if _always and not cells_df[_ncol].notna().any():
+                        continue
+                    tbl.obs[_ncol] = pd.to_numeric(_align(cells_df[_ncol]),
+                                                   errors="coerce").to_numpy(dtype="float64")
 
             # Cell-type annotations: per-method labels of the exported segmentation
             # (Xenium: labels_<method>; reseg: labels_<method>_<tool>_<run tag>)
@@ -10083,6 +10532,8 @@ def _format_seg_label(tool: str, params: dict) -> str:
             parts.append(f"x={x_min}-{x_max} y={y_min}-{y_max}µm")
         else:
             parts.append("full slide")
+        if params.get("n_patches"):
+            parts.append(f"{params['n_patches']} patches")
         n = params.get("n_cells")
         if n:
             parts.append(f"{n:,} cells")
@@ -10097,6 +10548,8 @@ def _format_seg_label(tool: str, params: dict) -> str:
             parts.append(f"x={x_min}-{x_max} y={y_min}-{y_max}µm")
         else:
             parts.append("full slide")
+        if params.get("n_patches"):
+            parts.append(f"{params['n_patches']} patches")
         n = params.get("n_cells")
         if n:
             parts.append(f"{n:,} cells")
@@ -12060,7 +12513,9 @@ app.layout = html.Div([
             html.Div(style={"marginBottom": "12px"}),
             ctrl_label("Genes to Impute"),
             html.Div(
-                "Leave empty for top-200 highly variable genes. Separate gene names with commas or newlines.",
+                "Leave empty for the 200 most variable reference genes outside the panel. "
+                "Separate gene names with commas or newlines. "
+                "Imputation always uses the original counts (not SPLIT-corrected ones).",
                 style={"fontSize": "10px", "color": MUTED, "marginBottom": "6px", "lineHeight": "1.4"},
             ),
             dcc.Textarea(
@@ -14175,12 +14630,14 @@ def baysor_fill_viewport(_, relayout):
     Output("seg-source",     "value",     allow_duplicate=True),
     Input("baysor-poll",     "n_intervals"),
     State("baysor-done",     "data"),
+    State("seg-source",      "value"),
     prevent_initial_call=True,
 )
-def poll_baysor(_, done_version):
+def poll_baysor(_, done_version, seg_value=None):
     with _baysor_lock:
         status  = _baysor_state["status"]
         message = _baysor_state["message"]
+        has_result = _baysor_state.get("result") is not None
 
     if status == "done":
         out_dir = (_baysor_state.get("result") or {}).get("out_dir", "")
@@ -14188,6 +14645,10 @@ def poll_baysor(_, done_version):
         seg_val = f"baysor:{param_tag}" if param_tag else "baysor"
         return f"✓ {message}", True, (done_version or 0) + 1, seg_val
     if status == "error":
+        # Nothing is loaded for this tool (failed run or failed cached load): do not
+        # leave the dropdown on a Baysor run that is not there.
+        if not has_result and _seg_tool(seg_value) == "baysor":
+            return f"✗ {message}", True, (done_version or 0) + 1, "xenium"
         return f"✗ {message}", True, no_update, no_update
     return message, False, no_update, no_update
 
@@ -14223,12 +14684,14 @@ def proseg_fill_viewport(_, relayout):
     Output("seg-source",     "value",     allow_duplicate=True),
     Input("proseg-poll",     "n_intervals"),
     State("proseg-done",     "data"),
+    State("seg-source",      "value"),
     prevent_initial_call=True,
 )
-def poll_proseg(_, done_version):
+def poll_proseg(_, done_version, seg_value=None):
     with _proseg_lock:
         status  = _proseg_state["status"]
         message = _proseg_state["message"]
+        has_result = _proseg_state.get("result") is not None
 
     if status == "done":
         out_dir = (_proseg_state.get("result") or {}).get("out_dir", "")
@@ -14236,6 +14699,9 @@ def poll_proseg(_, done_version):
         seg_val = f"proseg:{param_tag}" if param_tag else "proseg"
         return f"✓ {message}", True, (done_version or 0) + 1, seg_val
     if status == "error":
+        # see poll_baysor
+        if not has_result and _seg_tool(seg_value) == "proseg":
+            return f"✗ {message}", True, (done_version or 0) + 1, "xenium"
         return f"✗ {message}", True, no_update, no_update
     return message, False, no_update, no_update
 
@@ -14334,6 +14800,8 @@ def run_reseg_modal(n_clicks, algo, patches_confirmed,
                     precorded_samples, pschedule, pnuclear_prob, pprior_seg_prob, pprior_type):
     if not patches_confirmed:
         return "✗ Please confirm patches in Step 1 before running segmentation.", no_update, no_update, no_update
+    # "Skip - run on full tissue" overrides patches left over from earlier in the session
+    skip_patches = patches_confirmed == "skip"
     if algo == "baysor":
         with _baysor_lock:
             if _baysor_state["status"] == "running":
@@ -14344,7 +14812,7 @@ def run_reseg_modal(n_clicks, algo, patches_confirmed,
         scale_std  = float(bscale_std) if bscale_std is not None else None
         min_mol     = int(bmin_mol    or 10)
         n_clusters  = int(bn_clusters or 10)
-        use_patches = "yes" in (buse_patches or [])
+        use_patches = "yes" in (buse_patches or []) and not skip_patches
         prior_conf  = float(bprior_conf or 0.5)
         use_prior_bool = "yes" in (buse_prior or [])
         region = {k: v for k, v in
@@ -14377,6 +14845,7 @@ def run_reseg_modal(n_clicks, algo, patches_confirmed,
                         nuclear_reassign_prob=float(pnuclear_prob) if pnuclear_prob is not None else None,
                         prior_seg_prob=float(pprior_seg_prob) if pprior_seg_prob is not None else None,
                         prior_type=pprior_type or "nucleus",
+                        use_patches=not skip_patches,
                         **region),
             daemon=True,
         ).start()
@@ -14608,9 +15077,13 @@ def load_seg_run_from_cache(seg_value, baysor_ver, proseg_ver):
         else:
             # Claim the state before the thread starts so a second selection
             # (or Run) made meanwhile sees it as busy.
+            # The previously loaded run is dropped here: the figures use `result`
+            # whenever the dropdown names this tool, so keeping it would show (and
+            # annotate / export) the old run under the newly selected name while the
+            # new one loads, and for good if that load fails.
             state.update({"status": "running",
                           "message": f"Loading cached {tool.capitalize()} result…",
-                          "loading_out_dir": out_dir})
+                          "loading_out_dir": out_dir, "result": None})
     if busy:
         # A live run or another cached load of this tool owns the state. A second
         # thread would let whichever finishes last replace the result behind the
@@ -14659,7 +15132,14 @@ def start_spage(n_clicks, rds_path, n_pv, genes_input, seg_source):
         target=lambda: ctx.run(_run_spage_imputation, rds_path, n_pv, genes_str, seg_src),
         daemon=True,
     ).start()
-    return False, "Starting SpaGE…", "Starting SpaGE…", True
+    _start_msg = "Starting SpaGE…"
+    if _active_counts_mode == "corrected":
+        # SpaGE always imputes from the original counts (see _run_spage_imputation)
+        _start_msg = ("Starting SpaGE on the ORIGINAL counts (imputation does not use "
+                      "SPLIT-corrected counts)…")
+        print("  SpaGE: Active Counts is 'SPLIT Corrected', but imputation uses the "
+              "original counts", flush=True)
+    return False, _start_msg, _start_msg, True
 
 
 @app.callback(
@@ -14778,7 +15258,12 @@ def update_gene_options(_spage_version, _ds_version, seg_source):
         result_genes = _spage_state.get("result_genes") or []
     imp_gene_list = sorted(set(imp_genes) | set(result.columns if result is not None else result_genes))
     if imp_gene_list:
-        imp = [{"label": f"{g} [imp]", "value": f"{g} [imp]"} for g in imp_gene_list]
+        # Genes a store lists as imputed from SPLIT-corrected counts (written by
+        # functions/impute.py --use_corrected) are labelled as such; the value keeps
+        # the " [imp]" form every lookup understands.
+        _corr_imp = set(DATA.get("split_corrected_imputed_genes") or [])
+        imp = [{"label": f"{g} [corr+imp]" if g in _corr_imp else f"{g} [imp]",
+                "value": f"{g} [imp]"} for g in imp_gene_list]
         return base + imp
 
     return base
@@ -14981,6 +15466,28 @@ def update_server_log(_):
 
 _repl_globals = globals()  # share module namespace with REPL
 
+_REPL_LOOPBACK_ADDRS = ("127.0.0.1", "::1", "::ffff:127.0.0.1")
+_REPL_LOOPBACK_HOST_RE = re.compile(r"(localhost|127\.0\.0\.1|\[::1\])(:\d{1,5})?", re.IGNORECASE)
+
+
+def _repl_local_request_refusal(request):
+    """Why a REPL request is not accepted in local mode (XENIUM_ENABLE_REPL=1), or None.
+
+    The peer address alone is not enough: a web page whose hostname is re-bound to
+    127.0.0.1 (DNS rebinding) and any reverse proxy on this machine both connect from
+    loopback. So the Host header must itself name loopback, and requests that carry
+    a forwarding header are refused."""
+    if request.remote_addr not in _REPL_LOOPBACK_ADDRS:
+        return "not from localhost"
+    if not _REPL_LOOPBACK_HOST_RE.fullmatch((request.headers.get("Host") or "").strip()):
+        return ("Host header is not localhost / 127.0.0.1 / [::1] "
+                "(open the app through one of these addresses)")
+    for _h in ("X-Forwarded-For", "Forwarded", "X-Forwarded-Host", "X-Real-IP"):
+        if request.headers.get(_h):
+            return (f"request was forwarded by a proxy ({_h} header); local mode does not "
+                    f"serve the REPL through a proxy")
+    return None
+
 
 @app.callback(
     Output("repl-input", "value"),
@@ -14999,8 +15506,9 @@ def run_repl(_, __, code):
         return ""
     if not _REPL_ALLOW_REMOTE:
         import flask as _flask
-        if _flask.request.remote_addr not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
-            print("REPL request refused: not from localhost.", flush=True)
+        _why = _repl_local_request_refusal(_flask.request)
+        if _why:
+            print(f"REPL request refused: {_why}.", flush=True)
             return ""
     with _log_lock:
         _log_buffer.append(f">>> {code}")
@@ -15174,7 +15682,10 @@ def start_prepare_patches(n_clicks, qv):
 def confirm_patches(n_clicks, skip_clicks):
     if not (n_clicks or skip_clicks):
         return no_update, no_update, no_update, no_update
-    return 1, {}, {"display": "none"}, False
+    # "skip" = run on the full tissue: run_reseg_modal then ignores any patches
+    # that exist in the session (for Baysor and Proseg alike)
+    skipped = callback_context.triggered_id == "reseg-skip-patches-btn" and skip_clicks
+    return ("skip" if skipped else 1), {}, {"display": "none"}, False
 
 
 @app.callback(
@@ -15325,9 +15836,10 @@ def _running_jobs() -> list:
             ("UMAP", _umap_reseg_lock, _umap_reseg_state), ("SPLIT", _split_lock, _split_state),
             ("niches", _niche_lock, _niche_state),
             ("spatial analysis", _spatial_lock, _spatial_state),
-            ("Save as SpatialData", _save_sdata_lock, _save_sdata_state)):
+            ("Save as SpatialData", _save_sdata_lock, _save_sdata_state),
+            ("CellNEST load", _cellnest_lock, _cellnest_state)):
         with lock:
-            if state.get("status") in ("running", "starting"):
+            if state.get("status") in ("running", "starting", "loading"):
                 busy.append(name)
     return busy
 
@@ -15354,16 +15866,22 @@ def toggle_sample_modal(open_clicks, close_clicks, is_open):
     Output("gene-selector",       "value",         allow_duplicate=True),
     Output("roi-done",            "data",          allow_duplicate=True),
     Output("spatial-relayout",    "data",          allow_duplicate=True),
+    Output("extra-datasets-version", "data",       allow_duplicate=True),
+    Output("cellnest-version",    "data",          allow_duplicate=True),
     Input("sample-load-btn",      "n_clicks"),
     State("sample-picker",        "value"),
     State("sample-custom-path",   "value"),
     State("dataset-version",      "data"),
     State("roi-done",             "data"),
+    State("extra-datasets-version", "data"),
+    State("cellnest-version",     "data"),
     prevent_initial_call=True,
 )
-def load_sample(n_clicks, picked_path, custom_path, ds_version, roi_done):
-    # seg-source, gene-selector, roi-done, spatial-relayout
-    _nu3 = (no_update, no_update, no_update, no_update)
+def load_sample(n_clicks, picked_path, custom_path, ds_version, roi_done,
+                extra_ver=None, cellnest_ver=None):
+    # seg-source, gene-selector, roi-done, spatial-relayout, extra-datasets-version,
+    # cellnest-version
+    _nu3 = (no_update, no_update, no_update, no_update, no_update, no_update)
     new_dir = (custom_path or "").strip() or picked_path
     if not new_dir:
         return ("Select a sample or enter a path.", no_update, no_update) + _nu3
@@ -15419,6 +15937,15 @@ def load_sample(n_clicks, picked_path, custom_path, ds_version, roi_done):
         with _roi_lock:
             _roi_state["rois"] = []
             _roi_state["pending_hull"] = None
+        # CellNEST results (edges drawn from their own coordinates) and the extra
+        # side-by-side samples (offsets computed against the previous primary)
+        # belong to the previous dataset.
+        with _cellnest_lock:
+            _cellnest_state.update({"status": "idle", "message": "", "data": None})
+        if EXTRA_DATASETS:
+            print(f"  Removed {len(EXTRA_DATASETS)} extra sample(s) of the previous dataset",
+                  flush=True)
+            EXTRA_DATASETS.clear()
         # Re-run autoloads for the new dataset
         _auto_load_rois()
         _annot_autoload()
@@ -15427,7 +15954,8 @@ def load_sample(n_clicks, picked_path, custom_path, ds_version, roi_done):
         print(f"  Loaded new dataset: {new_dir}", flush=True)
         # {}: the stored viewport belongs to the previous dataset
         return ("Loaded.", False, (ds_version or 0) + 1,
-                "xenium", _default_gene, (roi_done or 0) + 1, {})
+                "xenium", _default_gene, (roi_done or 0) + 1, {},
+                (extra_ver or 0) + 1, (cellnest_ver or 0) + 1)
     except Exception as exc:
         import traceback
         traceback.print_exc()
@@ -15540,6 +16068,11 @@ def toggle_cache_clean_modal(open_clicks, cancel_clicks, confirm_clicks):
     if tid == "cache-clean-open-btn" and open_clicks:
         size = _cache_size_str(max_age=0)
         dataset_name = _dataset_name()
+        _busy = _running_jobs()
+        if _busy:
+            return True, (f"Still running: {', '.join(_busy)}. The cache cannot be cleaned "
+                          f"while a job is reading from or writing to it - wait for it to "
+                          f"finish. (Confirm will do nothing.)")
         return True, (f"Delete all cache entries for dataset '{dataset_name}'? "
                       f"Total cache size: {size}. This cannot be undone.")
     return False, no_update
@@ -15562,6 +16095,14 @@ def toggle_cache_clean_modal(open_clicks, cancel_clicks, confirm_clicks):
 def do_clean_cache(n_clicks, version, baysor_ver, proseg_ver):
     if not n_clicks:
         raise dash.exceptions.PreventUpdate
+    # A running job reads from / writes to the directories this would delete
+    # (run directories, the SpatialData store, annotation caches): refuse, as
+    # load_sample does. Nothing is deleted and nothing is reset.
+    _busy = _running_jobs()
+    if _busy:
+        print(f"  Cache clean refused - still running: {', '.join(_busy)}", flush=True)
+        return (False, no_update, f"Cache not cleaned - still running: {', '.join(_busy)}",
+                no_update, no_update, no_update, no_update)
     _clean_cache_for_dataset()
     # The cached runs and the patch store are gone from disk: drop the in-memory
     # handles to them and rebuild the seg-source dropdown (as confirm_seg_delete does).
@@ -16614,12 +17155,21 @@ class _ViewerProvider:
                  "colors": list(cols)}, {"codes": codes})
 
     @staticmethod
-    def _continuous(vals, label):
+    def _continuous(vals, label, colormap=None):
+        """Pack one value per cell. *colormap* (viridis / plasma / magma / cividis) names the
+        scale the values are drawn with when it is not the one of the requested mode."""
         vals = np.asarray(vals, dtype=np.float32)
         finite = vals[np.isfinite(vals)]
         lo = float(finite.min()) if len(finite) else 0.0
         hi = float(finite.max()) if len(finite) else 1.0
-        return {"kind": "continuous", "label": label, "min": lo, "max": hi}, {"values": vals}
+        if len(finite) and hi == lo:
+            # one value everywhere (e.g. a gene with no counts in this run): Plotly's
+            # automatic colour range is then value ± 0.5, i.e. the middle of the scale
+            lo, hi = lo - 0.5, hi + 0.5
+        meta = {"kind": "continuous", "label": label, "min": lo, "max": hi}
+        if colormap:
+            meta["colormap"] = colormap
+        return meta, {"values": vals}
 
     def colors(self, args):
         source = args.get("source", "xenium")
@@ -16638,7 +17188,7 @@ class _ViewerProvider:
                 if col not in df.columns and DATA.get("cluster_methods"):
                     col = cluster_col(DATA["cluster_methods"][0])
             else:
-                cands = [c for c in df.columns if str(c).startswith("cluster")]
+                cands = _reseg_cluster_cols(df.columns)      # as make_spatial_fig picks them
                 pref = [c for c in cands if ("split" in c) == corrected]
                 col = (pref or cands or [None])[0]
             if col is not None and col in df.columns:
@@ -16650,7 +17200,9 @@ class _ViewerProvider:
                                              names={c: f"Cluster {c}" for c in order})
                 vals = df[col]
                 order = sorted(vals.dropna().unique())
-                return self._categorical(vals.values, "Cluster", order=order)
+                # legend entries named as the Plotly traces are (_categorical_traces)
+                return self._categorical(vals.values, "Cluster", order=order,
+                                         names={c: f"Cluster {c}" for c in order})
             mode = "transcript_counts"
 
         if mode.startswith("cell_type:"):
@@ -16659,7 +17211,10 @@ class _ViewerProvider:
                 labels = _annot_state.get(key)
             if labels is not None:
                 aligned = labels.reindex(df.index.astype(str)).fillna("Unknown")
-                return self._categorical(aligned.values, "Cell type")
+                # labels of another segmentation match (almost) no cell of this run:
+                # make_spatial_fig's reseg branch then draws transcript counts instead
+                if alt is None or (aligned == "Unknown").sum() <= len(aligned) * 0.95:
+                    return self._categorical(aligned.values, "Cell type")
             mode = "transcript_counts"
 
         if mode == "niche":
@@ -16683,22 +17238,30 @@ class _ViewerProvider:
             # counts (its fallback for a streamed SpaGE gene applies log1p a second time)
             vals = (_get_expr_values(gene, alt, use_corrected=corrected)
                     if (alt is not None or corrected) else None)
+            if vals is None and alt is not None and corrected:
+                # imputed gene of a reseg run: no corrected values exist, the original
+                # ones are shown (as make_spatial_fig does)
+                vals = _get_expr_values(gene, alt, use_corrected=False)
             if vals is None and alt is None:
                 try:
                     vals = get_gene_expression(gene)
                 except KeyError:          # gene not in this dataset
                     vals = None
             if vals is not None and len(vals) == len(df):
-                return self._continuous(vals, f"{gene} (log1p)")
-            return self._continuous(np.full(len(df), np.nan), f"{gene} (unavailable)")
+                return self._continuous(vals, f"{gene} (log1p)", "plasma")
+            if alt is None:
+                return self._continuous(np.full(len(df), np.nan), f"{gene} (unavailable)", "plasma")
+            # a reseg run without this gene: transcript counts, as make_spatial_fig's fallback
 
+        # The colour scale goes with what is drawn (COLORSCALES; Viridis for the transcript
+        # count fallback), not with the mode that was asked for.
         col = mode if mode in df.columns else "transcript_counts"
         if col not in df.columns:
-            return self._continuous(np.full(len(df), np.nan), "No data")
+            return self._continuous(np.full(len(df), np.nan), "No data", "viridis")
         raw = pd.to_numeric(df[col], errors="coerce").values.astype(np.float64)
         if col == "transcript_counts":
-            return self._continuous(np.log1p(raw), "Transcript Counts (log1p)")
-        return self._continuous(raw, QC_METRICS.get(col, col))
+            return self._continuous(np.log1p(raw), "Transcript Counts (log1p)", "viridis")
+        return self._continuous(raw, QC_METRICS.get(col, col), COLORSCALES.get(col, "Viridis").lower())
 
     def _colors_multi(self, mode, method, gene, df, extras):
         """Colours for the primary sample followed by the extra ones, with the per-mode
@@ -16906,8 +17469,9 @@ class _ViewerProvider:
         for r in rois:
             pts = [[float(x), -float(y)] for x, y in r.get("polygon_xy") or []]
             if len(pts) >= 3:
-                polys.append({"points": pts, "color": r.get("color", "#ffffff"), "width": 2,
-                              "fill": r.get("color", "#ffffff"),
+                # line width and fill opacity (0.18) of _roi_shapes_for_fig
+                polys.append({"points": pts, "color": r.get("color", "#ffffff"), "width": 1.5,
+                              "fill": r.get("color", "#ffffff"), "fillAlpha": 46,
                               "label": f"{r.get('name', '')} ({r.get('cls', '')})"})
         show_roi = args.get("sdata_roi") == "1"
         show_patches = args.get("sdata_patches") == "1"
@@ -16928,7 +17492,7 @@ class _ViewerProvider:
                     for geom in _sdata_transform_to_um(patches).geometry:
                         bx0, by0, bx1, by1 = (float(v) for v in geom.bounds)
                         polys.append({"points": [[bx0, by0], [bx1, by0], [bx1, by1], [bx0, by1]],
-                                      "color": "#ffaa00", "width": 1,
+                                      "color": "#ffaa00", "width": 1, "alpha": 153,   # line opacity 0.6
                                       "fill": "#ffaa00", "fillAlpha": 8})
                 except Exception as exc:
                     print(f"  Patch overlay error: {exc}", flush=True)
@@ -17197,7 +17761,13 @@ if __name__ == "__main__":
     import logging
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
     _port = int(os.environ.get("PORT", 8050))
-    print(f"\nXenium Explorer running at http://localhost:{_port}\n", flush=True)
-    # Bind to localhost by default; set HOST=0.0.0.0 to serve other machines (e.g. in a container).
-    _host = os.environ.get("HOST", "127.0.0.1")
+    # Bind to localhost by default; set XENIUM_HOST=0.0.0.0 to serve other machines
+    # (e.g. in a container). The generic HOST variable is deliberately not read:
+    # csh/tcsh and conda compiler activation export it for other purposes.
+    _host = os.environ.get("XENIUM_HOST", "").strip() or "127.0.0.1"
+    if os.environ.get("HOST") and not os.environ.get("XENIUM_HOST"):
+        print(f"  Note: HOST={os.environ['HOST']!r} is ignored - set XENIUM_HOST to change "
+              f"the bind address (e.g. XENIUM_HOST=0.0.0.0 in a container).", flush=True)
+    print(f"\nXenium Explorer running at http://localhost:{_port} "
+          f"(bound to {_host}:{_port})\n", flush=True)
     app.run(debug=False, host=_host, port=_port)

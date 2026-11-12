@@ -571,6 +571,16 @@ class Viewer {
     return max < min ? [max, min] : [min, max]; // e.g. while a new Min is being typed
   }
 
+  /**
+   * Colour map of the continuous values on screen: the one the colours response names
+   * (the server may answer a mode with other values, e.g. transcript counts where a column
+   * is missing), else state.colormap.
+   */
+  _colormap() {
+    const h = this._colors && this._colors.header;
+    return (h && h.kind === 'continuous' && h.colormap) || this.state.colormap;
+  }
+
   /** Rebuild the per-cell RGBA attribute from the last colours response (no network). */
   _recolor() {
     const cells = this._cells;
@@ -607,7 +617,7 @@ class Viewer {
       fillCategorical(rgba, data, n, col.header.colors || [], mask);
     } else {
       const [min, max] = this._colorRange();
-      fillContinuous(rgba, data, n, min, max, this.state.colormap);
+      fillContinuous(rgba, data, n, min, max, this._colormap());
     }
     const sel = this.state.selected;
     if (sel && sel.length) {
@@ -765,7 +775,8 @@ class Viewer {
         filled: true,
         // fillAlpha: 0-255 (default 64); width 0 draws no outline
         getFillColor: (d) => (d.fill ? [...hexToRgb(d.fill), d.fillAlpha === undefined ? 64 : d.fillAlpha] : [0, 0, 0, 0]),
-        getLineColor: (d) => hexToRgb(d.color || '#ffffff'),
+        // alpha: 0-255 opacity of the outline (default opaque)
+        getLineColor: (d) => [...hexToRgb(d.color || '#ffffff'), d.alpha === undefined ? 255 : d.alpha],
         getLineWidth: (d) => (d.width === 0 ? 0 : d.width || 2),
         lineWidthUnits: 'pixels',
         pickable: false,
@@ -872,7 +883,7 @@ class Viewer {
       box.dataset.kind = 'continuous';
       box.appendChild(el('div', 'xv-title', col.header.label || ''));
       const bar = el('div', 'xv-bar');
-      bar.style.background = colormapCss(this.state.colormap);
+      bar.style.background = colormapCss(this._colormap());
       box.appendChild(bar);
       const [min, max] = this._colorRange();
       const range = el('div', 'xv-range');
@@ -1297,7 +1308,7 @@ class Viewer {
       if (box.range) {
         const n = 32, vals = new Float32Array(n), rgba = new Uint8Array(4 * n);
         for (let i = 0; i < n; i++) vals[i] = i / (n - 1);
-        fillContinuous(rgba, vals, n, 0, 1, this.state.colormap);
+        fillContinuous(rgba, vals, n, 0, 1, this._colormap());
         const grad = g.createLinearGradient(x + PAD, 0, x + W - PAD, 0);
         for (let i = 0; i < n; i++) grad.addColorStop(i / (n - 1), `rgb(${rgba[4 * i]},${rgba[4 * i + 1]},${rgba[4 * i + 2]})`);
         g.fillStyle = grad;

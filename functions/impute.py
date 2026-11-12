@@ -121,10 +121,33 @@ def _vectorized_spage(spatial_df: pd.DataFrame,
 
 # ── Reference loading ──────────────────────────────────────────────────────────
 
-def _load_reference(rds_path: str, genes_needed: list) -> tuple[pd.DataFrame, list]:
+# R: the %d highest-variance genes among .spage_cand (rows of rna_mat_data); row sums
+# are accumulated over blocks of cells so that no second copy of the matrix is made.
+_HVG_R = """
+local({
+  m <- rna_mat_data; n <- ncol(m)
+  s1 <- numeric(nrow(m)); s2 <- numeric(nrow(m))
+  for (j0 in seq(1L, n, by = 20000L)) {
+    b  <- m[, j0:min(n, j0 + 19999L), drop = FALSE]
+    s1 <- s1 + Matrix::rowSums(b)
+    s2 <- s2 + Matrix::rowSums(b * b)
+  }
+  v <- (s2 - s1 * s1 / n) / max(n - 1, 1)
+  names(v) <- rownames(m)
+  cand <- .spage_cand[.spage_cand %%in%% names(v)]
+  v <- v[cand]
+  cand[order(-v)[seq_len(min(%dL, length(cand)))]]
+})
+"""
+
+
+def _load_reference(rds_path: str, genes_needed: list,
+                    auto_hvg_exclude=None, n_hvg: int = 200) -> tuple[pd.DataFrame, list]:
     """
     Load a Seurat RDS file and extract a cells × genes_needed submatrix via rpy2.
-    Returns (rna_df, genes_actually_loaded).
+    With auto_hvg_exclude (the panel genes), the n_hvg highest-variance reference
+    genes outside that set are selected in R and loaded as well.
+    Returns (rna_df, all gene names of the reference).
     """
     import rpy2.robjects as ro
     import rpy2.robjects.conversion as _rconv
@@ -134,40 +157,52 @@ def _load_reference(rds_path: str, genes_needed: list) -> tuple[pd.DataFrame, li
     importr("SeuratObject")
     importr("Matrix")
 
-    rds_path_r = rds_path.replace("\\", "/")
-    ro.r(f'seurat_ref <- readRDS("{rds_path_r}")')
-    ro.r('rna_ref   <- seurat_ref[["RNA"]]')
-    # LayerData works for both Assay (v3/v4) and Assay5 (v5) objects
-    ro.r('rna_mat_data <- SeuratObject::LayerData(rna_ref, layer="data")')
-    ro.r('rna_genes <- rownames(rna_mat_data)')
-    all_rna_genes = list(ro.r("rna_genes"))
+    try:
+        # The path is passed as a value, never pasted into R source (a quote or a
+        # backslash in it would break the parse or run as code)
+        ro.globalenv["seurat_ref"] = importr("base").readRDS(rds_path)
+        ro.r('rna_ref   <- seurat_ref[["RNA"]]')
+        # LayerData works for both Assay (v3/v4) and Assay5 (v5) objects
+        ro.r('rna_mat_data <- SeuratObject::LayerData(rna_ref, layer="data")')
+        ro.r('rna_genes <- rownames(rna_mat_data)')
+        all_rna_genes = list(ro.r("rna_genes"))
 
-    # Filter to genes that exist in the reference
-    genes_needed_r = [g for g in genes_needed if g in all_rna_genes]
-    if not genes_needed_r:
-        raise ValueError("None of the requested genes were found in the reference.")
+        if auto_hvg_exclude is not None:
+            # Auto mode: top-n_hvg genes by variance over ALL genes outside the panel
+            # (not only the first 2000 in the reference's row order)
+            _excl = set(auto_hvg_exclude)
+            _cand = [g for g in all_rna_genes if g not in _excl]
+            ro.globalenv[".spage_cand"] = ro.StrVector(_cand)
+            _top = [str(g) for g in ro.r(_HVG_R % int(n_hvg))]
+            print(f"  Auto-selected {len(_top)} highly variable genes out of "
+                  f"{len(_cand):,} non-panel reference genes", flush=True)
+            genes_needed = list(genes_needed) + _top
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        mat_file   = os.path.join(tmpdir, "mat.mtx").replace("\\", "/")
-        genes_file = os.path.join(tmpdir, "genes.txt").replace("\\", "/")
-        cells_file = os.path.join(tmpdir, "cells.txt").replace("\\", "/")
+        # Filter to genes that exist in the reference
+        genes_needed_r = [g for g in genes_needed if g in all_rna_genes]
+        if not genes_needed_r:
+            raise ValueError("None of the requested genes were found in the reference.")
 
-        genes_r = "c(" + ",".join(f'"{g}"' for g in genes_needed_r) + ")"
-        ro.r(f"""
-genes_sub  <- {genes_r}
-genes_sub  <- genes_sub[genes_sub %in% rna_genes]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ro.globalenv[".spage_genes"] = ro.StrVector(genes_needed_r)
+            ro.globalenv[".spage_dir"]   = tmpdir
+            ro.r("""
+genes_sub  <- .spage_genes[.spage_genes %in% rna_genes]
 mat_sub    <- rna_mat_data[genes_sub, , drop=FALSE]
-Matrix::writeMM(mat_sub, "{mat_file}")
-writeLines(rownames(mat_sub), "{genes_file}")
-writeLines(colnames(mat_sub), "{cells_file}")
+Matrix::writeMM(mat_sub, file.path(.spage_dir, "mat.mtx"))
+writeLines(rownames(mat_sub), file.path(.spage_dir, "genes.txt"))
+writeLines(colnames(mat_sub), file.path(.spage_dir, "cells.txt"))
 """)
-        mat_sp = sio.mmread(mat_file).T.tocsr()   # cells × genes
-        with open(genes_file) as f:
-            loaded_genes = [l.strip() for l in f]
-        with open(cells_file) as f:
-            ref_cells = [l.strip() for l in f]
-
-    ro.r("rm(seurat_ref, rna_ref, rna_mat_data, mat_sub); gc()")
+            mat_sp = sio.mmread(os.path.join(tmpdir, "mat.mtx")).T.tocsr()   # cells × genes
+            with open(os.path.join(tmpdir, "genes.txt")) as f:
+                loaded_genes = [l.strip() for l in f]
+            with open(os.path.join(tmpdir, "cells.txt")) as f:
+                ref_cells = [l.strip() for l in f]
+    finally:
+        # also on errors: do not leave the multi-GB reference in the R heap
+        ro.r('suppressWarnings(rm(list = intersect(c("seurat_ref", "rna_ref", "rna_mat_data", '
+             '"mat_sub", "rna_genes", "genes_sub", ".spage_cand", ".spage_genes", ".spage_dir"), '
+             'ls(all.names = TRUE, envir = globalenv())), envir = globalenv())); invisible(gc())')
 
     rna_df = pd.DataFrame(
         mat_sp.toarray().astype(np.float32),
@@ -202,8 +237,12 @@ def impute(sdata_path: str,
     overwrite     : Overwrite output if it exists
     use_corrected : Use the X_corrected layer (SPLIT output) as input counts instead of X.
                     Raises ValueError if X_corrected is not present in the zarr.
-                    Imputed genes are tagged with '[corr+imp]' suffix and stored in
-                    adata.uns["split_corrected_imputed_genes"].
+                    The imputed genes are then listed in
+                    adata.uns["split_corrected_imputed_genes"] (instead of
+                    uns["imputed_genes"]); the app labels them '[corr+imp]'.
+
+    Imputed genes are appended to X under their plain gene names with
+    var["is_imputed"] = True, exactly as the app writes them.
     spage_repo    : Path to SpaGE_repo. Defaults to ../SpaGE_repo relative to this script
 
     Returns
@@ -294,11 +333,15 @@ def impute(sdata_path: str,
     from rpy2.robjects.packages import importr
     _rconv.set_conversion(ro.default_converter)
     importr("SeuratObject")
-    # R identifiers cannot start with "_" — use dot-prefixed temporaries
-    ro.r(f'.tmp_ref <- readRDS("{rds_path.replace(chr(92), "/")}")')
-    ro.r('.tmp_genes <- rownames(SeuratObject::LayerData(.tmp_ref[["RNA"]], layer="data"))')
-    all_rna_genes = list(ro.r(".tmp_genes"))
-    ro.r("rm(.tmp_ref, .tmp_genes); gc()")
+    # R identifiers cannot start with "_" — use dot-prefixed temporaries.
+    # The path is passed as a value, not pasted into R source.
+    try:
+        ro.globalenv[".tmp_ref"] = importr("base").readRDS(rds_path)
+        ro.r('.tmp_genes <- rownames(SeuratObject::LayerData(.tmp_ref[["RNA"]], layer="data"))')
+        all_rna_genes = list(ro.r(".tmp_genes"))
+    finally:
+        ro.r('suppressWarnings(rm(list = intersect(c(".tmp_ref", ".tmp_genes"), '
+             'ls(all.names = TRUE, envir = globalenv())), envir = globalenv())); invisible(gc())')
 
     # ── Determine shared genes and genes_to_predict ────────────────────────────
     shared_genes = sorted(panel_gene_set & set(all_rna_genes))
@@ -308,10 +351,10 @@ def impute(sdata_path: str,
 
     auto_hvg = genes is None
     if auto_hvg:
-        predict_candidates = [g for g in all_rna_genes if g not in panel_gene_set]
-        # Load a pool of candidates for variance-based HVG selection
-        genes_needed = shared_genes + predict_candidates[:2000]
-        print("  Auto-HVG mode: loading up to 2000 candidate genes …", flush=True)
+        # The 200 highest-variance genes over all non-panel reference genes are
+        # chosen in R when the reference is loaded (see _load_reference)
+        genes_needed = list(shared_genes)
+        print("  Auto-HVG mode: ranking all non-panel reference genes by variance …", flush=True)
     else:
         genes_to_predict = [g for g in genes
                             if g in all_rna_genes and g not in panel_gene_set]
@@ -329,25 +372,26 @@ def impute(sdata_path: str,
 
     # ── Load reference submatrix ───────────────────────────────────────────────
     print("Extracting reference expression submatrix …", flush=True)
-    rna_df, _ = _load_reference(rds_path, genes_needed)
+    rna_df, _ = _load_reference(rds_path, genes_needed,
+                                auto_hvg_exclude=panel_gene_set if auto_hvg else None)
 
-    # HVG selection for auto mode
+    # Auto mode: the genes _load_reference selected (in order of decreasing variance)
     if auto_hvg:
-        predict_pool = [g for g in rna_df.columns if g not in panel_gene_set]
-        var_scores   = rna_df[predict_pool].var(axis=0)
-        genes_to_predict = var_scores.nlargest(200).index.tolist()
-        print(f"  Auto-selected {len(genes_to_predict)} HVGs", flush=True)
+        genes_to_predict = [g for g in rna_df.columns if g not in panel_gene_set]
     else:
         genes_to_predict = [g for g in genes_to_predict if g in rna_df.columns]
 
-    # Skip genes already imputed into this table (re-run on own output would duplicate var names)
-    gene_suffix = " [corr+imp]" if use_corrected else " [imp]"
-    _existing   = set(adata.var_names)
-    _dup = [g for g in genes_to_predict if g + gene_suffix in _existing]
+    # Skip genes already imputed into this table (a re-run on own output would
+    # duplicate var names). Imputed genes are stored under their plain names, as
+    # the app does; stores written by older versions used a ' [imp]' / ' [corr+imp]'
+    # suffix, which is recognised here too.
+    _existing = set(adata.var_names)
+    _dup = [g for g in genes_to_predict
+            if g in _existing or f"{g} [imp]" in _existing or f"{g} [corr+imp]" in _existing]
     if _dup:
         print(f"  Warning: {len(_dup)} genes already imputed in this table (skipped): "
               f"{_dup[:10]}", flush=True)
-        genes_to_predict = [g for g in genes_to_predict if g + gene_suffix not in _existing]
+        genes_to_predict = [g for g in genes_to_predict if g not in set(_dup)]
 
     if not genes_to_predict:
         raise ValueError("No valid genes to predict after filtering against loaded reference.")
@@ -378,8 +422,10 @@ def impute(sdata_path: str,
     # ── Build output AnnData (original + imputed columns) ─────────────────────
     print("Building output AnnData …", flush=True)
 
-    # Tag gene names with [corr+imp] when imputing on corrected counts
-    tagged_genes  = [g + gene_suffix for g in genes_to_predict]
+    # Same convention as the app: plain gene name as var name plus var["is_imputed"].
+    # (The app shows them as "GENE [imp]", or "GENE [corr+imp]" for the genes listed
+    # in uns["split_corrected_imputed_genes"]; the suffix is a label, not a name.)
+    tagged_genes  = list(genes_to_predict)
 
     imp_X   = sp.csr_matrix(imp_df.values.astype(np.float32))
     imp_var = pd.DataFrame(
