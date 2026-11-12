@@ -203,14 +203,16 @@ What it draws:
 - **Click a cell** to fill the cell-info panel, from either the spatial view or the UMAP. Hovering shows the cell id and its value. Double-click a legend entry to isolate that category.
 - **Ruler**: end points snap to a cell centre when one is hit and are free otherwise.
 - **Overlays**: SpatialData ROI and patch outlines, CellNEST edges with their colour and gray-out options, and RCTD weight pies.
-- **Multiple samples** side by side with separators; boundaries, transcripts, image and UMAP remain primary-sample only, as in the Plotly view.
+- **Multiple samples** side by side, with a dotted separator midway in each gap; boundaries, transcripts, image and UMAP remain primary-sample only, as in the Plotly view. Clicking a cell of any sample fills the cell-info panel; cells of an added sample are marked `[sample N: <folder>]`.
 - **PNG export**: the **PNG** button next to Pan / Lasso / Box downloads the current view at 2× with legend and scale bar.
 
-Differences from the Plotly view: the Z-Level selector is disabled (the WebGL view reads the focus image); CellNEST arrowheads scale with edge length and edges have no hover text; gray-out dims every non-participating cell. CellNEST edges, RCTD pies, multi-sample display and Baysor/Proseg outlines have so far been tested in this view with synthetic inputs only.
+Differences from the Plotly view: the Z-Level selector is disabled (the WebGL view reads the focus image); CellNEST arrowheads scale with edge length and edges have no hover text; gray-out dims every non-participating cell. CellNEST edges have so far been tested in this view with synthetic inputs only.
+
+Both views degrade the same way when the selected colour cannot be drawn: a gene the dataset (or the Baysor/Proseg run) does not have is drawn as transcript counts; a cell-type mode with no labels loaded is drawn as one grey **No annotation** group on the Xenium source and as transcript counts on a Baysor/Proseg run; cell-type labels that match fewer than 5 % of a run's cells (left from another segmentation) are discarded and transcript counts are drawn.
 
 Measured on a Xenium Prime 5K run with 112,551 cells: a recolour transfers about 0.45 MB per view and takes a few milliseconds of server time, against 5–7 MB of JSON per Plotly figure and roughly a second of server time.
 
-Requirements and limits: a browser with WebGL2; the feature is new, so fall back to the Plotly view if something looks wrong. The browser bundle is prebuilt in `assets/`; Node.js is needed only to rebuild it (see [Developing the WebGL viewer](#developing-the-webgl-viewer)).
+Requirements and limits: a browser with WebGL2. When WebGL2 is missing or its context cannot be created, the app switches back to the Plotly view by itself, greys out the WebGL option and says why in the status line next to the selector (reload the page to try again). The Plotly view draws its points with WebGL 1, so with WebGL switched off altogether neither view can draw cells; the status line says so. The feature is new, so switch to the Plotly view if something looks wrong. The browser bundle is prebuilt in `assets/`; Node.js is needed only to rebuild it (see [Developing the WebGL viewer](#developing-the-webgl-viewer)).
 
 **Layout:**
 - The plots row and the bottom info bar are separated by a **vertical drag handle** — drag it to resize the panels.
@@ -781,6 +783,8 @@ node test/run.mjs                                  # viewer core against dev_ser
 node image_test/verify.mjs                         # image layer: decode and placement
 node test/app_smoke.mjs http://127.0.0.1:8050 out/ # the real app, started with XENIUM_RENDERER=webgl
 node test/glue_checks.mjs http://127.0.0.1:8050    # renderer switching, selection and image handling in the real app
+node test/webgl_fallback.mjs http://127.0.0.1:8050 # automatic fallback to Plotly without WebGL2 (browsers started with WebGL disabled)
+node test/real_results.mjs                         # WebGL against Plotly on real Baysor/Proseg/RCTD/SPLIT/SpaGE results; starts its own app (paths: see the top of the file)
 ```
 
 | Path | Contents |
@@ -836,6 +840,9 @@ A review of the code base fixed a number of defects. Most are invisible, but the
 - **`subset()` / `unsubset()`** apply to every loaded Baysor/Proseg run, not only to Proseg when both tools hold a result. Area filters on a bundle without area columns are skipped with a message, and a filter that fails no longer leaves the app marked "SUBSET ACTIVE".
 - **Spatial niches computed under a subset** are kept after `unsubset()` (cells outside the subset have no niche).
 - **Load Sample** removes the extra side-by-side samples and the CellNEST results of the previous dataset.
+- **RCTD weight pies in the Plotly view** are drawn. Their wedges were sent as SVG arcs, which plotly.js does not draw, so each wedge was an invisible zero-area line.
+- **Side-by-side samples (Plotly view)**: Color by Cluster no longer fails when an added sample has no cluster sets (its cells form one group, e.g. `S1:C0`); the dotted separator sits midway in the gap between two samples instead of inside the first one when the added sample's coordinates do not start at 0; clicking a cell of an added sample fills the cell-info panel instead of reporting the cell as not found.
+- **Unavailable colours** are handled the same way in both views (see [WebGL view](#webgl-view-beta)): a gene missing from the dataset no longer raises an error in the Plotly view, and the WebGL view shows grey **No annotation** cells where it used to show transcript counts.
 - **Cache: Clean** is refused while a background job is running.
 - **Bind address** is read from `XENIUM_HOST`; `HOST` is ignored. A container that set `HOST=0.0.0.0` must set `XENIUM_HOST=0.0.0.0`.
 - **REPL in local mode** (`XENIUM_ENABLE_REPL=1`) additionally requires a loopback `Host` header and refuses forwarded requests, so it no longer works through a reverse proxy; use `remote` there, on a trusted network.

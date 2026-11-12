@@ -116,6 +116,32 @@ def _label_key_for_active_seg(label_key, alt_res=None):
     with _annot_lock:
         return _alt_key if _annot_state.get(_alt_key) is not None else None
 
+
+def _reseg_cell_type_labels(method: str, alt_res, cell_ids_str):
+    """Cell-type labels of *method* for a Baysor / Proseg run, aligned to *cell_ids_str*
+    ("Unknown" where a cell has none), or None when there are none. Labels that match
+    fewer than 5 % of the run's cells belong to another segmentation (stale): they are
+    removed from _annot_state and None is returned. Every view of a reseg source - Plotly
+    spatial and UMAP, the WebGL colour endpoint - goes through here, so all of them fall
+    back to transcript counts in the same state and leave the same state behind."""
+    lkey = _labels_key_for_method(method, alt_res)
+    with _annot_lock:
+        labels = _annot_state.get(lkey)
+    if labels is None:
+        return None
+    aligned = labels.reindex(pd.Index(cell_ids_str)).fillna("Unknown")
+    n_unknown = int((aligned == "Unknown").sum())
+    if n_unknown > len(aligned) * 0.95:
+        print(f"  Warning: cell_type:{method} produced {n_unknown}/{len(aligned)} Unknown "
+              f"— labels index sample: {list(labels.index[:3])!r}, "
+              f"cells sample: {list(cell_ids_str[:3])!r}"
+              f" — stale labels cleared, re-run annotation", flush=True)
+        with _annot_lock:
+            if _annot_state.get(lkey) is labels:
+                _annot_state.pop(lkey, None)
+        return None
+    return aligned
+
 # ─── Baysor segmentation state ────────────────────────────────────────────────
 _baysor_state: dict = {"status": "idle", "message": "", "result": None}
 _baysor_lock  = threading.Lock()
@@ -7255,6 +7281,28 @@ _refresh_derived_data()
 EXTRA_DATASETS: list = []
 
 
+def _sample_separator_xs() -> list:
+    """x (µm, plot space) of the dashed line drawn left of each extra sample: midway
+    between the right edge of the sample before it and its own left edge. (x_offset moves
+    a sample's *minimum* x 500 µm past the previous sample, so x_offset - 250 is in the
+    gap only when that minimum is 0.) Used by both renderers."""
+    xs = []
+    try:
+        prev_max = float(DATA["df"]["x_centroid"].max())
+    except Exception:
+        prev_max = float("nan")
+    for eds in EXTRA_DATASETS:
+        off = float(eds.get("x_offset", 0.0))
+        ex = eds["df"]["x_centroid"]
+        lo = float(ex.min()) + off if len(ex) else float("nan")
+        hi = float(ex.max()) + off if len(ex) else float("nan")
+        xs.append((prev_max + lo) / 2.0 if np.isfinite(prev_max) and np.isfinite(lo)
+                  else off - 250.0)
+        if np.isfinite(hi):
+            prev_max = hi
+    return xs
+
+
 # ─── Data helpers ─────────────────────────────────────────────────────────────
 def get_gene_expression(gene: str) -> np.ndarray:
     """log1p expression for *gene*, aligned to DATA['df'] row order.
@@ -7330,6 +7378,22 @@ def get_gene_expression(gene: str) -> np.ndarray:
     result = np.log1p(vals)
     _gene_cache_put(_cache_key, result)
     return result
+
+
+def _xenium_gene_values(gene, use_corrected: bool = False):
+    """Values the Xenium source colours *gene* with (SPLIT-corrected when asked for and
+    available, else get_gene_expression), or None when the dataset has no such gene - a
+    selection left from another dataset, or no selection. Both renderers then draw
+    transcript counts, as they do for a Baysor / Proseg run without the gene."""
+    if not gene:
+        return None
+    vals = _get_expr_values(gene, use_corrected=True) if use_corrected else None
+    if vals is None:
+        try:
+            vals = get_gene_expression(gene)
+        except KeyError:
+            return None
+    return vals
 
 
 def _panel_gene_names() -> list:
@@ -7497,9 +7561,13 @@ def _cell_type_traces(x, y, df, size, opacity, mode="spatial", labels_key="label
     with _annot_lock:
         labels = _annot_state.get(labels_key)
     if labels is None:
+        _ids = df.index.tolist()        # ids as on every other trace: hover and click work
         return [go.Scattergl(x=x, y=y, mode="markers",
-                             marker=dict(size=size, color=MUTED, opacity=opacity),
-                             name="No annotation")]
+                             marker=dict(size=(size if mode == "spatial" else max(2, size * 1.3)),
+                                         color=MUTED, opacity=opacity),
+                             text=_ids, customdata=_ids,
+                             hovertemplate="<b>%{text}</b><extra>No annotation</extra>",
+                             name="No annotation", showlegend=(mode == "spatial"))]
 
     # Align labels to df index — cast both to str to handle int vs str mismatch
     aligned = labels.reindex(df.index.astype(str)).fillna("Unknown")
@@ -7794,36 +7862,23 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
 
         elif color_by.startswith("cell_type:"):
             _method = color_by.split(":")[1]
-            _lkey   = _labels_key_for_method(_method, alt_res)
-            with _annot_lock:
-                labels = _annot_state.get(_lkey)
-            if labels is not None:
-                aligned = labels.reindex(pd.Index(cell_ids_str)).fillna("Unknown")
-                n_unknown = (aligned == "Unknown").sum()
-                if n_unknown > len(aligned) * 0.95:
-                    print(f"  Warning: cell_type:{_method} produced {n_unknown}/{len(aligned)} Unknown "
-                          f"— labels index sample: {list(labels.index[:3])!r}, "
-                          f"cells sample: {cell_ids_str[:3]!r}"
-                          f" — stale labels cleared, re-run annotation", flush=True)
-                    with _annot_lock:
-                        _annot_state.pop(_lkey, None)
-                    labels = None
-                if labels is None:
-                    color_by = "transcript_counts"
-                else:
-                    cell_types = sorted(aligned.unique())
-                    cmap = {ct: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, ct in enumerate(cell_types)}
-                    traces = []
-                    for ct in cell_types:
-                        mask = (aligned == ct).values
-                        traces.append(go.Scattergl(
-                            x=x[mask], y=y[mask], mode="markers",
-                            marker=dict(size=size, color=cmap[ct], opacity=opacity),
-                            name=ct, legendgroup=ct, showlegend=True,
-                            text=_ids_arr[mask], customdata=_ids_arr[mask],
-                            hovertemplate="<b>%{text}</b><extra>" + ct + "</extra>",
-                        ))
-                    show_legend = True
+            aligned = _reseg_cell_type_labels(_method, alt_res, cell_ids_str)
+            if aligned is None:     # no labels, or stale ones (cleared by the helper)
+                color_by = "transcript_counts"
+            else:
+                cell_types = sorted(aligned.unique())
+                cmap = {ct: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, ct in enumerate(cell_types)}
+                traces = []
+                for ct in cell_types:
+                    mask = (aligned == ct).values
+                    traces.append(go.Scattergl(
+                        x=x[mask], y=y[mask], mode="markers",
+                        marker=dict(size=size, color=cmap[ct], opacity=opacity),
+                        name=ct, legendgroup=ct, showlegend=True,
+                        text=_ids_arr[mask], customdata=_ids_arr[mask],
+                        hovertemplate="<b>%{text}</b><extra>" + ct + "</extra>",
+                    ))
+                show_legend = True
 
         elif color_by == "gene":
             vals = _get_expr_values(gene, alt_res, use_corrected=use_corrected)
@@ -7908,8 +7963,7 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
 
             # Build per-sample separator annotations (vertical dashed lines)
             _separator_shapes = []
-            for eds in EXTRA_DATASETS:
-                sep_x = eds["x_offset"] - 250  # midpoint of gap
+            for sep_x in _sample_separator_xs():     # middle of each gap
                 _separator_shapes.append(dict(
                     type="line", x0=sep_x, x1=sep_x,
                     y0=0, y1=1, yref="paper",
@@ -7941,9 +7995,14 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                                 color_idx += 1
                         all_clust_names.extend(prefixed)
                     else:
+                        # a sample without cluster sets (or without this one): one
+                        # placeholder group, coloured like any other label
                         placeholders = [f"S{di}:C0"] * len(edf)
                         all_clust_vals.extend(placeholders)
                         all_clust_names.extend(placeholders)
+                        if placeholders and placeholders[0] not in cmap_combined:
+                            cmap_combined[placeholders[0]] = CLUSTER_COLORS[color_idx % len(CLUSTER_COLORS)]
+                            color_idx += 1
 
                 # Build one trace per unique cluster-label across all samples
                 unique_labels = list(dict.fromkeys(all_clust_vals))
@@ -8032,7 +8091,9 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                 all_vals = []
                 for di, edf in enumerate(all_dfs):
                     if di == 0:
-                        all_vals.append(get_gene_expression(gene))
+                        _v0 = _xenium_gene_values(gene)     # None: not in this sample
+                        all_vals.append(_v0 if _v0 is not None and len(_v0) == len(edf)
+                                        else np.zeros(len(edf)))
                     else:
                         eds = EXTRA_DATASETS[di - 1]
                         g_idx = eds.get("gene_name_to_idx", {}).get(gene)
@@ -8118,6 +8179,12 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
             # (`cluster_col` is a local name in this function: spell the column out)
             if color_by == "cluster" and f"clust__{method}" not in df.columns:
                 color_by = "transcript_counts"
+            # ... and for a gene this dataset does not have (as a reseg run without it)
+            _gene_vals = None
+            if color_by == "gene":
+                _gene_vals = _xenium_gene_values(gene, use_corrected)
+                if _gene_vals is None or len(_gene_vals) != len(df):
+                    color_by = "transcript_counts"
             if color_by == "niche":
                 if "niche" in df.columns:
                     _niche_vals = df["niche"].astype(str)
@@ -8149,8 +8216,7 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                 _pie_shapes = _rctd_pie_shapes_for_view(color_by, relayout) or []
                 show_legend = True
             elif color_by == "gene":
-                _cv = _get_expr_values(gene, use_corrected=True) if use_corrected else None
-                vals = _cv if _cv is not None else get_gene_expression(gene)
+                vals = _gene_vals
                 traces = [go.Scattergl(
                     x=x, y=y, mode="markers",
                     marker=dict(size=size, color=vals, colorscale="Plasma", opacity=opacity,
@@ -8869,11 +8935,8 @@ def make_umap_fig(color_by, method, gene, size, opacity,
 
         if color_by.startswith("cell_type:"):
             _method    = color_by.split(":")[1]
-            labels_key = _labels_key_for_method(_method, alt_res)
-            with _annot_lock:
-                labels = _annot_state.get(labels_key)
-            if labels is not None:
-                aligned    = labels.reindex(pd.Index(cell_ids_str)).fillna("Unknown")
+            aligned    = _reseg_cell_type_labels(_method, alt_res, cell_ids_str)
+            if aligned is not None:
                 cell_types = sorted(aligned.unique())
                 cmap = {ct: CLUSTER_COLORS[i % len(CLUSTER_COLORS)] for i, ct in enumerate(cell_types)}
                 traces = []
@@ -9030,6 +9093,11 @@ def make_umap_fig(color_by, method, gene, size, opacity,
                 and not color_by.startswith(("cell_type:", "roi_"))
                 and color_by not in df.columns):
             color_by = "transcript_counts"
+        _gene_vals = None
+        if color_by == "gene":       # a gene this dataset does not have: see make_spatial_fig
+            _gene_vals = _xenium_gene_values(gene, use_corrected)
+            if _gene_vals is None or len(_gene_vals) != len(DATA["df"]):
+                color_by = "transcript_counts"
 
         if color_by == "niche":
             if "niche" in df.columns:
@@ -9060,12 +9128,7 @@ def make_umap_fig(color_by, method, gene, size, opacity,
             # df may be a subset of DATA["df"] (cells with valid UMAP coords).
             # Use positional index into the full DATA["df"] to align expression values.
             _df_idx = DATA["df"].index.get_indexer(df.index)
-            _cv_full = _get_expr_values(gene, use_corrected=use_corrected) if use_corrected else None
-            if _cv_full is not None:
-                vals = _cv_full[_df_idx]
-            else:
-                _ge_full = get_gene_expression(gene)
-                vals = _ge_full[_df_idx]
+            vals = _gene_vals[_df_idx]
             _ckw = {}
             if cbar_range:
                 if cbar_range[0] is not None: _ckw["cmin"] = cbar_range[0]
@@ -10661,17 +10724,18 @@ def _xy_to_svg_path(xy: list) -> str:
 
 
 def _svg_sector(cx, cy, r, theta1, theta2):
-    """SVG path string for a filled wedge in data coordinates."""
+    """SVG path string for a filled wedge in data coordinates.
+
+    The arc is written as line segments (at least two, one per 15° at most - the polygon
+    the WebGL view draws): plotly.js converts only the M / L / Z style commands of a
+    data-referenced shape path, an ``A`` command is dropped and the wedge collapses to a
+    zero-area line."""
     import math
-    large = 1 if (theta2 - theta1) > math.pi else 0
-    x1 = cx + r * math.cos(theta1)
-    y1 = cy + r * math.sin(theta1)
-    x2 = cx + r * math.cos(theta2)
-    y2 = cy + r * math.sin(theta2)
-    if abs(theta2 - theta1 - 2 * math.pi) < 1e-6:   # full circle edge case
-        x2 = cx + r * math.cos(theta1 + 2 * math.pi - 1e-6)
-        y2 = cy + r * math.sin(theta1 + 2 * math.pi - 1e-6)
-    return f"M {cx},{cy} L {x1},{y1} A {r},{r},0,{large},1,{x2},{y2} Z"
+    span = theta2 - theta1
+    n_seg = max(2, int(math.ceil(abs(span) / (math.pi / 12))))
+    pts = [(cx, cy)] + [(cx + r * math.cos(theta1 + span * k / n_seg),
+                         cy + r * math.sin(theta1 + span * k / n_seg)) for k in range(n_seg + 1)]
+    return "M " + " L ".join(f"{px:.3f},{py:.3f}" for px, py in pts) + " Z"
 
 
 def _build_rctd_pie_shapes(df, weights_df, ct_colors, radius_um=RCTD_PIE_RADIUS_UM):
@@ -13434,12 +13498,17 @@ app.clientside_callback(
     prevent_initial_call=True,
 )
 def store_relayout(relayout_data, current):
+    # Nothing to store -> no_update, not the unchanged value: writing the store re-runs
+    # update_plots, and Dash drops the answer of a figure request that is still in flight
+    # when a newer one for the same output starts. A graph that has just become visible
+    # (renderer switched to Plotly, e.g. by the automatic fallback from WebGL) emits such
+    # an autosize-only event while its figure is being built, and stayed on "Loading…".
     if not relayout_data:
-        return current or {}
+        return no_update
     # If the event contains width/height, it's a container resize — ignore range
     # changes to prevent progressive zoom-out when UMAP panel opens/closes.
     if "width" in relayout_data or "height" in relayout_data:
-        return current or {}
+        return no_update
     merged = dict(current or {})
     for ax in ("xaxis", "yaxis"):
         # Autoscale / double-click: the stored zoom is no longer what is on screen
@@ -13457,7 +13526,7 @@ def store_relayout(relayout_data, current):
     for k, v in relayout_data.items():
         if k not in ignore:
             merged[k] = v
-    return merged
+    return no_update if merged == (current or {}) else merged
 
 
 @app.callback(
@@ -13603,8 +13672,8 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
         # selections for one callback round; fall back to this dataset's defaults.
         if method is not None and method not in _cm:
             method = _cm[0] if _cm else None
-        if gene and gene not in DATA["gene_name_to_idx"] and not gene.endswith("]"):
-            gene = _default_gene
+        # (a gene this dataset does not have is not replaced here: the figure builders
+        # draw transcript counts for it, as the WebGL view and the reseg sources do)
     if color_by == "cluster" and method is None and not (baysor_on or proseg_on):
         color_by = "transcript_counts"   # dataset has no Xenium cluster sets
 
@@ -13690,7 +13759,25 @@ def capture_click(spatial_click, umap_click, measure_state):
     if not click or not click.get("points"):
         return None
     pt = click["points"][0]
-    return pt.get("customdata") or pt.get("text")
+    cell_id = pt.get("customdata") or pt.get("text")
+    if triggered == "spatial-plot" and EXTRA_DATASETS and cell_id is not None:
+        # Side-by-side samples: ids are unique within a sample only, so the sample is
+        # taken from where the click landed (the point's x carries the sample's offset).
+        try:
+            px = float(pt.get("x"))
+        except (TypeError, ValueError):
+            px = None
+        if px is not None:
+            _p = DATA["df"]
+            _hit = np.flatnonzero(_p.index.astype(str) == str(cell_id))
+            if not (len(_hit) and np.any(np.abs(_p["x_centroid"].values[_hit] - px) < 1e-3)):
+                for si, eds in enumerate(list(EXTRA_DATASETS), start=1):
+                    _e = eds["df"]
+                    _hit = np.flatnonzero(_e.index.astype(str) == str(cell_id))
+                    if len(_hit) and np.any(np.abs(_e["x_centroid"].values[_hit]
+                                                   + float(eds["x_offset"]) - px) < 1e-3):
+                        return {"id": cell_id, "sample": si}
+    return cell_id
 
 
 # ─── Distance measurement ────────────────────────────────────────────────────
@@ -13827,23 +13914,47 @@ def show_cell_info(cell_id, method):
         return html.Div("Click a cell to see details",
                         style={"color": MUTED, "fontSize": "13px", "fontStyle": "italic"})
 
-    df = DATA["df"]
+    # A cell of a sample shown beside the primary one arrives as {"id", "sample"} (sample 1
+    # = first extra sample): cell ids are unique within a sample only.
+    ds, sample_tag, cell_pos = DATA, "", None
+    if isinstance(cell_id, dict):
+        _sample, cell_id = cell_id.get("sample"), cell_id.get("id")
+        _extras = list(EXTRA_DATASETS)
+        _eds = (_extras[_sample - 1] if isinstance(_sample, int) and 1 <= _sample <= len(_extras)
+                else None)
+        _pos = (np.flatnonzero(_eds["df"].index.astype(str) == str(cell_id))
+                if _eds is not None else [])
+        if not len(_pos):
+            return html.Div(f"Cell '{cell_id}' not found (the samples shown have changed).",
+                            style={"color": "#f85149"})
+        ds, cell_pos = _eds, int(_pos[0])
+        _name = os.path.basename((ds.get("data_dir") or "").rstrip("/"))
+        sample_tag = f" [sample {_sample + 1}" + (f": {_name}]" if _name else "]")
+    df = ds["df"]
 
     # ── Try Xenium cells first, then Proseg, then Baysor ─────────────────────
-    if cell_id in df.index:
-        # Original Xenium cell
-        row    = df.loc[cell_id]
-        _cm    = DATA.get("cluster_methods") or []
-        method = method or (_cm[0] if _cm else None)
+    if cell_pos is not None or cell_id in df.index:
+        # Original Xenium cell (of the primary or of an extra sample)
+        if cell_pos is None:
+            cell_pos = df.index.get_loc(cell_id)
+            if not isinstance(cell_pos, (int, np.integer)):      # duplicated id: first row
+                cell_pos = int(np.flatnonzero(df.index == cell_id)[0])
+        row    = df.iloc[cell_pos]
+        _cm    = ds.get("cluster_methods") or []
+        method = method if method in _cm else (_cm[0] if _cm else None)
         col    = cluster_col(method) if method else None
-        clust  = int(row[col]) if col and col in row and not pd.isna(row[col]) else "—"
+        clust  = "—"
+        if col and col in row and not pd.isna(row[col]):
+            try:
+                clust = int(row[col])
+            except (TypeError, ValueError):
+                clust = row[col]
 
-        cell_pos     = df.index.get_loc(cell_id)
-        expr_row_idx = DATA["df_to_expr"][cell_pos]
+        expr_row_idx = ds["df_to_expr"][cell_pos]
         if expr_row_idx >= 0:
-            raw       = DATA["expr"][expr_row_idx, :].toarray().flatten()
+            raw       = ds["expr"][expr_row_idx, :].toarray().flatten()
             top_idx   = np.argsort(raw)[::-1][:12]
-            top_genes = [(DATA["gene_names"][i], int(raw[i])) for i in top_idx if raw[i] > 0]
+            top_genes = [(ds["gene_names"][i], int(raw[i])) for i in top_idx if raw[i] > 0]
         else:
             top_genes = []
 
@@ -13864,7 +13975,7 @@ def show_cell_info(cell_id, method):
             info_chip("UMAP 1",      f"{umap_1:.2f}" if not np.isnan(umap_1) else "—"),
             info_chip("UMAP 2",      f"{umap_2:.2f}" if not np.isnan(umap_2) else "—"),
         ]
-        source_tag = ""
+        source_tag = sample_tag
 
     else:
         # Try reseg sources (Proseg cell IDs are ints, Baysor are strings)
@@ -15805,6 +15916,7 @@ def update_tissue_info(_, seg_source, _split_done):
 @app.callback(
     Output("morph-enable", "options"),
     Output("morph-enable", "labelStyle"),
+    Output("morph-enable", "value"),
     Input("dataset-version", "data"),
 )
 def update_morph_enable_state(_):
@@ -15817,7 +15929,9 @@ def update_morph_enable_state(_):
     ), "value": "show", "disabled": not has_images}]
     label_style = {"display": "flex", "alignItems": "center",
                    "cursor": "pointer" if has_images else "not-allowed"}
-    return options, label_style
+    # a tick left from a dataset with images could not be removed once the option is
+    # disabled, and would keep the overlay code paths of both renderers active
+    return options, label_style, (no_update if has_images else [])
 
 
 def _is_zarr_store(path: str) -> bool:
@@ -16937,10 +17051,18 @@ def update_roi_sidebar_summary(roi_done):
     Output("webgl-tx-genes", "options"),
     Output("webgl-tx-genes", "value"),
     Input("dataset-version", "data"),
+    State("webgl-tx-genes", "value"),
 )
-def update_webgl_tx_gene_options(_ds_version):
-    """Panel genes that can be drawn as transcripts (reset when the dataset changes)."""
-    return [{"label": g, "value": g} for g in sorted(_panel_gene_names())], []
+def update_webgl_tx_gene_options(_ds_version, current=None):
+    """Panel genes that can be drawn as transcripts. dataset-version is also bumped when
+    the dataset stays (Rerun UMAP): the picked genes that the panel still has are kept,
+    as update_cluster_options keeps its selection."""
+    panel = sorted(_panel_gene_names())
+    have = set(panel)
+    current = current if isinstance(current, list) else ([current] if current else [])
+    keep = [g for g in current if g in have]
+    return ([{"label": g, "value": g} for g in panel],
+            no_update if keep == current else keep)
 
 
 @app.callback(
@@ -16968,8 +17090,12 @@ def capture_webgl_selection(sel):
             return None, True, "", "The outline crosses itself; draw a simple closed shape."
     except Exception:
         pass
+    # The outline lives in the roi-pending store only (save_roi reads it from there) and in
+    # the glue, which drops it when the modal closes - also by backdrop / Esc, which no
+    # server callback sees. It is not kept in _roi_state["pending_hull"]: nothing would
+    # clear it there, and a later Plotly figure would draw it as a phantom outline.
     with _roi_lock:
-        _roi_state["pending_hull"] = pts
+        _roi_state["pending_hull"] = None
     return pts, True, f"{n:,} cells selected — enter name and class below.", ""
 
 
@@ -17175,7 +17301,7 @@ class _ViewerProvider:
         source = args.get("source", "xenium")
         mode = args.get("mode") or "transcript_counts"
         method = args.get("method") or ""
-        gene = args.get("gene") or ""
+        gene = args.get("gene") or _default_gene or ""    # no selection: as update_plots
         corrected = str(args.get("corrected", "0")).lower() in ("1", "true", "corrected")
         df, alt = self._frame(source)
         extras = self._extras(alt)
@@ -17206,15 +17332,21 @@ class _ViewerProvider:
             mode = "transcript_counts"
 
         if mode.startswith("cell_type:"):
-            key = _labels_key_for_method(mode.split(":", 1)[1], alt)
-            with _annot_lock:
-                labels = _annot_state.get(key)
-            if labels is not None:
+            _ct_method = mode.split(":", 1)[1]
+            if alt is None:
+                with _annot_lock:
+                    labels = _annot_state.get(f"labels_{_ct_method}")
+                if labels is None:
+                    # as _cell_type_traces: every cell in one grey "No annotation" group
+                    return self._categorical(np.full(len(df), "No annotation", dtype=object),
+                                             "Cell type", colors=[MUTED], order=["No annotation"])
                 aligned = labels.reindex(df.index.astype(str)).fillna("Unknown")
-                # labels of another segmentation match (almost) no cell of this run:
-                # make_spatial_fig's reseg branch then draws transcript counts instead
-                if alt is None or (aligned == "Unknown").sum() <= len(aligned) * 0.95:
-                    return self._categorical(aligned.values, "Cell type")
+                return self._categorical(aligned.values, "Cell type")
+            # a reseg run: no labels, or labels of another segmentation (stale, cleared by
+            # the helper as in make_spatial_fig) -> transcript counts
+            aligned = _reseg_cell_type_labels(_ct_method, alt, df.index.astype(str))
+            if aligned is not None:
+                return self._categorical(aligned.values, "Cell type")
             mode = "transcript_counts"
 
         if mode == "niche":
@@ -17236,22 +17368,17 @@ class _ViewerProvider:
         if mode == "gene" and gene:
             # Xenium source: as in make_spatial_fig, _get_expr_values only for corrected
             # counts (its fallback for a streamed SpaGE gene applies log1p a second time)
-            vals = (_get_expr_values(gene, alt, use_corrected=corrected)
-                    if (alt is not None or corrected) else None)
-            if vals is None and alt is not None and corrected:
-                # imputed gene of a reseg run: no corrected values exist, the original
-                # ones are shown (as make_spatial_fig does)
-                vals = _get_expr_values(gene, alt, use_corrected=False)
-            if vals is None and alt is None:
-                try:
-                    vals = get_gene_expression(gene)
-                except KeyError:          # gene not in this dataset
-                    vals = None
+            if alt is None:
+                vals = _xenium_gene_values(gene, corrected)
+            else:
+                vals = _get_expr_values(gene, alt, use_corrected=corrected)
+                if vals is None and corrected:
+                    # imputed gene of a reseg run: no corrected values exist, the original
+                    # ones are shown (as make_spatial_fig does)
+                    vals = _get_expr_values(gene, alt, use_corrected=False)
             if vals is not None and len(vals) == len(df):
                 return self._continuous(vals, f"{gene} (log1p)", "plasma")
-            if alt is None:
-                return self._continuous(np.full(len(df), np.nan), f"{gene} (unavailable)", "plasma")
-            # a reseg run without this gene: transcript counts, as make_spatial_fig's fallback
+            # a dataset / reseg run without this gene: transcript counts, as make_spatial_fig
 
         # The colour scale goes with what is drawn (COLORSCALES; Viridis for the transcript
         # count fallback), not with the mode that was asked for.
@@ -17307,10 +17434,7 @@ class _ViewerProvider:
             for di, edf in enumerate(dfs):
                 vals = None
                 if di == 0:
-                    try:
-                        vals = get_gene_expression(gene)
-                    except KeyError:
-                        vals = None
+                    vals = _xenium_gene_values(gene)
                 else:
                     eds = extras[di - 1]
                     g_idx = eds.get("gene_name_to_idx", {}).get(gene)
@@ -17496,22 +17620,23 @@ class _ViewerProvider:
                                       "fill": "#ffaa00", "fillAlpha": 8})
                 except Exception as exc:
                     print(f"  Patch overlay error: {exc}", flush=True)
-        for eds in self._extras(self._alt_res(source)):
-            sep_x = float(eds["x_offset"]) - 250    # middle of the gap, full height as in Plotly
+        # middle of each gap, full height, as in Plotly
+        for sep_x in (_sample_separator_xs() if self._extras(self._alt_res(source)) else []):
             lines.append({"from": [sep_x, -1e6], "to": [sep_x, 1e6], "color": MUTED, "width": 1})
         return {"polygons": polys, "lines": lines}
 
     def cell_at(self, source, index):
         df, alt = self._frame(source)
-        offset, row = 0.0, int(index)
-        for eds in self._extras(alt):       # rows past the primary sample belong to the extra ones
+        offset, row, sample = 0.0, int(index), 0
+        for si, eds in enumerate(self._extras(alt), start=1):   # rows past the primary sample belong to the extra ones
             if index < len(df):
                 break
             index -= len(df)
-            df, offset = eds["df"], float(eds["x_offset"])
+            df, offset, sample = eds["df"], float(eds["x_offset"]), si
         if index < 0 or index >= len(df):
             return {}
-        return {"index": row, "id": str(df.index[index]),
+        # "sample": 0 = primary, n = n-th extra sample (ids are unique within a sample only)
+        return {"index": row, "id": str(df.index[index]), "sample": sample,
                 "x": float(df["x_centroid"].iloc[index]) + offset,
                 "y": float(df["y_centroid"].iloc[index])}
 
@@ -17569,6 +17694,8 @@ class _ViewerProvider:
         try:
             q = json.loads(args.get("q") or "{}")
         except ValueError:
+            return none
+        if not isinstance(q, dict):
             return none
         with _cellnest_lock:
             data = _cellnest_state.get("data") if _cellnest_state.get("status") == "done" else None

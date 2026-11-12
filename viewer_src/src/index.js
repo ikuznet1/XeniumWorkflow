@@ -147,10 +147,19 @@ class Viewer {
       getCursor: ({isDragging}) => (this.state.tool !== 'pan' ? 'crosshair' : isDragging ? 'grabbing' : 'grab'),
       onViewStateChange: ({viewState}) => this._setViewState(viewState),
       onAfterRender: () => this._onAfterRender(),
+      onDeviceInitialized: () => {
+        this._deviceReady = true;
+      },
       onError: (err) => {
         console.error('[XeniumViewer]', err);
         // Own key: a successful data load must not hide that nothing can be drawn.
         this._setStatus('render', `render error: ${(err && err.message) || err}`);
+        // No WebGL2 device could be created at all: nothing will ever be drawn here, the
+        // host can fall back to another renderer.
+        if (!this._deviceReady && !this._fatalSent && this.opts.onFatal) {
+          this._fatalSent = true;
+          this.opts.onFatal('the WebGL2 context could not be created');   // details: console
+        }
       },
     });
 

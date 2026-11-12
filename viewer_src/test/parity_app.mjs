@@ -211,7 +211,7 @@ await wait(1500);
 await page.locator('#webgl-view').screenshot({path: `${out}/parity_6_multi.png`});
 const hit = await V(async (i) => (await fetch('/viewer/cell/' + i)).json(), n0 + 2);
 check('6 second sample: cells, per-sample cluster names and separator', multi.n === n0 + ex.n && multi.bounds[2] > B[2] + 400 && multi.lines.length === 1 &&
-  Math.abs(multi.lines[0].from[0] - (ex.offset - 250)) < 1 && multi.cats > 0 && hit.index === n0 + 2 && hit.x > B[2] + 400,
+  Math.abs(multi.lines[0].from[0] - (B[2] + 250)) < 1 && multi.cats > 0 && hit.index === n0 + 2 && hit.x > B[2] + 400,
   JSON.stringify({n0, n: multi.n, extra: ex, lines: multi.lines.length, s1cats: multi.cats, umapN: multi.umapN, hit}));
 await fab('extra_clear');
 await setProp('extra-datasets-version', {data: 2});

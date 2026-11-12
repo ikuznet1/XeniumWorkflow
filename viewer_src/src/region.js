@@ -33,6 +33,8 @@ export class RegionLoader {
     this.fetchW = 0;
     this.loading = false;
     this.error = null;
+    this.lastVp = null; // latest viewport / spec passed to update() for the current key
+    this.lastSpec = null;
   }
 
   get active() {
@@ -57,6 +59,9 @@ export class RegionLoader {
       this.onChange();
     }
     if (!vp || !(vp[2] > vp[0]) || !(vp[3] > vp[1])) return;
+    // the view a retry has to cover: the user may pan while a request is in flight
+    this.lastVp = vp;
+    this.lastSpec = spec;
     if (this.box && contains(this.box, vp) && !(this.refinable && vp[2] - vp[0] < 0.7 * this.fetchW)) return;
     if (this.truncBox && contains(vp, this.truncBox)) return; // a superset is truncated too
     // Padding only makes sense if the padded box is clearly smaller than a box the server
@@ -84,8 +89,10 @@ export class RegionLoader {
       (res) => {
         if (seq !== this.seq) return;
         if (res.header.truncated && padded) {
-          // The padding may be what pushed us over the server limit; retry the exact view.
-          this._start(vp, spec, false);
+          // The padding may be what pushed us over the server limit; retry the exact view
+          // - the current one, which can differ from the one this request was started for
+          // (a pan that stayed inside the padded box does not start a request of its own).
+          this._start(this.lastVp || vp, this.lastSpec || spec, false);
           return;
         }
         this.info = res.header;

@@ -9,7 +9,7 @@
 //   XV_REAL_EXTRA  second sample(s) for the multi-sample checks, comma-separated
 //                  (default …/prime_mouse_ileum_tiny and …/geo_rv_0038290_R2/bundle)
 //   XV_REAL_URL    use an app that is already running there instead of starting one
-//   XV_REAL_ONLY   comma-separated sections: reseg,counts,pies,sdata,click,lasso,subset,multi,umap
+//   XV_REAL_ONLY   comma-separated sections: reseg,counts,pies,sdata,click,lasso,subset,multi,umap,degraded
 //   XV_REAL_ROI=0  skip the lasso check (section 6). It saves an ROI of class "rrtest" and
 //                  deletes it again through the ROI manager; as with any ROI saved in the
 //                  app, the stores of the loaded runs keep an (empty) roi_rrtest column.
@@ -27,10 +27,12 @@
 // CellNEST edges stay on the fabricated test (parity_app.mjs).
 //
 // Where the Plotly figure itself is at fault the script says so instead of failing: a
-// second sample without cluster sets makes the Plotly figure callback raise in cluster mode
-// (reported with a NOTE; the WebGL view draws that state). The RCTD pie wedges are compared
-// with the figure's layout shapes, i.e. with what Plotly is asked to draw: plotly.js itself
-// drops the arc command of those paths, so its own picture of the pies is not usable.
+// figure callback that raises is reported with a NOTE and counted as a failure (a second
+// sample without cluster sets used to do that in cluster mode). The RCTD pie wedges are
+// compared with the figure's layout shapes and with the paths plotly.js puts on the page.
+// Sections 8 and 10 cover the states where the two renderers used to differ: the separator
+// between samples, a click on a cell of the second sample, a gene the dataset does not
+// have and cell_type without labels.
 import {chromium} from 'playwright';
 import {spawn} from 'node:child_process';
 import {existsSync, mkdirSync, readFileSync, readdirSync} from 'node:fs';
@@ -302,41 +304,63 @@ const HELPERS = () => {
   const area = (pts) => { let a = 0; for (let i = 0, j = pts.length - 1; i < pts.length; j = i++) a += pts[j][0] * pts[i][1] - pts[i][0] * pts[j][1]; return Math.abs(a) / 2; };
   // RCTD pies: wedges in the Plotly layout shapes against the viewer's pie polygons,
   // matched on (cell centre, fill colour) and compared by area.
-  // A Plotly wedge is the SVG path "M cx,cy L x1,y1 A r,r,0,large,1,x2,y2 Z" in plot space
-  // (y = -µm); the viewer's is a polygon [centre, start, …arc…, end] in µm. A wedge is
-  // matched on (centre, start point, fill colour) and compared by its end point and by
-  // whether it spans more than half the circle.
+  // A Plotly wedge is the SVG path "M cx,cy L x1,y1 L … L xn,yn Z" in plot space (y = -µm):
+  // centre, then the arc as line segments (an "A" arc command is not used: plotly.js drops
+  // it and draws nothing). The viewer's wedge is the polygon [centre, start, …arc…, end]
+  // in µm. A wedge is matched on (centre, start point, fill colour) and compared by its
+  // end point, its radius and its area. `arcs` counts Plotly paths that still hold an arc
+  // command, `drawn` the wedges plotly.js put on the page with a visible area.
   rr.cmpPies = (vp) => {
     const v = rr.viewer();
     const wedge = new Map();
-    let plotly = 0, plotlyInView = 0;
+    let plotly = 0, plotlyInView = 0, arcs = 0;
     const key = (c, s, fill) => c[0].toFixed(2) + ',' + c[1].toFixed(2) + ',' + s[0].toFixed(2) + ',' + s[1].toFixed(2) + ',' + rgbOf(fill).join();
     for (const s of gd().layout.shapes || []) {
       if (s.type !== 'path' || !s.fillcolor || !(s.line && s.line.width === 0)) continue;
+      if (/[AaCcQqSsTt]/.test(s.path)) arcs += 1;
       const m = (s.path.match(/-?\d+(?:\.\d+)?(?:e[-+]?\d+)?/gi) || []).map(Number);
-      if (m.length !== 11) continue;
+      if (m.length < 8 || m.length % 2) continue;
+      const pts = [];
+      for (let i = 0; i + 1 < m.length; i += 2) pts.push([m[i], -m[i + 1]]);
       plotly += 1;
-      const c = [m[0], -m[1]];
+      const c = pts[0];
       const inView = !vp || (c[0] >= vp.x0 && c[0] <= vp.x1 && c[1] >= vp.y0 && c[1] <= vp.y1);
       if (inView) plotlyInView += 1;
-      wedge.set(key(c, [m[2], -m[3]], s.fillcolor), {end: [m[9], -m[10]], large: m[7] === 1, r: m[4], opacity: s.opacity, inView, hit: false});
+      wedge.set(key(c, pts[1], s.fillcolor), {c, start: pts[1], fill: rgbOf(s.fillcolor).join(), end: pts[pts.length - 1], area: area(pts), n: pts.length,
+        r: Math.hypot(pts[1][0] - c[0], pts[1][1] - c[1]), opacity: s.opacity, inView, hit: false});
     }
     const polys = (v.state.overlays.polygons || []).filter((p) => p.width === 0);
-    let common = 0, maxEnd = 0, largeDiff = 0, maxRadius = 0;
+    let common = 0, maxEnd = 0, maxArea = 0, maxRadius = 0, vertexDiff = 0;
     for (const p of polys) {
       const n = p.points.length;
-      const w = wedge.get(key(p.points[0], p.points[1], p.fill));
+      let w = wedge.get(key(p.points[0], p.points[1], p.fill));
+      if (!w) {
+        // (the key rounds to 0.01 µm: a coordinate on a rounding edge needs the tolerant search)
+        const fill = rgbOf(p.fill).join(), near = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1]) < 0.01;
+        for (const q of wedge.values()) if (!q.hit && q.fill === fill && near(q.c, p.points[0]) && near(q.start, p.points[1])) { w = q; break; }
+      }
       if (!w) continue;
       common += 1;
       w.hit = true;
       maxEnd = Math.max(maxEnd, Math.hypot(p.points[n - 1][0] - w.end[0], p.points[n - 1][1] - w.end[1]));
       maxRadius = Math.max(maxRadius, Math.abs(Math.hypot(p.points[1][0] - p.points[0][0], p.points[1][1] - p.points[0][1]) - w.r));
-      // n - 2 arc steps of at most 15 degrees each: more than 12 means more than half a turn
-      if ((n - 2 > 12) !== w.large) largeDiff += 1;
+      maxArea = Math.max(maxArea, Math.abs(area(p.points) - w.area));
+      if (n !== w.n) vertexDiff += 1;
+    }
+    // what plotly.js drew: the <path> elements of the wedge shapes, by on-screen area
+    let drawn = 0, drawnFlat = 0;
+    for (const el of document.querySelectorAll('#spatial-plot .shapelayer path, #spatial-plot .layer-above path')) {
+      const st = el.getAttribute('style') || '';
+      if (!/stroke-width:\s*0/.test(st) || /fill:\s*none/.test(st) || /fill-opacity:\s*0[;\s]/.test(st)) continue;
+      let b;
+      try { b = el.getBBox(); } catch (e) { continue; }
+      if (b.width > 1.5 && b.height > 1.5 && /L[^Z]*L[^Z]*L/i.test(el.getAttribute('d') || '')) drawn += 1;
+      else drawnFlat += 1;
     }
     const cellsOf = (keys) => new Set(keys.map((k) => k.split(',').slice(0, 2).join())).size;
     return {plotly, plotlyInView, plotlyInViewMissing: [...wedge.values()].filter((w) => w.inView && !w.hit).length,
-      gl: polys.length, common, maxEnd, maxRadius, largeDiff, cells: cellsOf(polys.map((p) => key(p.points[0], p.points[1], p.fill))),
+      gl: polys.length, common, maxEnd, maxRadius, maxArea, vertexDiff, arcs, drawn, drawnFlat,
+      cells: cellsOf(polys.map((p) => key(p.points[0], p.points[1], p.fill))),
       glAlpha: polys[0] && polys[0].fillAlpha, plotlyOpacity: wedge.size ? [...wedge.values()][0].opacity : null};
   };
 
@@ -635,8 +659,12 @@ if (want('pies')) {
     const p = await withPlotly(() => V((vp) => window.__rr.cmpPies(vp), vp), `3_${mode.replace(/[^a-z0-9]+/gi, '-')}_pies_plotly.png`);
     // the wedges of every cell in the WebGL viewport, each with the Plotly wedge's geometry
     check(`3 ${mode}: RCTD weight pies of the cells in view equal the Plotly wedges`,
-      p.gl > 20 && p.common === p.gl && p.plotlyInViewMissing === 0 && p.maxEnd < 0.01 && p.maxRadius < 0.01 && p.largeDiff === 0 && p.glAlpha === 217 && p.plotlyOpacity === 0.85 &&
+      p.gl > 20 && p.common === p.gl && p.plotlyInViewMissing === 0 && p.maxEnd < 0.01 && p.maxRadius < 0.01 && p.maxArea < 0.05 && p.vertexDiff === 0 && p.glAlpha === 217 && p.plotlyOpacity === 0.85 &&
       reqs.slice(n0).some((u) => u.includes('/viewer/extra/pies.bin')), J(p));
+    // ... and plotly.js really draws them: polygon paths only (it drops an arc command and
+    // leaves a zero-area line), every wedge on the page with an area
+    check(`3 ${mode}: Plotly draws the wedges as filled polygons (no arc commands, none collapsed)`,
+      p.arcs === 0 && p.plotly > 20 && p.drawn === p.plotly && p.drawnFlat === 0, J({shapes: p.plotly, arcs: p.arcs, drawn: p.drawn, flat: p.drawnFlat}));
     // the weights themselves: normalised rows of the stored RCTD weights
     const w = await V(async ([m, vp]) => {
       const r = await fetch(`/viewer/extra/pies.bin?source=xenium&mode=${encodeURIComponent(m)}&x0=${vp.x0}&y0=${vp.y0}&x1=${vp.x1}&y1=${vp.y1}`);
@@ -917,8 +945,8 @@ if (want('multi')) {
       await wait(800);
       const r = await compareColours(`8_${tag}_${mode.replace(/[^a-z0-9]+/gi, '-')}`, mode === 'cluster');
       if (plotlyFailed(r, `8 ${tag}: ${mode}`)) {
-        // (seen with a second sample that has no cluster sets: KeyError 'S1:C0' in make_spatial_fig)
-        check(`8 ${tag}: ${mode}: the WebGL view still draws both samples`, r.gl.n === st.n && !!r.gl.kind, J({n: r.gl.n, kind: r.gl.kind}));
+        // (was: KeyError 'S1:C0' in make_spatial_fig for a second sample without cluster sets)
+        check(`8 ${tag}: ${mode}: the Plotly figure callback does not raise`, false);
         continue;
       }
       check(`8 ${tag}: ${mode} agrees with Plotly for the cells of both samples (count and positions)`, coloursAgree(r) && r.cmp.gl === st.n, brief(r));
@@ -927,10 +955,36 @@ if (want('multi')) {
     const sep = await V(() => window.__rr.viewer().state.overlays.lines.map((l) => l.from[0]));
     const plSep = await withPlotly(() => V(() => window.__rr.plotlyOutlines().filter((s) => s.type === 'line').map((s) => s.pts[0][0])));
     check(`8 ${tag}: the separator is where Plotly draws it`, sep.length === 1 && plSep.length === 1 && Math.abs(sep[0] - plSep[0]) < 0.01, J({gl: sep, plotly: plSep}));
+    // ... and that is the middle of the gap between the two samples (not inside either)
+    const gap = await V((n0) => { const c = window.__rr.viewer()._cells; let a = -Infinity, b = Infinity;
+      for (let i = 0; i < c.n; i++) { const x = c.xy[2 * i]; if (i < n0) { if (x > a) a = x; } else if (x < b) b = x; }
+      return [a, b]; }, nXenium);
+    check(`8 ${tag}: the separator is midway in the gap between the samples`,
+      sep.length === 1 && gap[1] > gap[0] && Math.abs(sep[0] - (gap[0] + gap[1]) / 2) < 0.5, J({separator: sep, firstSampleMaxX: gap[0], secondSampleMinX: gap[1]}));
     // boundaries stay those of the first sample, pies are off, as in the Plotly view
     await setProp('color-by', {value: 'cluster'});
+    // a click on a cell of the second sample fills the cell-info panel (shared handler):
+    // through the WebGL view, and through the Plotly graph's clickData
     const c = await clickRow(nXenium + Math.floor((st.n - nXenium) / 2));
-    note(`click on a cell of the second sample: ${J({id: c.target.id, ok: c.ok, panel: c.panel.slice(0, 80)})}`);
+    check(`8 ${tag}: clicking a cell of the second sample (WebGL) fills the cell-info panel`,
+      c.ok && /\[sample 2/.test(c.panel) && !/not found/i.test(c.panel), J({id: c.target.id, panel: c.panel.slice(0, 160)}));
+    await setProp('selected-cell', {data: null});
+    await wait(800);
+    const row2 = nXenium + Math.floor((st.n - nXenium) / 3);
+    const t2 = await V(async (i) => (await fetch(`/viewer/cell/${i}?source=xenium`)).json(), row2);
+    const pl = await withPlotly(async () => {
+      // the point Plotly reports for that cell: its customdata (cell id) and plotted x
+      const pt = await V((t) => { const g = document.querySelector('#spatial-plot .js-plotly-plot');
+        for (const tr of g._fullData) { if (!tr.customdata) continue;
+          for (let i = 0; i < tr.customdata.length; i++) if (String(tr.customdata[i]) === t.id && Math.abs(tr.x[i] - t.x) < 1e-3) return {customdata: tr.customdata[i], x: tr.x[i], y: tr.y[i]}; }
+        return null; }, t2);
+      if (!pt) return {pt};
+      await setProp('spatial-plot', {clickData: {points: [pt]}});
+      await until(async () => ((await V(() => document.querySelector('#cell-info-panel')?.innerText)) || '').includes(t2.id), 8000, 300);
+      return {pt, panel: ((await V(() => document.querySelector('#cell-info-panel')?.innerText)) || '').replace(/\n+/g, ' | ').slice(0, 160)};
+    });
+    check(`8 ${tag}: clicking a cell of the second sample (Plotly) fills the cell-info panel`,
+      !!pl.pt && (pl.panel || '').includes(t2.id) && /\[sample 2/.test(pl.panel) && !/not found/i.test(pl.panel), J({id: t2.id, panel: pl.panel}));
     await fit();
     // a resegmentation source shows that run only, in both renderers
     const run = baysorRuns.find((r) => r.endsWith('b7f1eed9')) || baysorRuns[0];
@@ -995,6 +1049,36 @@ if (want('umap')) {
   await setProp('color-by', {value: 'cluster'});
   if (!wasOpen) await V(() => document.querySelector('#umap-toggle').click());
   await wait(1000);
+}
+
+// ── 10. states the selected colour cannot be drawn in ───────────────────────────
+// Both renderers degrade the same way: a gene the dataset does not have is drawn as
+// transcript counts (as a Baysor / Proseg run without the gene is), a cell_type mode
+// without labels as one grey "No annotation" group.
+if (want('degraded')) {
+  await selectSource('xenium');
+  await setCounts('original');
+  await fit();
+  const gene0 = await prop('gene-selector');
+  await setProp('gene-selector', {value: 'NO_SUCH_GENE_XYZ'});
+  await setProp('color-by', {value: 'gene'});
+  await wait(1200);
+  let r = await compareColours('10_missing_gene', true);
+  if (plotlyFailed(r, '10 missing gene')) check('10 Xenium, gene not in the dataset: the Plotly figure callback does not raise', false);
+  else check('10 Xenium, gene not in the dataset: both renderers draw transcript counts', (await prop('gene-selector')) === 'NO_SUCH_GENE_XYZ' && coloursAgree(r) && /Transcript Counts/.test(r.cmp.label) && /Transcript Counts/.test(r.cmp.plotlyLabel), brief(r));
+  await setProp('gene-selector', {value: gene0});
+  await setProp('color-by', {value: 'cell_type:nolabels'});
+  await wait(1200);
+  r = await compareColours('10_no_labels', true);
+  if (plotlyFailed(r, '10 no labels')) check('10 Xenium, cell_type without labels: the Plotly figure callback does not raise', false);
+  else {
+    const names = await V(() => { const h = window.__rr.viewer()._colors.header; return {categories: h.categories, colors: h.colors}; });
+    check('10 Xenium, cell_type without labels: both renderers draw every cell grey as "No annotation"',
+      coloursAgree(r) && names.categories.length === 1 && names.categories[0] === 'No annotation' && r.plotly.names.join() === 'No annotation', brief(r) + ' ' + J(names));
+  }
+  await setProp('color-by', {value: 'cluster'});
+  await wait(800);
+  await idle();
 }
 
 check('no page errors', logs.length === 0, J(logs.slice(0, 6)));

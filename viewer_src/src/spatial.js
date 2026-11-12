@@ -89,20 +89,30 @@ export class PointGrid {
     const nb = this.nx * this.ny;
     const start = new Uint32Array(nb + 1);
     const bucket = new Uint32Array(n);
+    // Points without a position (NaN: cells with no UMAP embedding) are left out of the
+    // grid; counted or not, they would otherwise be written through bucket 0's cursor.
+    const NONE = 0xffffffff;
+    let placed = 0;
     for (let i = 0; i < n; i++) {
       const b = this._bucket(xy[2 * i], xy[2 * i + 1]);
+      if (b < 0) {
+        bucket[i] = NONE;
+        continue;
+      }
       bucket[i] = b;
       start[b + 1]++;
+      placed++;
     }
     for (let b = 0; b < nb; b++) start[b + 1] += start[b];
     const fill = start.slice(0, nb);
-    const order = new Uint32Array(n);
-    for (let i = 0; i < n; i++) order[fill[bucket[i]]++] = i;
+    const order = new Uint32Array(placed);
+    for (let i = 0; i < n; i++) if (bucket[i] !== NONE) order[fill[bucket[i]]++] = i;
     this.start = start;
     this.order = order;
   }
 
   _bucket(x, y) {
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return -1;
     let bx = Math.floor((x - this.x0) / this.cell);
     let by = Math.floor((y - this.y0) / this.cell);
     bx = bx < 0 ? 0 : bx >= this.nx ? this.nx - 1 : bx;

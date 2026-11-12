@@ -42,7 +42,13 @@
   var glueMsg = {};
   function renderStatus() {
     var parts = [];
-    if (lastMode === "webgl") {
+    if (glBroken) {
+      // Plotly draws the cells with WebGL 1: without any WebGL it shows its own notice.
+      parts.push(glNone ? "WebGL is switched off in this browser: neither the WebGL view nor the Plotly view can " +
+                          "draw cells - enable WebGL / hardware acceleration and reload"
+                        : "WebGL view unavailable: " + glBroken + " - showing the Plotly view");
+    }
+    if (lastMode === "webgl" && !glBroken) {
       parts.push(lost.spatial ? "WebGL context lost - change any setting or switch the renderer to redraw"
                               : viewerStatus);
       Object.keys(glueMsg).forEach(function (k) { parts.push(glueMsg[k]); });
@@ -56,9 +62,54 @@
     renderStatus();
   }
 
+  // The WebGL view needs a WebGL2 context. Without one (old browser, GPU blocklisted,
+  // hardware acceleration off, context creation refused) the app goes back to the Plotly
+  // view by itself and says why in the status line, instead of leaving an empty panel.
+  var glBroken = null;      // reason the WebGL view cannot be used in this page, or null
+  var glNone = false;       // not even WebGL 1: the Plotly view's point layer cannot draw either
+  var glChecked = false;
+  function probeGl(type) {
+    try {
+      var gl = document.createElement("canvas").getContext(type);
+      if (!gl) return false;
+      var lose = gl.getExtension("WEBGL_lose_context");
+      if (lose) lose.loseContext();   // give the probe context back
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+  function webglProblem() {
+    if (glBroken || glChecked) return glBroken;
+    var why = null;
+    if (!probeGl("webgl2")) {
+      why = "this browser has no WebGL2 (unsupported, or disabled / hardware acceleration off)";
+      glNone = !probeGl("webgl");
+    }
+    if (!why && !window.XeniumViewer) why = "the viewer bundle (assets/xenium_viewer.js) did not load";
+    glChecked = !why;
+    return why;
+  }
+  function fallBackToPlotly(why) {
+    if (glBroken) return;
+    glBroken = why;
+    console.warn("[XeniumViewer] " + why + " - falling back to the Plotly renderer");
+    renderStatus();
+    // Outside the running callback: renderer-mode is one of its own inputs.
+    setTimeout(function () {
+      setProps("renderer-mode", {
+        value: "plotly",
+        options: [{ label: " Plotly", value: "plotly" },
+                  { label: " WebGL (unavailable)", value: "webgl", disabled: true }],
+      });
+    }, 0);
+  }
+
   // Hides the Plotly UMAP graph while the WebGL one is shown.
   var hideCss = document.createElement("style");
   hideCss.textContent = "body.xv-webgl #umap-plot{display:none !important}" +
+    // Plotly's "WebGL is not supported" notice must not cover the renderer bar and its status line
+    "#spatial-plot .no-webgl{z-index:1 !important}" +
     "body:not(.xv-webgl) #webgl-png-btn{display:none !important}";   // PNG export: WebGL view only
   document.head.appendChild(hideCss);
 
@@ -126,7 +177,11 @@
         // Resolve the clicked index to a cell id and feed the existing cell-info panel.
         fetch(PREFIX + "/viewer/cell/" + info.index + "?source=" + encodeURIComponent(info.source || "xenium"))
           .then(function (r) { return r.json(); })
-          .then(function (cell) { if (cell && cell.id) setProps("selected-cell", { data: cell.id }); })
+          .then(function (cell) {
+            if (!cell || !cell.id) return;
+            // a cell of a sample shown beside the primary one is named with its sample
+            setProps("selected-cell", { data: cell.sample ? { id: cell.id, sample: cell.sample } : cell.id });
+          })
           .catch(function () { /* cell info is optional */ });
       },
       onSelect: function (sel) {
@@ -145,6 +200,7 @@
         viewerStatus = text || "";
         renderStatus();
       },
+      onFatal: fallBackToPlotly,   // no WebGL2 device after all
     });
     mountedOn = el;
     window.XeniumViewer.instance = viewer;   // handle for the browser console and tests
@@ -253,6 +309,20 @@
       pushOverlays();
       return;
     }
+    // Row indices (gray-out) and edges belong to one cell table: after a source / subset /
+    // dataset change the old ones must not be applied to the new table while (or if) the
+    // new answer is missing. A change of the CellNEST controls alone keeps them until the
+    // answer arrives, so the edges do not flicker.
+    var table = cur.source + "|" + cur.dataVersion;
+    if (cn.table !== table) {
+      cn.table = table;
+      if (cn.cells || cn.lines.length) {
+        cn.lines = [];
+        cn.cells = null;
+        applySelection();
+        pushOverlays();
+      }
+    }
     fetch(PREFIX + "/viewer/extra/cellnest.bin?source=" + encodeURIComponent(cur.source) +
           "&q=" + encodeURIComponent(q))
       .then(function (r) {
@@ -283,7 +353,11 @@
       .catch(function (err) {
         if (seq !== cn.seq) return;
         cn.key = null;   // asked again on the next change
+        cn.lines = [];   // nothing of the previous answer stays on screen
+        cn.cells = null;
         setMsg("cellnest", "CellNEST edges failed to load: " + ((err && err.message) || err));
+        applySelection();
+        pushOverlays();
       });
   }
 
@@ -494,6 +568,13 @@
                 datasetVer, subsetVer, baysorDone, prosegDone,
                 annotDone, spageDone, splitDone, roiDone, nicheDone, tool_, umapPanelStyle,
                 roiModalOpen, extraVer, relayout) {
+    if (mode === "webgl") {
+      var why = webglProblem();
+      if (why) {
+        fallBackToPlotly(why);
+        mode = "plotly";   // this call already lays the panels out for Plotly
+      }
+    }
     var webgl = mode === "webgl";
     var plotStyle = { height: "100%", display: webgl ? "none" : "block" };
     var glStyle = { position: "absolute", inset: "0", display: webgl ? "block" : "none" };
@@ -519,7 +600,19 @@
     }
     if (!webgl) return styles;
 
-    var v = mount();
+    var v = null;
+    try {
+      v = mount();
+    } catch (e) {
+      fallBackToPlotly("the viewer could not start (" + ((e && e.message) || e) + ")");
+      styles[0] = { height: "100%", display: "block" };
+      styles[1] = { position: "absolute", inset: "0", display: "none" };
+      styles[2] = Object.assign({}, umapGlStyle, { display: "none" });
+      styles[3] = false;
+      styles[4] = "";
+      document.body.classList.remove("xv-webgl");
+      return styles;
+    }
     if (!v) {
       setMsg("bundle", "WebGL viewer bundle not loaded");
       return styles;
