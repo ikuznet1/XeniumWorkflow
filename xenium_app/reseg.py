@@ -505,6 +505,24 @@ def _proseg_run_single(tx_df, patch_dir, proseg_bin, voxel_size, n_threads, n_sa
     return cells_df, cell_bounds, tx_meta_df
 
 
+def _geojson_ring(geom) -> list:
+    """The outline of a GeoJSON cell geometry as one ring of [x, y] pairs: the exterior
+    ring of a Polygon, the exterior ring of the largest part of a MultiPolygon ([] when
+    there is none). Every loader of polygon files uses this, so a cached run gets the
+    outline the live run drew."""
+    geom = geom or {}
+    coords = geom.get("coordinates") or []
+    try:
+        if geom.get("type") == "MultiPolygon":
+            rings = [poly[0] for poly in coords if poly]
+        else:
+            rings = [coords[0]] if coords else []
+        ring = _largest_ring(rings)
+        return list(ring) if len(ring) and np.asarray(ring, dtype=np.float64).ndim == 2 else []
+    except (TypeError, ValueError, IndexError):
+        return []
+
+
 def _largest_ring(rings):
     """Exterior ring enclosing the largest area (shoelace formula) among the parts of
     a multi-part cell. The ring with the most vertices is not always the largest part."""
@@ -742,7 +760,11 @@ def _zarr_write_lock(path: str):
 def _update_reseg_zarr_obs(zarr_path: str, cells_df: pd.DataFrame, force_cols=()) -> None:
     """Update the obs (cell metadata) in a reseg SpatialData zarr with new columns from cells_df.
     Writes directly via zarr low-level API to avoid spatialdata's 'target path in use' error.
-    Columns named in force_cols are rewritten even when they already exist."""
+    Columns named in force_cols are rewritten even when they already exist.
+
+    When cells_df holds only part of the store's cells (an active subset()), a column
+    that already exists is merged: the rows of the cells in cells_df are replaced, the
+    others keep their stored values (they are never blanked)."""
     if not os.path.isdir(zarr_path):
         return
     _zlock = _zarr_write_lock(zarr_path)
@@ -790,12 +812,34 @@ def _update_reseg_zarr_obs(zarr_path: str, cells_df: pd.DataFrame, force_cols=()
             from anndata.io import write_elem as _write_elem
         except ImportError:
             from anndata.experimental import write_elem as _write_elem
+        _cover = None        # per stored cell: is it in cells_df? (None: every cell is)
+        if _existing_idx is not None and len(_existing_idx) > 0:
+            _c = np.asarray(pd.Index(_existing_idx).isin(pd.Index(cells_df.index.astype(str))))
+            if not _c.all():
+                _cover = _c
         for col in new_cols:
             try:
                 _ser = cells_df[col].copy()
                 _ser.index = _ser.index.astype(str)
                 if _existing_idx is not None:
                     _ser = _ser.reindex(_existing_idx)
+                if _cover is not None and col in existing_cols:
+                    _node = _obs_grp[col]
+                    if hasattr(_node, "shape"):
+                        _old = np.asarray(_node[:])
+                    else:               # an encoded column (categorical, nullable)
+                        try:
+                            from anndata.io import read_elem as _read_elem
+                        except ImportError:
+                            from anndata.experimental import read_elem as _read_elem
+                        _old = np.asarray(_read_elem(_node))
+                    if len(_old) != len(_ser):
+                        print(f"  Warning: obs col '{col}' not updated (stored length differs)", flush=True)
+                        continue
+                    _is_str = (_ser.dtype == object or pd.api.types.is_string_dtype(_ser)
+                               or _old.dtype.kind in "USO")
+                    _oldv = pd.Series(_old.astype(object) if _is_str else _old, index=_ser.index)
+                    _ser = (_ser.astype(object) if _is_str else _ser).where(_cover, _oldv)
                 # For string/object columns bypass _write_elem (zarr warns on object dtype)
                 # and write directly as fixed-width unicode numpy array.
                 if _ser.dtype == object or pd.api.types.is_string_dtype(_ser):
@@ -1077,7 +1121,7 @@ def _load_cached_baysor(out_dir: str) -> None:
             if status != "running":
                 core._baysor_state["loading_out_dir"] = None   # see load_seg_run_from_cache
         if status == "done":
-            provenance._prov_record("baysor", "Baysor segmentation (cached run loaded)", seg_source=provenance._prov_run_source("baysor", result), params={"run": os.path.basename(str(out_dir).rstrip("/"))}, cache=True, message=message, result=result)
+            provenance._prov_record("baysor", "Baysor segmentation (cached run loaded)", seg_source=provenance._prov_run_source("baysor", result), params={"run": os.path.basename(str(out_dir).rstrip("/"))}, cache=True, message=message, result=result, once=("load", str(out_dir), core._seg_run_id(result)))
     print(f"Loading cached Baysor: {os.path.basename(out_dir)}…", flush=True)
     try:
         _set("running", "Loading cached Baysor result…")
@@ -1180,7 +1224,7 @@ def _load_cached_baysor(out_dir: str) -> None:
                     for feat in geo.get("features", []):
                         props = feat.get("properties", {})
                         cid = str(props.get("cell", props.get("cell_id", feat.get("id", ""))))
-                        coords = feat.get("geometry", {}).get("coordinates", [[]])[0]
+                        coords = _geojson_ring(feat.get("geometry", {}))   # as the live run
                         if coords:
                             cell_bounds[cid] = ([c[0] for c in coords], [c[1] for c in coords])
                     break  # only one polygon file per dir needed
@@ -1302,15 +1346,7 @@ def _load_proseg_patch_boundaries(out_dir: str, patch_names: list) -> dict:
                         _gid = str(int(_local) + _offset)
                     except (ValueError, TypeError):
                         _gid = str(_local)
-                    _geom = _feat.get("geometry", {})
-                    _gtype = _geom.get("type")
-                    if _gtype == "Polygon":
-                        _rings = [_geom["coordinates"][0]]
-                    elif _gtype == "MultiPolygon":
-                        _rings = [_p[0] for _p in _geom["coordinates"]]
-                    else:
-                        _rings = [_geom.get("coordinates", [[]])[0]]
-                    _coords = _largest_ring(_rings)
+                    _coords = _geojson_ring(_feat.get("geometry", {}))
                     if _coords:
                         cell_bounds[_gid] = ([c[0] for c in _coords], [c[1] for c in _coords])
             except Exception as _pe:
@@ -1334,7 +1370,7 @@ def _load_cached_proseg(out_dir: str) -> None:
             if status != "running":
                 core._proseg_state["loading_out_dir"] = None   # see load_seg_run_from_cache
         if status == "done":
-            provenance._prov_record("proseg", "Proseg segmentation (cached run loaded)", seg_source=provenance._prov_run_source("proseg", result), params={"run": os.path.basename(str(out_dir).rstrip("/"))}, cache=True, message=message, result=result)
+            provenance._prov_record("proseg", "Proseg segmentation (cached run loaded)", seg_source=provenance._prov_run_source("proseg", result), params={"run": os.path.basename(str(out_dir).rstrip("/"))}, cache=True, message=message, result=result, once=("load", str(out_dir), core._seg_run_id(result)))
     print(f"Loading cached Proseg: {os.path.basename(out_dir)}…", flush=True)
     try:
         _set("running", "Loading cached Proseg result…")
@@ -1568,15 +1604,7 @@ def _load_cached_proseg(out_dir: str) -> None:
                         for feat in geo.get("features", []):
                             props = feat.get("properties", {})
                             cid = str(props.get("cell_id", props.get("cell", feat.get("id", ""))))
-                            geom = feat.get("geometry", {})
-                            gtype = geom.get("type")
-                            if gtype == "Polygon":
-                                rings = [geom["coordinates"][0]]
-                            elif gtype == "MultiPolygon":
-                                rings = [poly[0] for poly in geom["coordinates"]]
-                            else:
-                                rings = [geom.get("coordinates", [[]])[0]]
-                            coords = _largest_ring(rings)
+                            coords = _geojson_ring(feat.get("geometry", {}))
                             if coords:
                                 cell_bounds[cid] = ([c[0] for c in coords], [c[1] for c in coords])
                         break

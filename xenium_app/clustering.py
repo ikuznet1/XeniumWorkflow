@@ -144,7 +144,10 @@ def _run_reseg_umap() -> None:
     """Background thread: compute UMAP for the active resegmented cells."""
     _gen = jobs._dataset_gen
 
-    def _set(status, message, result=None):
+    def _set(status, message, result=None, record=None):
+        """record: the facts of the finished run ({corrected, n_cells, n_uncorrected,
+        params}). The provenance record is written for that call only - once per run,
+        after the result is stored - and says which counts and cells were embedded."""
         with core._umap_reseg_lock:
             if jobs._stale_job(_gen, status, message):
                 return
@@ -152,8 +155,16 @@ def _run_reseg_umap() -> None:
             core._umap_reseg_state["message"] = message
             if result is not None:
                 core._umap_reseg_state["result"] = result
-        if status == "done":
-            provenance._prov_record("umap", seg_source=core._umap_reseg_state.get("seg_source", "xenium"), params={}, packages=("umap-learn", "leidenalg", "igraph", "scanpy"), message=message, result=result)
+        if status == "done" and record is not None:
+            _corr = bool(record.get("corrected"))
+            provenance._prov_record(
+                "umap", seg_source=core._umap_reseg_state.get("seg_source", "xenium"),
+                corrected=(core._umap_reseg_state.get("counts_mode", "original") == "corrected"),
+                params=dict(record.get("params") or {}), seeds={"random_state": 0},
+                packages=("umap-learn", "scikit-learn"), message=message,
+                result={"corrected": _corr, "n_cells": int(record.get("n_cells") or 0),
+                        "n_uncorrected": int(record.get("n_uncorrected") or 0) if _corr else 0,
+                        "embedding_columns": "split_umap_1/2" if _corr else "umap_1/2"})
 
     try:
         # Get the reseg result for the segmentation source selected in the UI
@@ -294,6 +305,7 @@ def _run_reseg_umap() -> None:
                                    message="invalid value encountered in divide")
                 _pca2 = _svd2.fit_transform(_mat)
             _set("running", "Running UMAP…")
+            _how2 = "UMAP"
             try:
                 import sys as _sys2, types as _types2
                 if "tensorflow" not in _sys2.modules:
@@ -308,6 +320,7 @@ def _run_reseg_umap() -> None:
                     raise   # t-SNE on this many cells would not finish; report the UMAP error
                 from sklearn.manifold import TSNE as _TSNE2
                 _set("running", "Running t-SNE (umap-learn unavailable)…")
+                _how2 = "t-SNE"
                 _emb2 = _TSNE2(n_components=2, perplexity=min(30, max(5, _n // 10)),
                                random_state=0).fit_transform(_pca2)
 
@@ -334,7 +347,13 @@ def _run_reseg_umap() -> None:
             with core._umap_reseg_lock:
                 core._umap_reseg_state["_xenium_bumped"] = False
             _label = "SPLIT-corrected" if _sub_mask is not None else "Xenium"
-            _set("done", f"{_label} UMAP — {_n:,} cells")
+            _set("done", f"{_label} UMAP — {_n:,} cells"
+                         + (f" ({_how2} of the SPLIT-corrected counts; {len(_xen_df) - _n:,} cells without them "
+                            f"have no coordinates)" if _sub_mask is not None else f" ({_how2} of the original counts)"),
+                 record={"corrected": _sub_mask is not None, "n_cells": _n,
+                         "n_uncorrected": len(_xen_df) - _n,
+                         "params": {"method": _how2, "n_components": int(_nc),
+                                    "n_neighbors": int(min(15, _n - 1)), "min_dist": 0.1}})
             print(f"  {_label} UMAP recomputed for {_n:,} cells", flush=True)
             return
 
@@ -418,6 +437,7 @@ def _run_reseg_umap() -> None:
 
         # UMAP — prefer umap-learn, fall back to t-SNE
         _set("running", "Running UMAP…")
+        _how = "UMAP"
         try:
             import sys, types
             # Stub tensorflow so umap/__init__.py can load parametric_umap without
@@ -436,6 +456,7 @@ def _run_reseg_umap() -> None:
                 raise   # t-SNE on this many cells would not finish; report the UMAP error
             from sklearn.manifold import TSNE
             _set("running", "Running t-SNE (umap-learn not installed or TF error)…")
+            _how = "t-SNE"
             perp = min(30, max(5, n_cells // 10))
             embedding = TSNE(n_components=2, perplexity=perp,
                              random_state=0).fit_transform(pca_coords)
@@ -448,7 +469,11 @@ def _run_reseg_umap() -> None:
         with core._umap_reseg_lock:
             jobs._check_dataset_gen(_gen)
             core._umap_reseg_state["owner"] = alt_res.get("out_dir")
-        _set("done", f"Done — {n_cells:,} cells", result=umap_df)
+        _is_corr = _src_label == "SPLIT-corrected"
+        _done_msg = (f"Done — {n_cells:,} cells ({_how} of the "
+                     + (f"SPLIT-corrected counts; {len(_all_cell_ids) - n_cells:,} cells without them have no "
+                        f"coordinates)" if _is_corr else "original counts)"))
+        _set("done", _done_msg, result=umap_df)
         print(f"  Reseg UMAP: computed for {n_cells:,} cells", flush=True)
 
         # ── Write UMAP coords back to cells_df + zarr for caching ────
@@ -478,7 +503,12 @@ def _run_reseg_umap() -> None:
                 _sdata_path, alt_res["cells_df"],
                 force_cols=() if "_cells_df_original" in alt_res else (_c1, _c2))
             print(f"  Reseg UMAP: cached to zarr", flush=True)
-        _set("done", f"Done — {n_cells:,} cells", result=umap_df)
+        # reported again after the zarr write; the record is written here, once per run
+        _set("done", _done_msg, result=umap_df,
+             record={"corrected": _is_corr, "n_cells": n_cells,
+                     "n_uncorrected": len(_all_cell_ids) - n_cells,
+                     "params": {"method": _how, "n_components": int(n_comp),
+                                "n_neighbors": int(min(15, n_cells - 1)), "min_dist": 0.1}})
 
     except jobs._JobCancelled:
         raise

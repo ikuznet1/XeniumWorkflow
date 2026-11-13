@@ -187,6 +187,68 @@ if (haveUmap) {
 } else {
   console.log('SKIP  joint UMAP (not computed)');
 }
+// ── a re-run replaces the embedding: the WebGL UMAP panel fetches the new coordinates ──
+// Nothing but the Run button is touched (Cluster Set keeps naming the joint set), so the
+// only thing that reaches the page is the version the poll bumps.
+if (haveUmap && gu) {
+  const xySum = () => page.evaluate(() => {
+    const v = window.XeniumViewer.umapInstance._viewer;
+    const xy = v._cells && v._cells.xy;
+    if (!xy) return null;
+    let s = 0;
+    for (let i = 0; i < xy.length; i += 97) if (Number.isFinite(xy[i])) s += xy[i] * ((i % 7) + 1);
+    return {n: v._cells.n, sum: Math.round(s * 1000) / 1000, key: v._cells.key || null};
+  });
+  const before = await xySum();
+  let cellFetches = 0;
+  const onReq = (r) => { if (/\/umap\/viewer\/cells/.test(r.url())) cellFetches += 1; };
+  page.on('request', onReq);
+  const seed0 = Number((await page.inputValue('#jc-seed').catch(() => '0')) || 0);
+  await tab('tab-joint');
+  await page.fill('#jc-seed', String(seed0 + 7));
+  await page.fill('#jc-res', '0.7');
+  await page.waitForTimeout(600);
+  const statusBefore = await text('#jc-status');
+  await click('#jc-run-btn');
+  await page.waitForFunction((old) => {
+    const t = document.querySelector('#jc-status')?.innerText || '';
+    return t !== old && /clusters of [\d,]+ cells in \d+ samples/.test(t) && !/^Running/.test(t);
+  }, statusBefore, {timeout: 1800000});
+  const status2 = await text('#jc-status');
+  await tab('tab-umap');
+  await page.waitForFunction((b) => {
+    const v = window.XeniumViewer.umapInstance && window.XeniumViewer.umapInstance._viewer;
+    const xy = v && v._cells && v._cells.xy;
+    if (!xy) return false;
+    let s = 0;
+    for (let i = 0; i < xy.length; i += 97) if (Number.isFinite(xy[i])) s += xy[i] * ((i % 7) + 1);
+    return Math.abs(Math.round(s * 1000) / 1000 - b) > 1e-3;
+  }, before.sum, {timeout: 60000}).catch(() => {});
+  const after = await xySum();
+  page.off('request', onReq);
+  check('re-run: the joint clustering ran again with another seed and resolution',
+        /seed \d+/.test(status2) && status2 !== statusBefore && !/from the cache/.test(status2), status2.slice(0, 200));
+  check('re-run: the WebGL UMAP panel fetched the cells again', cellFetches >= 1, `${cellFetches} request(s) for /umap/viewer/cells`);
+  check('re-run: the WebGL UMAP panel shows the new coordinates', !!after && !!before && after.n === before.n && after.sum !== before.sum,
+        JSON.stringify({before, after}));
+  // … and they are the coordinates the server now serves (not a mix of two runs)
+  const served = await page.evaluate(async () => {
+    const v = window.XeniumViewer.umapInstance._viewer;
+    const r = await fetch(`${v.baseUrl || '/umap'}/viewer/cells.bin?source=${encodeURIComponent(v.state.source)}&_=${Date.now()}`).catch(() => null);
+    return r ? r.status : 0;
+  });
+  if (served !== 200) console.log(`NOTE  cells.bin direct fetch returned ${served} (not compared)`);
+  // a click on a cell of an added sample names the sample (the server's answer)
+  const cellInfo = await page.evaluate(async (n) => {
+    const v = window.XeniumViewer.umapInstance._viewer;
+    const r = await fetch(`/umap/viewer/cell/${n - 1}?source=${encodeURIComponent(v.state.source)}`);
+    return r.ok ? r.json() : null;
+  }, after ? after.n : 1);
+  check('joint UMAP: the cell endpoint names the sample by its position', !!cellInfo && Number.isInteger(cellInfo.sample) && cellInfo.sample >= 1,
+        JSON.stringify(cellInfo));
+  await shot('joint_3b_webgl_umap_after_rerun');
+}
+
 // another cluster set: the panel goes back to the primary sample's own UMAP
 if (methodsBefore.length && haveUmap) {
   await setProp('cluster-method', {value: methodsBefore[0]});

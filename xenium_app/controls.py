@@ -107,12 +107,25 @@ def _controls_reset() -> None:
 
 # ─── Per-cell columns of the view ─────────────────────────────────────────────
 def _seg_tag(seg_source) -> str:
-    """Identity of the segmentation a column belongs to: "xenium", or the tool and the
-    output directory of the loaded Baysor / Proseg run."""
+    """Identity of the segmentation a column belongs to: "xenium", or the tool, the
+    output directory and the run id of the loaded Baysor / Proseg run (a re-run with the
+    same parameters is stored in the same directory and is another run)."""
     alt = analysis._an_alt_res(seg_source)
     if alt is None:
         return "xenium"
-    return f"{core._seg_tool(seg_source)}:{alt.get('out_dir', '')}"
+    rid = core._seg_run_id(alt)
+    return f"{core._seg_tool(seg_source)}:{alt.get('out_dir', '')}" + (f"#{rid}" if rid else "")
+
+
+def _ctl_forget_run(final_dir) -> None:
+    """A run was committed to *final_dir*: drop the columns of an earlier run there."""
+    with _ctl_columns_lock:
+        for k in [k for k in _ctl_columns
+                  if any(str(k[1]).split("#")[0] == f"{t}:{final_dir}" for t in core._SEG_TOOL_LABELS)]:
+            _ctl_columns.pop(k, None)
+
+
+caching._seg_commit_hooks.append(_ctl_forget_run)
 
 
 _CTL_SEG_CHANGED = ("The segmentation was switched while this job was running: its per-cell values belong "
@@ -690,8 +703,19 @@ def _spillover(samples, labels, source, markers, local_r=_SPILL_LOCAL_R_UM, near
                     .groupby("q").agg(rate=("f", "mean"), median_depth=("d", "median")).to_dict("records"))
     return {"per_sample": per, "reference": reference, "reference_kind": ref_kind,
             "source_detect": src_detect, "validity": val, "profile": prof, "flags": flags,
-            "n_non_source": int(non.sum()), "n_source": int(is_src.sum()),
+            "n_non_source": int(non.sum()), "n_source": int(len(src_share)),
+            "n_source_labelled": int(is_src.sum()),
             "by_type": by_type, "by_depth": by_depth, "edges": tuple(edges)}
+
+
+def _spill_flags(score, edges=_SPILL_FLAG_EDGES) -> np.ndarray:
+    """The per-cell flag name of a spillover score; None for a cell that was not scored
+    (NaN score: no matrix row, e.g. no SPLIT-corrected counts), never "none"."""
+    score = np.asarray(score, dtype=np.float64)
+    ok = np.isfinite(score)
+    flag = np.array(_SPILL_FLAG_NAMES, dtype=object)[np.digitize(np.where(ok, score, 0.0), list(edges))]
+    flag[~ok] = None
+    return flag
 
 
 def _auto_source(prof: dict, exclude=()) -> "str | None":
@@ -730,7 +754,7 @@ def _run_spillover(seg_source, method, label_kind, source, markers_text, n_marke
         if not samples:
             _set("error", analysis._an_no_matrix_msg(seg_source))
             return
-        labels, cat = stats._comp_labels(label_kind, samples, seg_source, method)
+        labels, cat = stats._comp_labels(label_kind, samples, seg_source, method, use_corrected)
         if all(l is None for l in labels):
             _set("error", f"The active view has no {cat} labels: run Cell Type Annotation first.")
             return
@@ -761,7 +785,7 @@ def _run_spillover(seg_source, method, label_kind, source, markers_text, n_marke
         own = _gene_ownership(prof, frac=own_frac)
         out = {}
         for s, p in zip(samples, res["per_sample"]):
-            flag = np.array(_SPILL_FLAG_NAMES, dtype=object)[np.digitize(np.nan_to_num(p["score"]), list(res["edges"]))]
+            flag = _spill_flags(p["score"], res["edges"])
             out[s["key"]] = {"spillover": p["score"].astype(np.float32), "spillover_flag": flag,
                              "source_distance_um": p["dist"].astype(np.float32)}
         jobs._job_shield("Writing the spillover columns…")

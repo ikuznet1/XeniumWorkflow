@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
-from . import core, jobs, dataview, ui, analysis, stats
+from . import core, jobs, caching, dataview, ui, analysis, stats
 
 
 _cs_registry: dict = {}        # key → {"name", "shared", "meta", "levels"}
@@ -40,44 +40,80 @@ _CS_MIN_PER_M_EDGES = 0.25         # neighbours + shared-neighbour graph + Leide
 _CS_RAM_SHARE = 0.5                # a job estimated above this share of the machine's memory is refused
 
 
+_CS_CGROUP_FILES = ("/sys/fs/cgroup/memory.max",                        # cgroup v2
+                    "/sys/fs/cgroup/memory/memory.limit_in_bytes")       # cgroup v1
+
+
+def _cs_cgroup_limit_gb(files=None) -> float:
+    """Memory limit of the container this process runs in, in GB (0.0: none set or not
+    readable). 'max' (v2) and the huge 'unlimited' value of v1 are no limit."""
+    best = 0.0
+    for f in (_CS_CGROUP_FILES if files is None else files):
+        try:
+            with open(f) as fh:
+                txt = fh.read().strip()
+            v = float(int(txt))
+        except (OSError, ValueError):
+            continue
+        if 0 < v < 2 ** 60:
+            best = v / 1e9 if not best else min(best, v / 1e9)
+    return best
+
+
 def _cs_ram_gb() -> float:
-    """Physical memory of the machine in GB (0.0 when it cannot be read)."""
+    """Memory this process can use, in GB (0.0 when it cannot be read): the physical
+    memory of the machine, or the memory limit of the container when that is smaller (a
+    Docker / Cloud Run container on a large host is killed at its limit, not the host's)."""
     try:
-        return float(os.sysconf("SC_PAGE_SIZE")) * float(os.sysconf("SC_PHYS_PAGES")) / 1e9
+        phys = float(os.sysconf("SC_PAGE_SIZE")) * float(os.sysconf("SC_PHYS_PAGES")) / 1e9
     except (ValueError, OSError, AttributeError):
-        return 0.0
+        phys = 0.0
+    lim = _cs_cgroup_limit_gb()
+    return min(phys, lim) if (phys > 0 and lim > 0) else (phys or lim)
 
 
-def _cs_cost(n_cells: int, k: int, passes: int = 1, matrix_gb: float = 0.0, extra_minutes: float = 0.0) -> dict:
+def _cs_cost(n_cells: int, k: int, passes: int = 1, matrix_gb: float = 0.0, extra_minutes: float = 0.0,
+             graph: bool = True) -> dict:
     """Rough cost of a clustering job: {"edges" (millions), "gb" (memory above the loaded
     data), "minutes"}. *passes*: clusterings run one after the other (time adds up, memory
     does not); *matrix_gb*: working copies of the count matrix the job makes;
-    *extra_minutes*: the part before the graph (PCA, Harmony, neighbourhood features)."""
-    edges = float(n_cells) * float(k) / 1e6
+    *extra_minutes*: the part before the graph (PCA, Harmony, neighbourhood features).
+    graph=False: no neighbour graph is built (the KMeans fallback when Leiden is not
+    installed), so the edges cost neither memory nor time."""
+    edges = float(n_cells) * float(k) / 1e6 if graph else 0.0
     return {"edges": edges, "gb": edges * _CS_GB_PER_M_EDGES + float(matrix_gb),
             "minutes": edges * _CS_MIN_PER_M_EDGES * max(1, int(passes)) + float(extra_minutes)}
 
 
 def _cs_size_guard(what: str, n_cells: int, k: int, passes: int = 1, matrix_gb: float = 0.0,
-                   extra_minutes: float = 0.0) -> tuple:
+                   extra_minutes: float = 0.0, graph=None) -> tuple:
     """(refusal text or None, one-line estimate or "") for a clustering job.
 
     The estimate is given for anything above a minute or a gigabyte. The job is refused
     when its estimated memory exceeds _CS_RAM_SHARE of the machine's memory, unless
     XENIUM_ALLOW_LARGE_JOBS=1 is set: better a number up front than a machine that swaps
     for an hour."""
-    c = _cs_cost(n_cells, k, passes, matrix_gb, extra_minutes)
+    # graph=None: whether a neighbour graph is built at all is what _cs_graph_cluster will
+    # do - Leiden on a kNN / SNN graph, or (leidenalg / igraph missing) KMeans without one
+    graph = _cs_leiden_available() if graph is None else bool(graph)
+    c = _cs_cost(n_cells, k, passes, matrix_gb, extra_minutes, graph=graph)
     ram = _cs_ram_gb()
     est = (f"estimated for {int(n_cells):,} cells with {int(k)} graph neighbours: about {c['gb']:.0f} GB of "
            f"memory above the loaded data and about {max(1, round(c['minutes'])):,} min "
-           f"(a graph of ~{c['edges']:.0f} million edges)")
+           f"(a graph of ~{c['edges']:.0f} million edges)" if graph else
+           f"estimated for {int(n_cells):,} cells (KMeans fallback, no neighbour graph: Leiden is not "
+           f"installed): about {c['gb']:.0f} GB of memory above the loaded data and about "
+           f"{max(1, round(c['minutes'])):,} min")
     if c["gb"] < 1.0 and c["minutes"] < 1.0:
         return None, ""
     allow = os.environ.get("XENIUM_ALLOW_LARGE_JOBS", "").strip().lower() in ("1", "true", "yes", "on")
     if ram > 0 and c["gb"] > _CS_RAM_SHARE * ram and not allow:
-        return (f"{what} was not started: {est}; this machine has {ram:.0f} GB. Cluster fewer cells "
-                f"(subset() in the REPL, or fewer samples), lower the number of graph neighbours, or set "
-                f"XENIUM_ALLOW_LARGE_JOBS=1 to run it anyway."), est
+        return (f"{what} was not started: {est}; this machine has {ram:.0f} GB"
+                f"{' (the memory limit of its container)' if 0 < _cs_cgroup_limit_gb() <= ram else ''}. "
+                f"Cluster fewer cells (subset() in the REPL, or fewer samples)"
+                f"{', lower the number of graph neighbours' if graph else ''}"
+                f"{', lower the gene cap' if 'gene' in str(what).lower() or 'banksy' in str(what).lower() else ''}"
+                f", or set XENIUM_ALLOW_LARGE_JOBS=1 to run it anyway."), est
     return None, est[0].upper() + est[1:] + "."
 
 
@@ -271,6 +307,33 @@ def _cs_seg_slug(alt, seg_source) -> str:
     return re.sub(r"[^0-9A-Za-z_.-]+", "_", f"{core._seg_tool(seg_source)}_{run}")
 
 
+def _cs_forget_run(final_dir) -> None:
+    """A run was committed to *final_dir*: remove the cached sets of an earlier run stored
+    there (the files are named by tool and directory) and their install records."""
+    base = os.path.basename(str(final_dir).rstrip("/"))
+    slugs = {re.sub(r"[^0-9A-Za-z_.-]+", "_", f"{t}_{base}") for t in core._SEG_TOOL_LABELS}
+    with _cs_lock:
+        for k in [k for k in _cs_table_run if k[1] in slugs]:
+            _cs_table_run.pop(k, None)
+        try:
+            dirs = [os.path.join(core.CACHE_BASE_DIR, d) for d in os.listdir(core.CACHE_BASE_DIR)
+                    if d.startswith("clustersets_")]
+        except OSError:
+            dirs = []
+        for d in dirs:
+            if not os.path.isdir(d):
+                continue
+            for fn in os.listdir(d):
+                if any(fn.endswith(f"__{s}{ext}") for s in slugs for ext in (".json", ".parquet")):
+                    try:
+                        os.remove(os.path.join(d, fn))
+                    except OSError:
+                        pass
+
+
+caching._seg_commit_hooks.append(_cs_forget_run)
+
+
 def _cs_reseg_col(columns, method):
     """The column of an installed set in the cell table of a Baysor / Proseg run, when
     *method* names one that this run has; else None (the run's own clusters are shown)."""
@@ -395,7 +458,8 @@ def _cs_install(name, per_table_labels, seg_source, meta=None) -> str:
                 pd.DataFrame({"cell_id": by_id.index, "label": by_id.to_numpy()}).to_parquet(stem + ".parquet.tmp")
                 os.replace(stem + ".parquet.tmp", stem + ".parquet")
                 with open(stem + ".json", "w") as fh:
-                    json.dump({"key": key, "seg": _cs_seg_slug(alt, seg_source), "n_cells": int(len(by_id)), **ent},
+                    json.dump({"key": key, "seg": _cs_seg_slug(alt, seg_source),
+                               "seg_run": core._seg_run_id(alt), "n_cells": int(len(by_id)), **ent},
                               fh, default=str)
             except Exception as exc:
                 print(f"  cluster set '{name}': not written to the cache ({exc})", flush=True)
@@ -436,6 +500,10 @@ def _cs_restore(seg_source="xenium") -> list:
                     with open(os.path.join(d, fn)) as fh:
                         info = json.load(fh)
                     key = info["key"]
+                    # a set of another run stored in this directory (a re-run with the
+                    # same parameters) is not this run's: its cells are other cells
+                    if alt is not None and str(info.get("seg_run") or "") != core._seg_run_id(alt):
+                        continue
                     col = dataview.cluster_col(key) if alt is None else f"cluster_{key}"
                     _cs_registry.setdefault(key, {"name": info.get("name", key), "shared": bool(info.get("shared")),
                                                   "meta": info.get("meta") or {}, "levels": info.get("levels") or [],

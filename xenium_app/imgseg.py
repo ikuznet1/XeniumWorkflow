@@ -712,7 +712,8 @@ def _load_cached_imgseg(out_dir: str) -> None:
             "imgseg", "Image-based segmentation (cached run loaded)",
             seg_source=provenance._prov_run_source(_ISEG_TOOL, {"out_dir": out_dir}),
             params={"run": os.path.basename(str(out_dir).rstrip("/"))},
-            result={"n_cells": int(n_cells)}, message=f"Loaded — {n_cells:,} cells", cache=True)
+            result={"n_cells": int(n_cells)}, message=f"Loaded — {n_cells:,} cells", cache=True,
+            once=("load", str(out_dir), core._seg_run_id({"out_dir": out_dir})))
     except jobs._JobCancelled:
         raise
     except jobs._DatasetChanged:

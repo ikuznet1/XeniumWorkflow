@@ -40,7 +40,8 @@ _BK_MAX_GENES = 2000         # feature cap: the most variable genes of a larger 
 _BK_MIN_CELLS = 50
 _BK_CHUNK = 8192             # cells per dense block
 _BK_KEEP_BYTES = 1.2e9       # neighbourhood blocks up to this size are kept instead of recomputed
-_BK_CACHE_VERSION = 2          # 2: the signature includes the content of the count matrix
+_BK_CACHE_VERSION = 3          # 2: the signature includes the content of the count matrix
+                               # 3: ... and whether Leiden could run (else the KMeans fallback)
 _BK_TOP_GENES = 5
 # cost of the part before the graph, per million cells (measured, README "Performance at
 # study scale"): the normalised matrix and its gene selection; the three passes over the
@@ -357,9 +358,22 @@ def _bk_cache_file(sig: str) -> str:
     return os.path.join(core.CACHE_BASE_DIR, f"banksy_{analysis._an_dataset_tag()}", f"{sig}.npz")
 
 
+def _bk_gram_gb(n_genes: int, agf: bool = True) -> float:
+    """Memory of the covariance step of _bk_embed, in GB: the Gram matrix of the augmented
+    features is (blocks × genes)² float64 whatever the number of cells (blocks: own
+    expression, neighbourhood mean and, with the azimuthal Gabor filter, its magnitude),
+    beside the float32 product of a block and its float64 copy, and one dense block of
+    cells. With the gene cap raised on a whole-transcriptome matrix this is tens of GB."""
+    d = (3 if agf else 2) * max(0, int(n_genes))
+    return 2.5 * d * d * 8 / 1e9 + _BK_CHUNK * d * 4 / 1e9
+
+
 def _bk_signature(samples, seg_source, params, genes) -> str:
     h = hashlib.md5()
-    h.update(json.dumps({"v": _BK_CACHE_VERSION, "p": params, "seg": controls._seg_tag(seg_source)},
+    # which clustering backend can run is part of the key (as joint._jc_backends): a
+    # KMeans-fallback partition is not handed back once leidenalg / igraph are installed
+    h.update(json.dumps({"v": _BK_CACHE_VERSION, "p": params, "seg": controls._seg_tag(seg_source),
+                         "leiden": bool(clustersets._cs_leiden_available())},
                         sort_keys=True, default=str).encode())
     for s in samples:
         h.update(str(s["key"]).encode())
@@ -498,7 +512,9 @@ def _run_banksy(seg_source, use_corrected, params=None) -> None:
             _n = int(sum(int((np.asarray(smp["rows"])[:len(smp["df"])] >= 0).sum()) for smp in samples))
             _stop, _est = clustersets._cs_size_guard(
                 "Banksy-style clustering", _n, p["k_expr"],
-                matrix_gb=_BK_MATRIX_GB_PER_M_CELLS * _n / 1e6, extra_minutes=_BK_MIN_PER_M_CELLS * _n / 1e6)
+                matrix_gb=(_BK_MATRIX_GB_PER_M_CELLS * _n / 1e6
+                           + _bk_gram_gb(min(int(p["max_genes"]), len(genes_all)), p["agf"])),
+                extra_minutes=_BK_MIN_PER_M_CELLS * _n / 1e6)
             if _stop:
                 _set("error", _stop)
                 return
@@ -556,7 +572,12 @@ def _run_banksy(seg_source, use_corrected, params=None) -> None:
                "params": p, "name": name, "key": key, "seg_source": seg_source, "gen": _gen,
                "seg_tag": controls._seg_tag(seg_source), "summary": summary, "cached": cached is not None,
                "corrected": bool(samples[0]["corrected"]), "seconds": _time.time() - _t0,
-               "n_samples": len(samples), "has_unassigned": bool((flat < 0).any())}
+               "n_samples": len(samples), "has_unassigned": bool((flat < 0).any()),
+               # cells of the samples that were clustered but have no cluster: no matrix row
+               # (in corrected mode, no SPLIT-corrected counts) - left out, not zeros
+               "n_no_counts": int(sum(int((np.asarray(l) < 0).sum()) for t, l in zip(tables, per)
+                                      if t["key"] in by_key)),
+               "n_uncorrected": analysis._an_uncorrected(samples)}
         ci = summary["cluster"]
         blocks = ("own expression, neighbourhood mean and AGF" if p["agf"] else "own expression and neighbourhood mean")
         how = "read from the cache" if cached is not None else f"{res['seconds']:.0f} s"
@@ -580,6 +601,9 @@ def _run_banksy(seg_source, use_corrected, params=None) -> None:
             msg += ("\nSeveral samples: neighbours were taken within each sample; scaling, PCA and clustering "
                     "were done on all cells together, so the labels are the same in every sample. No batch "
                     "correction is applied: a cluster found in one sample only may be a batch effect.")
+        if res["n_no_counts"]:
+            msg += (f"\n{res['n_no_counts']:,} cell(s) without "
+                    f"{'SPLIT-corrected ' if res['corrected'] else ''}counts were left out and have no cluster.")
         if missing:
             msg += f"\nLeft out (no count matrix): {', '.join(missing)}."
         if use_corrected and not res["corrected"]:
@@ -664,6 +688,9 @@ def _bk_csv(res) -> str:
              f"# neighbour_purity: mean share of a cell's {p['k_geom']} nearest cells in its own cluster; "
              f"purity_expected: the share of the cluster among all cells",
              "# cluster ids are the values of the cluster set (0 = no label)"]
+    if res.get("n_no_counts"):
+        lines.append(f"# {res['n_no_counts']} cell(s) without "
+                     f"{'SPLIT-corrected ' if res['corrected'] else ''}counts were left out and have no cluster")
     heat = pd.DataFrame(np.asarray(res["heat"], dtype=float), columns=res["heat_genes"])
     heat.insert(0, "domain", res["table"]["domain"].to_numpy())
     return provenance._prov_csv_stamp(res, ("\n".join(lines) + "\n# clusters\n" + res["table"].to_csv(index=False)

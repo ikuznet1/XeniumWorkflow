@@ -742,6 +742,17 @@ _PROX_COLUMNS = [("gene", "Gene", "text"), ("log2fc", "Near − far", "num"), ("
                  ("leak_fraction", "Leak fraction", "num"), ("leak_flag", "Leak gate", "text")]
 
 
+_PROX_FDR_NAMES = {"empirical": ("Emp. FDR", "empirical FDR"), "bh": ("FDR (BH)", "FDR (BH)"),
+                   "none": ("FDR", "FDR")}
+
+
+def _prox_columns(fdr) -> list:
+    """The table columns of a proximity result, the padj column headed by the adjustment
+    that produced it (*fdr*: "empirical", "bh" or "none")."""
+    head = _PROX_FDR_NAMES.get(str(fdr), _PROX_FDR_NAMES["none"])[0]
+    return [(c, head if c == "padj" else n, k) for c, n, k in _PROX_COLUMNS]
+
+
 def _prox_units_statement(res: dict) -> str:
     """Unit and n of the p-values of a proximity result."""
     info, N = res["info"], res["info"]["n_random_valid"]
@@ -778,7 +789,7 @@ def _run_proximity_de(target, anchor, label_kind, seg_source, method, use_correc
         if not samples:
             _set("error", analysis._an_no_matrix_msg(seg_source))
             return
-        labels, cat = stats._comp_labels(label_kind, samples, seg_source, method)
+        labels, cat = stats._comp_labels(label_kind, samples, seg_source, method, use_corrected)
         if all(l is None for l in labels):
             _set("error", f"The active view has no {cat} labels: run Cell Type Annotation first, or use clusters.")
             return
@@ -802,10 +813,13 @@ def _run_proximity_de(target, anchor, label_kind, seg_source, method, use_correc
         p, info, t = res["params"], res["info"], res["table"]
         res.update({"category": cat, "seg_source": seg_source or "xenium", "seconds": _time.time() - _t0,
                     "label_a": f"{target} ≤ {p['near']:g} µm from {anchor}",
-                    "label_b": f"{target} ≥ {p['far']:g} µm", "columns": _PROX_COLUMNS,
+                    "label_b": f"{target} ≥ {p['far']:g} µm", "columns": _prox_columns(info["fdr"]),
                     "lfc_title": f"near − far of {anchor} (residual log2 expression)",
                     "units_note": _prox_units_statement(res), "notes": [], "computed_defaults": defaults,
-                    "fdr_name": "empirical FDR" if info["fdr"] == "empirical" else "FDR (BH)",
+                    "fdr_name": _PROX_FDR_NAMES.get(info["fdr"], _PROX_FDR_NAMES["none"])[1],
+                    # what the run used, as scalars of the record (the methods text reads them)
+                    "estimator": info.get("estimator"), "fdr": info.get("fdr"), "mode": info.get("mode"),
+                    "by_donor": bool(info.get("by_donor")),
                     "up_name": f"higher near {anchor}", "down_name": f"lower near {anchor}"})
         res["title"] = (f"{target}: ≤ {p['near']:g} µm from {anchor} ({res['n_a']:,} cells) vs ≥ {p['far']:g} µm "
                         f"({res['n_b']:,}) — {'sign-flip across ' + str(info['n_units']) + ' units' if info['mode'] == 'cohort' else 'single-sample, matched-anchor null'}")
@@ -903,7 +917,14 @@ def _prox_csv_header(res: dict) -> str:
              f"# residual: log1p(CP10k) regressed within sample on log1p(library size)"
              + (f" and {p['n_bins']} quantile bins of the fraction of {res['source']} cells within {p['local_r']:g} um"
                 if res["source"] else ""),
-             f"# test statistic: {res['info']['estimator']}; padj = {res.get('fdr_name', 'empirical FDR')} from {res['info']['n_random_valid']} usable of {p['n_random']} count-matched random anchor sets (same compartment x "
+             f"# test statistic: {res['info']['estimator']}; padj = "
+             + (f"{res.get('fdr_name', 'empirical FDR')} from {res['info']['n_random_valid']} usable of {p['n_random']} "
+                if res["info"].get("fdr", "empirical") == "empirical" else
+                f"Benjamini-Hochberg over the sample-level p-values (no empirical FDR: only "
+                f"{res['info']['n_random_valid']} usable of {p['n_random']} "
+                if res["info"].get("fdr") == "bh" else
+                f"not computed ({res['info']['n_random_valid']} usable of {p['n_random']} ")
+             + f"count-matched random anchor sets{'' if res['info'].get('fdr', 'empirical') == 'empirical' else ')'} (same compartment x "
              f"edge-bin stratum, seed {p['seed']}); random_mean / z_random: the random sets' mean effect and "
              f"the observed effect in their SDs",
              f"# unit of the p-values: {res.get('units_note', '')}",
@@ -1160,11 +1181,22 @@ def _run_contact_de(target, anchor, label_kind, seg_source, method, use_correcte
     try:
         _t0 = _time.time()
         _set("running", "Collecting the contact and comparator cells…")
-        samples = analysis._an_samples(seg_source, use_corrected)
+        # A count model (DESeq2 / edgeR) is not given SPLIT-corrected counts - the rule of
+        # the pseudobulk mode, which this mode shares: the ORIGINAL counts are summed,
+        # whatever the counts mode (which still picks the cluster column of a run, as on
+        # the map). The status line says so when the mode is "SPLIT Corrected".
+        samples = analysis._an_samples(seg_source, False)
         if not samples:
             _set("error", analysis._an_no_matrix_msg(seg_source))
             return
-        labels, cat = stats._comp_labels(label_kind, samples, seg_source, method)
+        _not_raw = [s["label"] for s in samples if not stats._counts_are_integer(s)]
+        if _not_raw and not all(stats._counts_round_sums(s) for s in samples if s["label"] in _not_raw):
+            _set("error", f"The count matrix of {', '.join(_not_raw)} holds non-integer values: contact-group "
+                          f"pseudobulk differential expression needs raw counts (for an .h5ad that only has "
+                          f"corrected counts, \"noninteger_counts\": \"round_sums\" in the mapping allows "
+                          f"them to be summed and rounded).")
+            return
+        labels, cat = stats._comp_labels(label_kind, samples, seg_source, method, use_corrected)
         if all(l is None for l in labels):
             _set("error", f"The active view has no {cat} labels: run Cell Type Annotation first, or use clusters.")
             return
@@ -1193,7 +1225,8 @@ def _run_contact_de(target, anchor, label_kind, seg_source, method, use_correcte
                     "label_a": f"{target} in contact with {anchor}", "label_b": f"{target} without contact (matched)",
                     "population": f"{target} near {anchor}", "method_label": fitinfo["method_label"],
                     "stat_name": fitinfo["stat_name"], "shrink": fitinfo["shrink"], "engine": fitinfo["engine"],
-                    "mean_unit": fitinfo["mean_unit"], "design": "~ sample + group",
+                    "mean_unit": fitinfo["mean_unit"],
+                    "design": "~ donor + group" if res["by_donor"] else "~ sample + group",
                     "units_note": f"n = {k} {unit}, each with a contact and a matched comparator pseudobulk",
                     "notes": list(fitinfo.get("notes") or []), "computed_defaults": defaults,
                     "lfc_title": "log2 fold change (contact / comparator), unshrunken (MLE)",
@@ -1210,7 +1243,14 @@ def _run_contact_de(target, anchor, label_kind, seg_source, method, use_correcte
                f"{res['seconds']:.1f} s).")
         if res.get("n_uncorrected"):
             msg += " " + analysis._an_uncorrected_note(res["n_uncorrected"]) + "."
-        msg += f"\nUnit of the p-values: {res['units_note']} (the samples, not the cells)."
+        if use_corrected:
+            msg += ("\nNote: the counts mode is SPLIT-corrected, but contact-group pseudobulk uses the original "
+                    "integer counts (a count model is not given corrected counts), as the pseudobulk mode does.")
+        if _not_raw:
+            res["counts_rounded"] = True
+            msg += "\n⚠ " + stats._PB_NONINTEGER_NOTE[0].upper() + stats._PB_NONINTEGER_NOTE[1:] + "."
+        msg += (f"\nUnit of the p-values: {res['units_note']} "
+                f"({'the donors: not their sections, not the cells' if res['by_donor'] else 'the samples, not the cells'}).")
         if k < 3:
             msg += f"\n⚠ Only {k} {unit}: variance estimates from fewer than 3 are unreliable."
         if sh["n"]:

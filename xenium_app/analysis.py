@@ -355,7 +355,10 @@ def _an_cluster_labels(samples, method, use_corrected, alt) -> list:
         if own:
             lab[lab == str(clustersets._CS_UNASSIGNED)] = None
         if multi:
-            pre = "C" if shared else f"S{di}:C"
+            # the sample's own label, not its position: _an_samples leaves out samples
+            # without a matrix, and the view numbers every loaded sample
+            sl = str(s.get("label") or "")
+            pre = "C" if shared else f"{sl if re.fullmatch(r'S[0-9]+', sl) else f'S{di}'}:C"
             lab = np.array([None if x is None else f"{pre}{x}" for x in lab], dtype=object)
         out.append(lab)
     return out
@@ -1322,14 +1325,15 @@ def _run_geneset_score(name, seg_source, use_corrected) -> None:
     """Background job: score a saved gene set for the active view."""
     _gen = jobs._dataset_gen
 
-    def _set(status, message):
+    def _set(status, message, used=None):
         with _geneset_lock:
             if jobs._stale_job(_gen, status, message):
                 return
             _geneset_state["status"] = status
             _geneset_state["message"] = message
         if status == "done":
-            provenance._prov_record("geneset", f"Gene-set score: {name}", seg_source=seg_source, corrected=use_corrected, params={"gene_set": name}, message=message)
+            # used: the counts the score was computed on (not the mode that was asked for)
+            provenance._prov_record("geneset", f"Gene-set score: {name}", seg_source=seg_source, corrected=use_corrected, params={"gene_set": name}, message=message, result=used)
 
     try:
         _set("running", f"Scoring gene set '{name}'…")
@@ -1345,13 +1349,19 @@ def _run_geneset_score(name, seg_source, use_corrected) -> None:
         with _geneset_lock:
             _geneset_state["version"] += 1
         _dropped = len(info["found"]) - len(info["used"])
-        _unc_note = _an_uncorrected_note(_an_uncorrected(_an_samples(seg_source, use_corrected)))
+        _smp = _an_samples(seg_source, use_corrected)
+        _unc_note = _an_uncorrected_note(_an_uncorrected(_smp))
+        _corr = bool(_smp) and all(s["corrected"] for s in _smp)
         _set("done", f"Gene set '{name}': {len(info['used'])} genes scored against "
                      f"{info['n_control']} control genes."
                      + (f" {_dropped} gene(s) without any variance left out." if _dropped else "")
                      + _miss
                      + (f" {_unc_note}; they have no score." if _unc_note else "")
-                     + f" Pick 'Gene set: {name}' under Color By.")
+                     + (" Original counts were used: SPLIT-corrected counts do not exist for every sample "
+                        "of the view." if use_corrected and not _corr else "")
+                     + f" Pick 'Gene set: {name}' under Color By.",
+             used={"corrected": _corr, "n_uncorrected": int(_an_uncorrected(_smp)),
+                   "n_genes_used": len(info["used"]), "n_control": int(info["n_control"])})
     except jobs._JobCancelled:
         raise
     except jobs._DatasetChanged:

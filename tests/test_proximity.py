@@ -665,13 +665,14 @@ def test_type_pickers_follow_the_segmentation_cluster_set_and_samples(xe, D):
     method = (D.get("cluster_methods") or [None])[0]
     if not method:
         pytest.skip("the bundle has no cluster set")
-    opts, _o2, src_opts, tv, av, sv = xe.update_prox_type_options("cluster", 0, 0, 0, "xenium", method, 0,
+    opts, _o2, src_opts, tv, av, sv = xe.update_prox_type_options("cluster", 0, 0, 0, "xenium", method, 0, "original",
                                                                   None, None, "auto")
     have = [o["value"] for o in opts]
     assert have and (tv, av, sv) == (no_update, no_update, no_update)
     assert [o["value"] for o in src_opts][:2] == ["auto", "none"]
     # a pick that exists stays; one from another cluster set / segmentation is cleared
-    out = xe.update_prox_type_options("cluster", 0, 0, 0, "xenium", method, 0, have[0], "no-such-type", "gone")
+    out = xe.update_prox_type_options("cluster", 0, 0, 0, "xenium", method, 0, "original",
+                                      have[0], "no-such-type", "gone")
     assert out[3] is no_update and out[4] is None and out[5] == "auto"
 
 

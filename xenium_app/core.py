@@ -32,6 +32,14 @@ IMPUTE_GENES_DEFAULT = os.environ.get("XENIUM_IMPUTE_GENES", "").strip()
 REF_RDS_PLACEHOLDER = "/path/to/reference.rds (a Seurat object with cell-type labels; default: $XENIUM_REF_RDS)"
 
 
+def _ref_rds_path(path) -> str:
+    """The reference path as every job gets it: what was typed or pasted, without the
+    surrounding white space (a trailing space or newline) and with ~ expanded. The
+    callbacks validate and start their job with this one value."""
+    path = str(path or "").strip()
+    return os.path.expanduser(path) if path else ""
+
+
 def _ref_rds_problem(path) -> "str | None":
     """Why *path* cannot be used as the reference .rds file (None: it can)."""
     path = str(path or "").strip()
@@ -155,6 +163,31 @@ def _seg_states() -> list:
     return [(t,) + _seg_state(t)[::-1] for t in _SEG_TOOL_LABELS]
 
 
+# A run directory is reused by a re-run with the same parameters, so the directory alone
+# does not say which cells a result holds: every committed run also has a run id (a file
+# in the directory, written by caching._seg_stage_commit). Runs stored before this
+# existed have none ("").
+_SEG_RUN_ID_FILE = "run_id"
+
+
+def _seg_run_id(result) -> str:
+    """The run id of a loaded Baysor / Proseg / image-segmentation result ("" for a run
+    stored without one). Read from the run directory once and kept in the result, so a
+    result that stays in memory keeps its own id when a re-run replaces the directory."""
+    if not isinstance(result, dict):
+        return ""
+    rid = result.get("run_id")
+    if rid is None:
+        rid = ""
+        try:
+            with open(os.path.join(str(result.get("out_dir") or ""), _SEG_RUN_ID_FILE)) as fh:
+                rid = fh.read().strip()[:64]
+        except OSError:
+            pass
+        result["run_id"] = rid
+    return rid
+
+
 def _seg_result(seg_source, done_only: bool = False):
     """The loaded result of the tool *seg_source* names ("<tool>" or "<tool>:<tag>"),
     None for Xenium or when nothing is loaded (done_only: also while the tool's state is
@@ -165,7 +198,9 @@ def _seg_result(seg_source, done_only: bool = False):
     with lock:
         if done_only and state.get("status") != "done":
             return None
-        return state.get("result")
+        res = state.get("result")
+    _seg_run_id(res)         # fixed at first use (see _seg_run_id)
+    return res
 
 
 # ─── SpaGE imputation state ───────────────────────────────────────────────────

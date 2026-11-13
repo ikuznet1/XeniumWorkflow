@@ -70,6 +70,10 @@ def _job_starts() -> list:
     return out
 
 
+# a job whose record is written by another function, after its result is installed:
+# job function -> (module of the writer, writer, module of its caller, caller)
+_RECORDED_AFTER_INSTALL = {"_h5ad_job": ("h5ad", "_h5ad_record", "cb_data", "_h5ad_install")}
+
 # a job whose target is a variable: the functions it can be
 _DYNAMIC_TARGETS = {"loader": ["_load_cached_baysor", "_load_cached_proseg"]}
 
@@ -103,6 +107,15 @@ def test_every_registered_job_kind_writes_a_provenance_record(xe):
         assert cands, f"{where}: cannot find the function the job runs ({ast.dump(target)[:80]})"
         for fn in cands:
             got = _records_called(fn)
+            if not got and fn.name in _RECORDED_AFTER_INSTALL:
+                # the job only prepares the data; the record is written once the data is
+                # installed (written by the job it would describe the previous dataset)
+                mod, writer, caller_mod, caller = _RECORDED_AFTER_INSTALL[fn.name]
+                got = [k for f in by_module[mod].get(writer, []) for k in _records_called(f)]
+                src = ast.get_source_segment(trees[next(p for p in trees if p.stem == caller_mod)].body and
+                                             next(p for p in trees if p.stem == caller_mod).read_text(),
+                                             by_module[caller_mod][caller][0]) or ""
+                assert f"{writer}(" in src, f"{caller_mod}.{caller}() no longer calls {writer}"
             if not got:
                 missing.append(f"{where}: {fn.name}() never calls provenance._prov_record")
             elif kind is not None:

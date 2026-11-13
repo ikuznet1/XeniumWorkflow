@@ -431,8 +431,8 @@ def _agg_across(values, conds, donors) -> dict:
     bad = [i for i, c in enumerate(c_use) if c and not np.isfinite(vals[i])]
     if bad:
         # never a test on a silently reduced set of samples
-        return {"p": None, "why": (f"{len(bad)} sample(s) assigned to a condition have no value (fewer than 3 "
-                                   f"cells, or no tissue area)")}
+        return {"p": None, "why": (f"{len(bad)} sample(s) assigned to a condition have no value (no "
+                                   f"labels, fewer than 3 cells, or no tissue area)")}
     r = stats._sl_test(vals, c_use, donors, units=u)
     note = r["units_note"]
     if r.get("dropped"):
@@ -492,6 +492,7 @@ def _run_aggregates(seg_source, method, label_kind, classes, params=None) -> Non
         tpos = {t: i for i, t in enumerate(types)}
         T, S = len(types), len(tables)
         per, defaults, tissue_of = [], [], {}
+        unlabelled = []            # samples without any label: their density is unknown, not zero
         for si, (t, lab) in enumerate(zip(tables, labels)):
             jobs._job_check()
             xy = stats._xy_of(t["df"])
@@ -504,10 +505,16 @@ def _run_aggregates(seg_source, method, label_kind, classes, params=None) -> Non
                     lambda v: tpos.get(str(v), -1) if v is not None else -1).to_numpy(dtype=np.int64)
             ind = np.isin(code, [tpos[c] for c in cls])
             if n < 3 or not ind.any():
-                # no cell of the class: the sample has zero aggregates on its tissue area
-                # (a value of the between-condition test, not a missing one)
+                # labelled, but no cell of the class: the sample has zero aggregates on its
+                # tissue area (a value of the between-condition test, not a missing one).
+                # No label at all (no annotation for this sample): nothing is known about
+                # the class there - no value, and the test says so instead of using a 0.
                 per.append(None)
-                tissue_of[si] = float(_agg_tile_area(xy).sum()) if n >= 3 else np.nan
+                if not (code >= 0).any():
+                    unlabelled.append(si)
+                    tissue_of[si] = np.nan
+                else:
+                    tissue_of[si] = float(_agg_tile_area(xy).sum()) if n >= 3 else np.nan
                 continue
             levels, computed = _agg_strata(t, seg_source, xy)
             if computed:
@@ -548,8 +555,10 @@ def _run_aggregates(seg_source, method, label_kind, classes, params=None) -> Non
             if r is None:
                 tissue = tissue_of[si]
                 has = bool(np.isfinite(tissue) and tissue > 0)
-                srows.append({**base, "n_class": 0, "tissue_mm2": tissue / 1e6 if has else np.nan,
-                              "n_aggregates": 0, "per_mm2": 0.0 if has else np.nan,
+                srows.append({**base, "n_class": 0 if si not in unlabelled else np.nan,
+                              "tissue_mm2": tissue / 1e6 if has else np.nan,
+                              "n_aggregates": 0 if si not in unlabelled else np.nan,
+                              "per_mm2": 0.0 if has else np.nan,
                               "area_fraction": 0.0 if has else np.nan, "share_class_inside": np.nan, "n_hotspot": 0,
                               "control_mean": np.nan, "control_max": np.nan, "false_rate": np.nan,
                               "control_area_max": np.nan})
@@ -611,6 +620,8 @@ def _run_aggregates(seg_source, method, label_kind, classes, params=None) -> Non
                "seg_tag": seg_tag, "gen": _gen, "tests": tests, "n_samples": S,
                "seconds": _time.time() - _t0}
         n_lab = int(sum(int((r["code"] >= 0).sum()) for r in per if r is not None))
+        _unl = {tables[si]["label"] for si in unlabelled}
+        res["unlabelled"] = sorted(_unl)
         n_cells = int(sum(len(t["df"]) for t in tables))
         floor = 1.0 / (p["n_null"] + 1.0)
         msg = (f"{n_agg:,} aggregate(s) of ≥ {int(p['n_min'])} class cells in {S} sample(s); class = "
@@ -618,7 +629,8 @@ def _run_aggregates(seg_source, method, label_kind, classes, params=None) -> Non
                f"{p['link']:g} µm, hotspot: p ≤ {p['alpha']:g} of {p['n_null']} within-stratum permutations "
                f"(smallest possible p {floor:.3g}) and ≥ {int(p['min_nb'])} class cells within the radius; "
                f"seed {p['seed']} ({res['seconds']:.1f} s).\n"
-               + "; ".join(f"{r['sample']}: {r['n_aggregates']} aggregate(s)"
+               + "; ".join((f"{r['sample']}: no {cat} labels - not evaluated" if r["sample"] in _unl else
+                            f"{r['sample']}: {r['n_aggregates']} aggregate(s)")
                            + (f", {r['per_mm2']:.2f} / mm², {100 * r['area_fraction']:.2f} % of "
                               f"{r['tissue_mm2']:.2f} mm² tissue, {100 * r['share_class_inside']:.0f} % of the "
                               f"{r['n_class']:,} class cells inside" if np.isfinite(r["tissue_mm2"]) else "")

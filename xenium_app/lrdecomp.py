@@ -675,7 +675,7 @@ def _run_lrdecomp(pairs_text, label_kind, seg_source, method, use_corrected, rad
         if not samples:
             _set("error", analysis._an_no_matrix_msg(seg_source))
             return
-        labels, cat = stats._comp_labels(label_kind, samples, seg_source, method)
+        labels, cat = stats._comp_labels(label_kind, samples, seg_source, method, use_corrected)
         if all(l is None for l in labels):
             _set("error", f"The active view has no {cat} labels: run Cell Type Annotation first, or "
                           f"decompose between clusters.")

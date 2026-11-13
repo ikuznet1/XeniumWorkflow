@@ -63,31 +63,61 @@ def update_control_label_options(active_tab, _annot, _niche, _ds, seg_source, _e
             qc, no_update if cur_qc in qc_have else (qc_have[0] if qc_have else None))
 
 
+def _type_value(current, opts, fallback=None):
+    """no_update while the picked type is still among the options, else *fallback*."""
+    return no_update if (current is None or current in {o["value"] for o in opts}) else fallback
+
+
 @app_layout.app.callback(
     Output("ctl-dominant", "options"),
     Output("spill-source", "options"),
+    Output("ctl-dominant", "value"),
+    Output("spill-source", "value"),
     Input("ctl-labels",      "value"),
     Input("dataset-version", "data"),
     Input("annot-done",      "data"),
-    State("seg-source",      "value"),
-    State("cluster-method",  "value"),
+    Input("seg-source",      "value"),
+    Input("cluster-method",  "value"),
+    Input("subset-version",  "data"),
+    Input("extra-datasets-version", "data"),
+    Input("counts-mode-store",      "data"),
+    Input("baysor-done",     "data"),
+    Input("proseg-done",     "data"),
+    State("ctl-dominant",    "value"),
+    State("spill-source",    "value"),
 )
-def update_control_type_options(kind, _ds, _annot, seg_source, method):
-    return (_type_options(kind, seg_source, method, {"label": "auto (most abundant type)", "value": "auto"}),
-            _type_options(kind, seg_source, method,
-                          {"label": "auto (type with the most transcripts)", "value": "auto"}))
+def update_control_type_options(kind, _ds, _annot, seg_source, method, _sub=None, _ex=None, _cm=None,
+                                _bd=None, _pd=None, dominant=None, source=None):
+    """The types of the label source in the view as it is now: another segmentation,
+    cluster set, sample list, subset or counts mode has other types and counts, so the list
+    is rebuilt for each, and a picked type that no longer exists is cleared."""
+    dom = _type_options(kind, seg_source, method, {"label": "auto (most abundant type)", "value": "auto"})
+    src = _type_options(kind, seg_source, method, {"label": "auto (type with the most transcripts)", "value": "auto"})
+    return dom, src, _type_value(dominant, dom, "auto"), _type_value(source, src, "auto")
 
 
 @app_layout.app.callback(
     Output("coloc-placebo", "options"),
+    Output("coloc-placebo", "value"),
     Input("coloc-labels",    "value"),
     Input("dataset-version", "data"),
     Input("annot-done",      "data"),
-    State("seg-source",      "value"),
-    State("cluster-method",  "value"),
+    Input("seg-source",      "value"),
+    Input("cluster-method",  "value"),
+    Input("subset-version",  "data"),
+    Input("extra-datasets-version", "data"),
+    Input("counts-mode-store",      "data"),
+    Input("baysor-done",     "data"),
+    Input("proseg-done",     "data"),
+    State("coloc-placebo",   "value"),
 )
-def update_coloc_placebo_options(kind, _ds, _annot, seg_source, method):
-    return _type_options(kind, seg_source, method, None)
+def update_coloc_placebo_options(kind, _ds, _annot, seg_source, method, _sub=None, _ex=None, _cm=None,
+                                 _bd=None, _pd=None, current=None):
+    """The types of the label source in the view as it is now: another segmentation,
+    cluster set, sample list, subset or counts mode has other types and counts, so the list
+    is rebuilt for each, and a picked type that no longer exists is cleared."""
+    opts = _type_options(kind, seg_source, method, None)
+    return opts, _type_value(current, opts, None)
 
 
 @app_layout.app.callback(
@@ -288,6 +318,20 @@ def wake_jobs_poll_controls(_ctl, poll_disabled):
 )
 def update_color_by_for_controls(_comp, _spill, current_options):
     return cb_spatial._refresh_colorby_options(current_options)
+
+
+@app_layout.app.callback(
+    Output("geneset-version", "data", allow_duplicate=True),
+    Input("ctl-comp-done", "data"),
+    Input("spill-done",    "data"),
+    State("geneset-version", "data"),
+    prevent_initial_call=True,
+)
+def recolour_after_controls(_comp, _spill, gs_version):
+    """A finished compartments / spillover run replaced per-cell columns: the map colours
+    are keyed on geneset-version (as after Banksy, joint clustering, aggregates), so a map
+    coloured by a control column is redrawn with the new values."""
+    return (gs_version or 0) + 1
 
 
 @app_layout.app.callback(

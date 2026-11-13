@@ -78,10 +78,15 @@ def _install_dataset(new_data: dict) -> None:
 # bytes of JSON per cell, rebuilt on every change of colour). Above this many cells it is
 # not built: the app starts in the WebGL view, and the Plotly view says why it is empty.
 # XENIUM_PLOTLY_MAX_CELLS changes the limit (0: no limit).
+# The default is where the first draw stayed under about 15 s when it was measured
+# (headless Chromium with a GPU, local server, a 5,006-gene section replicated side by
+# side): 3 s at 113,000 cells, 4 s at 225,000, 5 s at 450,000, 7-10 s at 900,000, and a
+# recolour 2.5 / 3.5 / 6 / 10 s. The server held about 1 GB per 113,000 cells.
+_PLOTLY_MAX_CELLS_DEFAULT = 900_000
 try:
-    PLOTLY_MAX_CELLS = int(os.environ.get("XENIUM_PLOTLY_MAX_CELLS", "").strip() or 500_000)
+    PLOTLY_MAX_CELLS = int(os.environ.get("XENIUM_PLOTLY_MAX_CELLS", "").strip() or _PLOTLY_MAX_CELLS_DEFAULT)
 except ValueError:
-    PLOTLY_MAX_CELLS = 500_000
+    PLOTLY_MAX_CELLS = _PLOTLY_MAX_CELLS_DEFAULT
 
 
 def _loaded_cell_count() -> int:

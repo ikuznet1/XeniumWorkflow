@@ -36,11 +36,19 @@ def update_sfree_label_options(active_tab, _annot, _ds, seg_source, _ex, color_b
     Input("dataset-version", "data"),
     Input("annot-done",      "data"),
     Input("subset-version",  "data"),
-    State("seg-source",      "value"),
-    State("cluster-method",  "value"),
+    Input("seg-source",      "value"),
+    Input("cluster-method",  "value"),
+    Input("extra-datasets-version", "data"),
+    Input("counts-mode-store",      "data"),
+    Input("baysor-done",     "data"),
+    Input("proseg-done",     "data"),
     State("sfree-type",      "value"),
 )
-def update_sfree_type_options(kind, _ds, _annot, _sub, seg_source, method, current=None):
+def update_sfree_type_options(kind, _ds, _annot, _sub, seg_source, method, _ex=None, _cm=None,
+                              _bd=None, _pd=None, current=None):
+    """The types of the label source in the view as it is now: another segmentation,
+    cluster set, sample list, subset or counts mode has other types and counts, so the list
+    is rebuilt for each, and a picked type that no longer exists is cleared."""
     opts = cb_controls._type_options(kind, seg_source, method, None)
     have = [o["value"] for o in opts]
     return opts, (no_update if current in have else None)

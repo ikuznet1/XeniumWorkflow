@@ -1691,7 +1691,11 @@ def make_umap_fig(color_by, method, gene, size, opacity,
 
         title = f"UMAP [{core._SEG_TOOL_LABELS.get(_alt_tool, _alt_tool)}]"
     else:
-        # Original Xenium UMAP — switch to SPLIT UMAP coordinates when corrected counts active
+        # Original Xenium UMAP — switch to SPLIT UMAP coordinates when corrected counts active.
+        # With several samples the counts mode is the one of the map and of every analysis:
+        # corrected only when every sample has corrected counts.
+        if dataview.EXTRA_DATASETS:
+            use_corrected = dataview._multi_use_corrected(use_corrected)
         _has_split_umap = (use_corrected
                            and "split_umap_1" in core.DATA["df"].columns
                            and core.DATA["df"]["split_umap_1"].notna().any())

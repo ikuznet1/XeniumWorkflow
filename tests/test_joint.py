@@ -411,7 +411,7 @@ def test_joint_umap_columns_and_umap_panel(xe, world, client, monkeypatch, real_
     prov = xe._UmapViewerProvider()
     assert prov._split(f"xenium|corr|emb:{key}") == ("xenium", True) and prov._split("xenium|corr") == ("xenium", True)
     n0 = len(world.dsets[0]["df"])
-    assert prov.cell_at(f"xenium|emb:{key}", n0 + 2) == {"index": n0 + 2, "id": str(world.dsets[1]["df"].index[2]), "sample": "S1"}
+    assert prov.cell_at(f"xenium|emb:{key}", n0 + 2) == {"index": n0 + 2, "id": str(world.dsets[1]["df"].index[2]), "sample": 1}
     # per-cell columns are what Save as SpatialData exports for the primary sample
     assert xe._ctl_get(tables[0], "xenium", "joint_harmony_umap_2") is not None
     # after a restart the columns are gone but the set is restored: the embedding comes back from the cache
@@ -716,7 +716,5 @@ def test_webgl_joint_umap_token_changes_with_a_joint_rerun(xe, world):
         xe._jc_state["version"] = xe._jc_state.get("version", 0) + 1      # what a finished run does
     assert prov.cells(src)[0]["token"] != tok
     assert prov.cells("xenium")[0]["token"] == prov.cells("xenium")[0]["token"]
-    # the page's cells key of the joint embedding carries the version the poll bumps
-    js = open(os.path.join(os.path.dirname(os.path.dirname(viewer_provider.__file__)), "assets",
-                           "xenium_viewer_dash.js")).read()
-    assert "jointEmb ? an.gsVersion : 0" in js
+    # (that the page asks again after a re-run is tested on the glue itself:
+    # test_review_round6.test_webgl_joint_umap_refetches_coordinates_after_a_rerun)

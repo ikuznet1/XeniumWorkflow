@@ -271,6 +271,51 @@ rm(._dgc_i, ._dgc_p, ._dgc_x, ._dgc_rn, ._dgc_cn)
 """)
 
 
+def _split_onto_cells(mat, job_df, cur_df, cols=("cluster_split_10", "split_umap_1", "split_umap_2")) -> tuple:
+    """(matrix, {column: values}) of a SPLIT result for the cells of *cur_df*.
+
+    *mat* has one row per cell of *job_df* (the table the job read at its start). When
+    *cur_df* is still that table the inputs are returned as they are; otherwise each cell
+    of *cur_df* gets the row and the column values of the cell with its id (an empty row
+    and no value when the job did not see it). Raises RuntimeError before anything is
+    stored when the rows cannot be told apart by id."""
+    import scipy.sparse as sp_
+    have = [c for c in cols if c in job_df.columns]
+    if cur_df is job_df or cur_df.index.equals(job_df.index):
+        return mat, {c: job_df[c].values for c in have}
+    job_ids = pd.Index(job_df.index.astype(str))
+    if not job_ids.is_unique or mat.shape[0] != len(job_ids):
+        raise RuntimeError("The cells of the run changed while SPLIT was running and its result "
+                           "cannot be matched to them by cell id. Run SPLIT again.")
+    cur_ids = pd.Index(cur_df.index.astype(str))
+    pos = job_ids.get_indexer(cur_ids)
+    ok = pos >= 0
+    out = sp_.diags(ok.astype(np.float32)).dot(sp_.csr_matrix(mat)[np.where(ok, pos, 0)]).tocsr()
+    out.eliminate_zeros()
+    print(f"  SPLIT: the run's cell table changed during the job - result matched by cell id "
+          f"({int(ok.sum()):,} of {len(cur_ids):,} cells)", flush=True)
+    return out, {c: pd.Series(job_df[c].values, index=job_ids).reindex(cur_ids).values for c in have}
+
+
+def _split_publish_labels(state: dict, labels, mode_key: str, generic_key: str, partial: bool) -> list:
+    """Put the labels of SPLIT's own RCTD run into the annotation state (call inside
+    core._annot_lock); returns the keys written.
+
+    partial (the run saw the cells of an active subset() only): a key that already holds
+    labels is left alone - labels of part of the cells never replace an annotation of all
+    of them. Otherwise both keys are replaced, and the RCTD weights stored under them are
+    removed: they belong to the annotation run whose labels were just replaced (the rule
+    of annotation._annot_autoload: weights only beside the labels of their own run)."""
+    written = []
+    for k in dict.fromkeys((mode_key, generic_key)):
+        if partial and state.get(k) is not None:
+            continue
+        state[k] = labels
+        state[f"rctd_weights_{k}"] = None
+        written.append(k)
+    return written
+
+
 def _run_split_correction(rds_path: str, label_col: str = "Names",
                            max_cores: int = 4, seg_source: str = "xenium",
                            min_umi: int = 10, min_umi_sigma: int = 100,
@@ -538,8 +583,8 @@ names(._split_rctd_types) <- rownames(._split_rctd_res)
                 _rctd_generic_key = "_".join(_rctd_lkey.split("_")[:2] + _rctd_lkey.split("_")[3:])
                 with core._annot_lock:
                     jobs._check_dataset_gen(_gen)
-                    core._annot_state[_rctd_lkey]       = _split_labels
-                    core._annot_state[_rctd_generic_key] = _split_labels
+                    _split_publish_labels(core._annot_state, _split_labels, _rctd_lkey,
+                                          _rctd_generic_key, partial=bool(_cells_extra))
 
             print("  SPLIT: RCTD done, running purify()…", flush=True)
 
@@ -670,14 +715,17 @@ names(._split_rctd_types) <- rownames(._split_rctd_res)
         if _alt_res is not None:
             _lock = core._seg_state(_tool)[1] or core._proseg_lock
             with _lock:
-                _alt_res["split_corrected_expr"] = corrected_mat
+                # The run's cell table may have changed while SPLIT ran (subset() /
+                # unsubset() in the REPL): rows are paired with the cells now in the
+                # table by cell id, never by position.
+                _mat_cur, _cols_cur = _split_onto_cells(corrected_mat, cells_df, _alt_res["cells_df"])
+                _alt_res["split_corrected_expr"] = _mat_cur
                 _alt_res["split_corrected_cell_ids"] = corrected_cell_ids
                 _alt_res["split_panel_genes"] = list(panel_genes)
                 _alt_res["split_corrected_imputed_genes"] = []
                 # Merge cluster/UMAP cols back into alt_res cells_df
-                for col in ["cluster_split_10", "split_umap_1", "split_umap_2"]:
-                    if col in cells_df.columns:
-                        _alt_res["cells_df"][col] = cells_df[col].values
+                for col, _v in _cols_cur.items():
+                    _alt_res["cells_df"][col] = _v
                 # SPLIT ran on a subset(): also keep a full-size copy (zero rows
                 # outside the subset) so unsubset() restores an aligned matrix.
                 _orig_df = _alt_res.get("_cells_df_original")

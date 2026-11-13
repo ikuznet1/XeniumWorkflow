@@ -44,6 +44,7 @@ def open_split_modal(open_clicks, close_clicks, is_open):
 def run_split(n_clicks, rds_path, label_col, max_cores, min_umi, min_umi_sigma, purify_singlets, seg_source):
     if not n_clicks:
         return no_update, True, False
+    rds_path = core._ref_rds_path(rds_path)
     _problem = core._ref_rds_problem(rds_path)
     if _problem:
         return f"⚠ {_problem}", True, False
@@ -223,6 +224,10 @@ def run_niche(n_clicks, n_clusters, n_neighbors, label_key, seg_source):
     with core._proseg_lock:
         pres = core._proseg_state["result"] if tool == "proseg" and core._proseg_state["result"] else None
     alt_res = pres or bres or (core._seg_result(seg_source) if tool == "imgseg" else None)
+    if alt_res is None and tool != "xenium":
+        # a run that is named but not loaded is never replaced by the Xenium cells
+        return (False, True, f"The selected segmentation ({seg_source}) is not loaded (it is still loading, "
+                             f"or its load failed): no niches were computed.")
 
     # Label keys are per segmentation (Xenium ids vs the ids of one Baysor/Proseg
     # run): use the chosen method's labels for the active one, or refuse.

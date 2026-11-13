@@ -30,14 +30,29 @@ def update_agg_label_options(active_tab, _annot, _ds, seg_source, _ex, color_by=
 
 @app_layout.app.callback(
     Output("agg-classes", "options"),
+    Output("agg-classes", "value"),
     Input("agg-labels",      "value"),
     Input("dataset-version", "data"),
     Input("annot-done",      "data"),
-    State("seg-source",      "value"),
-    State("cluster-method",  "value"),
+    Input("seg-source",      "value"),
+    Input("cluster-method",  "value"),
+    Input("subset-version",  "data"),
+    Input("extra-datasets-version", "data"),
+    Input("counts-mode-store",      "data"),
+    Input("baysor-done",     "data"),
+    Input("proseg-done",     "data"),
+    State("agg-classes",     "value"),
 )
-def update_agg_class_options(kind, _ds, _annot, seg_source, method):
-    return cb_controls._type_options(kind, seg_source, method, None)
+def update_agg_class_options(kind, _ds, _annot, seg_source, method, _sub=None, _ex=None, _cm=None,
+                             _bd=None, _pd=None, current=None):
+    """The types of the label source in the view as it is now: another segmentation,
+    cluster set, sample list, subset or counts mode has other types and counts, so the list
+    is rebuilt for each, and a picked type that no longer exists is cleared."""
+    opts = cb_controls._type_options(kind, seg_source, method, None)
+    have = {o["value"] for o in opts}
+    cur = current if isinstance(current, list) else ([current] if current else [])
+    keep = [c for c in cur if c in have]
+    return opts, (no_update if keep == cur else keep)
 
 
 @app_layout.app.callback(

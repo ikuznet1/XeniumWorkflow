@@ -196,6 +196,7 @@ class _Baseline:
         for k in [k for k in mod.DATA if k not in self.data_keys]:
             mod.DATA.pop(k, None)
         mod.DATA["split_corrected_expr"] = self.corrected
+        mod._active_counts_mode = "original"
         del mod.EXTRA_DATASETS[:]
         for cache in ("_gene_expr_cache", "_umap_fig_cache", "_umap_df_cache", "_viewport_arrays"):
             getattr(mod, cache).clear()

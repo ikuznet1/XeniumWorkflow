@@ -226,7 +226,11 @@
         if (!info || ex.measure) return;   // no cell selection while the ruler is active
         fetch(PREFIX + "/umap/viewer/cell/" + info.index + "?source=" + encodeURIComponent(info.source || "xenium"))
           .then(function (r) { return r.json(); })
-          .then(function (cell) { if (cell && cell.id) setProps("selected-cell", { data: cell.id }); })
+          .then(function (cell) {
+            if (!cell || !cell.id) return;
+            // the joint UMAP shows every sample: a cell of an added sample is named with it
+            setProps("selected-cell", { data: cell.sample ? { id: cell.id, sample: cell.sample } : cell.id });
+          })
           .catch(function () { /* cell info is optional */ });
       },
     });
@@ -678,7 +682,8 @@
     lastTool = tool_;
     cur = { source: source, tool: tool, colorBy: colorBy || "cluster", dataVersion: dataVersion,
             colorVersion: colorVersion,
-            overlayBase: [datasetVer, roiDone, source, extraVer || 0].join("|") };
+            overlayBase: [datasetVer, roiDone, source, extraVer || 0].join("|"),
+            umapBase: null, jointEmb: false };
     syncOverlays();
     syncCellnest();
     syncPies();
@@ -690,12 +695,16 @@
       setTimeout(function () { u.resize(); }, 60);
       var corrected = countsMode === "corrected";
       var jointEmb = tool === "xenium" && /^joint_clusters/.test(method || "");
+      // kept for analysis(): a joint re-run bumps only the gene-set version, which is not
+      // an input of this callback
+      cur.umapBase = [dataVersion, splitDone, corrected ? 1 : 0].join("|");
+      cur.jointEmb = jointEmb;
       u.setState({
         // a joint cluster set brings its own embedding of all samples (served when it exists)
         source: source + (corrected ? "|corr" : "") + (jointEmb ? "|emb:" + method : ""),
         // a joint re-run replaces the coordinates under the same source: its version (the
         // one the poll bumps for the colours) is part of the cells key, so they are refetched
-        dataVersion: [dataVersion, splitDone, corrected ? 1 : 0, jointEmb ? an.gsVersion : 0].join("|"),
+        dataVersion: umapDataVersion(cur.umapBase, jointEmb, an.gsVersion),
         color: {
           mode: colorBy || "cluster", method: method || "", gene: gene || "",
           corrected: corrected ? 1 : 0,
@@ -747,6 +756,12 @@
   // Third callback: the transcript-density heat layer (density-store) and the version of
   // the saved gene sets (a rescored set must be fetched again although Color By is unchanged).
   var an = { density: null, gsVersion: 0 };
+  // The UMAP viewer's cells key. With a joint embedding the gene-set version is part of
+  // it: sync() and analysis() both build it here, so a joint re-run (which reaches only
+  // analysis()) changes the key the same way a control change does.
+  function umapDataVersion(base, jointEmb, gsVersion) {
+    return [base, jointEmb ? (gsVersion || 0) : 0].join("|");
+  }
   function densityState() {
     var d = an.density || {};
     return {
@@ -767,7 +782,15 @@
         var cv = cur.colorVersion.split("|").slice(0, -1).concat([an.gsVersion]).join("|");
         cur.colorVersion = cv;
         viewer.setState({ color: { version: cv } });
-        if (umapViewer) umapViewer.setState({ color: { version: cv } });
+        if (umapViewer) {
+          // a joint re-run also replaced the embedding: new cells key, so the coordinates
+          // are fetched again and not only the colours
+          var ust = { color: { version: cv } };
+          if (cur.jointEmb && cur.umapBase !== null) {
+            ust.dataVersion = umapDataVersion(cur.umapBase, true, an.gsVersion);
+          }
+          umapViewer.setState(ust);
+        }
       }
     }
     return window.dash_clientside.no_update;

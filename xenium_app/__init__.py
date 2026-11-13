@@ -63,6 +63,21 @@ def _batch_config_file(path: str) -> dict:
     return cfg
 
 
+def _batch_inline_mapping_file(mapping: dict, mdir: str) -> str:
+    """Write an inline data.h5ad_mapping where the h5ad loader reads it and return the
+    path. One file per mapping content (not one shared name): batch processes that start
+    together with different inline mappings never read each other's, and equal mappings
+    share a file safely. Written whole, then moved into place."""
+    import hashlib as _hashlib
+    text = _json.dumps(mapping, sort_keys=True)
+    mfile = _os.path.join(mdir, f"batch_h5ad_mapping_{_hashlib.md5(text.encode()).hexdigest()[:12]}.json")
+    tmp = f"{mfile}.{_os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    _os.replace(tmp, mfile)
+    return mfile
+
+
 def _batch_preconfigure() -> bool:
     """``python -m xenium_app.batch <config>``: the dataset and the cache root are read
     from the environment while the package is imported (below), so they are taken from
@@ -100,10 +115,7 @@ def _batch_preconfigure() -> bool:
     elif isinstance(mapping, dict):
         mdir = _os.environ.get("XENIUM_CACHE_DIR") or _os.path.join(_os.path.expanduser("~"), ".xenium_explorer_cache")
         _os.makedirs(mdir, exist_ok=True)
-        mfile = _os.path.join(mdir, "batch_h5ad_mapping.json")
-        with open(mfile, "w", encoding="utf-8") as fh:
-            _json.dump(mapping, fh)
-        _os.environ["XENIUM_H5AD_MAPPING"] = mfile
+        _os.environ["XENIUM_H5AD_MAPPING"] = _batch_inline_mapping_file(mapping, mdir)
     for var in ("XENIUM_ENABLE_REPL", "XENIUM_RENDERER"):      # a batch run has no browser and no REPL
         _os.environ.pop(var, None)
     return True

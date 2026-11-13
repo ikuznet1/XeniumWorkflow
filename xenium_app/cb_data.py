@@ -709,17 +709,20 @@ def _h5ad_job(path, mapping) -> None:
     """Background job of the dialog: convert (when not cached) and load the stores; the
     poll installs them."""
     def _set(status, message, result=None):
+        # (the provenance record is written by _h5ad_install, once the converted sections
+        # ARE the loaded dataset: written here it would describe the previous one)
         with h5ad._h5ad_lock:
             h5ad._h5ad_state.update({"status": status, "message": message, "result": result})
-        if status == "done":
-            provenance._prov_record("h5ad", params={"file": os.path.basename(str(path or '')), "mapping": mapping}, packages=("anndata", "h5py"), message=message)
 
     def _progress(fraction, message):
         jobs._job_progress(step=message, fraction=fraction)
         _set("running", message)
 
     try:
-        _set("done", "Loaded.", result=h5ad._h5ad_load(path, mapping, progress=_progress))
+        res = h5ad._h5ad_load(path, mapping, progress=_progress)
+        # last cancellation point: "done" makes the poll replace the loaded dataset
+        jobs._job_shield()
+        _set("done", "Loaded.", result=res)
     except jobs._JobCancelled:
         raise
     except Exception as exc:
@@ -777,6 +780,7 @@ def _h5ad_install(datasets, man, cache_dir) -> str:
     h5ad._h5ad_primary_labels()
     msg = h5ad._h5ad_design(force=False)
     print(f"  Loaded .h5ad: {man['source']} ({len(datasets)} sample(s))", flush=True)
+    h5ad._h5ad_record(man)
     return h5ad._h5ad_summary(man) + "\n" + msg
 
 

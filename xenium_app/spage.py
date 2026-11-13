@@ -393,6 +393,208 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                 _alt_res["spage_result_path"]  = _path
                 _alt_res["spage_result_genes"] = list(_genes)
 
+        def _publish(imp_df, cached: bool = False):
+            """Install an in-memory result: the cache file (a fresh run), the result
+            reference, the imputed columns of the store and of the matrix in memory. A
+            result read from the cache goes the same way: the columns on display may be
+            those of another run of the same genes (other n_pv, other reference)."""
+            # ── Publish an in-memory result (fresh, or read from the parquet cache) ──
+            _set("running", "Installing cached SpaGE results…" if cached else "Saving imputed results…")
+            # Last cancellation point. The cache file, the run's result reference, the
+            # zarr table (deleted, then rewritten) and DATA are written as one unit.
+            jobs._job_shield()
+            jobs._job_progress(fraction=None)
+            if not cached:
+                imp_df.to_parquet(cache_file)
+            if _alt_res is None:
+                # a result computed under a subset() covers part of the cells: it is not
+                # registered for auto-load at startup (as the streaming paths)
+                if not _xen_subset:
+                    _spage_index_update(cache_file, _ds_key)
+            else:
+                _record_reseg_result(cache_file, list(imp_df.columns))
+            if not cached:
+                print(f"  SpaGE: {len(imp_df.columns)} genes cached to {cache_file}", flush=True)
+
+            def _spage_replace_cols(X, col_idx, dense_vals):
+                """X (sparse, cells × genes) with the columns col_idx replaced by dense_vals."""
+                Xc = sp.csc_matrix(X, copy=True)
+                for _j in col_idx:
+                    Xc.data[Xc.indptr[_j]:Xc.indptr[_j + 1]] = 0
+                Xc.eliminate_zeros()
+                _vals = np.asarray(dense_vals, dtype=np.float32)
+                _rr = np.tile(np.arange(Xc.shape[0]), len(col_idx))
+                _cc = np.repeat(np.asarray(col_idx), Xc.shape[0])
+                _add = sp.csc_matrix((_vals.ravel(order="F"), (_rr, _cc)), shape=Xc.shape)
+                return (Xc + _add).tocsr()
+
+            def _spage_write_zarr(sdata_path, imp_df_sub, lock_ctx=None):
+                """Append imputed gene columns to a SpatialData zarr table. Returns list of new genes written."""
+                _zlock = reseg._zarr_write_lock(sdata_path)
+                _zlock.acquire()
+                try:
+                    import spatialdata as _sd_w, anndata as _ad_w
+                    import shutil as _sh_w
+                    _sdata_w = _sd_w.read_zarr(sdata_path)
+                    _adata_w = _sdata_w.tables["table"]
+                    # 'GENE [imp]' var names of an older functions/impute.py store → plain
+                    # names, so a re-imputed gene replaces its column instead of adding a
+                    # second one (the rewritten table then uses the plain names)
+                    loading._plain_imputed_var_names(_adata_w)
+                    # Imputed rows follow the cells the run saw; the table has its own
+                    # row order. Pair them by cell id and write only a complete match
+                    # (under a subset() the result stays in the SpaGE cache only).
+                    _obs_ids = pd.Index(_adata_w.obs_names.astype(str))
+                    _imp_ids = pd.Index(imp_df_sub.index.astype(str))
+                    _pos = _imp_ids.get_indexer(_obs_ids) if _imp_ids.is_unique \
+                        else np.full(len(_obs_ids), -1)
+                    if (_pos < 0).any() and _imp_ids.is_unique:
+                        _pos = _imp_ids.get_indexer(_obs_ids.str.replace(r'^p\d+_', '', regex=True))
+                    if len(_imp_ids) != len(_obs_ids) or (_pos < 0).any():
+                        print("  SpaGE: imputed cells do not match the zarr table "
+                              "(subset active?) — zarr write-back skipped", flush=True)
+                        return [], None
+                    if np.array_equal(_pos, np.arange(len(_pos))):
+                        _pos = slice(None)   # same order: no reordered copy of the values
+                    _existing = set(_adata_w.var_names)
+                    _new_genes = [g for g in imp_df_sub.columns if g not in _existing]
+                    # Genes imputed by an earlier run get their column replaced
+                    _is_imp = (_adata_w.var["is_imputed"].astype(bool)
+                               if "is_imputed" in _adata_w.var.columns
+                               else pd.Series(False, index=_adata_w.var_names))
+                    _re_genes = [g for g in imp_df_sub.columns
+                                 if g in _existing and bool(_is_imp.get(g, False))]
+                    if not _new_genes and not _re_genes:
+                        return [], None
+                    _old_X = sp.csr_matrix(_adata_w.X)
+                    if _re_genes:
+                        _old_X = _spage_replace_cols(
+                            _old_X, [_adata_w.var_names.get_loc(g) for g in _re_genes],
+                            imp_df_sub[_re_genes].values[_pos])
+                    _n_new = len(_new_genes)
+                    _new_X = sp.csr_matrix(imp_df_sub[_new_genes].values[_pos].astype(np.float32))
+                    _new_var = pd.DataFrame(
+                        {"is_imputed": True},
+                        index=pd.Index(_new_genes, name=_adata_w.var.index.name or "gene"),
+                    )
+                    # obs columns added through the low-level zarr API (UMAP, SPLIT
+                    # clusters, ROI tags) are not returned by read_zarr: carry them over.
+                    _obs_w = _adata_w.obs.copy()
+                    reseg._load_zarr_obs_into_df(sdata_path, _obs_w)
+                    _adata_new = _ad_w.AnnData(
+                        X=sp.hstack([_old_X, _new_X]).tocsr(),
+                        obs=_obs_w,
+                        var=pd.concat([_adata_w.var, _new_var]) if _n_new else _adata_w.var.copy(),
+                        uns=dict(_adata_w.uns),
+                        obsm=dict(_adata_w.obsm),
+                        # other layers (SPLIT's X_corrected) get zero columns for the new genes
+                        layers={_k: sp.hstack([sp.csr_matrix(_v), sp.csr_matrix(
+                                    (_v.shape[0], _n_new), dtype=_v.dtype)]).tocsr()
+                                for _k, _v in _adata_w.layers.items()},
+                    )
+                    _adata_new.uns["imputed_genes"] = list(dict.fromkeys(
+                        list(_adata_w.uns.get("imputed_genes", [])) + _new_genes + _re_genes))
+                    # a column re-imputed here now holds values from the original counts
+                    if len(_adata_w.uns.get("split_corrected_imputed_genes", [])):
+                        _adata_new.uns["split_corrected_imputed_genes"] = [
+                            g for g in _adata_w.uns["split_corrected_imputed_genes"]
+                            if g not in _re_genes]
+                    _sdata_w.tables["table"] = _adata_new
+                    # The table on disk has to be deleted before it can be rewritten:
+                    # keep a copy (and the root metadata) to put back if the write fails.
+                    _root_w  = str(sdata_path).rstrip("/\\")
+                    _tbl_dir = os.path.join(_root_w, "tables", "table")
+                    _bak_dir = _root_w + ".spage_table_bak"
+                    _meta_w  = [f for f in ("zarr.json", ".zmetadata", ".zattrs", ".zgroup")
+                                if os.path.isfile(os.path.join(_root_w, f))]
+                    _sh_w.rmtree(_bak_dir, ignore_errors=True)
+                    _sh_w.copytree(_tbl_dir, os.path.join(_bak_dir, "table"))
+                    for _f in _meta_w:
+                        _sh_w.copy2(os.path.join(_root_w, _f), os.path.join(_bak_dir, _f))
+                    try:
+                        _sdata_w.delete_element_from_disk("table")
+                        _sdata_w.write_element("table")
+                    except Exception:
+                        _sh_w.rmtree(_tbl_dir, ignore_errors=True)
+                        _sh_w.copytree(os.path.join(_bak_dir, "table"), _tbl_dir)
+                        for _f in _meta_w:
+                            _sh_w.copy2(os.path.join(_bak_dir, _f), os.path.join(_root_w, _f))
+                        _sh_w.rmtree(_bak_dir, ignore_errors=True)
+                        raise
+                    _sh_w.rmtree(_bak_dir, ignore_errors=True)
+                    return _new_genes, _adata_new
+                except Exception as _ze:
+                    print(f"  SpaGE: zarr write-back failed (non-fatal): {_ze}", flush=True)
+                    return [], None
+                finally:
+                    _zlock.release()
+
+            if _alt_res is not None:
+                # ── Reseg write-back: update alt_res["expr"] and per-reseg gene index ──
+                sdata_path = _alt_res.get("sdata_path", "")
+                if sdata_path and os.path.isdir(sdata_path):
+                    _set("running", "Writing imputed genes to reseg SpatialData zarr…")
+                    result_pair = _spage_write_zarr(sdata_path, imp_df)
+                    new_genes = result_pair[0] if result_pair else []
+                    adata_new = result_pair[1] if len(result_pair) > 1 else None
+                    if adata_new is not None:
+                        print(f"  SpaGE reseg: wrote {len(new_genes)} genes to {os.path.basename(sdata_path)}", flush=True)
+                        with core._spage_lock:
+                            _prev_imp = list(_alt_res.get("imputed_genes") or [])
+                            _prev_gni = _alt_res.get("gene_name_to_idx") or {}
+                            # Genes imputed before: replace their columns in memory too
+                            _re_genes = [g for g in imp_df.columns
+                                         if g in _prev_imp and g in _prev_gni
+                                         and _prev_gni[g] < _alt_res["expr"].shape[1]]
+                            if _re_genes:
+                                _alt_res["expr"] = _spage_replace_cols(
+                                    _alt_res["expr"], [_prev_gni[g] for g in _re_genes],
+                                    imp_df[_re_genes].values)
+                            if new_genes:
+                                # Extend alt_res["expr"] with new imputed columns
+                                new_cols = sp.csr_matrix(imp_df[new_genes].values.astype(np.float32))
+                                _alt_res["expr"] = sp.hstack([_alt_res["expr"], new_cols]).tocsr()
+                            if _alt_res["expr"].shape[1] == adata_new.n_vars:
+                                # Same columns as the zarr table (also for a run reloaded
+                                # from a zarr that already held imputed genes)
+                                _alt_res["gene_name_to_idx"] = {
+                                    g: i for i, g in enumerate(adata_new.var_names)}
+                                _alt_res["imputed_genes"] = [
+                                    g for g in adata_new.var_names
+                                    if bool(adata_new.var.loc[g, "is_imputed"])]
+                            elif new_genes:
+                                # Rebuild per-reseg gene index (preserves order)
+                                prev_gni = _alt_res.get("gene_name_to_idx") or core.DATA["gene_name_to_idx"]
+                                prev_names = sorted(prev_gni, key=prev_gni.__getitem__)
+                                extended_names = prev_names + new_genes
+                                _alt_res["gene_name_to_idx"] = {g: i for i, g in enumerate(extended_names)}
+                                _alt_res["imputed_genes"] = _prev_imp + new_genes
+            else:
+                # ── Xenium write-back: update DATA["expr"] and gene_names ─────────────
+                sdata_path = core.DATA.get("sdata_path", "")
+                if sdata_path and os.path.isdir(sdata_path):
+                    _set("running", "Writing imputed genes to SpatialData zarr…")
+                    result_pair = _spage_write_zarr(sdata_path, imp_df)
+                    new_genes = result_pair[0] if result_pair else []
+                    adata_new  = result_pair[1] if len(result_pair) > 1 else None
+                    if adata_new is not None:
+                        print(f"  SpaGE: wrote {len(new_genes)} imputed genes to zarr", flush=True)
+                        with core._spage_lock:
+                            jobs._check_dataset_gen(_gen)
+                            core.DATA["gene_names"]       = list(adata_new.var_names)
+                            core.DATA["gene_name_to_idx"] = {g: i for i, g in enumerate(core.DATA["gene_names"])}
+                            core.DATA["expr"]             = sp.csr_matrix(adata_new.X)
+                            core.DATA["expr_csc"]         = core.DATA["expr"].tocsc()
+                            core.DATA["gene_var"]         = adata_new.var
+                            if core.DATA.get("split_corrected_imputed_genes"):
+                                core.DATA["split_corrected_imputed_genes"] = [
+                                    str(g) for g in
+                                    adata_new.uns.get("split_corrected_imputed_genes", [])]
+                            dataview._gene_expr_cache.clear()
+
+            _set("done", f"Done{' (cached)' if cached else ''} — {len(imp_df.columns):,} genes imputed",
+                 result=imp_df if _alt_res is None else None)
+
         jobs._check_dataset_gen(_gen)
         if os.path.isdir(zarr_cache):
             try:
@@ -400,6 +602,7 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                 _zc = _zarr_c.open_array(zarr_cache, mode='r')
                 _genes_c = list(_zc.attrs.get('genes', []))
                 if _genes_c:
+                    jobs._job_shield()      # Cancel before this point publishes nothing
                     if _alt_res is None:
                         with core._spage_lock:
                             core._spage_state["result_path"]  = zarr_cache
@@ -420,6 +623,8 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                         _spage_index_update(zarr_cache, _ds_key)
                     _set("done", f"Done (cached) — {len(_genes_c):,} genes (streaming)", result=None)
                     return
+            except jobs._DatasetChanged:
+                raise                       # Cancel / dataset replaced: not a cache failure
             except Exception as _zce:
                 print(f"  SpaGE: zarr cache load failed: {_zce} — re-running", flush=True)
         if os.path.exists(cache_file):
@@ -431,6 +636,7 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                 _nr_c = _pf_c.metadata.num_rows
                 if _nr_c * _nc_c > core.SPAGE_STREAM_THRESHOLD:
                     _genes_c = _pf_c.schema_arrow.names
+                    jobs._job_shield()      # Cancel before this point publishes nothing
                     if _alt_res is None:
                         with core._spage_lock:
                             core._spage_state["result_path"]  = cache_file
@@ -441,15 +647,12 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                         _record_reseg_result(cache_file, _genes_c)
                     _set("done", f"Done (cached, streaming) — {_nc_c:,} genes", result=None)
                     return
+            except jobs._DatasetChanged:
+                raise
             except Exception:
                 pass
             imp_df = pd.read_parquet(cache_file)
-            if _alt_res is None:
-                _spage_index_update(cache_file, _ds_key)
-            else:
-                _record_reseg_result(cache_file, list(imp_df.columns))
-            _set("done", f"Done (cached) — {len(imp_df.columns):,} genes imputed",
-                 result=imp_df if _alt_res is None else None)
+            _publish(imp_df, cached=True)
             return
 
         # ── Extract submatrix from R and save to temp files ──────────────
@@ -581,6 +784,7 @@ writeLines(colnames(mat_sub), "{cells_file}")
             _vectorized_spage(spatial_df, rna_df, n_pv, genes_to_predict, out_zarr=zarr_cache)
             del spatial_df, rna_df
             jobs._check_dataset_gen(_gen)
+            jobs._job_shield()              # Cancel before this point publishes nothing
             if _alt_res is None:
                 with core._spage_lock:
                     core._spage_state["result_path"]  = zarr_cache
@@ -606,207 +810,7 @@ writeLines(colnames(mat_sub), "{cells_file}")
         imp_df = _vectorized_spage(spatial_df, rna_df, n_pv, genes_to_predict)
         del spatial_df, rna_df
 
-        # ── Cache to parquet ──────────────────────────────────────────────
-        _set("running", "Saving imputed results…")
-        # Last cancellation point. The cache file, the run's result reference, the
-        # zarr table (deleted, then rewritten) and DATA are written as one unit.
-        jobs._job_shield()
-        jobs._job_progress(fraction=None)
-        imp_df.to_parquet(cache_file)
-        if _alt_res is None:
-            _spage_index_update(cache_file, _ds_key)
-        else:
-            try:
-                import json as _json_sc
-                _sj = {"path": cache_file, "genes": genes_to_predict}
-                with open(os.path.join(_alt_res["out_dir"], "spage_result.json"), "w") as _sjf:
-                    _json_sc.dump(_sj, _sjf)
-            except Exception as _sje:
-                print(f"  SpaGE: could not persist result ref: {_sje}", flush=True)
-            _alock = core._seg_state(core._seg_tool(seg_source or ""))[1] or core._proseg_lock
-            with _alock:
-                _alt_res["spage_result_path"]  = cache_file
-                _alt_res["spage_result_genes"] = genes_to_predict
-        print(f"  SpaGE: {len(imp_df.columns)} genes cached to {cache_file}", flush=True)
-
-        def _spage_replace_cols(X, col_idx, dense_vals):
-            """X (sparse, cells × genes) with the columns col_idx replaced by dense_vals."""
-            Xc = sp.csc_matrix(X, copy=True)
-            for _j in col_idx:
-                Xc.data[Xc.indptr[_j]:Xc.indptr[_j + 1]] = 0
-            Xc.eliminate_zeros()
-            _vals = np.asarray(dense_vals, dtype=np.float32)
-            _rr = np.tile(np.arange(Xc.shape[0]), len(col_idx))
-            _cc = np.repeat(np.asarray(col_idx), Xc.shape[0])
-            _add = sp.csc_matrix((_vals.ravel(order="F"), (_rr, _cc)), shape=Xc.shape)
-            return (Xc + _add).tocsr()
-
-        def _spage_write_zarr(sdata_path, imp_df_sub, lock_ctx=None):
-            """Append imputed gene columns to a SpatialData zarr table. Returns list of new genes written."""
-            _zlock = reseg._zarr_write_lock(sdata_path)
-            _zlock.acquire()
-            try:
-                import spatialdata as _sd_w, anndata as _ad_w
-                import shutil as _sh_w
-                _sdata_w = _sd_w.read_zarr(sdata_path)
-                _adata_w = _sdata_w.tables["table"]
-                # 'GENE [imp]' var names of an older functions/impute.py store → plain
-                # names, so a re-imputed gene replaces its column instead of adding a
-                # second one (the rewritten table then uses the plain names)
-                loading._plain_imputed_var_names(_adata_w)
-                # Imputed rows follow the cells the run saw; the table has its own
-                # row order. Pair them by cell id and write only a complete match
-                # (under a subset() the result stays in the SpaGE cache only).
-                _obs_ids = pd.Index(_adata_w.obs_names.astype(str))
-                _imp_ids = pd.Index(imp_df_sub.index.astype(str))
-                _pos = _imp_ids.get_indexer(_obs_ids) if _imp_ids.is_unique \
-                    else np.full(len(_obs_ids), -1)
-                if (_pos < 0).any() and _imp_ids.is_unique:
-                    _pos = _imp_ids.get_indexer(_obs_ids.str.replace(r'^p\d+_', '', regex=True))
-                if len(_imp_ids) != len(_obs_ids) or (_pos < 0).any():
-                    print("  SpaGE: imputed cells do not match the zarr table "
-                          "(subset active?) — zarr write-back skipped", flush=True)
-                    return [], None
-                if np.array_equal(_pos, np.arange(len(_pos))):
-                    _pos = slice(None)   # same order: no reordered copy of the values
-                _existing = set(_adata_w.var_names)
-                _new_genes = [g for g in imp_df_sub.columns if g not in _existing]
-                # Genes imputed by an earlier run get their column replaced
-                _is_imp = (_adata_w.var["is_imputed"].astype(bool)
-                           if "is_imputed" in _adata_w.var.columns
-                           else pd.Series(False, index=_adata_w.var_names))
-                _re_genes = [g for g in imp_df_sub.columns
-                             if g in _existing and bool(_is_imp.get(g, False))]
-                if not _new_genes and not _re_genes:
-                    return [], None
-                _old_X = sp.csr_matrix(_adata_w.X)
-                if _re_genes:
-                    _old_X = _spage_replace_cols(
-                        _old_X, [_adata_w.var_names.get_loc(g) for g in _re_genes],
-                        imp_df_sub[_re_genes].values[_pos])
-                _n_new = len(_new_genes)
-                _new_X = sp.csr_matrix(imp_df_sub[_new_genes].values[_pos].astype(np.float32))
-                _new_var = pd.DataFrame(
-                    {"is_imputed": True},
-                    index=pd.Index(_new_genes, name=_adata_w.var.index.name or "gene"),
-                )
-                # obs columns added through the low-level zarr API (UMAP, SPLIT
-                # clusters, ROI tags) are not returned by read_zarr: carry them over.
-                _obs_w = _adata_w.obs.copy()
-                reseg._load_zarr_obs_into_df(sdata_path, _obs_w)
-                _adata_new = _ad_w.AnnData(
-                    X=sp.hstack([_old_X, _new_X]).tocsr(),
-                    obs=_obs_w,
-                    var=pd.concat([_adata_w.var, _new_var]) if _n_new else _adata_w.var.copy(),
-                    uns=dict(_adata_w.uns),
-                    obsm=dict(_adata_w.obsm),
-                    # other layers (SPLIT's X_corrected) get zero columns for the new genes
-                    layers={_k: sp.hstack([sp.csr_matrix(_v), sp.csr_matrix(
-                                (_v.shape[0], _n_new), dtype=_v.dtype)]).tocsr()
-                            for _k, _v in _adata_w.layers.items()},
-                )
-                _adata_new.uns["imputed_genes"] = list(dict.fromkeys(
-                    list(_adata_w.uns.get("imputed_genes", [])) + _new_genes + _re_genes))
-                # a column re-imputed here now holds values from the original counts
-                if len(_adata_w.uns.get("split_corrected_imputed_genes", [])):
-                    _adata_new.uns["split_corrected_imputed_genes"] = [
-                        g for g in _adata_w.uns["split_corrected_imputed_genes"]
-                        if g not in _re_genes]
-                _sdata_w.tables["table"] = _adata_new
-                # The table on disk has to be deleted before it can be rewritten:
-                # keep a copy (and the root metadata) to put back if the write fails.
-                _root_w  = str(sdata_path).rstrip("/\\")
-                _tbl_dir = os.path.join(_root_w, "tables", "table")
-                _bak_dir = _root_w + ".spage_table_bak"
-                _meta_w  = [f for f in ("zarr.json", ".zmetadata", ".zattrs", ".zgroup")
-                            if os.path.isfile(os.path.join(_root_w, f))]
-                _sh_w.rmtree(_bak_dir, ignore_errors=True)
-                _sh_w.copytree(_tbl_dir, os.path.join(_bak_dir, "table"))
-                for _f in _meta_w:
-                    _sh_w.copy2(os.path.join(_root_w, _f), os.path.join(_bak_dir, _f))
-                try:
-                    _sdata_w.delete_element_from_disk("table")
-                    _sdata_w.write_element("table")
-                except Exception:
-                    _sh_w.rmtree(_tbl_dir, ignore_errors=True)
-                    _sh_w.copytree(os.path.join(_bak_dir, "table"), _tbl_dir)
-                    for _f in _meta_w:
-                        _sh_w.copy2(os.path.join(_bak_dir, _f), os.path.join(_root_w, _f))
-                    _sh_w.rmtree(_bak_dir, ignore_errors=True)
-                    raise
-                _sh_w.rmtree(_bak_dir, ignore_errors=True)
-                return _new_genes, _adata_new
-            except Exception as _ze:
-                print(f"  SpaGE: zarr write-back failed (non-fatal): {_ze}", flush=True)
-                return [], None
-            finally:
-                _zlock.release()
-
-        if _alt_res is not None:
-            # ── Reseg write-back: update alt_res["expr"] and per-reseg gene index ──
-            sdata_path = _alt_res.get("sdata_path", "")
-            if sdata_path and os.path.isdir(sdata_path):
-                _set("running", "Writing imputed genes to reseg SpatialData zarr…")
-                result_pair = _spage_write_zarr(sdata_path, imp_df)
-                new_genes = result_pair[0] if result_pair else []
-                adata_new = result_pair[1] if len(result_pair) > 1 else None
-                if adata_new is not None:
-                    print(f"  SpaGE reseg: wrote {len(new_genes)} genes to {os.path.basename(sdata_path)}", flush=True)
-                    with core._spage_lock:
-                        _prev_imp = list(_alt_res.get("imputed_genes") or [])
-                        _prev_gni = _alt_res.get("gene_name_to_idx") or {}
-                        # Genes imputed before: replace their columns in memory too
-                        _re_genes = [g for g in imp_df.columns
-                                     if g in _prev_imp and g in _prev_gni
-                                     and _prev_gni[g] < _alt_res["expr"].shape[1]]
-                        if _re_genes:
-                            _alt_res["expr"] = _spage_replace_cols(
-                                _alt_res["expr"], [_prev_gni[g] for g in _re_genes],
-                                imp_df[_re_genes].values)
-                        if new_genes:
-                            # Extend alt_res["expr"] with new imputed columns
-                            new_cols = sp.csr_matrix(imp_df[new_genes].values.astype(np.float32))
-                            _alt_res["expr"] = sp.hstack([_alt_res["expr"], new_cols]).tocsr()
-                        if _alt_res["expr"].shape[1] == adata_new.n_vars:
-                            # Same columns as the zarr table (also for a run reloaded
-                            # from a zarr that already held imputed genes)
-                            _alt_res["gene_name_to_idx"] = {
-                                g: i for i, g in enumerate(adata_new.var_names)}
-                            _alt_res["imputed_genes"] = [
-                                g for g in adata_new.var_names
-                                if bool(adata_new.var.loc[g, "is_imputed"])]
-                        elif new_genes:
-                            # Rebuild per-reseg gene index (preserves order)
-                            prev_gni = _alt_res.get("gene_name_to_idx") or core.DATA["gene_name_to_idx"]
-                            prev_names = sorted(prev_gni, key=prev_gni.__getitem__)
-                            extended_names = prev_names + new_genes
-                            _alt_res["gene_name_to_idx"] = {g: i for i, g in enumerate(extended_names)}
-                            _alt_res["imputed_genes"] = _prev_imp + new_genes
-        else:
-            # ── Xenium write-back: update DATA["expr"] and gene_names ─────────────
-            sdata_path = core.DATA.get("sdata_path", "")
-            if sdata_path and os.path.isdir(sdata_path):
-                _set("running", "Writing imputed genes to SpatialData zarr…")
-                result_pair = _spage_write_zarr(sdata_path, imp_df)
-                new_genes = result_pair[0] if result_pair else []
-                adata_new  = result_pair[1] if len(result_pair) > 1 else None
-                if adata_new is not None:
-                    print(f"  SpaGE: wrote {len(new_genes)} imputed genes to zarr", flush=True)
-                    with core._spage_lock:
-                        jobs._check_dataset_gen(_gen)
-                        core.DATA["gene_names"]       = list(adata_new.var_names)
-                        core.DATA["gene_name_to_idx"] = {g: i for i, g in enumerate(core.DATA["gene_names"])}
-                        core.DATA["expr"]             = sp.csr_matrix(adata_new.X)
-                        core.DATA["expr_csc"]         = core.DATA["expr"].tocsc()
-                        core.DATA["gene_var"]         = adata_new.var
-                        if core.DATA.get("split_corrected_imputed_genes"):
-                            core.DATA["split_corrected_imputed_genes"] = [
-                                str(g) for g in
-                                adata_new.uns.get("split_corrected_imputed_genes", [])]
-                        dataview._gene_expr_cache.clear()
-
-        _set("done", f"Done — {len(imp_df.columns):,} genes imputed",
-             result=imp_df if _alt_res is None else None)
+        _publish(imp_df)
 
     except jobs._JobCancelled:
         raise                      # reported by _job_finish; the finally below still runs
@@ -879,7 +883,7 @@ def run_spage(rds_path: str, genes_file: str = None, n_pv: int = 50,
         n_pv=50,
     )
     """
-    rds_path = (rds_path or core.REF_RDS_DEFAULT or "").strip()
+    rds_path = core._ref_rds_path(rds_path or core.REF_RDS_DEFAULT)
     _problem = core._ref_rds_problem(rds_path)
     if _problem:
         print(f"  SpaGE: {_problem} Nothing was run.", flush=True)

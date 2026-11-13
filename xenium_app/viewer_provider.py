@@ -691,6 +691,9 @@ class _UmapViewerProvider(_ViewerProvider):
     def _umap_xy(self, source):
         base, corrected = self._split(source)
         df, alt = self._frame(base)
+        if alt is None and dataview.EXTRA_DATASETS:
+            # several samples: corrected only when every sample has corrected counts
+            corrected = dataview._multi_use_corrected(corrected)
         n = len(df)
         x = np.full(n, np.nan)
         y = np.full(n, np.nan)
@@ -761,6 +764,10 @@ class _UmapViewerProvider(_ViewerProvider):
         args["source"] = base
         if joint_view:           # the colours of every sample, as the spatial view has them
             return _viewer_provider.colors(args)
+        if dataview.EXTRA_DATASETS and core._seg_tool(base) == "xenium":
+            # the primary sample alone, under the counts rule of the multi-sample view
+            args["corrected"] = "1" if dataview._multi_use_corrected(
+                str(args.get("corrected", "0")).lower() in ("1", "true", "corrected")) else "0"
         return super().colors(args)
 
     def boundaries(self, source, kind, x0, y0, x1, y1):
@@ -776,9 +783,11 @@ class _UmapViewerProvider(_ViewerProvider):
         jv = self._joint(source)
         if jv is not None:
             pos = int(index)
-            for t in jv["tables"]:
+            # "sample" as the spatial provider gives it: the position among the samples
+            # (0 = primary, n = n-th added sample), which is what show_cell_info resolves
+            for si, t in enumerate(jv["tables"]):
                 if pos < len(t["df"]):
-                    return ({"index": int(index), "id": str(t["df"].index[pos]), "sample": t["label"]}
+                    return ({"index": int(index), "id": str(t["df"].index[pos]), "sample": int(si)}
                             if pos >= 0 else {})
                 pos -= len(t["df"])
             return {}

@@ -58,11 +58,12 @@ def update_prox_label_options(active_tab, mode, _annot, _ds, seg_source, _ex, co
     Input("seg-source",      "value"),
     Input("cluster-method",  "value"),
     Input("extra-datasets-version", "data"),
+    Input("counts-mode-store", "data"),
     State("prox-target",     "value"),
     State("prox-anchor",     "value"),
     State("prox-source",     "value"),
 )
-def update_prox_type_options(kind, _ds, _annot, _sub, seg_source, method, _ex=None,
+def update_prox_type_options(kind, _ds, _annot, _sub, seg_source, method, _ex=None, _cm=None,
                              target=None, anchor=None, source=None):
     """The types of the label source in the view as it is now: another segmentation,
     cluster set or sample list has other types and counts, so the lists are rebuilt for

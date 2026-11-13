@@ -727,7 +727,7 @@ def _run_joint(seg_source, use_corrected: bool = False, params=None) -> None:
 
 
 # ─── The joint UMAP in the UMAP panel ─────────────────────────────────────────
-_jc_restore_seen: dict = {}     # (dataset generation, method) → True once a restore was tried
+_jc_restore_seen: dict = {}     # (dataset generation, method, cached run, sample keys) → True once a restore was tried
 
 
 def _jc_variant_of(method) -> "str | None":
@@ -742,13 +742,16 @@ def _jc_variant_of(method) -> "str | None":
 
 def _jc_restore_umap(method, tables, seg_source="xenium") -> None:
     """After a restart the cluster set is restored from the cache but its UMAP is not in
-    memory: read the coordinates of the run the set came from (once per dataset)."""
-    key = (jobs._dataset_gen, str(method))
+    memory: read the coordinates of the run the set came from. Tried once per dataset,
+    set, cached run and list of loaded samples: a restore refused because a sample of the
+    run is not loaded yet is tried again when the samples change."""
+    meta = clustersets._cs_meta(method)
+    key = (jobs._dataset_gen, str(method), str(meta.get("cache_tag") or ""),
+           tuple(str(t["key"]) for t in tables))
     if _jc_restore_seen.get(key):
         return
     _jc_restore_seen.clear()
     _jc_restore_seen[key] = True
-    meta = clustersets._cs_meta(method)
     variant = _jc_variant_of(method)
     if variant is None or not meta.get("cache_tag"):
         return
@@ -980,8 +983,11 @@ def _jc_records(res) -> list:
 
 def _jc_csv(res) -> str:
     p, d = res["params"], res["diag"]
+    _left = int(res.get("n_cells_view", res["n_cells"])) - int(res["n_cells"])
     lines = [f"# {res['name']}; {res['n_cells']} cells of {len(res['samples'])} samples; "
-             f"{'SPLIT-corrected' if res['corrected'] else 'original'} counts",
+             f"{'SPLIT-corrected' if res['corrected'] else 'original'} counts"
+             + (f"; {_left} cell(s) without {'SPLIT-corrected ' if res['corrected'] else ''}counts were left out "
+                f"and have no cluster" if _left > 0 else ""),
              f"# {res['n_genes']} shared genes, {res['n_hvg']} used, {res['n_pcs']} PCs; clustering: "
              f"{res['backend'].get('backend')}, {p['n_neighbors']} neighbours, resolution {p['resolution']:g}, "
              f"seed {p['seed']}",

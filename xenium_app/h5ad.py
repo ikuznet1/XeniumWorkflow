@@ -133,11 +133,13 @@ def _h5ad_inspect(path) -> dict:
             if pd.api.types.is_bool_dtype(s) or not pd.api.types.is_numeric_dtype(s):
                 lv = pd.unique(s.dropna())
                 cols.append({"name": str(c), "kind": "categorical", "n_levels": int(len(lv)),
-                             "levels": [str(v) for v in lv[:_H5AD_MAX_LEVELS]]})
+                             "levels": [_h5ad_level_str(v) for v in lv[:_H5AD_MAX_LEVELS]]})
             else:
                 nun = int(s.nunique(dropna=True)) if len(s) else 0
                 cols.append({"name": str(c), "kind": "numeric", "n_levels": nun,
-                             "levels": ([str(v) for v in sorted(pd.unique(s.dropna()))]
+                             # as the conversion writes them ("0", not "0.0"): the values
+                             # the dialog offers are the levels of the manifest
+                             "levels": ([_h5ad_level_str(v) for v in sorted(pd.unique(s.dropna()))]
                                         if nun <= _H5AD_MAX_LEVELS else [])})
         mats = {}
         if "X" in f:
@@ -194,6 +196,9 @@ def _h5ad_mapping_for(path, info=None) -> dict:
         mapping.update(given)
         if ("x" in given or "y" in given) and "spatial" not in given:
             mapping.pop("spatial", None)
+        if given.get("spatial") and "x" not in given and "y" not in given:
+            # the mapping names the obsm key: guessed x / y columns do not override it
+            mapping["x"] = mapping["y"] = None
         print(f"  h5ad: column mapping read from {side}", flush=True)
     elif os.environ.get("XENIUM_H5AD_MAPPING", "").strip():
         raise ValueError(f"XENIUM_H5AD_MAPPING names a file that does not exist: {side}")
@@ -313,6 +318,26 @@ def _h5ad_row_blocks(node, block_nnz=None):
 
 def _h5ad_natural_key(s) -> list:
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", str(s))]
+
+
+def _h5ad_unique_names(names) -> list:
+    """*names* with repeats numbered ("a", "a-1", "a-2" …) so that every name is unique: a
+    suffixed name that already exists ("a-1" beside two "a") is never produced twice."""
+    names = [str(n) for n in names]
+    used = set(names)                      # names that exist as they are keep them
+    seen, nxt, out = set(), {}, []
+    for n in names:
+        if n not in seen:
+            seen.add(n)
+            out.append(n)
+            continue
+        k = nxt.get(n, 1)
+        while f"{n}-{k}" in used:
+            k += 1
+        nxt[n] = k + 1
+        used.add(f"{n}-{k}")
+        out.append(f"{n}-{k}")
+    return out
 
 
 def _h5ad_level_str(v) -> str:
@@ -504,8 +529,7 @@ def _h5ad_convert(path, mapping, progress=None, force: bool = False, block_nnz=N
             cid = pd.Index(ids[rows])
             if not cid.is_unique:
                 # the same obs name twice in one section: keep both cells, numbered
-                dup = pd.Series(cid).groupby(cid).cumcount().to_numpy()
-                cid = pd.Index([f"{a}-{d}" if d else a for a, d in zip(cid, dup)])
+                cid = pd.Index(_h5ad_unique_names(cid))
             tot = np.asarray(X.sum(axis=1)).ravel()
             df = pd.DataFrame({"x_centroid": xy[rows, 0], "y_centroid": xy[rows, 1],
                                "transcript_counts": tot, "total_counts": tot,
@@ -649,10 +673,34 @@ def _h5ad_load(path, mapping=None, progress=None) -> tuple:
     path = os.path.abspath(os.path.expanduser(str(path)))
     mapping = _h5ad_mapping_for(path) if mapping is None else _h5ad_clean_mapping(mapping)
     conv = (lambda f, m: progress(0.8 * f, m)) if progress is not None else None
+    reused = _h5ad_manifest(_h5ad_cache_dir(path, _h5ad_clean_mapping(mapping))) is not None
     man, cache_dir = _h5ad_convert(path, mapping, progress=conv)
-    man = dict(man, mapping=dict(man["mapping"], **{k: mapping.get(k) for k in _H5AD_LOAD_KEYS}))
+    # from_cache: the stores of a finished conversion were reused (for the provenance record)
+    man = dict(man, mapping=dict(man["mapping"], **{k: mapping.get(k) for k in _H5AD_LOAD_KEYS}),
+               from_cache=bool(reused))
     load = (lambda f, m: progress(0.8 + 0.2 * f, m)) if progress is not None else None
     return _h5ad_load_stores(man, cache_dir, progress=load), man, cache_dir
+
+
+def _h5ad_record(man=None) -> None:
+    """The provenance record of the conversion, written once the converted sections are
+    the loaded dataset (so it is filed under them and describes them): the file, the
+    column mapping, whether the count matrix is integer-valued and what the mapping says
+    about a matrix that is not (noninteger_counts), and whether the stores were reused."""
+    man = man or _h5ad_loaded.get("manifest")
+    if not man:
+        return
+    from . import provenance
+    c = man.get("counts") or {}
+    mp = dict(man.get("mapping") or {})
+    provenance._prov_record(
+        "h5ad", params={"file": os.path.basename(str(man.get("source") or "")), "mapping": mp},
+        packages=("anndata", "h5py"), message=_h5ad_summary(man), cache=bool(man.get("from_cache")),
+        result={"n_sections": len(man.get("sections") or []), "counts_matrix": c.get("matrix"),
+                "counts_integer": bool(c.get("integer", True)),
+                "n_noninteger": int(c.get("n_noninteger") or 0), "n_negative": int(c.get("n_negative") or 0),
+                "noninteger_counts": str(mp.get("noninteger_counts") or "refuse")},
+        once=("h5ad", str(man.get("source") or ""), json.dumps(mp, sort_keys=True, default=str)))
 
 
 def _h5ad_register(man: "dict | None", cache_dir=None) -> None:
@@ -706,19 +754,33 @@ def _h5ad_design(cond_a=None, cond_b=None, force: bool = True, man=None, cache_d
     cache_dir = cache_dir or _h5ad_loaded.get("cache_dir")
     if not man:
         return "No .h5ad is loaded."
-    keys = [os.path.join(cache_dir, s["store"]) for s in man["sections"]]
-    if not force:
-        p = stats._design_path(stats._design_keys())
-        if p is not None and os.path.isfile(p):
-            return "The sample design saved for these samples was kept."
+    # the keys the loaded samples are known by (dataview._ds_key: an absolute path), also
+    # when the cache directory was given as a relative one
+    keys = [os.path.abspath(os.path.join(cache_dir, s["store"])) for s in man["sections"]]
     levels = _h5ad_levels(man)
     mp = man.get("mapping") or {}
     a, b = cond_a or mp.get("cond_a"), cond_b or mp.get("cond_b")
+    saved = {}
+    if not force:
+        p = stats._design_path(stats._design_keys())
+        if p is not None and os.path.isfile(p):
+            # A saved design is kept - unless a pair of levels is asked for that it does not
+            # hold (the first load saves a design even when nothing could be assigned, and
+            # the cache directory does not depend on cond_a / cond_b). Then the conditions
+            # are assigned again; donor and batch edits of the saved design stay.
+            cur = stats._design_samples()
+            names = stats._design_names()
+            if not (a or b) or (any(r["cond"] for r in cur)
+                                and (names.get("A"), names.get("B")) == (str(a), str(b))):
+                return "The sample design saved for these samples was kept."
+            saved = {r["key"]: r for r in cur}
     note = ""
     if (a or b) and (a not in levels or b not in levels or a == b):
-        return (f"Conditions not assigned: {a!r} / {b!r} are not two levels of the condition column "
+        # the donors are still filled from the file; only the conditions stay unassigned
+        note = (f" Conditions not assigned: {a!r} / {b!r} are not two levels of the condition column "
                 f"(levels: {', '.join(levels) or 'none'}).")
-    if not a and len(levels) == 2:
+        a = b = None
+    elif not a and len(levels) == 2:
         a, b = levels
     elif not a and len(levels) > 2:
         note = (f" The condition column has {len(levels)} levels ({', '.join(levels)}): no sample was "
@@ -727,8 +789,10 @@ def _h5ad_design(cond_a=None, cond_b=None, force: bool = True, man=None, cache_d
     rows = []
     for k, s in zip(keys, man["sections"]):
         c = s.get("condition", "")
+        old = saved.get(k) or {}
         rows.append({"key": k, "cond": "A" if (a and c == a) else "B" if (b and c == b) else "",
-                     "batch": "", "donor": str(s.get("donor", "") or "")})
+                     "batch": str(old.get("batch") or ""),
+                     "donor": str(old.get("donor") or s.get("donor", "") or "")})
     stats._design_set(rows, {"A": a or "A", "B": b or "B"})
     n_a, n_b = sum(r["cond"] == "A" for r in rows), sum(r["cond"] == "B" for r in rows)
     donors = {r["donor"] for r in rows if r["donor"]}

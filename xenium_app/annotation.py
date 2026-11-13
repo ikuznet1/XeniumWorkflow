@@ -20,6 +20,29 @@ def _labels_key_for_method(method: str, alt_res=None) -> str:
     return f"labels_{method}_{tool}_{out_tag}"
 
 
+def _annot_forget_run(final_dir) -> None:
+    """A run was committed to *final_dir*: forget the annotation labels (and RCTD weights)
+    of an earlier run stored there, in memory and in the annotation cache. They are keyed
+    by tool and directory and attached by cell id, and the new run has other cells."""
+    import glob
+    tag = hashlib.md5(str(final_dir).encode()).hexdigest()[:8]
+    parts = [f"_{t}_{tag}" for t in core._SEG_TOOL_LABELS]
+    with core._annot_lock:
+        for k in [k for k in core._annot_state
+                  if str(k).startswith(("labels_", "rctd_weights_")) and any(p in str(k) for p in parts)]:
+            core._annot_state.pop(k, None)
+    for f in glob.glob(os.path.join(core.CACHE_BASE_DIR, "*_labels_*")):
+        name = os.path.basename(f)
+        if os.path.isfile(f) and any(p + "_" in name or p + "." in name for p in parts):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+
+
+caching._seg_commit_hooks.append(_annot_forget_run)
+
+
 def _label_key_for_active_seg(label_key, alt_res=None):
     """Check a chosen _annot_state labels key against the active segmentation.
     Xenium keys ('labels_<method>[_<mode>]') hold Xenium cell ids, reseg keys carry

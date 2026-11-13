@@ -771,7 +771,7 @@ def _run_txfactor(seg_source, cluster_method, label_kind, method="nmf", params=N
         labels, cat = (None, "")
         if label_kind:
             try:
-                labels, cat = stats._comp_labels(label_kind, tables, seg_source, cluster_method)
+                labels, cat = stats._comp_labels(label_kind, tables, seg_source, cluster_method, use_corrected)
             except ValueError:
                 labels = None
             if labels is not None and all(l is None for l in labels):
@@ -907,6 +907,8 @@ def _run_txfactor(seg_source, cluster_method, label_kind, method="nmf", params=N
         # which annotated type each factor's loadings resemble
         best = [("", np.nan)] * K
         tp = _txf_type_profiles(seg_source, tables, labels, genes, use_corrected) if labels is not None else None
+        _corr_used = (provenance._prov_counts_used(seg_source, use_corrected, None)
+                      if (method == "reference" or tp is not None) else None)
         if tp is not None:
             _m, _c, C = _txf_match(H, tp[1])
             best = [(tp[0][int(C[f].argmax())], float(C[f].max())) for f in range(K)]
@@ -933,7 +935,13 @@ def _run_txfactor(seg_source, cluster_method, label_kind, method="nmf", params=N
                "factors": pd.DataFrame(frows), "crosstab": ct, "agreement": agree, "category": cat,
                "label_kind": label_kind, "seg_source": seg_source or "xenium",
                "seg_tag": seg_tag, "from_cache": from_cache, "share_cols": share_cols,
-               "corrected": bool(use_corrected), "seconds": _time.time() - _t0, "uid": f"{_gen}-{_time.time():.3f}"}
+               # the counts that were READ, not the mode that was asked for: only the type
+               # profiles (the reference components, the factor-type comparison) come from
+               # the count matrix, and the view falls back to the original counts when not
+               # every sample has corrected ones. None: no count matrix was read (an NMF /
+               # LDA fit without cell labels reads the transcript file alone).
+               "corrected": _corr_used, "counts_requested": "corrected" if use_corrected else "original",
+               "seconds": _time.time() - _t0, "uid": f"{_gen}-{_time.time():.3f}"}
         with _txf_mem_lock:
             _txf_mem.clear()
         n_bins = int(sum(s["n_bins"] for s in smps))
@@ -952,7 +960,9 @@ def _run_txfactor(seg_source, cluster_method, label_kind, method="nmf", params=N
                + "\nA simplified transcript-binning factorisation in the spirit of FICTURE; not that tool.")
         if method == "reference":
             msg += (f"\nReference components: the mean profiles of {K} cell types ({cat}; "
-                    f"{'SPLIT-corrected' if use_corrected else 'original'} counts) - not fitted."
+                    f"{'SPLIT-corrected' if _corr_used else 'original'} counts"
+                    f"{'; SPLIT-corrected counts do not exist for every sample of the view' if use_corrected and not _corr_used else ''}"
+                    f") - not fitted."
                     + (f" Left out (fewer than {_TXF_REF_MIN_CELLS} cells): {', '.join(left[:8])}"
                        f"{'…' if len(left) > 8 else ''}." if left else ""))
         msg += (f"\nCells ({res['seg_source']}): {n_under:,} of {n_cells:,} lie over a bin with transcripts; "

@@ -24,6 +24,31 @@ def _loaded_reseg_results() -> list:
     return out
 
 
+def _subset_xenium_labels(state: dict):
+    """The cell-type labels of the Xenium cells for subset(cell_type=…): per method the
+    key "labels_<method>", else a mode key of it ("labels_rctd_doublet"). Keys of a
+    Baysor / Proseg / image-segmentation run ("labels_<method>_<tool>_<run tag>…") hold
+    that run's cell ids and are never taken."""
+    of_run = lambda k: any(f"_{t}_" in str(k) for t in core._SEG_TOOL_LABELS)
+    for m in core._ANNOT_METHODS:
+        if state.get(f"labels_{m}") is not None:
+            return state[f"labels_{m}"]
+    for m in core._ANNOT_METHODS:
+        for k, v in state.items():
+            if str(k).startswith(f"labels_{m}_") and not of_run(k) and v is not None:
+                return v
+    return None
+
+
+def _subset_reseg_gene_col(gene, alt_res, n_cols) -> "int | None":
+    """Column of *gene* ("G" or "G [imp]") in the matrix of a segmentation run, by the
+    run's own gene index; None when the run does not have the gene."""
+    base = gene[:-6] if str(gene).endswith(" [imp]") else gene
+    gni = (alt_res or {}).get("gene_name_to_idx") or core.DATA["gene_name_to_idx"]
+    j = gni.get(base)
+    return int(j) if j is not None and 0 <= int(j) < int(n_cols) else None
+
+
 def subset(cluster=None, cell_type=None,
            gene=None, min_expr=None, max_expr=None,
            min_transcripts=None, max_transcripts=None,
@@ -94,17 +119,7 @@ def subset(cluster=None, cell_type=None,
         _reseg_active = (core._proseg_state["status"] == "done" or core._baysor_state["status"] == "done"
                          or core._imgseg_state["status"] == "done")
         with core._annot_lock:
-            # Only use Xenium-specific labels (exact key "labels_{method}") — not reseg-suffixed ones.
-            # Reseg annotation labels (labels_{method}_proseg_xxx) have reseg cell IDs, not barcodes.
-            if _reseg_active:
-                labels = next((v for m in core._ANNOT_METHODS
-                               for k, v in core._annot_state.items()
-                               if k == f"labels_{m}" and v is not None), None)
-            else:
-                labels = next((v for m in core._ANNOT_METHODS
-                               for k, v in core._annot_state.items()
-                               if (k == f"labels_{m}" or k.startswith(f"labels_{m}_"))
-                               and v is not None), None)
+            labels = _subset_xenium_labels(core._annot_state)
         if labels is None:
             if _reseg_active:
                 print("  subset: no Xenium cell type annotation — skipping Xenium cell_type filter", flush=True)
@@ -193,8 +208,10 @@ def subset(cluster=None, cell_type=None,
 
         # Gene expression filter — reseg uses its own expr matrix
         if gene is not None and (min_expr is not None or max_expr is not None):
-            if gene in core.DATA["gene_names"]:
-                _gidx    = core.DATA["gene_names"].index(gene)
+            # the run's own gene index: its matrix is [panel genes | genes imputed for
+            # this run], not the columns of the Xenium matrix
+            _gidx = _subset_reseg_gene_col(gene, _alt_res, _bexpr_all.shape[1])
+            if _gidx is not None:
                 _braw    = _bexpr_all.getcol(_gidx).toarray().ravel()
                 _bgexpr  = pd.Series(np.log1p(_braw), index=bdf.index)
                 if min_expr is not None: bmask &= _bgexpr >= min_expr
@@ -233,16 +250,35 @@ def subset(cluster=None, cell_type=None,
 
     # Update active data
     core.DATA["df"] = df_sub
-    # what was asked for, for the provenance record of the analyses run on the subset
-    # (a second subset() narrows the first: one entry per call)
+    # The filters of the active subset, for the provenance record of the analyses run on
+    # it. Every subset() call filters the whole dataset again (it starts from
+    # _df_original), so the last call alone defines the active subset: its filters
+    # replace the recorded ones. Only filters that were applied to the Xenium cells are
+    # listed; the ones that were asked for and skipped are named under "skipped".
     _asked = dict(cluster=cluster, cell_type=cell_type, gene=gene, min_expr=min_expr, max_expr=max_expr,
                   min_transcripts=min_transcripts, max_transcripts=max_transcripts,
                   min_cell_area=min_cell_area, max_cell_area=max_cell_area,
                   min_nucleus_area=min_nucleus_area, max_nucleus_area=max_nucleus_area, method=method,
                   n_cell_ids=(len(cell_ids) if cell_ids is not None else None))
-    core.DATA.setdefault("_subset_desc", []).append(
-        {k: (v if isinstance(v, (int, float, str, bool)) else [str(x) for x in list(v)[:50]] if isinstance(v, (list, tuple, set)) else str(v))
-         for k, v in _asked.items() if v is not None})
+    _skip = set()
+    if cell_type is not None and labels is None:
+        _skip.add("cell_type")
+    _gene_ok = gene is not None and (gene[:-6] if gene.endswith(" [imp]") else gene) in core.DATA["gene_name_to_idx"]
+    if not _gene_ok or (min_expr is None and max_expr is None):
+        _skip |= {k for k in ("gene", "min_expr", "max_expr") if _asked[k] is not None}
+    for _ncol, _names in (("transcript_counts", ("min_transcripts", "max_transcripts")),
+                          ("cell_area", ("min_cell_area", "max_cell_area")),
+                          ("nucleus_area", ("min_nucleus_area", "max_nucleus_area"))):
+        if _ncol not in df.columns:
+            _skip |= {k for k in _names if _asked[k] is not None}
+    if cluster is None:
+        _skip |= {"method"} if method is not None else set()
+    _plain = lambda v: (v if isinstance(v, (int, float, str, bool))
+                        else [str(x) for x in list(v)[:50]] if isinstance(v, (list, tuple, set)) else str(v))
+    _entry = {k: _plain(v) for k, v in _asked.items() if v is not None and k not in _skip}
+    if _skip:
+        _entry["skipped"] = sorted(_skip)
+    core.DATA["_subset_desc"] = [_entry]
 
     # Rebuild df_to_expr for the subset (map subset row → expr matrix row)
     orig_to_expr = core.DATA["_df_to_expr_orig"]

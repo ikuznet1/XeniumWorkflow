@@ -334,7 +334,8 @@ def test_run_is_a_segmentation_qc_source_and_a_view_table(xe, loaded):
     assert len(tabs) == 1 and tabs[0]["df"] is loaded["cells_df"] and tabs[0]["label"] == "imgseg"
     smp = xe._an_samples(seg)
     assert len(smp) == 1 and smp[0]["csc"].shape[0] == len(loaded["cells_df"])
-    assert xe._seg_tag(seg) == f"imgseg:{loaded['out_dir']}"
+    # tool, directory and the id of this run (a re-run in the same directory is another run)
+    assert xe._seg_run_id(loaded) and xe._seg_tag(seg) == f"imgseg:{loaded['out_dir']}#{xe._seg_run_id(loaded)}"
     assert [t for t, r in xe._loaded_reseg_results() if r["cells_df"] is loaded["cells_df"]] == ["imgseg"]
     key = xe._labels_key_for_method("celltypist", loaded)
     assert "_imgseg_" in key and xe._label_key_for_active_seg("labels_celltypist", None) == "labels_celltypist"

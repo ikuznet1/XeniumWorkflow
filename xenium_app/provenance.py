@@ -42,6 +42,7 @@ _PROV_LIST_MAX    = 60            # longest list kept in a record
 _prov_lock = threading.RLock()
 _prov_state: dict = {"version": 0, "last_id": None}
 _prov_recent: list = []            # the last records written by this process, whatever the cache directory
+_prov_once: set = set()            # (dataset, kind, identity) recorded once per session (see _prov_record)
 _PROV_RECENT_MAX = 400
 
 # Analysis kinds and their titles. Every kind a job is registered under (jobs._job_start)
@@ -318,6 +319,31 @@ def _prov_unit(message, result) -> dict:
 
 
 # ─── Context: data, design, software ──────────────────────────────────────────
+def _prov_counts_used(seg_source, corrected, result) -> "bool | None":
+    """The counts an analysis used (True: SPLIT-corrected, False: original, None: it read
+    no count matrix or did not say). What the job reports wins (result["corrected"]). A
+    job that reports nothing is never taken at its word for "corrected": the requested
+    mode is only what was asked for, and the view falls back to the original counts when
+    corrected ones do not exist for every sample (analysis._an_samples) - so the fallback
+    rule is applied here as well."""
+    if isinstance(result, dict) and "corrected" in result:
+        return None if result["corrected"] is None else bool(result["corrected"])
+    if corrected is None:
+        return None
+    if not corrected:
+        return False
+    try:
+        seg = seg_source or "xenium"
+        if core._seg_tool(seg) != "xenium":
+            alt = core._seg_result(seg)
+            return bool(alt is not None and alt.get("split_corrected_expr") is not None)
+        if dataview.EXTRA_DATASETS:
+            return bool(dataview._multi_use_corrected(True))
+        return core.DATA.get("split_corrected_expr") is not None
+    except Exception:
+        return None
+
+
 def _prov_data(seg_source=None, corrected=None, result=None, labels=None) -> dict:
     dsets = [core.DATA] + list(dataview.EXTRA_DATASETS)
     samples = []
@@ -359,11 +385,10 @@ def _prov_data(seg_source=None, corrected=None, result=None, labels=None) -> dic
             out["subset"] = {"filters": "not recorded"}
     else:
         out["subset"] = None
-    used = result.get("corrected") if isinstance(result, dict) and "corrected" in result else None
+    used = _prov_counts_used(seg, corrected, result)
     out["counts"] = {
         "requested": None if corrected is None else ("corrected" if corrected else "original"),
-        "used": None if used is None and corrected is None else
-                ("SPLIT-corrected" if (used if used is not None else corrected) else "original"),
+        "used": None if used is None else ("SPLIT-corrected" if used else "original"),
         "n_cells_left_out": (int(result["n_uncorrected"]) if isinstance(result, dict)
                              and isinstance(result.get("n_uncorrected"), (int, np.integer)) else None)}
     if labels is not None:
@@ -486,7 +511,7 @@ def _prov_software(packages=(), r_packages=(), tools=None) -> dict:
 def _prov_record(kind: str, title: str = None, *, seg_source=None, corrected=None, params=None,
                  result=None, message=None, labels=None, seeds=None, cache=None,
                  packages=(), r_packages=(), tools=None, warnings=None, outputs=None,
-                 t0: float = None, uses_design: bool = False):
+                 t0: float = None, uses_design: bool = False, once=None):
     """Write the provenance record of an analysis that has just published its result.
 
     kind: a key of _PROV_KINDS. params: every parameter of the run, user-set ones and the
@@ -494,9 +519,18 @@ def _prov_record(kind: str, title: str = None, *, seg_source=None, corrected=Non
     the headline numbers; ``result["prov_id"]`` is set to the record id). message: the
     job's status line (the unit of the p-values and the caveats are taken from it,
     verbatim). labels: (label kind, cluster method) of the cell labels used. cache: the
-    result came from the cache. Never raises: a failure is printed and None returned, the
-    analysis itself is not affected."""
+    result came from the cache. once: a hashable identity of something that is recorded once
+    per session (a cached segmentation run that is loaded: picking it again in the
+    dropdown reads the same files and is not another event of the analysis); a second
+    call with the same identity writes nothing. Never raises: a failure is printed and
+    None returned, the analysis itself is not affected."""
     try:
+        if once is not None:
+            with _prov_lock:
+                okey = (caching._dataset_key(), kind, once)
+                if okey in _prov_once:
+                    return None
+                _prov_once.add(okey)
         now = _time.time()
         job = jobs._job_current()
         started = t0 if t0 is not None else (job.started if job is not None else None)
@@ -552,8 +586,12 @@ def _prov_from_cache(cache, result, message) -> bool:
     result (from_cache / cached), else its status line ("Done (cached) ...")."""
     if cache is not None:
         return bool(cache)
-    if isinstance(result, dict) and (result.get("from_cache") or result.get("cached")):
-        return True
+    if isinstance(result, dict):
+        # the job's own flag wins, also when it says "computed": a status line may mention
+        # a cached input ("binning 0 s (cached), fit 35 s") of a freshly computed result
+        flags = [result[k] for k in ("from_cache", "cached") if k in result and result[k] is not None]
+        if flags:
+            return any(bool(f) for f in flags)
     return bool(_PROV_CACHE_RE.search(str(message or "")))
 
 
@@ -912,43 +950,106 @@ def _pm_pseudobulk(r):
          + "); adjusted p-values are those of the fitting package (Benjamini-Hochberg).",
          f"{_pm_num(_pm_v(H, 'n_genes'))} genes were tested, {_pm_num(_pm_v(H, 'n_filtered'))} were not "
          f"(low count), and {_pm_num(_pm_v(H, 'n_padj_na', 0))} have no adjusted p-value.",
-         "Original (uncorrected) counts were summed; SPLIT-corrected counts are not used for count models."]
+         ]
     if H.get("counts_rounded"):
-        s.append("The count matrix held non-integer values: they were summed and the sums rounded, so the "
-                 "count model is an approximation.")
+        # stated plainly, in place of "original counts": the option is off by default
+        s.append("The count matrix of this data does NOT hold raw counts (it has non-integer values), and "
+                 "noninteger_counts = round_sums was set when it was loaded: the values were summed per "
+                 "pseudobulk column (per sample, or per donor and condition) and each sum was rounded to a "
+                 "whole number. The count model of DESeq2 / edgeR is then an approximation, and these results "
+                 "are not from raw counts.")
+    else:
+        s.append("Original (uncorrected) counts were summed; SPLIT-corrected counts are not used for count "
+                 "models.")
     return s, refs
 
 
 def _pm_proximity(r):
+    """Written from what the run recorded: the estimator the p-values are of (near − far,
+    or the slope), the adjustment behind padj (empirical, Benjamini-Hochberg or none),
+    whether a density covariate was used, and whether the test is across units."""
     H, P = r["headline"], r["params"]
-    return ([f"Proximity differential expression: genes of the cells of type '{_pm_v(P, 'target')}' that "
-             f"change near cells of the anchor type '{_pm_v(P, 'anchor')}', on {_pm_seg(r)}.",
-             "Per sample, log1p(counts per 10,000) of every target cell was residualised (ordinary least "
-             "squares) on log1p(library size) and on decile bins of the local fraction of the "
-             "density-covariate cell type within 50 µm. The effect of a gene is the mean residual of the "
-             "target cells whose nearest anchor cell is within the near distance minus that of the target "
-             "cells with no anchor cell closer than the far distance.",
-             "Matched random anchors (sets of as many non-anchor cells, drawn within the same compartment x "
-             "edge-distance stratum) went through the same computation; the empirical FDR of a gene is the "
-             "number of genes the random sets yield at its threshold divided by the number observed. With at "
-             "least 3 independent units (donors, or samples) the p-value is the exact sign-flip test of the "
-             "per-unit effects; with fewer it is the share of random anchor sets at least as extreme, which "
-             "describes these sections only.",
-             "A gradient with distance is an association with position, not an effect of the anchor type."],
-            [])
+    info = H.get("info") if isinstance(H.get("info"), dict) else {}
+    est = str(H.get("estimator") or info.get("estimator") or "")
+    fdr = str(H.get("fdr") or info.get("fdr") or "")
+    mode = str(H.get("mode") or info.get("mode") or "")
+    src = P.get("source") if P.get("source") not in ("", "none") else None
+    src = src or (H.get("source") if H.get("source") not in ("", "none") else None)
+    rp = P.get("resolved") if isinstance(P.get("resolved"), dict) else {}
+    near, far = rp.get("near", P.get("near")), rp.get("far", P.get("far"))
+    lr = rp.get("local_r", 50)
+    s = [f"Proximity differential expression: genes of the cells of type '{_pm_v(P, 'target')}' that "
+         f"change near cells of the anchor type '{_pm_v(P, 'anchor')}', on {_pm_seg(r)}."]
+    resid = ("Per sample, log1p(counts per 10,000) of every target cell was residualised (ordinary least "
+             "squares) on log1p(library size)")
+    if src:
+        resid += (f" and on quantile bins of the local fraction of '{src}' cells within {_pm_num(lr)} µm "
+                  f"(the density covariate)")
+    else:
+        resid += "; no density-covariate cell type was used"
+    s.append(resid + ".")
+    nf = ("the mean residual of the target cells whose nearest anchor cell is within the near distance"
+          + (f" ({_pm_num(near)} µm)" if near is not None else "")
+          + " minus that of the target cells with no anchor cell closer than the far distance"
+          + (f" ({_pm_num(far)} µm)" if far is not None else ""))
+    sl = "the ordinary-least-squares slope of the residual on −log(d + 1), d the distance to the nearest anchor cell"
+    if est == "slope":
+        s.append(f"The statistic the p-values and the FDR are of is {sl} (too few random anchor sets left "
+                 f"far cells for the near − far difference, which is reported beside it: {nf}).")
+    elif est == "nearfar":
+        s.append(f"The effect of a gene is {nf}; the slope ({sl}) is reported beside it.")
+    else:
+        s.append(f"Two statistics were computed per gene: {nf}; and {sl}. Which of the two the p-values "
+                 f"are of was not recorded for this run (see its status line).")
+    rnd = ("Matched random anchors (sets of as many non-anchor cells, drawn within the same compartment x "
+           "edge-distance stratum) went through the same computation")
+    refs = []
+    if fdr == "empirical":
+        s.append(rnd + "; the empirical FDR of a gene is the number of genes the random sets yield at its "
+                 "threshold divided by the number observed.")
+    elif fdr == "bh":
+        s.append(rnd + ", but too few of them gave an effect in every unit for an empirical FDR: the FDR "
+                 "reported is Benjamini-Hochberg over the sign-flip p-values.")
+        refs.append("bh")
+    elif fdr == "none":
+        s.append(rnd + "; no FDR was computed for this run (no usable random anchor set).")
+    else:
+        s.append(rnd + "; the adjustment behind the reported FDR (empirical from the random sets, or "
+                 "Benjamini-Hochberg) was not recorded for this run (see its status line).")
+    if mode == "cohort":
+        s.append("The p-value is the exact sign-flip test of the per-unit effects across the independent "
+                 "units (donors, or samples).")
+    elif mode == "single":
+        s.append("With fewer than 3 independent units the p-value is the share of random anchor sets at "
+                 "least as extreme, which describes these sections only.")
+    else:
+        s.append("With at least 3 independent units (donors, or samples) the p-value is the exact sign-flip "
+                 "test of the per-unit effects; with fewer it is the share of random anchor sets at least as "
+                 "extreme, which describes these sections only.")
+    s.append("A gradient with distance is an association with position, not an effect of the anchor type.")
+    return s, refs
 
 
 def _pm_contact(r):
     H, P = r["headline"], r["params"]
+    by_donor = bool(H.get("by_donor"))
+    unit = "donor" if by_donor else "sample"
     return ([f"Contact-group pseudobulk differential expression: cells of type '{_pm_v(P, 'target')}' with a "
              f"cell of type '{_pm_v(P, 'anchor')}' within the radius were compared with those without, on "
              f"{_pm_seg(r)}.",
              "Within each sample the comparator cells were weighted so that their mix of compartment x "
              "edge-distance bin x density quintile equals that of the contact cells. Weighted counts were "
-             "summed per sample and group (rounded to whole counts) and fitted with ~ sample + group in R "
-             "(DESeq2, or edgeR when DESeq2 is not installed); the unit of the p-values is the sample.",
+             + ("summed per donor and group (the sections of one donor pooled; rounded to whole counts) and "
+                "fitted with ~ donor + group" if by_donor else
+                "summed per sample and group (rounded to whole counts) and fitted with ~ sample + group")
+             + f" in R (DESeq2, or edgeR when DESeq2 is not installed); the unit of the p-values is the {unit}.",
              "The contact / comparator labels were also permuted within sample x stratum and the fit "
-             "repeated, to compare the number of genes passing with the observed number."],
+             "repeated, to compare the number of genes passing with the observed number.",
+             ("The count matrix of this data does NOT hold raw counts (non-integer values; noninteger_counts = "
+              "round_sums was set when it was loaded): the weighted sums of these values were rounded, and the "
+              "results are not from raw counts." if H.get("counts_rounded") else
+              "Original (uncorrected) counts were summed; SPLIT-corrected counts are not used for count "
+              "models.")],
             ["deseq2", "edger", "bh"])
 
 
@@ -1244,9 +1345,20 @@ def _pm_spage(r):
 
 
 def _pm_umap(r):
-    return ([f"Embedding of {_pm_seg(r)}: counts per 10,000, log1p, truncated SVD (up to 50 components) and "
-             "UMAP (15 neighbours, min_dist 0.1; t-SNE when UMAP is not available); clusters of a "
-             "re-segmentation run come from KMeans on the SVD components. Exploratory; no test."], ["umap"])
+    P, H = r.get("params") or {}, r.get("headline") or {}
+    how = str(P.get("method") or "")
+    if how == "t-SNE":
+        emb = "t-SNE (umap-learn was not available)"
+    elif how == "UMAP":
+        emb = (f"UMAP ({_pm_num(P.get('n_neighbors', 15))} neighbours, min_dist "
+               f"{_pm_num(P.get('min_dist', 0.1))})")
+    else:
+        emb = "UMAP (15 neighbours, min_dist 0.1; t-SNE when UMAP is not available)"
+    ncomp = f"{_pm_num(P['n_components'])} components" if P.get("n_components") else "up to 50 components"
+    cells = (f" of {_pm_num(H['n_cells'])} cells" if isinstance(H.get("n_cells"), int) else "")
+    return ([f"Embedding{cells} of {_pm_seg(r)}: counts per 10,000, log1p, truncated SVD ({ncomp}) and "
+             f"{emb}; clusters of a re-segmentation run come from KMeans on the SVD components. "
+             f"Exploratory; no test."], ["umap"] if how != "t-SNE" else [])
 
 
 def _pm_spatial(r):
@@ -1260,6 +1372,19 @@ def _pm_spatial(r):
 
 def _pm_niches(r):
     P = r["params"]
+    feat = str(P.get("features") or "")
+    if feat.startswith("normalised spatial coordinates"):
+        # no labels: the job clustered the coordinates, not a neighbourhood composition
+        return ([f"Spatial blocks: no cell-type labels were available, so the normalised cell centroid "
+                 f"coordinates were clustered with KMeans into {_pm_num(_pm_v(P, 'n_clusters'))} groups "
+                 f"(random_state 42, 10 initialisations). These are contiguous spatial blocks, not niches of "
+                 f"the neighbourhood composition. Exploratory; no test."], [])
+    if not feat.startswith("cell-type composition"):
+        # an older record that does not say what was clustered
+        return ([f"Spatial niches: KMeans into {_pm_num(_pm_v(P, 'n_clusters'))} groups (random_state 42, 10 "
+                 f"initialisations) on the features named in the status line of the run (the cell-type "
+                 f"composition of the {_pm_num(_pm_v(P, 'n_neighbors'))} nearest neighbours when cell-type "
+                 f"labels existed, otherwise the cell coordinates). Exploratory; no test."], [])
     return ([f"Spatial niches: for every cell the cell-type composition of its "
              f"{_pm_num(_pm_v(P, 'n_neighbors'))} nearest neighbours was clustered with KMeans into "
              f"{_pm_num(_pm_v(P, 'n_clusters'))} niches (random_state 42, 10 initialisations). Exploratory; "
@@ -1268,9 +1393,27 @@ def _pm_niches(r):
 
 def _pm_h5ad(r):
     P = r["params"]
-    return ([f"The AnnData file '{_pm_v(P, 'file')}' was converted once into one store per section with the "
-             "column mapping recorded in the parameters; the values of its count matrix were taken as "
-             "given."], ["anndata"])
+    H = r.get("headline") or {}
+    s = [f"The AnnData file '{_pm_v(P, 'file')}' was converted once into one store per section with the "
+         "column mapping recorded in the parameters; the values of its count matrix were taken as given."]
+    mode = str(H.get("noninteger_counts") or ((P.get("mapping") or {}).get("noninteger_counts")
+                                              if isinstance(P.get("mapping"), dict) else "") or "")
+    if H.get("counts_integer") is False:
+        s.append(f"The count matrix is NOT integer-valued ({_pm_num(H.get('n_noninteger', 0))} stored values "
+                 f"are not whole numbers, {_pm_num(H.get('n_negative', 0))} are negative): it does not hold "
+                 f"raw counts.")
+        if mode == "round_sums":
+            s.append("The mapping set noninteger_counts = round_sums: the sample-level count models "
+                     "(pseudobulk DESeq2 / edgeR, contact-group pseudobulk) were allowed to sum these values "
+                     "per sample or donor and round the sums to whole numbers. Results obtained this way are "
+                     "not from raw counts and say so in their own record.")
+        else:
+            s.append("The sample-level count models (pseudobulk DESeq2 / edgeR) refuse this matrix "
+                     "(noninteger_counts = refuse, the default).")
+    elif mode == "round_sums":
+        s.append("The mapping set noninteger_counts = round_sums; the count matrix is integer-valued, so "
+                 "the setting had no effect.")
+    return s, ["anndata"]
 
 
 def _pm_save(r):
@@ -1325,6 +1468,21 @@ def _pm_variant(r) -> tuple:
     return (r.get("kind"), d.get("seg_source"), (d.get("counts") or {}).get("used"), json.dumps(extra, default=str))
 
 
+_PM_RUN_KINDS = ("baysor", "proseg", "imgseg")
+
+
+def _pm_is_reload_of(new, old) -> bool:
+    """*new* (same variant as *old*, written later) only reports that the result *old*
+    computed was read back from the cache: a cached segmentation run loaded again (the
+    variant names the run), or a cache hit of an analysis with the same parameters."""
+    if new.get("cache") != "cache" or old.get("cache") == "cache":
+        return False
+    if new.get("kind") in _PM_RUN_KINDS:
+        return True
+    strip = lambda p: {k: v for k, v in (p or {}).items() if k != "resolved"}
+    return strip(new.get("params")) == strip(old.get("params"))
+
+
 def _prov_methods_md(records=None, latest_only: bool = True) -> str:
     """Methods text (Markdown) written from the provenance records: a data paragraph, one
     section per analysis from its template (method, parameters, unit and n as the app
@@ -1354,10 +1512,17 @@ def _prov_methods_md(records=None, latest_only: bool = True) -> str:
                               if isinstance(d.get("subset"), dict) and isinstance(d["subset"].get("n_cells"), int)
                               else ""))
     out.append("")
-    chosen = {}
+    chosen, reloaded = {}, {}
     if latest_only:
         for r in recs:
-            chosen[_pm_variant(r)] = r
+            v = _pm_variant(r)
+            cur = chosen.get(v)
+            if cur is not None and _pm_is_reload_of(r, cur):
+                # the same result read back from the cache: the section stays that of the
+                # run that computed it (its parameters, tool versions and software)
+                reloaded[cur.get("id")] = r
+                continue
+            chosen[v] = r
         todo = list(chosen.values())
     else:
         todo = list(recs)
@@ -1396,7 +1561,10 @@ def _prov_methods_md(records=None, latest_only: bool = True) -> str:
             out += ["Caveats raised by the app:", ""] + [f"- {w}" for w in r["warnings"]] + [""]
         out += [f"Software: {_pm_software(r.get('software'))}. Record {r.get('id')} "
                 f"({'loaded from the cache' if r.get('cache') == 'cache' else 'computed'}"
-                + (f", {r['runtime_s']:g} s" if isinstance(r.get("runtime_s"), (int, float)) else "") + ").", ""]
+                + (f", {r['runtime_s']:g} s" if isinstance(r.get("runtime_s"), (int, float)) else "") + ")."
+                + (f" The result was read back from the cache later (newest: record {reloaded[r.get('id')].get('id')}, "
+                   f"{str(reloaded[r.get('id')].get('time_local') or reloaded[r.get('id')].get('time') or '')[:10]})."
+                   if r.get("id") in reloaded else ""), ""]
     if refs_used:
         out += ["## References", ""]
         out += [f"{i}. {_PROV_REFS[k]}" for i, k in enumerate(refs_used, 1)]

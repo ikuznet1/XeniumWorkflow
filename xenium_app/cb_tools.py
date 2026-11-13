@@ -404,6 +404,11 @@ def start_annotation(n_clicks, source, model_name, rds_path, label_col,
         bres = core._baysor_state["result"] if core._seg_tool(seg_source) == "baysor" and core._baysor_state["status"] == "done" else None
     alt_res = pres or bres or (core._seg_result(seg_source, done_only=True)
                                if core._seg_tool(seg_source) == "imgseg" else None)
+    if alt_res is None and core._seg_tool(seg_source) != "xenium":
+        # a run that is named but not loaded is never replaced by the Xenium cells
+        msg = (f"✗ The selected segmentation ({seg_source}) is not loaded (it is still loading, or its "
+               f"load failed): nothing was annotated.")
+        return True, msg, False, msg   # no job started: keep the poll off
 
     if alt_res is not None:
         if alt_res.get("expr") is None:
@@ -432,6 +437,7 @@ def start_annotation(n_clicks, source, model_name, rds_path, label_col,
         mode_labels_key = labels_key
 
     if source in ("seurat", "rctd"):
+        rds_path = core._ref_rds_path(rds_path)
         _problem = core._ref_rds_problem(rds_path)
         if _problem:
             msg = f"✗ {_problem}"

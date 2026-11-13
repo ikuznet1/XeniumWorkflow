@@ -75,19 +75,32 @@ def de_capture_plotly_selection(selected_data, version, seg_source):
     return _de_set_selection(poly, len(selected_data["points"]), version)
 
 
+def _outline_cell_count(polygon_xy, seg_source) -> int:
+    """Cells of the active view inside an outline in plot space. The count the WebGL
+    viewer sends leaves out the cells of legend-hidden categories, but an ROI or a
+    selection is defined by the outline alone: this is the number that is saved / tested."""
+    try:
+        return int(sum(int(analysis._an_polygon_mask(polygon_xy, t).sum())
+                       for t in stats._view_tables(seg_source or "xenium")))
+    except Exception as exc:
+        print(f"  selection count: {exc}", flush=True)
+        return 0
+
+
 @app_layout.app.callback(
     Output("de-selection", "data", allow_duplicate=True),
     Input("webgl-select",  "data"),
     State("de-selection",  "data"),
+    State("seg-source",    "value"),
     prevent_initial_call=True,
 )
-def de_capture_webgl_selection(webgl_sel, version):
+def de_capture_webgl_selection(webgl_sel, version, seg_source=None):
     """As de_capture_plotly_selection, for a lasso / rectangle drawn in the WebGL view
     (its outline is in µm with y down)."""
     if not webgl_sel or not webgl_sel.get("polygon"):
         raise dash.exceptions.PreventUpdate
     poly = [[float(x), -float(y)] for x, y in webgl_sel["polygon"]]
-    return _de_set_selection(poly, webgl_sel.get("count") or 0, version)
+    return _de_set_selection(poly, _outline_cell_count(poly, seg_source), version)
 
 
 @app_layout.app.callback(
@@ -666,15 +679,18 @@ def update_webgl_tx_gene_options(_ds_version, current=None):
     Output("roi-save-preview", "children", allow_duplicate=True),
     Output("roi-save-error",   "children", allow_duplicate=True),
     Input("webgl-select", "data"),
+    State("seg-source",   "value"),
     prevent_initial_call=True,
 )
-def capture_webgl_selection(sel):
+def capture_webgl_selection(sel, seg_source=None):
     """A lasso / rectangle drawn in the WebGL view: the drawn outline itself becomes the
-    pending ROI (the Plotly path has only the selected cells and uses their convex hull)."""
+    pending ROI (the Plotly path has only the selected cells and uses their convex hull).
+    The cell count is that of the outline (every cell inside it gets the ROI), not the
+    viewer's count of the cells currently shown."""
     if not sel or not sel.get("polygon"):
         raise dash.exceptions.PreventUpdate
-    n = int(sel.get("count") or 0)
     pts = [[float(x), -float(y)] for x, y in sel["polygon"]]   # ROI space is plot space (y = -µm)
+    n = _outline_cell_count(pts, seg_source) if len(pts) >= 3 else 0
     if len(pts) < 3 or n < 3:
         return None, True, "", "Need at least 3 cells inside the outline to define an ROI."
     if pts[0] != pts[-1]:

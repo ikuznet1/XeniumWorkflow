@@ -99,12 +99,28 @@ def _seg_stage_dir(final_dir: str) -> str:
 
 def _seg_stage_commit(stage: str, final_dir: str) -> None:
     """Give a finished run its real directory name, replacing an earlier run with
-    the same parameters."""
+    the same parameters. The run gets a new run id (core._seg_run_id), and everything
+    recorded for an earlier run in this directory - per-cell columns, cached cluster
+    sets, annotation labels, all attached by cell id - is forgotten (_seg_commit_hooks):
+    a re-run has other cells, possibly under the same ids."""
     import shutil
+    import uuid
+    with open(os.path.join(stage, core._SEG_RUN_ID_FILE), "w") as fh:
+        fh.write(uuid.uuid4().hex[:16])
     if os.path.isdir(final_dir):
         shutil.rmtree(final_dir)
     os.rename(stage, final_dir)
     _seg_stage_active.discard(stage)
+    for hook in list(_seg_commit_hooks):
+        try:
+            hook(final_dir)
+        except Exception as exc:
+            print(f"  {getattr(hook, '__name__', 'hook')}: {exc}", flush=True)
+
+
+# Called with the run directory when a run is committed to it: each forgets what its
+# module recorded for an earlier run stored in the same directory.
+_seg_commit_hooks: list = []
 
 
 _seg_stage_active: set = set()    # working directories of the runs in progress

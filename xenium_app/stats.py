@@ -105,8 +105,10 @@ def _design_save() -> None:
 
 def _design_sync() -> bool:
     """Restore the saved design when the set of loaded samples changed since the last
-    look: True when a saved design was read. Entries set in this session for samples
-    that have no saved design are kept."""
+    look: True when a saved design was read. The file of a sample set is older than
+    anything set in this session, so it fills in only the samples that have no assignment
+    in memory (and the condition names only while they are the defaults): an assignment
+    made with other samples loaded is not reverted when the set changes back."""
     keys = _design_keys()
     cur = tuple(sorted(set(keys)))
     with _design_lock:
@@ -122,13 +124,13 @@ def _design_sync() -> bool:
             assign = saved.get("assign") or {}
             for k in keys:
                 a = assign.get(k)
-                if isinstance(a, dict):
+                if isinstance(a, dict) and k not in _design_state["assign"]:
                     _design_state["assign"][k] = {
                         "cond": a.get("cond") if a.get("cond") in ("A", "B") else "",
                         "batch": str(a.get("batch") or ""), "donor": str(a.get("donor") or "")}
             nm = saved.get("names") or {}
             for c in ("A", "B"):
-                if nm.get(c):
+                if nm.get(c) and _design_state["names"].get(c, c) == c:
                     _design_state["names"][c] = str(nm[c])
             _design_state["version"] += 1
             print(f"  Sample design restored for {len(cur)} sample(s) from {os.path.basename(path)}",
@@ -240,12 +242,24 @@ def _view_tables(seg_source="xenium") -> list:
     return out
 
 
-def _raw_cluster_labels(samples, method, alt) -> list:
+def _active_corrected(use_corrected=None) -> bool:
+    """The counts mode a label lookup follows: *use_corrected* when the caller carries
+    one, else the mode the sidebar shows (core._active_counts_mode)."""
+    if use_corrected is None:
+        return core._active_counts_mode == "corrected"
+    return bool(use_corrected)
+
+
+def _raw_cluster_labels(samples, method, alt, use_corrected=None) -> list:
     """Per sample: the active cluster set's label of each cell without the sample prefix
     the multi-sample view adds ("3", not "S1:C3"); None for a sample without the set.
     Whether cluster 3 of one sample is cluster 3 of another depends on how the samples
-    were clustered: the ids are comparable only when they were clustered together."""
-    labs = analysis._an_cluster_labels(samples, method, False, alt)
+    were clustered: the ids are comparable only when they were clustered together.
+
+    On a Baysor / Proseg run the cluster column depends on the counts mode (the SPLIT
+    clusters in corrected mode), as on the map and in the DE group picker:
+    *use_corrected* is the mode of the calling analysis, None the active one."""
+    labs = analysis._an_cluster_labels(samples, method, _active_corrected(use_corrected), alt)
     out = []
     for lab in labs:
         if lab is None:
@@ -581,20 +595,29 @@ _PB_NONINTEGER_NOTE = ("the count matrix holds non-integer values (corrected, no
 
 
 def _counts_are_integer(s: dict) -> bool:
-    """True when the count matrix of analysis sample *s* holds whole numbers only. Checked
-    once per matrix (the result is kept on the dataset dict the sample comes from)."""
+    """True when the count matrix of analysis sample *s* holds raw counts: whole numbers,
+    none negative. Checked once per matrix (the result is kept on the dataset dict the
+    sample comes from). For a sample of an .h5ad the verdict of the conversion wins: it
+    was made on every stored value at full precision (the matrix in memory is float32,
+    where 2.0000000001 is 2), and it is what the load status told the user."""
     data = s["csc"].data
-    if data.dtype.kind in "iu" or not len(data):
-        return True
     ds = s.get("ds")
+    if isinstance(ds, dict) and ds.get("counts_noninteger"):
+        return False
+    if not len(data):
+        return True
+    if data.dtype.kind == "u":
+        return True
+    if data.dtype.kind == "i":
+        return not bool((data < 0).any())
     memo = ds.get("_counts_integer") if isinstance(ds, dict) else None
     if memo is not None and memo[0] is data:
         return memo[1]
     ok = True
     for a in range(0, len(data), 8_000_000):           # in blocks: no full-size temporary
         blk = data[a:a + 8_000_000]
-        if not np.array_equal(blk, np.rint(blk)):
-            ok = False
+        if blk.min() < 0 or not np.array_equal(blk, np.rint(blk)):
+            ok = False                                  # fractions, or negative values: not raw counts
             break
     if isinstance(ds, dict):
         ds["_counts_integer"] = (data, ok)
@@ -688,6 +711,13 @@ def _design_check(conds, batches, min_per_cond=2) -> tuple:
     return list(batches), warn
 
 
+def _pb_dropped_text(rows) -> str:
+    """The dropped samples, each with its own reason (too few cells, no counts, or the
+    paired rule): "S7 (5,000 cells; its donor has samples in one condition only …)"."""
+    return "; ".join(f"{r['label']} ({r['n_cells']:,} cells; {str(r['note'])[len('dropped: '):]})"
+                     for r in rows)
+
+
 def _pb_prepare(samples, masks, conds, batches, min_cells=_PB_MIN_CELLS,
                 min_count=_PB_MIN_COUNT, donors=None) -> dict:
     """The pseudobulk matrix and its design.
@@ -696,8 +726,8 @@ def _pb_prepare(samples, masks, conds, batches, min_cells=_PB_MIN_CELLS,
     population in each; conds / batches: the assignment of each sample. Samples that
     are excluded, have no usable matrix rows or contribute fewer than *min_cells* cells
     are left out (and listed); genes whose total count over the used samples is below
-    *min_count* are not tested. The genes are those shared by the samples assigned to A
-    or B. donors: donor label per sample; when the used samples all have one, the samples
+    *min_count* are not tested. The genes are those shared by the used samples (a
+    sample that is excluded or dropped does not narrow the list). donors: donor label per sample; when the used samples all have one, the samples
     of a donor within a condition are summed into one column (they are not independent
     replicates). The donor is the blocking factor (~ donor + condition, in place of the
     batch labels) only when the design is paired by the rule of _sl_units; otherwise the
@@ -709,39 +739,75 @@ def _pb_prepare(samples, masks, conds, batches, min_cells=_PB_MIN_CELLS,
     n_filtered, units_note."""
     min_cells = max(1, int(min_cells if min_cells is not None else _PB_MIN_CELLS))
     min_count = max(0, int(min_count if min_count is not None else _PB_MIN_COUNT))
-    # the tested genes are those of the samples that take part: a sample excluded in the
-    # design (another panel, say) does not shrink the gene list
-    cand = [i for i, c in enumerate(conds) if c in ("A", "B")]
-    genes = analysis._an_common_genes([samples[i] for i in cand] or samples)
-    if not genes:
-        raise ValueError("The samples of this comparison share no measured genes.")
-    rows, cols, used = [], [], []
+    # The tested genes are those shared by the samples that are USED: a sample excluded in
+    # the design, dropped for too few cells or counts, or left out by the paired rule (its
+    # donor has samples in one condition only) does not shrink the gene list. So who is
+    # used is decided first, the gene list second.
+    tots, ns, note = [], [], {}
     for i, s in enumerate(samples):
         if not _counts_are_integer(s):
             _pb_sum_counts(s, np.zeros(len(s["df"]), dtype=bool))    # raises unless rounding is allowed
         tot, n = _pb_sum_values(s, masks[i])
-        v = tot[np.array([s["gni"][g] for g in genes if g in s["gni"]], dtype=np.int64)]
-        row = {"label": s["label"], "name": s["name"], "cond": conds[i], "batch": batches[i],
-               "donor": (donors[i] if donors is not None else "") or "",
-               "n_cells": n, "lib_size": int(np.rint(v.sum())), "used": False, "note": ""}
+        tots.append(np.asarray(tot, dtype=np.float64))
+        ns.append(n)
+        own = np.array([s["gni"][g] for g in s["genes"] if g in s["gni"]], dtype=np.int64)
         if conds[i] not in ("A", "B"):
-            row["note"] = "excluded"
+            note[i] = "excluded"
         elif n < min_cells:
-            row["note"] = f"dropped: fewer than {min_cells} cells"
-        elif row["lib_size"] <= 0:
-            row["note"] = "dropped: no counts"
-        else:
-            row["used"] = True
-            used.append(i)
+            note[i] = f"dropped: fewer than {min_cells} cells"
+        elif float(tots[i][own].sum()) <= 0:
+            note[i] = "dropped: no counts"
+
+    def _on(i, genes):
+        """Sums of sample i over *genes* (0 for a gene the sample does not measure)."""
+        gni = samples[i]["gni"]
+        v = np.zeros(len(genes), dtype=np.float64)
+        have = np.array([g in gni for g in genes], dtype=bool)
+        v[have] = tots[i][np.array([gni[g] for g, h in zip(genes, have) if h], dtype=np.int64)]
+        return v
+
+    def _tested(used):
+        """The samples of *used* that enter the model: all of them, or with donor labels
+        in a paired design those of the donors seen in both conditions."""
+        d = [(donors[i] or "") if donors is not None else "" for i in used]
+        if d and all(d):
+            u0 = _sl_units([conds[i] for i in used], d)
+            if u0["paired"]:
+                kept0 = {dd for dd, _ia, _ib in u0["pairs"]}
+                return [i for i, dd in zip(used, d) if dd in kept0]
+        return list(used)
+
+    used = [i for i in range(len(samples)) if i not in note]
+    while True:
+        tested = _tested(used)
+        genes = analysis._an_common_genes([samples[i] for i in tested]) if tested else []
+        empty = [i for i in tested if genes and float(_on(i, genes).sum()) <= 0]
+        if not empty:
+            break
+        for i in empty:                       # counts only in genes the others do not measure
+            note[i] = "dropped: no counts"
+            used.remove(i)
+    if tested and not genes:
+        raise ValueError("The samples of this comparison share no measured genes.")
+    if not genes:                             # no sample is usable: _design_check says why
+        cand = [i for i, c in enumerate(conds) if c in ("A", "B")]
+        genes = analysis._an_common_genes([samples[i] for i in cand] or samples)
+    rows, cols = [], []
+    for i, s in enumerate(samples):
+        v = _on(i, genes)
+        rows.append({"label": s["label"], "name": s["name"], "cond": conds[i], "batch": batches[i],
+                     "donor": (donors[i] if donors is not None else "") or "",
+                     "n_cells": ns[i], "lib_size": int(np.rint(v.sum())), "used": i in used,
+                     "note": note.get(i, "")})
+        if i in used:
             cols.append(v)
-        rows.append(row)
     u_cond = [conds[i] for i in used]
     u_block = [batches[i] for i in used]
     u_donor = [(donors[i] or "") if donors is not None else "" for i in used]
     labels = [samples[i]["label"] for i in used]
     col_of = {lab: j for j, lab in enumerate(labels)}
     block_name, pre_warn = "batch", []
-    n_panel = max((len(samples[i]["genes"]) for i in used), default=len(genes))
+    n_panel = max((len(samples[i]["genes"]) for i in tested), default=len(genes))
     if len(genes) < n_panel:
         pre_warn.append(f"the used samples share {len(genes):,} genes (the largest panel among them has "
                         f"{n_panel:,}): only the shared genes are tested")
@@ -806,8 +872,7 @@ def _pb_prepare(samples, masks, conds, batches, min_cells=_PB_MIN_CELLS,
         warn = pre_warn + warn
     except ValueError as exc:
         dropped = [r for r in rows if r["note"].startswith("dropped")]
-        extra = (" Dropped: " + "; ".join(f"{r['label']} ({r['n_cells']} cells)" for r in dropped) + "."
-                 if dropped else "")
+        extra = (" Dropped: " + _pb_dropped_text(dropped) + "." if dropped else "")
         raise ValueError(str(exc) + extra) from None
     # rounded here, once per model column (a no-op for raw counts, whose sums are whole)
     counts = np.rint(np.column_stack(cols)).astype(np.int64)
@@ -1087,8 +1152,7 @@ def _run_pseudobulk_de(population, seg_source, method, color_by, counts_correcte
                + "\n" + analysis._depth_note(med_a, med_b)
                + ("\n" + res["leak_summary"] if res.get("leak_summary") else ""))
         if dropped:
-            msg += (" Dropped (fewer than " + str(prep["min_cells"]) + " cells or no counts): "
-                    + ", ".join(f"{r['label']} ({r['n_cells']} cells)" for r in dropped) + ".")
+            msg += " Dropped: " + _pb_dropped_text(dropped) + "."
         for w in prep["warnings"]:
             msg += f"\n⚠ {w[0].upper() + w[1:]}."
         for nt in notes:
@@ -1312,15 +1376,17 @@ def _comp_category_options(seg_source, color_by) -> list:
     return opts
 
 
-def _comp_labels(kind, tables, seg_source, method) -> tuple:
-    """(per-sample label arrays, name of the categories) for a category picker value."""
+def _comp_labels(kind, tables, seg_source, method, use_corrected=None) -> tuple:
+    """(per-sample label arrays, name of the categories) for a category picker value.
+    *use_corrected*: the counts mode that picks the cluster column of a segmentation run
+    (see _raw_cluster_labels); None = the active mode."""
     alt = analysis._an_alt_res(seg_source)
     kind = str(kind or "")
     if kind.startswith("celltype:"):
         m = kind.split(":", 1)[1]
         return analysis._an_celltype_labels(tables, m, alt), f"cell type ({core._ANNOT_METHODS.get(m, m)})"
     if kind == "cluster":
-        return _raw_cluster_labels(tables, method, alt), "cluster"
+        return _raw_cluster_labels(tables, method, alt, use_corrected), "cluster"
     if kind == "niche":
         return _niche_labels(tables), "niche"
     raise ValueError("Pick what the proportions are computed of.")
@@ -1520,10 +1586,19 @@ def _comp_compute(kind, seg_source="xenium", method=None, transform="logit", tes
         if not r["used"] and r["cond"]:
             res["warnings"].append(f"{r['label']} has {r['note']} and is left out")
     t_idx = [i for i in used if conds[i] in ("A", "B")]
+    donors = _design_donors(tables)
+    # In a paired design the donors with samples in one condition only are left out
+    # (_sl_units). They are left out here, before the categories are chosen: such a sample
+    # adds no category to the family of tests and no cells to the n_cells column.
+    left_out = []
+    _u0 = _sl_units([conds[i] if i in set(t_idx) else "" for i in range(len(tables))], donors)
+    if _u0["paired"] and _u0["dropped"]:
+        _in = {int(j) for _n, _c, ix in _u0["units"] for j in ix}
+        left_out = list(_u0["dropped"])
+        t_idx = [i for i in t_idx if i in _in]
     t_cond = [conds[i] for i in t_idx]
     n_a, n_b = t_cond.count("A"), t_cond.count("B")
     res["n_a"], res["n_b"] = n_a, n_b
-    donors = _design_donors(tables)
     for r, d in zip(rows, donors):
         r["donor"] = d
     res["test"] = "exact" if test == "exact" else "moderated"
@@ -1536,6 +1611,8 @@ def _comp_compute(kind, seg_source="xenium", method=None, transform="logit", tes
                                 "categories with cells.")
             return res
         tests, note = _comp_exact(sub, t_idx, len(tables), conds, donors, transform, names, cat_name)
+        if left_out:
+            note += f" Donors with samples in one condition only were left out: {', '.join(left_out)}."
         res["test_note"] = note
         if tests is not None:
             tests.insert(0, "category", list(sub.index))
@@ -1610,7 +1687,8 @@ def _comp_compute(kind, seg_source="xenium", method=None, transform="logit", tes
         + f" Unit of the p-values: {unit_note}."
         + (" The samples of one donor within a condition are one unit: their transformed "
            "proportions were averaged before the test." if by_donor and len(u_cond) < len(t_idx) else "")
-        + (f" Donors with samples in one condition only were left out: {', '.join(dropped)}." if dropped else ""))
+        + (f" Donors with samples in one condition only were left out: {', '.join(dropped or left_out)}."
+           if (dropped or left_out) else ""))
     return res
 
 
@@ -2348,7 +2426,7 @@ def _run_lr(pairs_text, label_kind, seg_source, method, use_corrected, k, n_perm
         if not samples:
             _set("error", analysis._an_no_matrix_msg(seg_source))
             return
-        labels, cat_name = _comp_labels(label_kind, samples, seg_source, method)
+        labels, cat_name = _comp_labels(label_kind, samples, seg_source, method, use_corrected)
         if all(l is None for l in labels):
             _set("error", f"The active view has no {cat_name} labels: run Cell Type Annotation "
                           f"first, or score between clusters.")

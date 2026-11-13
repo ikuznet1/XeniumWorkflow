@@ -235,6 +235,7 @@ def _batch_context(cfg) -> dict:
     counts = str(cfg.get("counts") or "original").lower()
     if counts not in ("original", "corrected"):
         raise _BatchError(f"counts: '{counts}' is not 'original' or 'corrected'")
+    core._active_counts_mode = counts
     methods = list(core.DATA.get("cluster_methods") or [])
     return {"seg-source": cfg.get("seg_source") or "xenium", "counts-mode-store": counts,
             "cluster-method": cfg.get("cluster_method") or _batch_default("cluster-method", "value")
@@ -265,6 +266,8 @@ def _batch_step_args(spec, params, ctx, kind=None) -> tuple:
                           + ", ".join(sorted(n for n, c in allowed.items() if n != c)))
     given = {allowed[k]: v for k, v in (params or {}).items()}
     args, resolved = [], {}
+    # label lookups without a counts argument follow the mode of the step (core mirror)
+    core._active_counts_mode = ctx.get("counts-mode-store") or "original"
     for name, cid, prop, is_input in io:
         if is_input:
             val = 1 if prop in ("n_clicks", "n_intervals", "data") else None
@@ -274,6 +277,7 @@ def _batch_step_args(spec, params, ctx, kind=None) -> tuple:
             val = _batch_coerce(cid, prop, given[cid])
             if cid == "counts-mode-store":
                 val = "corrected" if str(val).lower() == "corrected" else "original"
+                core._active_counts_mode = val
         elif cid in ctx:
             val = ctx[cid]
         else:
@@ -402,6 +406,9 @@ def _batch_setup_samples(cfg, log) -> None:
             for k in (r["label"], r["name"], r["key"], os.path.basename(str(r["key"]).rstrip("/"))):
                 by.setdefault(str(k), r)
         new = []
+        names = design.get("names") or {}
+        # names as text: YAML reads `A: 1` / `B: no` as a number / a boolean
+        names = {c: str(names[c]).strip() for c in ("A", "B") if names.get(c) is not None and str(names[c]).strip()}
         for d in design.get("samples") or []:
             if not isinstance(d, dict) or "sample" not in d:
                 raise _BatchError("data.design.samples: each entry needs 'sample' (S0, S1, …, a name or a path)")
@@ -409,17 +416,24 @@ def _batch_setup_samples(cfg, log) -> None:
             if r is None:
                 raise _BatchError(f"data.design: no loaded sample '{d['sample']}' "
                                   f"(loaded: {', '.join(x['label'] + '=' + x['name'] for x in rows)})")
-            cond = str(d.get("condition") or "").strip()
-            names = design.get("names") or {}
-            cond = next((c for c in ("A", "B") if cond in (c, str(names.get(c)))), "")
-            if d.get("condition") and not cond:
-                raise _BatchError(f"data.design: sample '{d['sample']}' has condition '{d['condition']}', "
+            # presence, not truthiness: a condition written as 0 or false is a condition
+            raw = d.get("condition")
+            asked = "" if raw is None else str(raw).strip()
+            cond = next((c for c in ("A", "B") if asked and asked in (c, names.get(c))), "")
+            if asked and not cond:
+                raise _BatchError(f"data.design: sample '{d['sample']}' has condition '{raw}', "
                                   f"which is neither A / B nor one of the names {names}")
-            row = {"key": r["key"], "cond": cond, "batch": d.get("batch") or ""}
-            if "donor" in d:
-                row["donor"] = d.get("donor") or ""
-            new.append(row)
-        stats._design_set(new, design.get("names"))
+            _txt = lambda v: "" if v is None else str(v).strip()
+            new.append({"key": r["key"], "cond": cond, "batch": _txt(d.get("batch")),
+                        "donor": _txt(d.get("donor"))})
+        # The config IS the design of the run: a sample it does not list is unassigned and
+        # a listed sample without donor / batch has none, whatever an earlier session or
+        # run left in the design file of these samples.
+        listed = {row["key"] for row in new}
+        new += [{"key": r["key"], "cond": "", "batch": "", "donor": ""} for r in rows if r["key"] not in listed]
+        with stats._design_lock:
+            stats._design_state["names"].update({"A": "A", "B": "B"})
+        stats._design_set(new, names)
         log("  design: " + stats._design_summary())
 
 
@@ -529,16 +543,22 @@ def _batch_write_outputs(step, spec, resolved, ctx, res, step_dir, cfg, log) -> 
             cells = _batch_cell_table(kind, resolved, ctx)
         elif kind == "annotation":
             src = str(resolved.get("annot-source") or "celltypist")
-            lk = "labels" if core._seg_tool(ctx["seg-source"]) == "xenium" else f"labels_{core._seg_tool(ctx['seg-source'])}"
+            seg = resolved.get("seg-source") or ctx["seg-source"]
+            # the key the annotation job wrote: per method and, for a run, per run
+            lk = _batch_module("annotation")._labels_key_for_method(
+                src if src in core._ANNOT_METHODS else "celltypist", core._seg_result(seg, done_only=True))
             with core._annot_lock:
                 lab = core._annot_state.get(lk)
             if lab is not None:
                 cells = pd.DataFrame({"cell_id": pd.Series(lab).index.astype(str),
                                       f"cell_type_{src}": pd.Series(lab).astype(object).to_numpy()})
         elif kind == "geneset":
-            name = str(resolved.get("geneset-name") or "").strip()
-            arrays, _info = analysis._geneset_values(name, ctx["seg-source"], ctx["counts-mode-store"] == "corrected")
-            tabs = stats._view_tables(ctx["seg-source"])
+            # the name as the callback stored it, the segmentation and counts of the step
+            name = re.sub(r"\s+", " ", str(resolved.get("geneset-name") or "").strip())
+            seg = resolved.get("seg-source") or ctx["seg-source"]
+            corr = (resolved.get("counts-mode-store") or ctx["counts-mode-store"]) == "corrected"
+            arrays, _info = analysis._geneset_values(name, seg, corr)
+            tabs = stats._view_tables(seg)
             if arrays is not None and len(arrays) == len(tabs):
                 cells = pd.concat([pd.DataFrame({"sample": t["label"], "cell_id": t["df"].index.astype(str),
                                                  f"geneset_{name}": np.asarray(a)})
@@ -590,6 +610,52 @@ def _batch_write_figure(fig, stem) -> list:
 
 
 # ─── Validation (--dry-run) ───────────────────────────────────────────────────
+def _batch_seg_run(seg_source) -> "dict | None":
+    """The cached run *seg_source* ("<tool>:<tag>") names, from the listing; None when
+    there is none."""
+    return next((r for r in caching._list_cached_seg_runs() if r["value"] == seg_source), None)
+
+
+def _batch_seg_ready(seg_source) -> bool:
+    """True when the cells a step on *seg_source* would use are those it names: the
+    Xenium cells, or the loaded result of the tool when that IS the named run (a tool
+    holds one run at a time, and core._seg_result() answers for the tool alone)."""
+    tool = core._seg_tool(seg_source)
+    if tool == "xenium":
+        return True
+    res = core._seg_result(seg_source, done_only=True)
+    if res is None:
+        return False
+    if ":" not in str(seg_source):
+        return True                              # "<tool>": whichever run is loaded
+    run = _batch_seg_run(seg_source)
+    return run is not None and _batch_same_path(run.get("out_dir") or "", res.get("out_dir") or "")
+
+
+def _batch_ensure_seg(seg_source, log) -> None:
+    """Load the cached run *seg_source* names unless it is the loaded one (nothing is
+    computed). _BatchError when it does not exist or cannot be loaded."""
+    tool = core._seg_tool(seg_source)
+    if _batch_seg_ready(seg_source):
+        return
+    if tool not in core._SEG_TOOL_LABELS:
+        raise _BatchError(f"seg_source '{seg_source}': unknown segmentation (xenium, or <tool>:<run tag> with "
+                          f"tool one of {', '.join(core._SEG_TOOL_LABELS)})")
+    if ":" not in str(seg_source) or _batch_seg_run(seg_source) is None:
+        runs = sorted(o["value"] for o in caching._list_cached_seg_runs())
+        raise _BatchError(f"seg_source '{seg_source}': no such cached run (cached: {', '.join(runs) or 'none'})")
+    log(f"Loading the cached run {seg_source}…")
+    try:
+        if tool == "imgseg":
+            _batch_run_callback("cb_reseg", "load_imgseg_run_from_cache", [seg_source], "load", log)
+        else:
+            _batch_run_callback("cb_reseg", "load_seg_run_from_cache", [seg_source, 0, 0], "load", log)
+    except _BatchError:
+        pass                                     # PreventUpdate: judged by the result below
+    if not _batch_seg_ready(seg_source):
+        raise _BatchError(f"seg_source '{seg_source}' could not be loaded from the cache")
+
+
 def _batch_label_kinds(ctx) -> set:
     try:
         return {o["value"] for o in stats._comp_category_options(ctx["seg-source"], ctx["color-by"])}
@@ -600,14 +666,17 @@ def _batch_label_kinds(ctx) -> set:
 def _batch_cell_types(kind, ctx) -> "set | None":
     try:
         tables = stats._view_tables(ctx["seg-source"])
-        labels, _cat = stats._comp_labels(kind, tables, ctx["seg-source"], ctx["cluster-method"])
+        labels, _cat = stats._comp_labels(kind, tables, ctx["seg-source"], ctx["cluster-method"],
+                                           ctx["counts-mode-store"] == "corrected")
         return {str(t) for t in controls._pooled_types(labels).index}
     except Exception:
         return None
 
 
-def _batch_validate(cfg) -> tuple:
-    """(errors, warnings) of the config against the loaded data, without computing."""
+def _batch_validate(cfg, log=None) -> tuple:
+    """(errors, warnings) of the config against the loaded data, without computing. The
+    checks of a step are made on the segmentation the step names: a cached run is loaded
+    for them (also in a dry run - loading computes nothing)."""
     errors, warns = [], []
     try:
         ctx = _batch_context(cfg)
@@ -616,11 +685,11 @@ def _batch_validate(cfg) -> tuple:
     genes = set(map(str, core.DATA.get("gene_names") or []))
     methods = list(core.DATA.get("cluster_methods") or [])
     seg_tool = core._seg_tool(ctx["seg-source"])
-    if seg_tool != "xenium" and core._seg_result(ctx["seg-source"]) is None:
-        runs = {o["value"] for o in caching._list_cached_seg_runs()}
-        if ctx["seg-source"] not in runs:
-            errors.append(f"seg_source '{ctx['seg-source']}': no such cached run (cached: "
-                          f"{', '.join(sorted(runs)) or 'none'})")
+    if not _batch_seg_ready(ctx["seg-source"]):
+        try:
+            _batch_ensure_seg(ctx["seg-source"], log or (lambda s: None))
+        except _BatchError as exc:
+            return [str(exc)], warns
     if cfg.get("cluster_method") and methods and cfg["cluster_method"] not in methods:
         try:
             from . import clustersets
@@ -635,11 +704,21 @@ def _batch_validate(cfg) -> tuple:
         if not st.get("all"):
             warns.append("counts: corrected - not every loaded sample has SPLIT-corrected counts; the "
                          "analyses will say that original counts were used")
+    # counts that are not raw counts (an .h5ad whose matrix is not integer-valued): what the
+    # mapping says the count models may do with them is said before anything runs
+    _ni = {str(ds.get("counts_noninteger")) for ds in [core.DATA] + list(dataview.EXTRA_DATASETS)
+           if ds.get("counts_noninteger")}
+    if "round_sums" in _ni:
+        warns.append("noninteger_counts = round_sums: the count matrix of this data is NOT integer-valued "
+                     "(corrected, not raw, counts). Pseudobulk steps will sum these values per sample or donor "
+                     "and round the sums; their results are not from raw counts, and the provenance record "
+                     "and methods text say so")
     rows = stats._design_samples()
     n_a, n_b = sum(r["cond"] == "A" for r in rows), sum(r["cond"] == "B" for r in rows)
     have_tx = bool(core.DATA.get("data_dir")) and os.path.exists(
         os.path.join(str(core.DATA.get("data_dir")), "transcripts.parquet"))
     label_kinds = _batch_label_kinds(ctx)
+    _lk_seg = ctx["seg-source"]              # the segmentation label_kinds was read for
     annotated_later = False
     for st in cfg["steps"]:
         spec, where = _BATCH_STEPS[st["kind"]], f"step {st['index']} ({st['name']})"
@@ -653,9 +732,34 @@ def _batch_validate(cfg) -> tuple:
                 nm = sorted(n for n, c in allowed.items() if c == cid and n != cid)
                 errors.append(f"{where}: parameter '{nm[0] if nm else cid}' is required")
         sctx = {**ctx, **{k: v for k, v in resolved.items() if k in _BATCH_CONTEXT}}
+        if sctx["seg-source"] != ctx["seg-source"]:
+            # a step on another segmentation: its labels, cell types and groups are those
+            # of that run, which is loaded for the checks (and again before the step runs)
+            try:
+                _batch_ensure_seg(sctx["seg-source"], log or (lambda s: None))
+            except _BatchError as exc:
+                errors.append(f"{where}: {exc}")
+                continue
+            label_kinds = _batch_label_kinds(sctx)
+        elif not _batch_seg_ready(ctx["seg-source"]):
+            try:
+                _batch_ensure_seg(ctx["seg-source"], log or (lambda s: None))
+            except _BatchError as exc:
+                errors.append(f"{where}: {exc}")
+                continue
+            label_kinds = _batch_label_kinds(ctx)
+        else:
+            label_kinds = _batch_label_kinds(ctx) if _lk_seg != ctx["seg-source"] else label_kinds
+        _lk_seg = sctx["seg-source"]
         if spec.get("design") and (n_a < 1 or n_b < 1):
             errors.append(f"{where}: needs the sample design (samples in condition A and in B); "
                           f"the design has {n_a} in A and {n_b} in B")
+        if st["kind"] == "pseudobulk" and "refuse" in _ni:
+            errors.append(f"{where}: the count matrix is not integer-valued (not raw counts) and pseudobulk "
+                          f"refuses it. Name the matrix with the raw counts in the h5ad mapping, or - when the "
+                          f"file only has corrected counts - set \"noninteger_counts\": \"round_sums\" there")
+        elif st["kind"] == "pseudobulk" and "round_sums" in _ni:
+            warns.append(f"{where}: runs on non-integer counts (sums rounded, noninteger_counts = round_sums)")
         if spec.get("multi") and len(rows) < 2:
             errors.append(f"{where}: needs at least two loaded samples (data.extra_samples)")
         if spec.get("transcripts") and not have_tx:
@@ -748,11 +852,19 @@ def _batch_run_step(step, cfg, ctx, out_dir, log) -> dict:
         io = _batch_io(getattr(_batch_module(spec["run"][0]), spec["run"][1]))
         args[[c for _n, c, _p, _i in io].index("save-sdata-dir")] = step_dir
         resolved["save-sdata-dir"] = step_dir
+    # the step runs on the cells it names: the named run is (re)loaded when another run of
+    # the tool - or none - is in memory
+    _batch_ensure_seg(resolved.get("seg-source") or ctx["seg-source"], log)
     n_before = len(provenance._prov_recent)
     last_id = provenance._prov_recent[-1]["id"] if provenance._prov_recent else None
     t0 = _time.time()
+    _res_before = _batch_step_result(spec)[2]
     job, out = _batch_run_callback(spec["run"][0], spec["run"][1], args, step["kind"], log)
     status, message, res = _batch_step_result(spec)
+    if spec.get("sync") and res is _res_before:
+        # the callback returned without computing (a missing input): the result in the
+        # state is an earlier step's, not this one's
+        raise _BatchError(_batch_text(out) or "the step produced no result")
     if job is None and not spec.get("sync"):
         raise _BatchError(_batch_text(out) or "the step did not start")
     if job is not None and job.state != "done":
@@ -790,31 +902,25 @@ def _batch_run(cfg: dict, dry_run: bool = False, log=None) -> dict:
     ctx = _batch_context(cfg)
     summary = {"ok": True, "dry_run": bool(dry_run), "data": cfg["data"]["path"], "steps": [],
                "errors": [], "warnings": [], "kaleido": _batch_kaleido()}
-    if core._seg_tool(ctx["seg-source"]) != "xenium" and not dry_run and core._seg_result(ctx["seg-source"]) is None:
-        log(f"Loading the cached run {ctx['seg-source']}…")
-        cb_reseg = _batch_module("cb_reseg")
-        fn = cb_reseg.load_imgseg_run_from_cache if core._seg_tool(ctx["seg-source"]) == "imgseg" \
-            else cb_reseg.load_seg_run_from_cache
-        try:
-            _batch_run_callback("cb_reseg", fn.__name__,
-                                [ctx["seg-source"]] + ([0, 0] if fn is cb_reseg.load_seg_run_from_cache else []),
-                                "load", log)
-        except Exception as exc:
-            if type(exc).__name__ != "PreventUpdate":
-                raise
-        if core._seg_result(ctx["seg-source"], done_only=True) is None:
-            raise _BatchError(f"seg_source '{ctx['seg-source']}' could not be loaded from the cache")
-    errors, warns = _batch_validate(cfg)
+    # The run seg_source names is loaded before anything is checked or computed - in a dry
+    # run too: its labels, clusters and groups are what the checks have to be made on.
+    _batch_ensure_seg(ctx["seg-source"], log)
+    errors, warns = _batch_validate(cfg, log)
+    _batch_ensure_seg(ctx["seg-source"], log)      # the checks of a step may have loaded another run
     summary["errors"], summary["warnings"] = errors, warns
     for w in warns:
         log(f"  warning: {w}")
+    for e in errors:
+        log(f"  error: {e}")
     if dry_run:
-        for e in errors:
-            log(f"  error: {e}")
         summary["ok"] = not errors
         log(f"Dry run: {len(cfg['steps'])} step(s), {len(errors)} error(s), {len(warns)} warning(s). "
             "Nothing was computed.")
         return summary
+    if errors:
+        # the steps still run (each fails on its own, see continue_on_error), but a run
+        # whose config did not pass its checks is never reported as ok
+        summary["ok"] = False
     out_dir = os.path.abspath(os.path.expanduser(str(cfg.get("output_dir") or "batch_output")))
     os.makedirs(out_dir, exist_ok=True)
     summary["output_dir"] = out_dir

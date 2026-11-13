@@ -68,3 +68,4 @@ if _h5ad_start is not None:
     h5ad._h5ad_primary_labels()
     print("  h5ad: " + h5ad._h5ad_design(force=False), flush=True)
     print("  h5ad: " + h5ad._h5ad_summary(), flush=True)
+    h5ad._h5ad_record()

@@ -451,3 +451,26 @@ def test_job_can_be_cancelled_publishes_nothing_and_reruns(xe, D, tmp_path, monk
     tl.wait_state(xe._sfree_state, xe._sfree_lock)
     r = xe._sfree_state["result"]["table"].iloc[0]
     assert r["n_tx_sample"] == 4000 and os.path.exists(xe._density_cache_file(mk))
+
+
+# ── review round 6, finding 29: a sample without labels has no value, not zero ───────
+def test_unlabelled_sample_gets_no_cell_density_and_is_not_tested_as_zero(xe, D, labels, tmp_path):
+    if not os.path.exists(os.path.join(D["data_dir"], "transcripts.parquet")):
+        pytest.skip("bundle without transcripts.parquet")
+    extras = [_extra(D, tmp_path, i, 500 + 50 * i) for i in range(6)]
+    rng = np.random.default_rng(5)
+    for e in extras[:5]:                                   # the sixth has no annotation
+        e["_cell_type_labels"] = pd.Series(rng.choice(["Alpha", "Beta"], size=len(e["df"])), index=e["df"].index)
+    xe.EXTRA_DATASETS.extend(extras)
+    xe._design_set([{"key": xe._ds_key(e), "cond": "A" if i < 3 else "B", "batch": ""}
+                    for i, e in enumerate(extras)])
+    mk = D["gene_names"][0]
+    xe.run_segfree(1, "celltype:celltypist", "Alpha", mk, 5, "200", "cells", 0, 0, "xenium", None, "original")
+    msg = tl.wait_state(xe._sfree_state, xe._sfree_lock)
+    res = xe._sfree_state["result"]
+    t = res["table"].set_index("sample")
+    assert np.isnan(t.loc["S6", "cells_per_mm2"]) and np.isnan(t.loc["S6", "n_cells_type"])
+    assert t.loc["S1", "n_cells_type"] > 0 and np.isfinite(t.loc["S1", "cells_per_mm2"])
+    a = res["across"]
+    assert "tx_per_mm2" in set(a["metric"]) and "cells_per_mm2" not in set(a["metric"])
+    assert res["unlabelled"] == ["S6"] and "labels in S6" in msg and "no value, not 0" in msg

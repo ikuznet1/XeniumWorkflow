@@ -483,7 +483,7 @@ def _run_segfree(seg_source, method, label_kind, cell_type, markers_text, n_mark
         by_key = {s["key"]: s for s in samples}
         labels, cat = [None] * len(tables), ""
         if label_kind:
-            labels, cat = stats._comp_labels(label_kind, tables, seg_source, method)
+            labels, cat = stats._comp_labels(label_kind, tables, seg_source, method, use_corrected)
         ctype = str(cell_type) if cell_type not in (None, "") else None
         if ctype is not None:
             vc = controls._pooled_types(labels)
@@ -525,6 +525,7 @@ def _run_segfree(seg_source, method, label_kind, cell_type, markers_text, n_mark
                           + f" {dataview._origin_phrase(tables[0]['ds'])}, which has cells but no transcripts.")
             return
         rows, gene_rows, scanned = [], [], []
+        unlabelled = []            # samples without labels while a cell type is picked
         for k, i in enumerate(usable):
             t = tables[i]
             lo, span = k / len(usable), 1.0 / len(usable)
@@ -536,11 +537,15 @@ def _run_segfree(seg_source, method, label_kind, cell_type, markers_text, n_mark
             _set("running", f"Tissue area and concentration of {t['label']}…")
             xy = stats._xy_of(t["df"])
             lab = labels[i]
+            # A sample without labels (no annotation for the chosen source) has no known
+            # cells of the type: is_type stays None, so its segmented-cell columns are
+            # NaN and the between-condition test of cells per mm² is not run on a zero.
             is_type = None
-            if ctype is not None and lab is not None:
-                is_type = pd.Series(lab, dtype=object).astype(str).to_numpy() == ctype
+            if ctype is not None and lab is not None and pd.Series(lab, dtype=object).notna().any():
+                _ls = pd.Series(lab, dtype=object)
+                is_type = (_ls.astype(str).to_numpy() == ctype) & _ls.notna().to_numpy()
             elif ctype is not None:
-                is_type = np.zeros(len(xy), dtype=bool)
+                unlabelled.append(t["label"])
             if len(xy) < 1 and area_mode == "cells":
                 continue
             r_s, per_gene = _sfree_sample(
@@ -654,6 +659,11 @@ def _run_segfree(seg_source, method, label_kind, cell_type, markers_text, n_mark
             msg += f"\nNot on the panel: {', '.join(missing[:12])}."
         if skipped:
             msg += (f"\nLeft out (loaded from a .zarr, no transcript file): {', '.join(skipped)}.")
+        if unlabelled:
+            res["unlabelled"] = list(unlabelled)
+            msg += (f"\nNo {cat} labels in {', '.join(unlabelled)}: the segmented cells of '{ctype}' are "
+                    f"unknown there (no value, not 0), and cells per mm² is not tested between the "
+                    f"conditions while a sample has no value.")
         if area_mode == "transcripts" and "_df_original" in core.DATA:
             msg += "\nNote: a cell subset is active; with the area from all transcripts it is not applied."
         if use_corrected and not corrected and samples:

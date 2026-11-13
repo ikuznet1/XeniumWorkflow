@@ -23,7 +23,7 @@ from . import compat, core, jobs, dataview, spage, subsetting, morph, app_layout
     prevent_initial_call=True,
 )
 def start_spage(n_clicks, rds_path, n_pv, genes_input, seg_source):
-    rds_path = (rds_path or core.REF_RDS_DEFAULT or "").strip()
+    rds_path = core._ref_rds_path(rds_path or core.REF_RDS_DEFAULT)
     _problem = core._ref_rds_problem(rds_path)
     if _problem:                              # nothing is started: the poll stays off, Run stays enabled
         return True, f"✗ {_problem}", f"✗ {_problem}", False

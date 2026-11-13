@@ -181,6 +181,11 @@ def _niche_name(niche: str) -> str:
     return "No niche" if niche == _NICHE_NONE else f"Niche {niche}"
 
 
+# what the niche KMeans was run on (recorded, and read by the methods text)
+_NICHE_FEATURES_COMPOSITION = "cell-type composition of the neighbours"
+_NICHE_FEATURES_COORDINATES = "normalised spatial coordinates (no cell-type labels available)"
+
+
 def _run_spatial_niches(n_clusters: int, n_neighbors: int, label_key: str | None,
                         alt_res) -> None:
     """Background thread: compute spatial niches via BuildNicheAssay-style KMeans."""
@@ -312,14 +317,20 @@ def _run_spatial_niches(n_clusters: int, n_neighbors: int, label_key: str | None
         with core._niche_lock:
             jobs._check_dataset_gen(_gen)
             core._niche_state["status"] = "done"
-            core._niche_state["message"] = f"Done — {n_clusters} niches computed for {n_cells:,} cells"
+            _niche_msg = (f"Done — {n_clusters} niches computed for {n_cells:,} cells"
+                          + ("" if labels_series is not None else
+                             " from the normalised cell coordinates: no cell-type labels were available, so "
+                             "these are spatial blocks, not composition niches (run Cell Type Annotation "
+                             "first for niches of the neighbourhood composition)"))
+            core._niche_state["message"] = _niche_msg
         provenance._prov_record(
-            "niches", seg_source=("xenium" if alt_res is None else str(alt_res.get("source") or "resegmentation")),
+            "niches", seg_source=("xenium" if alt_res is None else provenance._prov_run_source(
+                str(alt_res.get("source") or "resegmentation"), alt_res)),
             params={"n_clusters": n_clusters, "n_neighbors": n_neighbors, "labels_key": label_key,
-                    "features": ("cell-type composition of the neighbours" if labels_series is not None
-                                 else "see the status line")},
+                    "features": (_NICHE_FEATURES_COMPOSITION if labels_series is not None
+                                 else _NICHE_FEATURES_COORDINATES)},
             result={"n_niches": int(n_clusters), "n_cells": int(n_cells)},
-            message=f"Done — {n_clusters} niches computed for {n_cells:,} cells", labels=(label_key, None))
+            message=_niche_msg, labels=(label_key, None))
     except jobs._JobCancelled:
         raise
     except Exception as exc:

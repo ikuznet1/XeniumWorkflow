@@ -96,10 +96,32 @@ def open_design_modal_nav(n_clicks):
 
 
 # ─── "this tab cannot work with the loaded data", said in place ───────────────
+def _nav_transcript_samples() -> tuple:
+    """(labels of the loaded samples that have a transcript file, labels of those that do
+    not). The transcript tabs run on every sample that has one and skip the others."""
+    have, lack = [], []
+    dsets = [core.DATA] + list(dataview.EXTRA_DATASETS)
+    for i, ds in enumerate(dsets):
+        d = ds.get("data_dir")
+        ok = bool(d) and any(os.path.exists(os.path.join(str(d), f))
+                             for f in ("transcripts.parquet", "transcripts.zarr.zip"))
+        (have if ok else lack).append(f"S{i}" if len(dsets) > 1 else "the dataset")
+    return have, lack
+
+
 def _nav_has_transcripts() -> bool:
-    d = core.DATA.get("data_dir")
-    return bool(d) and any(os.path.exists(os.path.join(d, f))
-                           for f in ("transcripts.parquet", "transcripts.zarr.zip"))
+    """A sample of the view has a transcript file (not only the primary one)."""
+    return bool(_nav_transcript_samples()[0])
+
+
+def _nav_has_niches(seg_source="xenium") -> bool:
+    """The condition the Niche UMAP figure draws on: a 'niche' column in a cell table of
+    the active view (computed in this session or restored from a store) - not the state of
+    the last niche job."""
+    try:
+        return any("niche" in t["df"].columns for t in stats._view_tables(seg_source or "xenium"))
+    except Exception:
+        return "niche" in core.DATA["df"].columns
 
 
 def _nav_has_annotation() -> bool:
@@ -107,7 +129,7 @@ def _nav_has_annotation() -> bool:
         return any(str(k).startswith("labels") and v is not None for k, v in core._annot_state.items())
 
 
-def _nav_notice(tab: str) -> str:
+def _nav_notice(tab: str, seg_source="xenium") -> str:
     """Why the open tab has nothing to show for the loaded data ('' when it can work).
     Reads flags only; never loads or computes."""
     msgs = []
@@ -116,6 +138,11 @@ def _nav_notice(tab: str) -> str:
         msgs.append("This tab reads the transcript file (transcripts.parquet or transcripts.zarr.zip) of a "
                     "Xenium output directory; this dataset was " + dataview._origin_phrase() +
                     ", so there are no transcripts to read. Open the Xenium output directory to use it.")
+    elif tab in ("tab-density", "tab-segfree", "tab-txf") and _nav_transcript_samples()[1]:
+        _have, _lack = _nav_transcript_samples()
+        msgs.append(f"This tab reads the transcript file of each sample: {', '.join(_lack)} "
+                    f"{'was' if len(_lack) == 1 else 'were'} loaded without one and will be left out; "
+                    f"it runs on {', '.join(_have)}.")
     if tab == "tab-composition" and n_samples < 2:       # (the Joint clusters tab says so itself)
         msgs.append("One sample is loaded. A composition test between conditions needs several samples: add "
                     f"them with '+ Add sample' in the sidebar (at least {stats._COMP_MIN_SAMPLES} per condition "
@@ -131,9 +158,7 @@ def _nav_notice(tab: str) -> str:
                         + ("first annotate the cell types, then " if not _nav_has_annotation() else "")
                         + "open 'Spatial Analysis Tools' in the sidebar and run the spatial analysis; the plot appears here.")
     if tab == "tab-niche-umap":
-        with core._niche_lock:
-            done = core._niche_state.get("status") == "done"
-        if not done:
+        if not _nav_has_niches(seg_source):
             msgs.append("No niches have been computed yet: open 'Spatial Analysis Tools' in the sidebar and run the niches "
                         "(it needs a cell-type annotation or clusters).")
     if tab == "tab-cellnest":
@@ -154,10 +179,15 @@ def _nav_notice(tab: str) -> str:
     Input("annot-done",             "data"),
     Input("spatial-done",           "data"),
     Input("niche-done",             "data"),
+    Input("cellnest-version",       "data"),
+    Input("seg-source",             "value"),
+    Input("baysor-done",            "data"),
+    Input("proseg-done",            "data"),
 )
-def update_nav_notice(tab, _ds, _extra, _annot, _spatial, _niche):
+def update_nav_notice(tab, _ds, _extra, _annot, _spatial, _niche, _cellnest=None, seg_source=None,
+                      _baysor=None, _proseg=None):
     try:
-        msg = _nav_notice(tab or "")
+        msg = _nav_notice(tab or "", seg_source or "xenium")
     except Exception as exc:                 # a note must never break the panel
         print(f"  nav notice: {exc}", flush=True)
         msg = ""
