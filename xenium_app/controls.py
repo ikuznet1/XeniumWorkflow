@@ -114,14 +114,46 @@ def _seg_tag(seg_source) -> str:
     return f"{core._seg_tool(seg_source)}:{alt.get('out_dir', '')}"
 
 
-def _ctl_put(table: dict, seg_source, columns: dict) -> None:
-    """Store per-cell columns of one view table: {name: values aligned to table["df"]}."""
-    key = (table["key"], _seg_tag(seg_source))
+_CTL_SEG_CHANGED = ("The segmentation was switched while this job was running: its per-cell values belong "
+                    "to the cells of the other run and were discarded. Run it again.")
+
+
+def _ctl_check_tag(seg_source, tag) -> str:
+    """The segmentation tag to write under. *tag* is the one a job resolved when it read
+    its tables; when the loaded run has changed since (another cached run was picked in
+    the dropdown), the job's values belong to other cells: ValueError, nothing is written."""
+    cur = _seg_tag(seg_source)
+    if tag is not None and tag != cur:
+        raise ValueError(_CTL_SEG_CHANGED)
+    return cur
+
+
+def _ctl_put(table: dict, seg_source, columns: dict, tag=None, drop=()) -> None:
+    """Store per-cell columns of one view table: {name: values aligned to table["df"]}.
+    tag: see _ctl_check_tag; drop: names removed first (the other columns of the same
+    computation, so that a rerun never leaves a mix of two runs)."""
+    key = (table["key"], _ctl_check_tag(seg_source, tag))
     idx = pd.Index(table["df"].index.astype(str))
     with _ctl_columns_lock:
         store = _ctl_columns.setdefault(key, {})
+        for name in drop:
+            store.pop(name, None)
         for name, vals in columns.items():
             store[name] = pd.Series(np.asarray(vals), index=idx)
+
+
+def _ctl_replace(tables, seg_source, family, per_table: dict, tag=None) -> None:
+    """Write phase of a job, for all samples at once: in every table of *tables* the
+    columns named in *family* are replaced by per_table.get(table key) - a sample the run
+    skipped loses the columns of the previous run instead of keeping them beside the new
+    result. Call it after the job's last cancellation point (jobs._job_shield)."""
+    _ctl_check_tag(seg_source, tag)
+    for t in tables:
+        _ctl_put(t, seg_source, per_table.get(t["key"]) or {}, tag=tag, drop=family)
+
+
+_COMP_COLUMNS = ("edge_distance_um", "local_density", "dominant_fraction", "core", "compartment")
+_SPILL_COLUMNS = ("spillover", "spillover_flag", "source_distance_um")
 
 
 def _ctl_get(table: dict, seg_source, name: str):
@@ -322,7 +354,9 @@ def _run_compartments(seg_source, method, label_kind, dominant, params=None) -> 
     try:
         _t0 = _time.time()
         _set("running", "Rasterising the tissue…")
+        analysis._an_require_seg(seg_source)
         tables = stats._view_tables(seg_source)
+        seg_tag = _seg_tag(seg_source)
         labels, cat = (None, "")
         if label_kind:
             labels, cat = stats._comp_labels(label_kind, tables, seg_source, method)
@@ -333,7 +367,7 @@ def _run_compartments(seg_source, method, label_kind, dominant, params=None) -> 
             if dom is not None and dom not in vc.index:
                 _set("error", f"No cell of the view is labelled '{dom}'.")
                 return
-        infos = []
+        infos, out = [], {}
         for i, t in enumerate(tables):
             jobs._job_check()
             jobs._job_progress(f"Compartments: {t['label']} ({len(t['df']):,} cells)…", i / len(tables))
@@ -344,12 +378,17 @@ def _run_compartments(seg_source, method, label_kind, dominant, params=None) -> 
             is_dom = None if (dom is None or lab is None) else (pd.Series(lab, dtype=object).astype(str).to_numpy() == dom)
             cols, info = _compartments(xy, is_dom, **p)
             jobs._check_dataset_gen(_gen)
-            _ctl_put(t, seg_source, cols)
+            out[t["key"]] = cols
             info.update({"label": t["label"], "name": t["name"]})
             infos.append(info)
         if not infos:
             _set("error", "No sample of the view has at least 3 cells.")
             return
+        # All samples are written together, after the last cancellation point: a cancelled
+        # run changes nothing, and the columns of an earlier run (a core that this run
+        # does not define, a sample this run skipped) do not stay beside the new ones.
+        jobs._job_shield("Writing the compartment columns…")
+        _ctl_replace(tables, seg_source, _COMP_COLUMNS, out, tag=seg_tag)
         res = {"samples": infos, "params": p, "dominant": dom, "category": cat,
                "seg_source": seg_source or "xenium", "seconds": _time.time() - _t0}
         msg = (f"Compartments ({p['bin_um']:g} µm bins"
@@ -652,11 +691,14 @@ def _spillover(samples, labels, source, markers, local_r=_SPILL_LOCAL_R_UM, near
             "by_type": by_type, "by_depth": by_depth, "edges": tuple(edges)}
 
 
-def _auto_source(prof: dict) -> "str | None":
-    """The type contributing the most transcripts to the view (abundance × expression)."""
-    if not len(prof["types"]):
+def _auto_source(prof: dict, exclude=()) -> "str | None":
+    """The type contributing the most transcripts to the view (abundance × expression),
+    among the types not named in *exclude*; None when no type is left."""
+    keep = [i for i, t in enumerate(prof["types"]) if t not in set(exclude)]
+    if not keep:
         return None
-    return prof["types"][int(np.argmax(prof["depth"]))]
+    depth = np.asarray(prof["depth"], dtype=np.float64)[keep]
+    return prof["types"][keep[int(np.argmax(depth))]]
 
 
 def _run_spillover(seg_source, method, label_kind, source, markers_text, n_markers, use_corrected,
@@ -679,8 +721,9 @@ def _run_spillover(seg_source, method, label_kind, source, markers_text, n_marke
         _t0 = _time.time()
         _set("running", "Summing counts per cell type…")
         samples = analysis._an_samples(seg_source, use_corrected)
+        seg_tag = _seg_tag(seg_source)
         if not samples:
-            _set("error", "The active view has no expression matrix.")
+            _set("error", analysis._an_no_matrix_msg(seg_source))
             return
         labels, cat = stats._comp_labels(label_kind, samples, seg_source, method)
         if all(l is None for l in labels):
@@ -709,15 +752,23 @@ def _run_spillover(seg_source, method, label_kind, source, markers_text, n_marke
         _set("running", f"Spillover of '{src}': scoring cells ({len(markers)} markers)…")
         res = _spillover(samples, labels, src, markers)
         jobs._check_dataset_gen(_gen)
-        own = _gene_ownership(prof, frac=float(own_frac or _OWN_FRAC))
+        own_frac = float(own_frac or _OWN_FRAC)
+        own = _gene_ownership(prof, frac=own_frac)
+        out = {}
         for s, p in zip(samples, res["per_sample"]):
             flag = np.array(_SPILL_FLAG_NAMES, dtype=object)[np.digitize(np.nan_to_num(p["score"]), list(res["edges"]))]
-            _ctl_put(s, seg_source, {"spillover": p["score"].astype(np.float32), "spillover_flag": flag,
-                                     "source_distance_um": p["dist"].astype(np.float32)})
+            out[s["key"]] = {"spillover": p["score"].astype(np.float32), "spillover_flag": flag,
+                             "source_distance_um": p["dist"].astype(np.float32)}
+        jobs._job_shield("Writing the spillover columns…")
+        _by_key = {s["key"]: s for s in samples}
+        _ctl_replace([_by_key.get(t["key"], t) for t in stats._view_tables(seg_source)], seg_source,
+                     _SPILL_COLUMNS, out, tag=seg_tag)
         v = res["validity"]
         corrected = bool(samples[0]["corrected"])
         res.update({"source": src, "markers": markers, "marker_info": minfo, "ownership": own,
                     "category": cat, "corrected": corrected, "seg_source": seg_source or "xenium",
+                    "n_uncorrected": analysis._an_uncorrected(samples),
+                    "own_frac": own_frac,
                     "types": prof["types"], "n_cells_type": dict(zip(prof["types"], prof["n"].tolist())),
                     "samples": [{"label": s["label"], "name": s["name"], "n_cells": len(s["df"])} for s in samples],
                     "seconds": _time.time() - _t0})
@@ -773,6 +824,8 @@ def _run_spillover(seg_source, method, label_kind, source, markers_text, n_marke
                 f"Color By: 'Control: Spillover score'.")
         if use_corrected and not corrected:
             msg += " Original counts were used: not every sample has SPLIT-corrected counts."
+        if res["n_uncorrected"]:
+            msg += " " + analysis._an_uncorrected_note(res["n_uncorrected"]) + "."
         _set("done", msg, result=res)
         print(f"  {msg}", flush=True)
     except jobs._JobCancelled:
@@ -1128,7 +1181,8 @@ _SEGQC_NOTE = (
     "identity transcripts per 100 transcripts regressed on the number of source-type neighbours "
     "within the radius (reference-free; 0 = no dependence on neighbours); the reverse slope is "
     "foreign identity transcripts in source cells against non-source neighbours. Own-identity "
-    "retention (corrected counts only): own identity transcripts after ÷ before correction, which "
+    "retention (corrected counts only): own identity transcripts after ÷ before correction (the row "
+    "value pools all types: Σ after ÷ Σ before; a type without such transcripts before has none), which "
     "guards against over-correction; own identity per 100 is given for every row. A corrected row "
     "is computed on the cells the correction covered (a non-empty corrected row; their share is "
     "'Corrected share') and its retention compares the same cells before and after. A run without "
@@ -1248,7 +1302,8 @@ def _qc_metrics(s: dict, labels, sets: dict, source_type=None, radius: float = _
         fail = float(np.mean(~(foreign < own)))
         own_sum = float(ident[c, j].sum())
         ident_sums[k] = own_sum
-        ret = (own_sum / max(ref_ident[k], 1e-9)) if (ref_ident is not None and k in ref_ident) else np.nan
+        # undefined (not 0, not 1e9) when the type's cells had no own-identity transcript before
+        ret = ((own_sum / ref_ident[k]) if (ref_ident is not None and ref_ident.get(k, 0) > 0) else np.nan)
         per.append({"type": k, "n": int(c.sum()), "exclusion_failure": fail,
                     "own_per_100": float(100.0 * own_sum / max(tot[c].sum(), 1e-9)), "retention": ret})
         fails += fail * int(c.sum())
@@ -1259,7 +1314,11 @@ def _qc_metrics(s: dict, labels, sets: dict, source_type=None, radius: float = _
     row["own_per_100"] = (float(100.0 * sum(ident_sums.values())
                                 / max(sum(tot[labelled & (L == k)].sum() for k in ident_sums), 1e-9))
                           if ident_sums else np.nan)
-    row["retention"] = float(per["retention"].mean()) if len(per) and per["retention"].notna().any() else np.nan
+    # the row value is the pooled ratio Σ after / Σ before over the types with a reference:
+    # a type of two cells does not weigh as much as one of twenty thousand
+    _rk = [k for k in ident_sums if ref_ident is not None and ref_ident.get(k, 0) > 0]
+    row["retention"] = (float(sum(ident_sums[k] for k in _rk) / sum(ref_ident[k] for k in _rk))
+                        if _rk else np.nan)
     # co-expression of mutually exclusive markers
     if not pairs:
         tops = [(k, sets[k][0]) for k in setk if sets[k] and sets[k][0] in s["gni"]]
@@ -1871,18 +1930,29 @@ def _coloc_placebo(prep, focal, n_samples, draws=_COLOC_PLACEBO_DRAWS, seed=1, p
     effect with compartment-level expectations, the same statistic for count-matched
     random anchors drawn within sample × compartment (mean, 95 % range, two-sided p of
     the focal value against them) and for the other types of similar abundance whose
-    most common compartment is the focal type's. Effects are means over the samples."""
+    most common compartment is the focal type's. Effects are means over the samples in
+    which the pair is testable (focal ≥ _COLOC_MIN_FOCAL and target ≥ _COLOC_MIN_TARGET cells)."""
     types, T = prep["types"], len(prep["types"])
     f = types.index(focal)
     strata = prep["levels"][2]                              # sample × compartment
     e_all, _ = _coloc_perm(prep["cnt"], prep["code"], prep["sample"], strata, T, n_samples, n_perm=0)
     e_f, e_rand = _coloc_perm(prep["cnt"], prep["code"], prep["sample"], strata, T, n_samples,
                               n_perm=draws, seed=seed, focal_idx=[f], progress=progress)
+    code, comp = prep["code"], prep["comp"]
+    # A sample where the focal or the target type is absent (or below the cell minimum of
+    # the main table) has no effect for the pair: its statistic is log2(0.5 / 0.5) = 0, not
+    # a measurement, and must not dilute the mean over the samples.
+    lab = code >= 0
+    n_st = np.zeros((n_samples, T))
+    np.add.at(n_st, (np.asarray(prep["sample"])[lab], code[lab]), 1.0)
+    ok = (n_st[:, :, None] >= _COLOC_MIN_FOCAL) & (n_st[:, None, :] >= _COLOC_MIN_TARGET)   # [s, a, b]
+    e_f = np.where(ok[:, [f], :], e_f, np.nan)
+    e_rand = np.where(ok[None, :, [f], :], e_rand, np.nan)
+    e_all = np.where(ok, e_all, np.nan)
     with np.errstate(invalid="ignore"):
         ef = _nanmean(e_f[:, 0, :], axis=0)               # targets
         er = _nanmean(e_rand[:, :, 0, :], axis=1)         # draws × targets
         ea = _nanmean(e_all, axis=0)                      # types × targets
-    code, comp = prep["code"], prep["comp"]
     n_t = np.bincount(code[code >= 0], minlength=T).astype(np.float64)
     major = np.array([np.bincount(comp[code == a], minlength=len(prep["comp_names"])).argmax()
                       if n_t[a] else -1 for a in range(T)])
@@ -1931,7 +2001,8 @@ def _coloc_across(e_corr, testable, conds, donors, labels) -> dict:
     for i in inc:
         groups.setdefault(dn[i] if by_donor else f"sample{i}", []).append(i)
     n_units = len(groups)
-    out = {"n_units_max": n_units, "p_enrich": np.full((T, T), np.nan), "mean": np.full((T, T), np.nan),
+    out = {"inc": list(inc), "groups": [list(ix) for ix in groups.values()],
+           "n_units_max": n_units, "p_enrich": np.full((T, T), np.nan), "mean": np.full((T, T), np.nan),
            "n_units": np.zeros((T, T), dtype=np.int64), "p_diff": None, "effect_diff": None,
            "min_p": np.nan, "min_p_diff": np.nan, "diff_note": "",
            "units_note": (f"n = {len(inc)} samples" + (f" ({n_units} donors; samples of a donor averaged)"
@@ -1998,6 +2069,7 @@ def _run_coloc(seg_source, method, label_kind, radius, n_perm, placebo_focal=Non
         radius = float(max(1.0, radius or _COLOC_RADIUS_UM))
         n_perm = int(max(0, min(5000, _COLOC_N_PERM if n_perm is None else n_perm)))
         _set("running", "Counting neighbours within each sample…")
+        analysis._an_require_seg(seg_source)
         tables = stats._view_tables(seg_source)
         labels, cat = stats._comp_labels(label_kind, tables, seg_source, method)
         if all(l is None for l in labels):
@@ -2047,18 +2119,29 @@ def _run_coloc(seg_source, method, label_kind, radius, n_perm, placebo_focal=Non
         for lab_s, ix in long.groupby("sample").groups.items():
             long.loc[ix, "fdr_within"] = stats._bh(long.loc[ix, "p_within"].to_numpy())
         # pair-level summary
-        any_t = testable.any(axis=0)
-        ai, bi = np.nonzero(any_t & ~np.eye(T, dtype=bool))
+        # In cohort mode the effect shown beside a p-value is the statistic that p-value
+        # tests: the mean over the tested units (samples with a condition; a donor's samples
+        # averaged first). Samples left out of the design do not enter it, nor the counts.
+        cohort = ac["mode"] == "cohort"
+        inc = np.asarray(ac["inc"] if cohort else list(range(S)), dtype=np.int64)
         ev = np.where(testable, e_corr, np.nan)
         nv = np.where(testable, naive["e"], np.nan)
+        any_t = testable[inc].any(axis=0)
+        ai, bi = np.nonzero(any_t & ~np.eye(T, dtype=bool))
         with np.errstate(invalid="ignore"):
+            if cohort:
+                eff = ac["mean"][ai, bi]
+                nai = _nanmean(np.stack([_nanmean(nv[ix], axis=0) for ix in ac["groups"]]), axis=0)[ai, bi]
+            else:
+                eff = _nanmean(ev[:, ai, bi], axis=0)
+                nai = _nanmean(nv[:, ai, bi], axis=0)
             summ = pd.DataFrame({
                 "focal": [types[i] for i in ai], "target": [types[i] for i in bi],
-                "n_samples": testable[:, ai, bi].sum(axis=0),
-                "effect": _nanmean(ev[:, ai, bi], axis=0),
-                "fold": 2.0 ** _nanmean(ev[:, ai, bi], axis=0),
-                "effect_naive": _nanmean(nv[:, ai, bi], axis=0),
-                "n_positive": (ev[:, ai, bi] > 0).sum(axis=0)})
+                "n_samples": testable[inc][:, ai, bi].sum(axis=0),
+                "effect": eff,
+                "fold": 2.0 ** eff,
+                "effect_naive": nai,
+                "n_positive": (ev[inc][:, ai, bi] > 0).sum(axis=0)})
         if ac["mode"] == "cohort":
             summ["n_units"] = ac["n_units"][ai, bi]
             summ["p_enrich"] = ac["p_enrich"][ai, bi]
@@ -2314,14 +2397,16 @@ def _spill_csv(res) -> str:
              f"counts: {'SPLIT-corrected' if res['corrected'] else 'original'}",
              f"# spillover source type: {res['source']}; markers ({res['marker_info']['rule']}): "
              f"{' '.join(res['markers'])}",
-             f"# median marker share inside source cells: {res['reference']:.6g}; validity: "
+             f"# {res.get('reference_kind', 'median')} marker share inside source cells: {res['reference']:.6g}; validity: "
              f"{'passed' if v['valid'] else 'FAILED' if v['valid'] is False else 'not fully testable'}; "
              f"near/far ratio {v['near_far_ratio']:.4g}; Spearman rho with local source fraction {v['rho_local']:.4g}",
              f"# owner = type with the highest rate (sum of counts / sum of depth); owners = all types at >= "
-             f"{_OWN_FRAC:g} of it; genes with < {_OWN_MIN_COUNT} transcripts have no owner; "
+             f"{res.get('own_frac', _OWN_FRAC):g} of it; genes with < {_OWN_MIN_COUNT} transcripts have no owner; "
              f"second_ratio = runner-up rate / top rate"]
     for p in res["profile"]:
         lines.append(f"# distance {p['band']} um: {p['n']} non-source cells, mean marker share {p['mean_share']:.6g}")
+    if res.get("n_uncorrected"):
+        lines.append(f"# {analysis._an_uncorrected_note(res['n_uncorrected'])}")
     return "\n".join(lines) + "\n" + res["ownership"].to_csv(index=False)
 
 

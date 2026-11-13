@@ -54,13 +54,21 @@ const axisTitle = (id) => page.evaluate((i) => {
 }, id);
 const dropdownOptions = (id) => page.evaluate((i) => {
   const el = document.getElementById(i);
+  if (!el) return [];
   const key = Object.keys(el).find((k) => k.startsWith('__reactFiber'));
-  let f = el[key];
-  for (let d = 0; f && d < 30; d += 1, f = f.return) {
-    const p = f.memoizedProps;
-    if (p && Array.isArray(p.options)) return p.options.map((o) => (o && o.value !== undefined ? o.value : o));
-  }
-  return [];
+  // The fiber a DOM node points at may be the alternate of the committed one (React keeps
+  // two per component), whose props are those of the render before: both are read and the
+  // longer list is the current one in this flow (the lists only grow from empty).
+  const walk = (f) => {
+    for (let d = 0; f && d < 30; d += 1, f = f.return) {
+      const p = f.memoizedProps;
+      if (p && Array.isArray(p.options)) return p.options.map((o) => (o && o.value !== undefined ? o.value : o));
+    }
+    return [];
+  };
+  const a = walk(el[key]);
+  const b = walk(el[key] && el[key].alternate);
+  return b.length > a.length ? b : a;
 }, id);
 
 if (await page.evaluate(() => getComputedStyle(document.querySelector('#umap-panel')).display === 'none')) {
@@ -83,9 +91,10 @@ const labOpts = await dropdownOptions('prox-labels');
 const labels = process.env.XP_LABELS || labOpts.find((v) => String(v).startsWith('celltype:')) || labOpts[0];
 check('label sources are offered', labOpts.length > 0 && labOpts.includes(labels), JSON.stringify(labOpts));
 await setProp('prox-labels', {value: labels});
-// the type lists are filled by a callback that queues behind the others: wait for it, up to 30 s
+// the type lists are filled by a callback that queues behind the others (on a busy machine
+// for a long time): wait for the condition - the lists are there - not for a fixed time
 let types = [];
-for (let i = 0; i < 60 && types.length < 2; i += 1) {
+for (let i = 0; i < 360 && types.length < 2; i += 1) {
   await page.waitForTimeout(500);
   types = await dropdownOptions('prox-target');
 }

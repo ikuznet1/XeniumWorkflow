@@ -133,6 +133,17 @@ def _assert_result_consistent(xe, res, tool, region, cache_dir):
     np.testing.assert_array_equal(np.asarray(expr.sum(axis=1)).ravel(), cdf["transcript_counts"].to_numpy(float))
     assert {str(k) for k in bounds} <= set(ids)
     x0, x1, y0, y1 = region
+    proseg_geoms = {}
+    if tool == "proseg":
+        import glob
+        import gzip
+        from shapely.geometry import shape
+        for f in glob.glob(os.path.join(res["out_dir"], "**", "cell-polygons.geojson.gz"), recursive=True):
+            with gzip.open(f, "rt") as fh:
+                for feat in json.load(fh)["features"]:
+                    pr = feat["properties"]
+                    proseg_geoms[str(pr.get("cell") if pr.get("cell") is not None else pr.get("id"))] = shape(feat["geometry"])
+        assert proseg_geoms, "Proseg's polygon file is kept in the run directory"
     if tool == "baysor":
         # Baysor cells are hulls of their molecules. (Proseg grows cells through empty
         # space around a small island of transcripts, so its centroids may lie outside.)
@@ -145,8 +156,23 @@ def _assert_result_consistent(xe, res, tool, region, cache_dir):
             assert vy[ok].min() >= y0 - 15 and vy[ok].max() <= y1 + 15
         if ok.all() and ok.sum() >= 4:
             row = cdf.loc[cdf.index.astype(str) == str(key)].iloc[0]
-            assert Polygon(np.column_stack([vx, vy])).buffer(0).buffer(3.0).contains(
-                Point(row["x_centroid"], row["y_centroid"])), f"centroid of {key} is not at its polygon"
+            ring = Polygon(np.column_stack([vx, vy])).buffer(0)
+            cen = Point(row["x_centroid"], row["y_centroid"])
+            if tool == "proseg":
+                # Proseg writes most cells as several parts (MultiPolygon); the app outlines the
+                # largest one, and Proseg's own centroid may lie a few µm outside that part. What
+                # must hold: the outline is the largest part of THIS cell's geometry in Proseg's
+                # polygon file (ids pair outline and centroid), and the centroid lies at the
+                # cell as a whole (the hull of all its parts).
+                geom = proseg_geoms.get(str(key))
+                assert geom is not None, f"cell {key} has an outline but no geometry in Proseg's polygon file"
+                parts = list(getattr(geom, "geoms", [geom]))
+                biggest = max(parts, key=lambda g: Polygon(g.exterior).area)
+                assert ring.symmetric_difference(Polygon(biggest.exterior).buffer(0)).area <= 1e-3 * max(ring.area, 1e-9), \
+                    f"the outline of {key} is not the largest part of its Proseg geometry"
+                assert geom.convex_hull.buffer(3.0).contains(cen), f"centroid of {key} is not at its cell"
+            else:
+                assert ring.buffer(3.0).contains(cen), f"centroid of {key} is not at its polygon"
     # run directory: under the tmp cache, with a parameter record
     out_dir = res["out_dir"]
     assert os.path.realpath(out_dir).startswith(os.path.realpath(cache_dir) + os.sep)

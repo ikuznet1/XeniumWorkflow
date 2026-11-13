@@ -44,8 +44,9 @@ def open_split_modal(open_clicks, close_clicks, is_open):
 def run_split(n_clicks, rds_path, label_col, max_cores, min_umi, min_umi_sigma, purify_singlets, seg_source):
     if not n_clicks:
         return no_update, True, False
-    if not rds_path or not os.path.isfile(rds_path):
-        return "⚠ RDS file not found.", True, False
+    _problem = core._ref_rds_problem(rds_path)
+    if _problem:
+        return f"⚠ {_problem}", True, False
     with core._split_lock:
         if core._split_state["status"] == "running":
             return "Already running…", False, True

@@ -107,6 +107,29 @@ def _an_alt_res(seg_source):
     return core._seg_result(seg_source)
 
 
+def _an_seg_missing(seg_source) -> bool:
+    """*seg_source* names a Baysor / Proseg / image-segmentation run whose result is not
+    in memory (still loading from the cache, or the load failed)."""
+    tool = core._seg_tool(seg_source)
+    return tool != "xenium" and core._seg_state(tool)[0] is not None and _an_alt_res(seg_source) is None
+
+
+def _an_require_seg(seg_source) -> None:
+    """ValueError when *seg_source* names a segmentation run that is not loaded (a job
+    then stops instead of computing on the Xenium cells under that run's name)."""
+    if _an_seg_missing(seg_source):
+        raise ValueError(_an_no_matrix_msg(seg_source))
+
+
+def _an_no_matrix_msg(seg_source=None) -> str:
+    """Why _an_samples() gave nothing."""
+    if seg_source is not None and _an_seg_missing(seg_source):
+        return (f"The selected segmentation ({seg_source}) is not loaded (it is still loading, or its "
+                f"load failed): wait for it or pick it again. Nothing was computed on the Xenium cells "
+                f"in its place.")
+    return "The active view has no expression matrix."
+
+
 def _ds_panel_genes(ds: dict) -> list:
     """Measured (not SpaGE-imputed) genes of a dataset dict (DATA or an extra sample)."""
     names = list(ds.get("gene_names") or [])
@@ -121,7 +144,8 @@ def _an_samples(seg_source="xenium", use_corrected: bool = False) -> list:
     """The cell tables of the active view with the count matrix behind each.
 
     One dict per sample: df (cells, as drawn), csc (cells × genes counts, CSC), rows
-    (matrix row of each df row, -1: none), gni (gene → matrix column), genes (measured
+    (matrix row of each df row, -1: none - with the SPLIT-corrected matrix also a cell
+    that has no corrected counts; n_uncorrected counts those), gni (gene → matrix column), genes (measured
     panel genes present in the matrix; imputed genes are left out, their values are not
     counts), x_offset (µm the sample is shifted by in the view), corrected (the matrix
     is the SPLIT-corrected one), label, ds (the dataset dict the sample comes from: DATA
@@ -129,9 +153,15 @@ def _an_samples(seg_source="xenium", use_corrected: bool = False) -> list:
 
     With several samples, SPLIT-corrected counts are used only when every sample has
     them (dataview._corrected_status); otherwise all samples give their original counts,
-    so one test or colour scale never mixes the two."""
+    so one test or colour scale never mixes the two.
+
+    Empty when *seg_source* names a segmentation run that is not loaded: the Xenium cells
+    are never returned in its place (_an_no_matrix_msg says so)."""
     alt = _an_alt_res(seg_source)
     out = []
+    if alt is None and _an_seg_missing(seg_source):
+        # never the Xenium cells under the name of another segmentation
+        return out
 
     def _add(label, df, holder, key, rows, gni, panel, x_off, ds=None):
         m = holder.get(key)
@@ -146,9 +176,19 @@ def _an_samples(seg_source="xenium", use_corrected: bool = False) -> list:
             return
         genes = [g for g in panel if g in gni and gni[g] < csc.shape[1]]
         ds = core.DATA if ds is None else ds
+        n_unc = 0
+        if key == "split_corrected_expr":
+            # Cells without corrected counts (dropped by RCTD, or outside the subset SPLIT
+            # ran on) have an empty padding row: they are not in this view of the matrix.
+            cov = dataview._corrected_covered(holder)
+            if cov is not None and len(cov) == csc.shape[0]:
+                drop = (rows >= 0) & ~cov[np.clip(rows, 0, None)]
+                n_unc = int(drop.sum())
+                if n_unc:
+                    rows = np.where(drop, -1, rows)
         out.append({"label": label, "df": df, "csc": csc, "rows": rows, "gni": gni,
                     "genes": genes, "x_offset": float(x_off or 0.0),
-                    "corrected": key == "split_corrected_expr",
+                    "corrected": key == "split_corrected_expr", "n_uncorrected": n_unc,
                     "ds": ds, "key": dataview._ds_key(ds), "name": dataview._ds_name(ds)})
 
     if alt is not None:
@@ -183,6 +223,32 @@ def _an_samples(seg_source="xenium", use_corrected: bool = False) -> list:
              eds.get("gene_name_to_idx", {}), _ds_panel_genes(eds), eds.get("x_offset", 0.0),
              ds=eds)
     return out
+
+
+def _an_uncorrected(samples) -> int:
+    """Cells of the view left out because they have no SPLIT-corrected counts."""
+    return int(sum(int(s.get("n_uncorrected") or 0) for s in samples or []))
+
+
+def _an_uncorrected_note(n) -> str:
+    """Sentence for status lines and CSV headers ("" when no cell was left out)."""
+    n = int(n or 0)
+    if not n:
+        return ""
+    return (f"{n:,} cell{'s' if n != 1 else ''} without SPLIT-corrected counts (dropped by the "
+            f"correction or outside the cells it was run on) {'were' if n != 1 else 'was'} left out")
+
+
+def _an_matrix_digest(m) -> str:
+    """Content fingerprint of a count matrix for disk-cache keys: shape, number of stored
+    values and a CRC of the values and of their positions. Two matrices of the same cells
+    with different counts (SPLIT run again with other settings) never share it; shape and
+    nnz alone can coincide."""
+    import zlib
+    parts = [str(m.shape), str(int(m.nnz))]
+    for a in (m.data, m.indices, m.indptr):
+        parts.append(format(zlib.crc32(memoryview(np.ascontiguousarray(a)).cast("B")) & 0xFFFFFFFF, "08x"))
+    return "|".join(parts)
 
 
 def _an_view_key(seg_source, use_corrected, samples) -> tuple:
@@ -556,6 +622,31 @@ def _de_test_stats(rank_sum_a, tie_term, n_a: int, n_b: int):
     return u, z, log10p
 
 
+_P_FLOOR = 1e-300          # p-values / FDRs below this are written as this value (never 0)
+_P_FLOOR_NOTE = ("pval / padj below 1e-300 are written as 1e-300 (they are below the float range); "
+                 "neg_log10_pval / neg_log10_padj hold the exact values")
+
+
+def _p_from_log10(log10p) -> np.ndarray:
+    """p-values from their log10: 10**x underflows to exactly 0 for x below about -324
+    (|z| above about 38), which would read as "p = 0" and tie every such gene. The value
+    is floored at _P_FLOOR; the log-scale column next to it keeps the exact number."""
+    lp = np.asarray(log10p, dtype=np.float64)
+    with np.errstate(under="ignore"):
+        return np.maximum(10.0 ** np.maximum(lp, -400.0), _P_FLOOR)
+
+
+def _de_sorted(t: pd.DataFrame) -> pd.DataFrame:
+    """A result table, most significant first: by FDR, then p (both on the log scale where
+    the table has it, so that values below the float range still order), then |statistic|."""
+    k = pd.DataFrame(index=t.index)
+    k["a"] = -t["neg_log10_padj"] if "neg_log10_padj" in t.columns else t["padj"]
+    k["b"] = -t["neg_log10_pval"] if "neg_log10_pval" in t.columns else t["pval"]
+    st = next((c for c in ("z", "stat") if c in t.columns), None)
+    k["c"] = -pd.to_numeric(t[st], errors="coerce").abs() if st else 0.0
+    return t.loc[k.sort_values(["a", "b", "c"], kind="stable", na_position="last").index]
+
+
 def _bh_log10(log10p: np.ndarray) -> np.ndarray:
     """Benjamini-Hochberg adjusted p-values, computed and returned as log10 (so that a
     p-value below the float range still gets an FDR)."""
@@ -639,8 +730,8 @@ def _de_compute(samples, masks_a, masks_b, progress=None) -> dict:
         "low_count": (r["raw_a"] + r["raw_b"]) < _DE_RATE_MIN_COUNT,
         "mean_a": mean_a, "mean_b": mean_b,
         "U": u, "z": z,
-        "pval": 10.0 ** log10p, "padj": 10.0 ** log10padj,
-        "neg_log10_padj": -log10padj,
+        "pval": _p_from_log10(log10p), "padj": _p_from_log10(log10padj),
+        "neg_log10_pval": -log10p, "neg_log10_padj": -log10padj,
     })
     return {"table": table, "n_a": n_a, "n_b": n_b, "n_overlap": n_overlap,
             "n_no_matrix": n_nomat, "n_genes": len(genes), "n_samples": len(samples),
@@ -719,7 +810,7 @@ def _run_de(spec_a, spec_b, seg_source, method, color_by, use_corrected, options
         _set("running", "Collecting the two groups…")
         samples = _an_samples(seg_source, use_corrected)
         if not samples:
-            _set("error", "The active view has no expression matrix.")
+            _set("error", _an_no_matrix_msg(seg_source))
             return
         ma, la = _de_group_masks(spec_a, samples, seg_source, method, color_by, use_corrected)
         mb, lb = _de_group_masks(spec_b, samples, seg_source, method, color_by, use_corrected)
@@ -730,6 +821,7 @@ def _run_de(spec_a, spec_b, seg_source, method, color_by, use_corrected, options
             jobs._job_progress(fraction=0.05 + 0.9 * f)
 
         res = _de_compute(samples, ma, mb, progress=_prog)
+        res["n_uncorrected"] = _an_uncorrected(samples)
         res.update({"label_a": la, "label_b": lb, "seg_source": seg_source or "xenium",
                     "units_note": f"n = {res['n_a'] + res['n_b']:,} cells, treated as independent",
                     "detect_rule": _DETECT_RULE, "notes": []})
@@ -748,6 +840,8 @@ def _run_de(spec_a, spec_b, seg_source, method, color_by, use_corrected, options
             _msg += (f" {res['n_overlap']:,} cells were in both groups and were removed from B.")
         if res["n_samples"] > 1:
             _msg += f" Cells of {res['n_samples']} samples were pooled."
+        if res.get("n_uncorrected"):
+            _msg += " " + _an_uncorrected_note(res["n_uncorrected"]) + "."
         _msg += (f"\nUnit of the p-values: {res['units_note']} (they are not, when the groups come "
                  f"from few samples: the p-values are then far too small).")
         _msg += "\n" + _depth_note(res["median_counts_a"], res["median_counts_b"], res["depth_ratio"])
@@ -868,7 +962,7 @@ def _de_table_records(res) -> list:
     """Rows of the result table, most significant first (numbers rounded for display)."""
     if not res:
         return []
-    t = res["table"].sort_values(["padj", "pval"], kind="stable")
+    t = _de_sorted(res["table"])
     _g3 = lambda v: None if not np.isfinite(v) else float(f"{v:.3g}")
     if res.get("columns"):
         # a result that names its own columns: [(column, header, "text" | "num")]
@@ -1218,10 +1312,13 @@ def _run_geneset_score(name, seg_source, use_corrected) -> None:
         with _geneset_lock:
             _geneset_state["version"] += 1
         _dropped = len(info["found"]) - len(info["used"])
+        _unc_note = _an_uncorrected_note(_an_uncorrected(_an_samples(seg_source, use_corrected)))
         _set("done", f"Gene set '{name}': {len(info['used'])} genes scored against "
                      f"{info['n_control']} control genes."
                      + (f" {_dropped} gene(s) without any variance left out." if _dropped else "")
-                     + _miss + f" Pick 'Gene set: {name}' under Color By.")
+                     + _miss
+                     + (f" {_unc_note}; they have no score." if _unc_note else "")
+                     + f" Pick 'Gene set: {name}' under Color By.")
     except jobs._JobCancelled:
         raise
     except jobs._DatasetChanged:

@@ -468,7 +468,13 @@ def _run_segfree(seg_source, method, label_kind, cell_type, markers_text, n_mark
         bins = _sfree_parse_bins(bins_text)
         area_mode = "transcripts" if area_mode == "transcripts" else "cells"
         n_null = int(max(0, min(5000, _SFREE_N_NULL if n_null is None else n_null)))
-        hole = None if hole_max_bins is None else int(max(0, hole_max_bins))
+        # a cleared input (None) is the documented default, 0 = no hole is filled; filling
+        # every interior hole has to be asked for by name ("all")
+        if isinstance(hole_max_bins, str) and hole_max_bins.strip().lower() == "all":
+            hole = None
+        else:
+            hole = int(max(0, _SFREE_HOLE_BINS if hole_max_bins in (None, "") else float(hole_max_bins)))
+        analysis._an_require_seg(seg_source)
         tables = stats._view_tables(seg_source)
         samples = analysis._an_samples(seg_source, use_corrected)
         by_key = {s["key"]: s for s in samples}
@@ -735,7 +741,7 @@ def _sfree_csv(res) -> str:
              f"{'SPLIT-corrected' if res['corrected'] else 'original'}",
              f"# markers ({info['rule']}): {' '.join(res['markers'])}",
              f"# tissue area: {'tiles with a cell centroid' if res['area_mode'] == 'cells' else 'tiles with a gene transcript'}; "
-             f"interior holes filled up to {res['hole_max_bins']} tiles; area_mm2 = n_tiles x (bin_um / 1000)^2",
+             f"interior holes filled up to {'all' if res['hole_max_bins'] is None else res['hole_max_bins']} tiles; area_mm2 = n_tiles x (bin_um / 1000)^2",
              "# n_tx: marker transcripts (Q >= 20) on tissue tiles, from the transcript file; tx_per_mm2 = n_tx / area_mm2; "
              "tx_per_10k: per 10,000 gene transcripts on the same tiles (needs the all-transcripts grid)",
              "# n_cells_type / cells_per_mm2: segmented cells of the type on the same tiles; tx_per_cell = n_tx / n_cells_type",

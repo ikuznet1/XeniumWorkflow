@@ -871,11 +871,16 @@ def run_spage(rds_path: str, genes_file: str = None, n_pv: int = 50,
     Example
     -------
     run_spage(
-        rds_path="/Users/ikuz/Documents/XeniumWorkflow/snRV_ref.rds",
-        genes_file="/Users/ikuz/Documents/XeniumWorkflow/to_impute.txt",
+        rds_path="/path/to/reference.rds",
+        genes_file="/path/to/genes_to_impute.txt",
         n_pv=50,
     )
     """
+    rds_path = (rds_path or core.REF_RDS_DEFAULT or "").strip()
+    _problem = core._ref_rds_problem(rds_path)
+    if _problem:
+        print(f"  SpaGE: {_problem} Nothing was run.", flush=True)
+        return
     with core._spage_lock:
         if core._spage_state["status"] == "running":
             print("  SpaGE is already running.", flush=True)

@@ -48,13 +48,22 @@ const tableRows = (id) => page.evaluate((i) => [...document.querySelectorAll(`#$
 const headers = (id) => page.evaluate((i) => [...document.querySelectorAll(`#${i} th`)].map((e) => e.innerText.trim()).filter(Boolean), id);
 const dropdownOptions = (id) => page.evaluate((i) => {
   const el = document.getElementById(i);
+  if (!el) return [];
   const key = Object.keys(el).find((k) => k.startsWith('__reactFiber'));
-  let f = el[key];
-  for (let d = 0; f && d < 30; d += 1, f = f.return) {
-    const p = f.memoizedProps;
-    if (p && Array.isArray(p.options)) return p.options.map((o) => (o && o.value !== undefined ? o.value : o));
-  }
-  return [];
+  // The fiber a DOM node points at may be the alternate of the committed one (React keeps
+  // two per component), whose props are those of the render before: both are read, and the
+  // one whose options differ from the other's older copy is taken - the longer list here,
+  // as the lists these checks wait for only grow from empty.
+  const walk = (f) => {
+    for (let d = 0; f && d < 30; d += 1, f = f.return) {
+      const p = f.memoizedProps;
+      if (p && Array.isArray(p.options)) return p.options.map((o) => (o && o.value !== undefined ? o.value : o));
+    }
+    return [];
+  };
+  const a = walk(el[key]);
+  const b = walk(el[key] && el[key].alternate);
+  return b.length > a.length ? b : a;
 }, id);
 const run = async (re) => {
   const t0 = Date.now();
@@ -141,7 +150,12 @@ check('plot: cell types × dominant factor', plot && plot.type === 'heatmap' && 
 await shot('txf_1_fit');
 
 // 3. the map layer, Plotly
-const layers = await dropdownOptions('txf-layer');
+// the layer list is filled by a callback that follows the result: wait for it (condition, not a fixed time)
+let layers = [];
+for (let i = 0; i < 120 && layers.length !== K + 1; i += 1) {
+  if (i) await page.waitForTimeout(500);
+  layers = await dropdownOptions('txf-layer');
+}
 check('map layers: dominant factor and one per factor', layers.length === K + 1 && layers[0] === '@txf:dominant', layers.slice(0, 3).join(', '));
 await setProp('txf-layer', {value: '@txf:dominant'});
 await page.waitForFunction(() => document.querySelector('#spatial-plot .js-plotly-plot')?._fullData?.[0]?.type === 'heatmap', null, {timeout: 180000});

@@ -277,24 +277,23 @@ def run_reseg_modal(n_clicks, algo, patches_confirmed,
     Output("reseg-status", "children"),
     Input("baysor-done", "data"),
     Input("proseg-done", "data"),
+    Input("seg-source",  "value"),
     prevent_initial_call=True,
 )
-def update_reseg_status(baysor_done, proseg_done):
-    with core._baysor_lock:
-        b_status = core._baysor_state["status"]
-        b_msg    = core._baysor_state["message"]
-    with core._proseg_lock:
-        p_status = core._proseg_state["status"]
-        p_msg    = core._proseg_state["message"]
-    if b_status == "done":
-        return f"\u2713 Baysor: {b_msg}"
-    if p_status == "done":
-        return f"\u2713 Proseg: {p_msg}"
-    with core._imgseg_lock:
-        i_status, i_msg = core._imgseg_state["status"], core._imgseg_state["message"]
-    if i_status == "done":
-        return f"\u2713 Image segmentation: {i_msg}"
-    return ""
+def update_reseg_status(baysor_done, proseg_done, seg_source=None):
+    """The finished run the sidebar reports: the one of the active segmentation source when
+    that tool has one, else the first loaded one (Baysor, Proseg, image segmentation)."""
+    done = {}
+    for tool, lock, state in core._seg_states():
+        with lock:
+            if state["status"] == "done":
+                done[tool] = state["message"]
+    if not done:
+        return ""
+    tool = core._seg_tool(seg_source)
+    if tool not in done:
+        tool = next(iter(done))
+    return f"\u2713 {core._SEG_TOOL_LABELS.get(tool, tool)}: {done[tool]}"
 
 
 # ─── Reseg UMAP callbacks ─────────────────────────────────────────────────────
@@ -650,8 +649,10 @@ def run_imgseg_modal(n_clicks, algo, patches_confirmed, backend, channel, channe
             return "Already running…", True, False
         core._imgseg_state.update({"status": "running", "message": "Starting…", "result": None,
                                    "loading_out_dir": None})
-    channels = ([channel_cyto] if channel_cyto and channel_cyto != channel and backend.startswith("cellpose")
-                else []) + [channel]
+    # the membrane / cytoplasm channel goes to the models that use one (cyto-type); the
+    # nuclei model and the classical backend get the nuclear channel alone
+    channels = ([channel_cyto] if channel_cyto and channel_cyto != channel
+                and imgseg._iseg_uses_second_channel(backend) else []) + [channel]
     region = {k: v for k, v in dict(x_min=xmin, x_max=xmax, y_min=ymin, y_max=ymax).items() if v is not None}
     jobs._job_start("imgseg", "Image segmentation" + (" (region)" if region else ""), imgseg._run_imgseg,
                     kwargs=dict(backend=backend, channels=channels, diameter_um=float(diameter),

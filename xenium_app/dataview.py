@@ -4,6 +4,7 @@ import os
 import sys
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
 import plotly.graph_objects as go
 
 from . import core, jobs, morph, figures
@@ -122,6 +123,32 @@ def _ds_corrected(ds: dict):
     return m
 
 
+def _corrected_covered(holder: dict):
+    """Per row of holder["split_corrected_expr"]: True when the cell has corrected counts.
+
+    SPLIT returns no values for the cells RCTD dropped (too few counts) and for cells
+    outside the subset it was run on; the corrected matrix carries an empty row for each
+    of them so that it stays aligned with the cell table. Such a row is "no corrected
+    value", not "zero expression": corrected-mode tests, scores and colours leave these
+    cells out. A cell is without corrected counts when its corrected row is empty although
+    its original row is not (a cell with no counts at all is the same in both modes: it
+    stays, with zeros). None when the holder has no corrected matrix. Cached per matrix
+    object."""
+    m = holder.get("split_corrected_expr")
+    if m is None or not sp.issparse(m):
+        return None
+    e = holder.get("expr")
+    if holder.get("_split_cov_src") is not m or holder.get("_split_cov_expr") is not e:
+        cov = np.asarray(abs(m).sum(axis=1)).ravel() > 0
+        if e is not None and sp.issparse(e) and e.shape[0] == m.shape[0]:
+            # measured genes only: the imputed gene columns appended to "expr" are not counts
+            ee = e if e.shape[1] <= m.shape[1] else sp.csr_matrix(e)[:, :m.shape[1]]
+            cov |= ~(np.asarray(abs(ee).sum(axis=1)).ravel() > 0)
+        holder["_split_cov"] = cov
+        holder["_split_cov_src"], holder["_split_cov_expr"] = m, e
+    return holder["_split_cov"]
+
+
 def _corrected_status() -> dict:
     """Which samples of the Xenium view carry SPLIT-corrected counts: {labels, have,
     missing (labels without them), all, any}. Corrected counts are shown and tested only
@@ -151,7 +178,12 @@ def _extra_gene_values(eds: dict, gene, use_corrected: bool = False):
     m = figures._csc_view(eds, key)
     if g_idx >= m.shape[1]:
         return None
-    raw = m[:, g_idx].toarray().ravel()
+    raw = m[:, g_idx].toarray().ravel().astype(np.float64)
+    if key != "expr":
+        # a cell without corrected counts has no value (not a zero)
+        cov = _corrected_covered(eds)
+        if cov is not None and len(cov) == len(raw):
+            raw[~cov] = np.nan
     idx_ = eds.get("df_to_expr")
     idx_ = np.arange(len(eds["df"])) if idx_ is None else np.asarray(idx_)
     return np.log1p(np.where(idx_ >= 0, raw[np.clip(idx_, 0, len(raw) - 1)], 0.0))

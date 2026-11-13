@@ -971,13 +971,37 @@ try {
       m = window.mk({n: 1000, fail: {'colors.bin': 1}});
       m.h.setState({color: {mode: 'A'}});
       await window.wait(300);
-      await m.h.whenIdle();
       out.colFail = {status: m.h.getStatus(), n: m.v._cells && m.v._cells.n, layers: m.h.deck.props.layers.map((l) => l.id).join(',')};
-      m.h.setState({pointSize: 4});   // any later state change retries the colours
+      await m.h.whenIdle();   // waits for the automatic retry: no state change is needed
+      out.colRetry = {status: m.h.getStatus(), shown: m.v._colors && m.v._colors.header.label, reqs: m.count('colors.bin')};
+      m.done();
+      // a colours-only request (the cells are already there) that fails is retried as well
+      const cfgCol = {n: 1000, fail: {}};
+      m = window.mk(cfgCol);
+      m.h.setState({color: {mode: 'A'}});
       await window.wait(300);
       await m.h.whenIdle();
-      out.colRetry = {status: m.h.getStatus(), shown: m.v._colors && m.v._colors.header.label};
+      cfgCol.fail['colors.bin'] = 1;
+      m.h.setState({color: {mode: 'B'}});
+      await window.wait(300);
+      out.colOnlyFail = {status: m.h.getStatus(), shown: m.v._colors && m.v._colors.header.label};
+      await m.h.whenIdle();
+      out.colOnlyRetry = {status: m.h.getStatus(), shown: m.v._colors && m.v._colors.header.label};
+      m.done();
+      m = window.mk({n: 1000, fail: {'colors.bin': 99}});
+      m.h.setState({color: {mode: 'A'}});
+      await window.wait(300);
+      await m.h.whenIdle();
+      out.colGivesUp = {status: m.h.getStatus(), reqs: m.count('colors.bin'), n: m.v._cells && m.v._cells.n};
+      m.h.setState({pointSize: 4});   // after that, any later state change asks again
+      await window.wait(300);
+      out.colGivesUp.reqsAfterChange = m.count('colors.bin');
+      m.done();
       // render errors stay visible through later loads
+      m = window.mk({n: 1000});
+      m.h.setState({color: {mode: 'A'}});
+      await window.wait(300);
+      await m.h.whenIdle();
       m.h.deck.props.onError(new Error('Failed to create WebGL context'));
       m.h.setState({color: {mode: 'B'}});
       await window.wait(300);
@@ -1009,7 +1033,12 @@ try {
     T.ok(fail.auto.n === 1000 && fail.auto.reqs === 2 && fail.auto.status === '', '9 a failed cells load is retried automatically', JSON.stringify(fail.auto));
     T.ok(fail.givesUp.reqs === 3 && /failed to load cells/.test(fail.givesUp.status), '9 automatic retries are bounded (2), the error stays', JSON.stringify(fail.givesUp));
     T.ok(fail.colFail.n === 1000 && fail.colFail.layers === 'xv-cells' && /^failed to load colours/.test(fail.colFail.status) &&
-      fail.colRetry.status === '' && fail.colRetry.shown === 'A', '9 a failing colours request does not block the cells and is retried', JSON.stringify([fail.colFail, fail.colRetry]));
+      fail.colRetry.status === '' && fail.colRetry.shown === 'A' && fail.colRetry.reqs === 2,
+      '9 a failing colours request does not block the cells and is retried automatically', JSON.stringify([fail.colFail, fail.colRetry]));
+    T.ok(/^failed to load colours/.test(fail.colOnlyFail.status) && fail.colOnlyRetry.status === '' && fail.colOnlyRetry.shown === 'B',
+      '9 a failed colours-only request (Active Counts, Color By) is retried automatically', JSON.stringify([fail.colOnlyFail, fail.colOnlyRetry]));
+    T.ok(fail.colGivesUp.reqs === 3 && /^failed to load colours/.test(fail.colGivesUp.status) && fail.colGivesUp.n === 1000 &&
+      fail.colGivesUp.reqsAfterChange === 4, '9 automatic colour retries are bounded (2); the next state change asks again', JSON.stringify(fail.colGivesUp));
     T.ok(/^render error: Failed to create WebGL context$/.test(fail.render.status) && fail.render.shown === 'B',
       '9 a render error is not cleared by later successful loads', JSON.stringify(fail.render));
     T.ok(!fail.sw.cells && !fail.sw.colors && fail.sw.legend === 0 && fail.sw.layers === '' && /failed to load cells/.test(fail.sw.status) &&

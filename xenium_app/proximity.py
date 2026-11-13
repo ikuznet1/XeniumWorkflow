@@ -513,8 +513,15 @@ def _prox_compute(samples, labels, target, anchor, strata=None, source="auto", c
         if nm not in types:
             raise ValueError(f"No cell of the view is labelled '{nm}'.")
     if source == "auto":
-        source = controls._auto_source(prof)
+        # never the anchor (its local fraction is nearly a function of the distance that is
+        # tested: regressing it out removes the effect) nor the tested cells' own type
+        source = controls._auto_source(prof, exclude=(anchor, target))
     source = str(source) if source and str(source) != "none" else None
+    if source == anchor:
+        raise ValueError(f"The density covariate cannot be the anchor type '{anchor}': the local {anchor} "
+                         f"fraction is almost a function of the distance to the nearest {anchor} cell, so "
+                         f"adjusting for it removes the proximity effect that is tested. Pick another type, "
+                         f"'auto' or 'none'.")
     n_of = dict(zip(types, prof["n"]))
     sim = [t for t in types if t not in (target, anchor) and n_of[t] >= p["min_anchors"]
            and max(n_of[t], n_of[anchor]) / max(1, min(n_of[t], n_of[anchor])) <= controls._COLOC_SIMILAR_FOLD]
@@ -579,6 +586,14 @@ def _prox_compute(samples, labels, target, anchor, strata=None, source="auto", c
     groups = {k: ix for k, ix in groups.items() if ix}
     if not groups:
         raise ValueError("No testable sample is included in the design (Samples & conditions).")
+    # counts, the leak gate and the "used" flags follow the samples that are tested: a
+    # sample without a condition in the design is not part of the result
+    tested = sorted({i for ix in groups.values() for i in ix})
+    for i in used:
+        if i not in tested:
+            rows_out[i]["used"] = False
+            rows_out[i]["note"] = "no condition in the design (excluded)"
+    used = tested
     n_units = len(groups)
     U_obs = {w: _prox_unit_means(E_obs[w], groups) for w in E_obs}
     U_rand = {w: np.stack([_prox_unit_means(E_rand[w][j], groups) for j in range(N)]) for w in E_rand}
@@ -698,7 +713,8 @@ def _prox_compute(samples, labels, target, anchor, strata=None, source="auto", c
             "n_target": int(sum(r["n_target"] for r in rows_out if r["used"])),
             "n_anchor": int(sum(r["n_anchor"] for r in rows_out if r["used"])),
             "short": int(sum(r["short"] for r in rows_out)),
-            "corrected": bool(samples[0]["corrected"])}
+            "corrected": bool(samples[0]["corrected"]),
+            "n_uncorrected": analysis._an_uncorrected(samples)}
 
 
 _PROX_COLUMNS = [("gene", "Gene", "text"), ("log2fc", "Near − far", "num"), ("slope", "Slope", "num"),
@@ -743,7 +759,7 @@ def _run_proximity_de(target, anchor, label_kind, seg_source, method, use_correc
         _set("running", "Collecting cells, labels and strata…")
         samples = analysis._an_samples(seg_source, use_corrected)
         if not samples:
-            _set("error", "The active view has no expression matrix.")
+            _set("error", analysis._an_no_matrix_msg(seg_source))
             return
         labels, cat = stats._comp_labels(label_kind, samples, seg_source, method)
         if all(l is None for l in labels):
@@ -805,6 +821,8 @@ def _run_proximity_de(target, anchor, label_kind, seg_source, method, use_correc
             msg += (f"\n⚠ Only {info['n_random_valid']} of {p['n_random']} random anchor sets gave an effect in "
                     f"every unit (too few far or near cells): no empirical FDR; the FDR shown is "
                     f"Benjamini-Hochberg over the sign-flip p-values.")
+        if res.get("n_uncorrected"):
+            msg += " " + analysis._an_uncorrected_note(res["n_uncorrected"]) + "."
         msg += f"\nUnit of the p-values: {res['units_note']}."
         if info["mode"] != "cohort":
             msg += (f"\n⚠ SINGLE-SAMPLE RESULT: {info['n_units']} independent unit(s); at least "
@@ -877,6 +895,8 @@ def _prox_csv_header(res: dict) -> str:
              f"leak_flag = anchor_owned or gate_flag"]
     if res.get("diff_note"):
         lines.append(f"# {res['diff_note']}")
+    if res.get("n_uncorrected"):
+        lines.append(f"# {analysis._an_uncorrected_note(res['n_uncorrected'])}")
     for r in res["samples"]:
         lines.append(f"# sample {r['label']} ({r['name']}): {r['n_target']} target cells, {r['n_anchor']} anchors, "
                      f"{r['n_near']} near, {r['n_far']} far; condition {r['cond'] or '-'}; donor {r['donor'] or '-'}"
@@ -1094,7 +1114,8 @@ def _contact_compute(samples, labels, target, anchor, strata=None, radius=_CONTA
             "min_count": min_count, "lfc_min": lfc_min, "fdr": fdr, "n_genes": len(genes),
             "n_filtered": int((~keep).sum()), "n_sig": int(sig0.sum()), "n_pass": obs,
             "n_a": int(sum(grp[i]["n_a"] for i in test)), "n_b": int(sum(grp[i]["n_c"] for i in test)),
-            "corrected": bool(samples[0]["corrected"])}
+            "corrected": bool(samples[0]["corrected"]),
+            "n_uncorrected": analysis._an_uncorrected(samples)}
 
 
 def _run_contact_de(target, anchor, label_kind, seg_source, method, use_corrected, radius=None,
@@ -1122,7 +1143,7 @@ def _run_contact_de(target, anchor, label_kind, seg_source, method, use_correcte
         _set("running", "Collecting the contact and comparator cells…")
         samples = analysis._an_samples(seg_source, use_corrected)
         if not samples:
-            _set("error", "The active view has no expression matrix.")
+            _set("error", analysis._an_no_matrix_msg(seg_source))
             return
         labels, cat = stats._comp_labels(label_kind, samples, seg_source, method)
         if all(l is None for l in labels):
@@ -1168,6 +1189,8 @@ def _run_contact_de(target, anchor, label_kind, seg_source, method, use_correcte
                f"{res['n_pass']:,} pass (FDR < {res['fdr']:g}, |log2FC| > {res['lfc_min']:g}, not flagged) "
                f"({'SPLIT-corrected' if res['corrected'] else 'original'} counts, weighted sums rounded; "
                f"{res['seconds']:.1f} s).")
+        if res.get("n_uncorrected"):
+            msg += " " + analysis._an_uncorrected_note(res["n_uncorrected"]) + "."
         msg += f"\nUnit of the p-values: {res['units_note']} (the samples, not the cells)."
         if k < 3:
             msg += f"\n⚠ Only {k} {unit}: variance estimates from fewer than 3 are unreliable."
@@ -1239,6 +1262,8 @@ def _contact_csv_header(res: dict) -> str:
         lines.append(f"# sample {r['label']} ({r['name']}): {r['n_a']} contact cells ({r['n_a_dropped']} dropped), "
                      f"{r['n_c']} comparator cells, {r['n_strata']} shared strata; "
                      + (f"block {r['block']}" if r["testable"] else "not used"))
+    if res.get("n_uncorrected"):
+        lines.append(f"# {analysis._an_uncorrected_note(res['n_uncorrected'])}")
     return "\n".join(lines) + "\n"
 
 
@@ -1288,7 +1313,7 @@ def _prox_controls() -> list:
             html.Span("Far ≥ (µm):", style=L), num(id="prox-far", value=_PROX_FAR_UM, min=2, max=5000, step=1),
             html.Span("Random anchor sets:", style=L), num(id="prox-nrand", value=_PROX_N_RANDOM, min=1, max=2000, step=1),
             html.Span("Density covariate:", style=L),
-            dcc.Dropdown(id="prox-source", options=[{"label": "auto (type with the most transcripts)", "value": "auto"},
+            dcc.Dropdown(id="prox-source", options=[{"label": "auto (type with the most transcripts, not T or X)", "value": "auto"},
                                                     {"label": "none", "value": "none"}],
                          value="auto", clearable=False, style={"width": "220px", "fontSize": "11px"}),
             dcc.Checklist(id="prox-length",

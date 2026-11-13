@@ -644,23 +644,29 @@ def _pb_prepare(samples, masks, conds, batches, min_cells=_PB_MIN_CELLS,
     population in each; conds / batches: the assignment of each sample. Samples that
     are excluded, have no usable matrix rows or contribute fewer than *min_cells* cells
     are left out (and listed); genes whose total count over the used samples is below
-    *min_count* are not tested. donors: donor label per sample; when the used samples all
-    have one, the samples of a donor within a condition are summed into one column (they
-    are not independent replicates) and the donor is the blocking factor (~ donor +
-    condition), which takes the place of the batch labels. Returns counts (genes × model
+    *min_count* are not tested. The genes are those shared by the samples assigned to A
+    or B. donors: donor label per sample; when the used samples all have one, the samples
+    of a donor within a condition are summed into one column (they are not independent
+    replicates). The donor is the blocking factor (~ donor + condition, in place of the
+    batch labels) only when the design is paired by the rule of _sl_units; otherwise the
+    per-donor sums are the columns of ~ condition (~ batch + condition when every donor
+    column has one batch label). Returns counts (genes × model
     columns, int64), genes, cond, batch (the blocking labels; None: no such term),
     design, labels, col_of_sample (sample label → model column), sample_rows (every
     sample with cells, library size and whether / why not it was used), warnings,
     n_filtered, units_note."""
     min_cells = max(1, int(min_cells if min_cells is not None else _PB_MIN_CELLS))
     min_count = max(0, int(min_count if min_count is not None else _PB_MIN_COUNT))
-    genes = analysis._an_common_genes(samples)
+    # the tested genes are those of the samples that take part: a sample excluded in the
+    # design (another panel, say) does not shrink the gene list
+    cand = [i for i, c in enumerate(conds) if c in ("A", "B")]
+    genes = analysis._an_common_genes([samples[i] for i in cand] or samples)
     if not genes:
-        raise ValueError("The samples of this view share no measured genes.")
+        raise ValueError("The samples of this comparison share no measured genes.")
     rows, cols, used = [], [], []
     for i, s in enumerate(samples):
         tot, n = _pb_sum_counts(s, masks[i])
-        v = tot[np.array([s["gni"][g] for g in genes], dtype=np.int64)]
+        v = tot[np.array([s["gni"][g] for g in genes if g in s["gni"]], dtype=np.int64)]
         row = {"label": s["label"], "name": s["name"], "cond": conds[i], "batch": batches[i],
                "donor": (donors[i] if donors is not None else "") or "",
                "n_cells": n, "lib_size": int(v.sum()), "used": False, "note": ""}
@@ -681,27 +687,64 @@ def _pb_prepare(samples, masks, conds, batches, min_cells=_PB_MIN_CELLS,
     labels = [samples[i]["label"] for i in used]
     col_of = {lab: j for j, lab in enumerate(labels)}
     block_name, pre_warn = "batch", []
+    n_panel = max((len(samples[i]["genes"]) for i in used), default=len(genes))
+    if len(genes) < n_panel:
+        pre_warn.append(f"the used samples share {len(genes):,} genes (the largest panel among them has "
+                        f"{n_panel:,}): only the shared genes are tested")
     if any(u_donor):
         if not all(u_donor):
             raise ValueError("Donor labels are set for some samples only: give every included "
                              "sample a donor, or none.")
+        # The shared rule of every sample-level test (_sl_units): samples of a donor within
+        # a condition are one unit (summed here); the donor is a blocking factor only when
+        # the design is paired (>= 2 donors with samples in both conditions; donors seen in
+        # one condition only are then left out). Otherwise the donors are the independent
+        # units of ~ condition - a donor term would be confounded with the condition.
+        units = _sl_units(u_cond, u_donor)
+        if units["paired"]:
+            kept = {d for d, _ia, _ib in units["pairs"]}
+            for j in [j for j in range(len(used)) if u_donor[j] not in kept]:
+                rows[used[j]]["used"] = False
+                rows[used[j]]["note"] = ("dropped: its donor has samples in one condition only "
+                                         "(paired design)")
+            if units["dropped"]:
+                pre_warn.append("paired design: donors with samples in one condition only were left "
+                                "out: " + ", ".join(units["dropped"]))
+            sel = [j for j in range(len(used)) if u_donor[j] in kept]
+        else:
+            sel = list(range(len(used)))
         groups: dict = {}
-        for j, key in enumerate(zip(u_donor, u_cond)):
-            groups.setdefault(key, []).append(j)
-        if len(groups) < len(used):
+        for j in sel:
+            groups.setdefault((u_donor[j], u_cond[j]), []).append(j)
+        if len(groups) < len(sel):
             merged = [g for g in groups.values() if len(g) > 1]
             pre_warn.append("samples of one donor within a condition are not independent and "
                             "were summed into one pseudobulk column: "
                             + "; ".join("+".join(labels[j] for j in g) for g in merged))
-        if any(u_block):
-            pre_warn.append("batch labels are not used when donors are given: the donor is the "
-                            "blocking factor")
+        g_batch = [sorted({u_block[j] for j in g}) for g in groups.values()]
         col_of = {labels[j]: gi for gi, g in enumerate(groups.values()) for j in g}
         cols = [np.sum([cols[j] for j in g], axis=0) for g in groups.values()]
         labels = ["+".join(labels[j] for j in g) for g in groups.values()]
+        used = [used[j] for j in sel]
         u_cond = [c for (_d, c) in groups]
-        u_block = [d for (d, _c) in groups]
-        block_name = "donor"
+        if units["paired"]:
+            if any(any(b) for b in g_batch):
+                pre_warn.append("batch labels are not used in a paired design: the donor is the "
+                                "blocking factor")
+            u_block = [d for (d, _c) in groups]
+            block_name = "donor"
+        else:
+            both = sorted({d for (d, c) in groups if (d, "A") in groups and (d, "B") in groups})
+            if both:
+                pre_warn.append(f"donor {', '.join(both)} occurs in both conditions but the design is not "
+                                f"paired (at least 2 donors in both conditions are needed): its two "
+                                f"columns are treated as independent")
+            if all(len(b) == 1 for b in g_batch):
+                u_block = [b[0] for b in g_batch]          # one batch per donor column (or none at all)
+            else:
+                u_block = [""] * len(groups)
+                pre_warn.append("batch labels differ between the samples summed into one donor column "
+                                "and were not used")
     try:
         u_batch, warn = _design_check(u_cond, u_block)
         warn = pre_warn + warn
@@ -883,7 +926,7 @@ def _run_pseudobulk_de(population, seg_source, method, color_by, counts_correcte
         # always the original counts (see _PB_CAVEAT)
         samples = analysis._an_samples(seg_source, False)
         if not samples:
-            _set("error", "The active view has no expression matrix.")
+            _set("error", analysis._an_no_matrix_msg(seg_source))
             return
         if analysis._an_alt_res(seg_source) is not None:
             _set("error", "A Baysor / Proseg run is one sample: pseudobulk differential "
@@ -1355,6 +1398,7 @@ def _comp_compute(kind, seg_source="xenium", method=None, transform="logit", tes
     """Per-sample proportions of the categories of *kind* and, when the design allows
     it, the test of each category between the two conditions. Raises ValueError with a
     message when nothing can be shown."""
+    analysis._an_require_seg(seg_source)
     tables = _view_tables(seg_source)
     labels, cat_name = _comp_labels(kind, tables, seg_source, method)
     conds, batches = _design_of(tables)
@@ -1754,8 +1798,9 @@ def _moran_sample(s: dict, k: int = _MORAN_K, progress=None, chunk_bytes: float 
     log10padj = np.full(len(I), np.nan)
     log10padj[okg] = analysis._bh_log10(log10p[okg])
     table = pd.DataFrame({"gene": genes, "moran_i": I, "z": z,
-                          "pval": np.where(okg, 10.0 ** log10p, np.nan),
-                          "padj": 10.0 ** log10padj, "neg_log10_padj": -log10padj,
+                          "pval": np.where(okg, analysis._p_from_log10(log10p), np.nan),
+                          "padj": analysis._p_from_log10(log10padj),
+                          "neg_log10_pval": np.where(okg, -log10p, np.nan), "neg_log10_padj": -log10padj,
                           "pct_cells": pct, "mean": mean})
     return {"table": table, "n_cells": n, "k": kk, "expected": ei, "variance": var}
 
@@ -1779,7 +1824,7 @@ def _run_moran(seg_source, use_corrected, k=_MORAN_K) -> None:
         _set("running", "Building the spatial graph…")
         samples = analysis._an_samples(seg_source, use_corrected)
         if not samples:
-            _set("error", "The active view has no expression matrix.")
+            _set("error", analysis._an_no_matrix_msg(seg_source))
             return
         parts, infos, skipped = [], [], []
         for si, s in enumerate(samples):
@@ -1804,6 +1849,7 @@ def _run_moran(seg_source, use_corrected, k=_MORAN_K) -> None:
         table = pd.concat(parts, ignore_index=True)
         corrected = bool(samples[0]["corrected"])
         res = {"table": table, "samples": infos, "k": k, "corrected": corrected,
+               "n_uncorrected": analysis._an_uncorrected(samples),
                "seg_source": seg_source or "xenium", "seconds": _time.time() - _t0}
         msg = ("Moran's I, kNN graph (k = " + str(k) + "), "
                + "; ".join(f"{i['label']}: {i['n_cells']:,} cells, {i['n_tested']:,} genes, "
@@ -1815,6 +1861,8 @@ def _run_moran(seg_source, use_corrected, k=_MORAN_K) -> None:
                   "% cells: count ≥ 1 transcript.")
         if use_corrected and not corrected:
             msg += " Original counts were used: not every sample has SPLIT-corrected counts."
+        if res["n_uncorrected"]:
+            msg += " " + analysis._an_uncorrected_note(res["n_uncorrected"]) + "."
         if skipped:
             msg += " Skipped: " + " ".join(skipped)
         _set("done", msg, result=res)
@@ -2107,7 +2155,7 @@ def _run_lr(pairs_text, label_kind, seg_source, method, use_corrected, k, n_perm
             return
         samples = analysis._an_samples(seg_source, use_corrected)
         if not samples:
-            _set("error", "The active view has no expression matrix.")
+            _set("error", analysis._an_no_matrix_msg(seg_source))
             return
         labels, cat_name = _comp_labels(label_kind, samples, seg_source, method)
         if all(l is None for l in labels):
@@ -2126,6 +2174,7 @@ def _run_lr(pairs_text, label_kind, seg_source, method, use_corrected, k, n_perm
         info = res["info"]
         corrected = bool(samples[0]["corrected"])
         res.update({"category": cat_name, "label_kind": label_kind, "corrected": corrected,
+                    "n_uncorrected": analysis._an_uncorrected(samples),
                     "seg_source": seg_source or "xenium", "n_samples": len(samples),
                     "n_skipped_lines": n_skip, "seconds": _time.time() - _t0})
         t = res["table"]
@@ -2139,6 +2188,8 @@ def _run_lr(pairs_text, label_kind, seg_source, method, use_corrected, k, n_perm
                f"{'SPLIT-corrected' if corrected else 'original'} counts; {res['seconds']:.1f} s).")
         if use_corrected and not corrected:
             msg += " Original counts were used: not every sample has SPLIT-corrected counts."
+        if res["n_uncorrected"]:
+            msg += " " + analysis._an_uncorrected_note(res["n_uncorrected"]) + "."
         if len(samples) > 1:
             msg += f" Cells of {len(samples)} samples were pooled (graph and permutations within each sample)."
         msg += (f"\nUnit of the p-values: n = {info['n_cells']:,} cells, treated as exchangeable within "

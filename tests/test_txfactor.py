@@ -209,11 +209,20 @@ def test_projection_keeps_the_counts_and_finds_the_planted_mixture(xe, monkeypat
     assert xe._txf_project(sp.csr_matrix((0, G), dtype=np.float32), Hn).shape == (0, k)
 
 
-@pytest.mark.parametrize("method,shape", [("nmf", "square"), ("nmf", "hex"), ("lda", "square")])
-def test_planted_spatial_programs_are_recovered_up_to_permutation(xe, tmp_path, method, shape):
+@pytest.mark.parametrize("method,shape,size", [
+    ("nmf", "square", 600.0), ("nmf", "hex", 600.0),
+    # online LDA makes several passes over every bin: the default tier fits it on a quarter of
+    # the area (the same transcript density, stripes of half the width, a quarter of the
+    # minibatch), the slow tier on all of it
+    ("lda", "square", 300.0), pytest.param("lda", "square", 600.0, marks=pytest.mark.slow)])
+def test_planted_spatial_programs_are_recovered_up_to_permutation(xe, tmp_path, monkeypatch, method, shape, size):
+    if size < 600.0:
+        # a quarter of the bins: a quarter of the minibatch, so that the online updates per pass stay the same
+        monkeypatch.setattr(xe, "_TXF_LDA_BATCH", xe._TXF_LDA_BATCH // 4)
     rng = np.random.default_rng(5)
     genes = [f"G{i}" for i in range(80)]
-    x, y, g, P, _stripe = _planted(rng, genes, n_tx=150_000, size=600.0, k=4, per=12)
+    w = size / 4.0                                                   # width of a planted stripe
+    x, y, g, P, _stripe = _planted(rng, genes, n_tx=int(150_000 * (size / 600.0) ** 2), size=size, k=4, per=12)
     d = _write_tx(tmp_path / "s", x, y, g, row_group_size=20_000)
     scan = xe._txf_scan(d, genes, 10.0, shape)
     n_tx = np.asarray(scan["X"].sum(axis=1)).ravel()
@@ -225,8 +234,8 @@ def test_planted_spatial_programs_are_recovered_up_to_permutation(xe, tmp_path, 
     # the dominant factor of a bin is the program of its stripe (bins astride a border left out)
     W = xe._txf_project(scan["X"], H)
     cx, _cy = xe._txf_bin_centres(scan["r"], scan["c"], 10.0, shape)
-    inside = (np.abs((cx % 150.0) - 75.0) < 60.0) & (n_tx >= 10) & (cx > 0) & (cx < 600)
-    want = np.minimum((cx / 150.0).astype(int), 3)
+    inside = (np.abs((cx % w) - w / 2.0) < 0.4 * w) & (n_tx >= 10) & (cx > 0) & (cx < size)
+    want = np.minimum((cx / w).astype(int), 3)
     assert (match[W.argmax(axis=1)][inside] == want[inside]).mean() > 0.97
     # a fixed seed gives the same loadings; the top genes of a factor are its planted genes
     H2, _ = xe._txf_fit(scan["X"][n_tx >= 10], 4, method, seed=0)
@@ -632,3 +641,43 @@ def test_job_can_be_cancelled_publishes_nothing_and_reruns(xe, D, tmp_path, monk
     assert xe.run_txfactor(3, *args)[:2] == (True, False)
     tl.wait_state(xe._txf_state, xe._txf_lock)
     assert xe._txf_result()["samples"][0]["total"] == 20_000
+
+
+# ── review round 5 ───────────────────────────────────────────────────────────
+def test_share_columns_are_unique_for_names_that_differ_in_punctuation(xe):
+    names = ["CD4+ T", "CD4- T", "NK/T", "NK T", "B"]
+    cols = xe._txf_cols(names)
+    assert len(set(cols)) == len(names) and cols[0] == "txf_share_CD4_T" and cols[1] == "txf_share_CD4_T_2"
+    assert cols[4] == "txf_share_B" and xe._txf_cols(["F1", "F2"]) == ["txf_share_F1", "txf_share_F2"]
+
+
+def test_reference_types_with_colliding_names_keep_their_own_share_and_cells_are_all_counted(xe, D, labels):
+    if not os.path.exists(os.path.join(D["data_dir"], "transcripts.parquet")):
+        pytest.skip("bundle without transcripts.parquet")
+    lab = labels.copy()
+    lab[:] = np.where(np.arange(len(lab)) % 2 == 0, "CD4+ T", "CD4- T")
+    lab.iloc[-4:] = None                                             # four cells without a label
+    with xe._annot_lock:
+        xe._annot_state["labels_celltypist"] = lab
+    keep = xe._TXF_REF_MIN_CELLS
+    xe._TXF_REF_MIN_CELLS = 5
+    try:
+        _run(xe, 1, method="reference", k=99)
+    finally:
+        xe._TXF_REF_MIN_CELLS = keep
+    res = xe._txf_result()
+    assert sorted(res["names"]) == ["CD4+ T", "CD4- T"] and len(set(res["share_cols"])) == 2
+    t = xe._view_tables("xenium")[0]
+    a, b = (xe._ctl_get(t, "xenium", c).astype(float) for c in res["share_cols"])
+    ok = np.isfinite(a) & np.isfinite(b)
+    assert ok.any() and np.allclose(a[ok] + b[ok], 1.0, atol=1e-5) and not np.allclose(a[ok], b[ok])
+    for j in range(2):                                               # Color By reads the column of its own factor
+        vals = xe._txf_color(f"{xe._TXF_COLOR}share:{j}", "xenium")[0]
+        np.testing.assert_allclose(vals[ok], (a, b)[j][ok], atol=1e-6)
+    # "Cells" counts every cell a factor dominates; the labelled ones are a column of their own
+    f = res["factors"].set_index("factor")
+    dom = pd.Series(xe._ctl_get(t, "xenium", "txf_dominant"), dtype=object)
+    for nm in res["names"]:
+        assert f.loc[nm, "n_cells_dominant"] == int((dom == nm).sum())
+        assert f.loc[nm, "n_cells_labelled"] == int(res["crosstab"].loc[nm].sum()) if nm in res["crosstab"].index else True
+    assert f["n_cells_dominant"].sum() == int(dom.notna().sum()) > f["n_cells_labelled"].sum()

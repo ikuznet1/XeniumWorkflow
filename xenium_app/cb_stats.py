@@ -283,7 +283,7 @@ def run_moran(n_clicks, k, seg_source, counts_mode):
     if not n_clicks:
         raise dash.exceptions.PreventUpdate
     if not analysis._an_samples(seg_source, counts_mode == "corrected"):
-        return False, True, "The active view has no expression matrix."
+        return False, True, analysis._an_no_matrix_msg(seg_source)
     if not cb_analysis._an_job_claim(stats._moran_state, stats._moran_lock):
         return True, False, "Moran's I is already being computed."
     jobs._job_start("moran", "Spatially variable genes (Moran's I)", stats._run_moran,
@@ -349,14 +349,16 @@ def download_moran_table(n_clicks):
         res = stats._moran_state.get("result")
     if not res:
         raise dash.exceptions.PreventUpdate
-    t = (res["table"].drop(columns=["neg_log10_padj"])
-         .sort_values(["sample", "moran_i"], ascending=[True, False], kind="stable"))
+    t = res["table"].sort_values(["sample", "moran_i"], ascending=[True, False], kind="stable")
     header = (f"# Moran's I per gene; kNN graph of the cell centroids, k = {res['k']}, "
               f"row-standardised weights; log1p(CP10K) of the "
               f"{'SPLIT-corrected' if res['corrected'] else 'original'} counts; segmentation: "
               f"{res['seg_source']}; z and two-sided p under the normality assumption; BH FDR per sample\n"
               f"# unit of the p-values: the cells of a sample, treated as independent; pct_cells: "
-              f"count >= 1 transcript\n")
+              f"count >= 1 transcript\n"
+              f"# {analysis._P_FLOOR_NOTE}\n")
+    if res.get("n_uncorrected"):
+        header += f"# {analysis._an_uncorrected_note(res['n_uncorrected'])}\n"
     for i in res["samples"]:
         header += (f"# sample {i['label']} ({i['name']}): {i['n_cells']} cells; E[I] = "
                    f"{i['expected']:.6g}; Var[I] = {i['variance']:.6g}\n")
@@ -519,6 +521,8 @@ def download_lr_table(n_clicks):
               f"evidence of signalling\n"
               f"# unit of the p-values: n = {info['n_cells']} cells, exchangeable within their sample; "
               f"frac_ligand / frac_receptor: cells with count >= 1 transcript\n")
+    if res.get("n_uncorrected"):
+        header += f"# {analysis._an_uncorrected_note(res['n_uncorrected'])}\n"
     return dict(content=header + t.to_csv(index=False), filename="ligand_receptor_scores.csv")
 
 

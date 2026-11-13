@@ -48,17 +48,33 @@ def update_prox_label_options(active_tab, mode, _annot, _ds, seg_source, _ex, co
     Output("prox-target", "options"),
     Output("prox-anchor", "options"),
     Output("prox-source", "options"),
+    Output("prox-target", "value"),
+    Output("prox-anchor", "value"),
+    Output("prox-source", "value"),
     Input("prox-labels",     "value"),
     Input("dataset-version", "data"),
     Input("annot-done",      "data"),
     Input("subset-version",  "data"),
-    State("seg-source",      "value"),
-    State("cluster-method",  "value"),
+    Input("seg-source",      "value"),
+    Input("cluster-method",  "value"),
+    Input("extra-datasets-version", "data"),
+    State("prox-target",     "value"),
+    State("prox-anchor",     "value"),
+    State("prox-source",     "value"),
 )
-def update_prox_type_options(kind, _ds, _annot, _sub, seg_source, method):
+def update_prox_type_options(kind, _ds, _annot, _sub, seg_source, method, _ex=None,
+                             target=None, anchor=None, source=None):
+    """The types of the label source in the view as it is now: another segmentation,
+    cluster set or sample list has other types and counts, so the lists are rebuilt for
+    each, and a picked type that no longer exists is cleared (the run would otherwise test
+    a type of the same name in another clustering, or fail on a name that is not there)."""
     opts = _prox_type_options(kind, seg_source, method)
-    return opts, opts, ([{"label": "auto (type with the most transcripts)", "value": "auto"},
-                         {"label": "none", "value": "none"}] + opts)
+    have = {o["value"] for o in opts}
+    return (opts, opts, ([{"label": "auto (type with the most transcripts, not T or X)", "value": "auto"},
+                          {"label": "none", "value": "none"}] + opts),
+            no_update if (target is None or target in have) else None,
+            no_update if (anchor is None or anchor in have) else None,
+            no_update if (source in (None, "auto", "none") or source in have) else "auto")
 
 
 @app_layout.app.callback(

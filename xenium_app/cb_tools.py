@@ -431,6 +431,12 @@ def start_annotation(n_clicks, source, model_name, rds_path, label_col,
     else:
         mode_labels_key = labels_key
 
+    if source in ("seurat", "rctd"):
+        _problem = core._ref_rds_problem(rds_path)
+        if _problem:
+            msg = f"✗ {_problem}"
+            return True, msg, False, msg      # no job started: keep the poll off
+
     # Ensure rpy2 conversion rules are set in this callback thread BEFORE copy_context()
     # so the spawned thread's context copy includes them (done before the status is
     # set to "running" so a missing rpy2 cannot leave it stuck)

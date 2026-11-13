@@ -37,7 +37,7 @@ _JC_HVG_BINS = 20            # mean-expression bins within which the dispersion 
 _JC_MIN_COUNTS = 1           # a cell needs at least this many counts over the shared genes
 _JC_LISI_K = 30              # neighbours of the mixing index
 _JC_LISI_QUERY = 5000        # cells the mixing index is computed for (random, fixed seed)
-_JC_CACHE_VERSION = 1
+_JC_CACHE_VERSION = 2          # 2: matrix content and backend availability in the key; cell ids stored
 
 # variant → (cluster set name, prefix of the per-cell UMAP columns)
 _JC_VARIANTS = {"plain": ("Joint clusters", "joint_umap"),
@@ -351,17 +351,27 @@ def _jc_cache_dir() -> str:
     return os.path.join(core.CACHE_BASE_DIR, f"joint_{tag}")
 
 
+def _jc_backends() -> dict:
+    """Optional packages a joint run uses when they are installed."""
+    import importlib.util
+    return {"umap": importlib.util.find_spec("umap") is not None,
+            "leiden": bool(clustersets._cs_leiden_available())}
+
+
 def _jc_cache_tag(samples, seg_source, params: dict, var_levels) -> str:
     """Identifies a run: the samples and their cells (ids and matrix), the counts used,
     the parameters and the level of every sample."""
     h = hashlib.sha1()
+    # which optional backends can run is part of the key: a run made without umap-learn or
+    # without Leiden (KMeans fallback) is not handed back once they are installed
     h.update(json.dumps({"v": _JC_CACHE_VERSION, "seg": str(seg_source or "xenium"),
+                         "backends": _jc_backends(),
                          "params": {k: params[k] for k in sorted(params)},
                          "levels": list(var_levels)}, sort_keys=True, default=str).encode())
     for s in samples:
         h.update(str(s["key"]).encode())
         h.update(b"corrected" if s["corrected"] else b"original")
-        h.update(str(s["csc"].shape).encode() + str(int(s["csc"].nnz)).encode())
+        h.update(analysis._an_matrix_digest(s["csc"]).encode())
         h.update(pd.util.hash_pandas_object(pd.Index(s["df"].index.astype(str)), index=False).values.tobytes())
     return h.hexdigest()[:16]
 
@@ -529,6 +539,7 @@ def _run_joint(seg_source, use_corrected: bool = False, params=None) -> None:
             return
         samples = analysis._an_samples(seg_source, use_corrected)
         tables = stats._view_tables(seg_source)
+        seg_tag = controls._seg_tag(seg_source)
         if len(samples) < 2 or len(samples) != len(tables):
             _set("error", "Joint clustering needs at least two loaded samples with a count matrix "
                           "(Load Sample → add a sample).")
@@ -593,7 +604,10 @@ def _run_joint(seg_source, use_corrected: bool = False, params=None) -> None:
         n_genes = r["genes"] if isinstance(r["genes"], int) else len(r["genes"])
         if not from_cache:
             arrays = {"sample": code, "hvg": r["hvg"], "pcs": r["pcs"], "emb": r["emb"], "evr": r["evr"],
-                      "labels": r["labels"], **{f"take_{i}": tk for i, tk in enumerate(r["take"])}}
+                      "labels": r["labels"], **{f"take_{i}": tk for i, tk in enumerate(r["take"])},
+                      # the embedded cells by id: what a later session re-attaches the UMAP by
+                      **{f"ids_{i}": np.asarray(s["df"].index.astype(str))[np.asarray(tk, dtype=np.int64)].astype(str)
+                         for i, (tk, s) in enumerate(zip(r["take"], samples))}}
             if r["labels_before"] is not None:
                 arrays["labels_before"] = r["labels_before"]
             if r["umap"] is not None:
@@ -602,12 +616,13 @@ def _run_joint(seg_source, use_corrected: bool = False, params=None) -> None:
                 _jc_cache_write(tag, arrays, {
                     "genes_n": n_genes, "info": r["info"], "timings": r["timings"], "params": p_run,
                     "levels": levels, "name": name, "umap_missing": bool(p["umap"] and r["umap"] is None),
+                    "sample_keys": [str(s["key"]) for s in samples],
                     "mixing_after": r["diag"]["after"]["mixing"],
                     "mixing_before": (r["diag"].get("before") or {}).get("mixing")})
             except Exception as exc:
                 print(f"  Joint clustering: could not write the cache ({exc})", flush=True)
         # labels and UMAP coordinates per sample table
-        per_labels = []
+        per_labels, umap_cols = [], []
         for si, (t, s) in enumerate(zip(tables, samples)):
             lab = np.full(len(s["df"]), None, dtype=object)
             sel = code == si
@@ -617,10 +632,14 @@ def _run_joint(seg_source, use_corrected: bool = False, params=None) -> None:
             u2 = u1.copy()
             if r["umap"] is not None:
                 u1[r["take"][si]], u2[r["take"][si]] = r["umap"][sel, 0], r["umap"][sel, 1]
-            controls._ctl_put(t, seg_source, {f"{col_prefix}_1": u1, f"{col_prefix}_2": u2})
+            umap_cols.append({f"{col_prefix}_1": u1, f"{col_prefix}_2": u2})
         method_key = clustersets._cs_install(name, per_labels, seg_source, meta={
             "kind": "joint", "variant": variant, "params": p_run, "levels": levels, "cache_tag": tag,
             "backend": r["info"].get("backend")})
+        # only now, with the set installed (the install validates the view against the
+        # tables of this run): a failed install leaves the embedding of the last run in place
+        for t, cols in zip(tables, umap_cols):
+            controls._ctl_put(t, seg_source, cols, tag=seg_tag)
         dataview._umap_fig_cache.clear()
         table = _jc_diag_table(tables, levels, code, r["labels"], r["labels_before"], r["batch"])
         n = int(len(code))
@@ -716,15 +735,27 @@ def _jc_restore_umap(method, tables, seg_source="xenium") -> None:
     arr = got[0]
     prefix = _JC_VARIANTS[variant][1]
     try:
-        take = [arr[f"take_{i}"] for i in range(len(tables))]
-        if f"take_{len(tables)}" in arr or any(len(tk) and tk.max() >= len(t["df"]) for tk, t in zip(take, tables)):
+        # The coordinates go back to the samples and cells they were computed for, or not
+        # at all: the run names its samples, and the cells are matched by id (row positions
+        # differ once a subset is set or cleared, sample positions once the list changes).
+        keys = [str(k) for k in (got[1].get("sample_keys") or [])]
+        if keys != [str(t["key"]) for t in tables] or any(f"ids_{i}" not in arr for i in range(len(tables))):
             return
+        cols = []
         for si, t in enumerate(tables):
             sel = arr["sample"] == si
-            u1 = np.full(len(t["df"]), np.nan, dtype=np.float32)
-            u2 = u1.copy()
-            u1[take[si]], u2[take[si]] = arr["umap"][sel, 0], arr["umap"][sel, 1]
-            controls._ctl_put(t, seg_source, {f"{prefix}_1": u1, f"{prefix}_2": u2})
+            ids = pd.Index(arr[f"ids_{si}"].astype(str))
+            if len(ids) != int(sel.sum()) or not ids.is_unique:
+                return
+            own = pd.Index(t["df"].index.astype(str))
+            full = (t.get("ds") or {}).get("_df_original")       # the whole sample when a subset is active
+            known = own if full is None else pd.Index(full.index.astype(str))
+            if not len(ids) or not ids.isin(known).all():
+                return                              # not the cells of this sample
+            um = pd.DataFrame(arr["umap"][sel, :2], index=ids).reindex(own)
+            cols.append({f"{prefix}_1": um[0].to_numpy(dtype=np.float32), f"{prefix}_2": um[1].to_numpy(dtype=np.float32)})
+        for t, c in zip(tables, cols):
+            controls._ctl_put(t, seg_source, c)
     except Exception as exc:
         print(f"  Joint clustering: the cached UMAP was not restored ({exc})", flush=True)
 
@@ -822,8 +853,11 @@ def _jc_umap_fig(color_by, method, gene, size, opacity, baysor_active=False, pro
             if all(l is not None for l in labs):
                 traces, what = _categorical(np.concatenate(labs), "Cluster"), "cluster"
         elif color_by == "gene" and gene:
-            parts = [dataview._xenium_gene_values(gene, use_corrected)]
-            parts += [dataview._extra_gene_values(eds, gene, use_corrected) for eds in dataview.EXTRA_DATASETS]
+            # corrected counts only when every sample has them: one colour scale never
+            # mixes corrected and original values (as the map and the WebGL colours)
+            mc = dataview._multi_use_corrected(use_corrected)
+            parts = [dataview._xenium_gene_values(gene, mc)]
+            parts += [dataview._extra_gene_values(eds, gene, mc) for eds in dataview.EXTRA_DATASETS]
             if all(p is not None and len(p) == len(t["df"]) for p, t in zip(parts, tables)):
                 traces, what = _continuous(np.concatenate(parts), str(gene)), str(gene)
         elif color_by.startswith("cell_type:"):

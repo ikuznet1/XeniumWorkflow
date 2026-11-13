@@ -5,14 +5,18 @@
 // dev_server.py and opens it through assets/xenium_viewer.js.
 import { chromium } from "playwright";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const port = Number(process.argv[2] || 8097);
-const tiny = process.env.XV_TINY || "/Users/ikuz/Documents/XeniumTestData/prime_mouse_ileum_tiny";
+// the bundle: XV_TINY, else <XV_TEST_DATA>/prime_mouse_ileum_tiny (as test/lib.mjs), else the repository fixture
+const testData = process.env.XV_TEST_DATA || resolve(homedir(), "Documents", "XeniumTestData");
+const tinyIn = resolve(testData, "prime_mouse_ileum_tiny");
+const tiny = process.env.XV_TINY || (existsSync(tinyIn) ? tinyIn
+  : resolve(here, "..", "..", "tests", "data", "prime_mouse_ileum_tiny"));
 const dir = mkdtempSync(join(process.env.XV_TMP || tmpdir(), "xv-single-"));
 const py = process.env.XV_PYTHON || "python";
 const made = spawnSync(py, ["-c", `

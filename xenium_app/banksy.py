@@ -39,7 +39,7 @@ _BK_MAX_GENES = 2000         # feature cap: the most variable genes of a larger 
 _BK_MIN_CELLS = 50
 _BK_CHUNK = 8192             # cells per dense block
 _BK_KEEP_BYTES = 1.2e9       # neighbourhood blocks up to this size are kept instead of recomputed
-_BK_CACHE_VERSION = 1
+_BK_CACHE_VERSION = 2          # 2: the signature includes the content of the count matrix
 _BK_TOP_GENES = 5
 
 _BK_NOTE = (
@@ -353,6 +353,7 @@ def _bk_signature(samples, seg_source, params, genes) -> str:
     for s in samples:
         h.update(str(s["key"]).encode())
         h.update(b"corrected" if s["corrected"] else b"original")
+        h.update(analysis._an_matrix_digest(s["csc"]).encode())     # the counts themselves, not only whose they are
         h.update(pd.util.hash_pandas_object(pd.Index(s["df"].index.astype(str)), index=False).values.tobytes())
     h.update("|".join(genes).encode())
     return h.hexdigest()[:16]
@@ -456,7 +457,8 @@ def _run_banksy(seg_source, use_corrected, params=None) -> None:
         samples = analysis._an_samples(seg_source, bool(use_corrected))
         tables = stats._view_tables(seg_source)
         if not samples:
-            _set("error", "The active view has no count matrix.")
+            _set("error", analysis._an_no_matrix_msg(seg_source) if analysis._an_seg_missing(seg_source)
+                 else "The active view has no count matrix.")
             return
         by_key = {s["key"]: s for s in samples}
         missing = [t["label"] for t in tables if t["key"] not in by_key]

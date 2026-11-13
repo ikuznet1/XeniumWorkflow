@@ -37,6 +37,7 @@ _AGG_HULL_ALPHA_UM = 30.0    # alpha hull: Delaunay triangles with every edge at
 _AGG_OE_MIN_POOL = 20        # outside cells a stratum needs to give the expected composition
 _AGG_BATCH = 25              # permutations per sparse product (and per cancellation point)
 _AGG_OUTLINE_COLOR = "#f0c040"
+_AGG_COLUMNS = ("aggregate_id", "aggregate_hotspot", "aggregate_p")   # per-cell columns of a run
 _AGG_COLOR_KEY = "agg#id"    # Color By value "geneset:agg#id"
 _AGG_COLOR_LABEL = "Aggregate id (1 = most class cells)"
 
@@ -408,7 +409,13 @@ def _agg_across(values, conds, donors) -> dict:
     if k < stats._SL_MIN_UNITS:
         return {"p": None, "why": (f"fewer than {stats._SL_MIN_UNITS} independent units per condition "
                                    f"({u['note']})")}
-    r = stats._sl_test(np.asarray(values, dtype=np.float64), c_use, donors, units=u)
+    vals = np.asarray(values, dtype=np.float64)
+    bad = [i for i, c in enumerate(c_use) if c and not np.isfinite(vals[i])]
+    if bad:
+        # never a test on a silently reduced set of samples
+        return {"p": None, "why": (f"{len(bad)} sample(s) assigned to a condition have no value (fewer than 3 "
+                                   f"cells, or no tissue area)")}
+    r = stats._sl_test(vals, c_use, donors, units=u)
     return {"p": float(r["p"]), "effect": float(r["effect"]), "min_p": float(r["min_p"]),
             "test": r["test"], "exact": bool(r["exact"]), "units_note": r["units_note"]}
 
@@ -440,7 +447,9 @@ def _run_aggregates(seg_source, method, label_kind, classes, params=None) -> Non
         if not classes:
             _set("error", "Pick the cell types that make up the class (e.g. the immune types).")
             return
+        analysis._an_require_seg(seg_source)
         tables = stats._view_tables(seg_source)
+        seg_tag = controls._seg_tag(seg_source)
         labels, cat = stats._comp_labels(label_kind, tables, seg_source, method)
         if all(l is None for l in labels):
             _set("error", f"The active view has no {cat} labels: run Cell Type Annotation first, or use clusters.")
@@ -458,7 +467,7 @@ def _run_aggregates(seg_source, method, label_kind, classes, params=None) -> Non
         types = sorted(map(str, vc.index), key=str)
         tpos = {t: i for i, t in enumerate(types)}
         T, S = len(types), len(tables)
-        per, defaults, cols_out = [], [], []
+        per, defaults, tissue_of = [], [], {}
         for si, (t, lab) in enumerate(zip(tables, labels)):
             jobs._job_check()
             xy = stats._xy_of(t["df"])
@@ -471,8 +480,10 @@ def _run_aggregates(seg_source, method, label_kind, classes, params=None) -> Non
                     lambda v: tpos.get(str(v), -1) if v is not None else -1).to_numpy(dtype=np.int64)
             ind = np.isin(code, [tpos[c] for c in cls])
             if n < 3 or not ind.any():
+                # no cell of the class: the sample has zero aggregates on its tissue area
+                # (a value of the between-condition test, not a missing one)
                 per.append(None)
-                cols_out.append(None)
+                tissue_of[si] = float(_agg_tile_area(xy).sum()) if n >= 3 else np.nan
                 continue
             levels, computed = _agg_strata(t, seg_source, xy)
             if computed:
@@ -506,12 +517,16 @@ def _run_aggregates(seg_source, method, label_kind, classes, params=None) -> Non
         srows = []
         conds, _b = stats._design_of(tables)
         donors = stats._design_donors(tables)
+        new_cols = {}
         for si, (t, r) in enumerate(zip(tables, per)):
             base = {"sample": t["label"], "name": t["name"], "cond": conds[si], "donor": donors[si],
                     "n_cells": int(len(t["df"]))}
             if r is None:
-                srows.append({**base, "n_class": 0, "tissue_mm2": np.nan, "n_aggregates": 0, "per_mm2": np.nan,
-                              "area_fraction": np.nan, "share_class_inside": np.nan, "n_hotspot": 0,
+                tissue = tissue_of[si]
+                has = bool(np.isfinite(tissue) and tissue > 0)
+                srows.append({**base, "n_class": 0, "tissue_mm2": tissue / 1e6 if has else np.nan,
+                              "n_aggregates": 0, "per_mm2": 0.0 if has else np.nan,
+                              "area_fraction": 0.0 if has else np.nan, "share_class_inside": np.nan, "n_hotspot": 0,
                               "control_mean": np.nan, "control_max": np.nan, "false_rate": np.nan,
                               "control_area_max": np.nan})
                 continue
@@ -521,8 +536,8 @@ def _run_aggregates(seg_source, method, label_kind, classes, params=None) -> Non
             if m:
                 lut = np.array([gid[(si, a)] for a in range(m)], dtype=np.float64)
                 ids[lab >= 0] = lut[lab[lab >= 0]]
-            controls._ctl_put(t, seg_source, {"aggregate_id": ids, "aggregate_hotspot": r["hot"].astype(np.float32),
-                                              "aggregate_p": r["p"].astype(np.float32)})
+            new_cols[t["key"]] = {"aggregate_id": ids, "aggregate_hotspot": r["hot"].astype(np.float32),
+                                  "aggregate_p": r["p"].astype(np.float32)}
             mem = lab >= 0
             tissue = r["tissue_um2"]
             ctl = r["control"]
@@ -552,6 +567,8 @@ def _run_aggregates(seg_source, method, label_kind, classes, params=None) -> Non
                     if O[a, j] > 0 or E[a, j] >= 0.5:
                         oe_rows.append({"id": g, "sample": t["label"], "type": types[j], "in_class": types[j] in cls,
                                         "observed": float(O[a, j]), "expected": float(E[a, j]), "log2_oe": float(l2[j])})
+        # every sample of the view: a sample without a result loses the columns of the last run
+        controls._ctl_replace(tables, seg_source, _AGG_COLUMNS, new_cols, tag=seg_tag)
         agg["sample"] = [tables[int(i)]["label"] for i in agg["si"]]
         agg["class_fraction"] = agg["n_class"] / agg["n_cells"].clip(lower=1)
         agg["composition"] = [top_txt.get(int(i), "") for i in agg["id"]]
@@ -567,7 +584,7 @@ def _run_aggregates(seg_source, method, label_kind, classes, params=None) -> Non
                    oe_rows, columns=["id", "sample", "type", "in_class", "observed", "expected", "log2_oe"]),
                "samples": samples, "pooled": pooled, "outlines": outlines, "types": types, "classes": cls,
                "params": p, "category": cat, "seg_source": seg_source or "xenium",
-               "seg_tag": controls._seg_tag(seg_source), "gen": _gen, "tests": tests, "n_samples": S,
+               "seg_tag": seg_tag, "gen": _gen, "tests": tests, "n_samples": S,
                "seconds": _time.time() - _t0}
         n_lab = int(sum(int((r["code"] >= 0).sum()) for r in per if r is not None))
         n_cells = int(sum(len(t["df"]) for t in tables))

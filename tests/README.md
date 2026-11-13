@@ -8,7 +8,7 @@ folder.
 pytest                      # default tier: fast, no external tools
 pytest -m tools             # real Baysor / Proseg / R on a very small region
 pytest -m browser           # node + Playwright tests of the WebGL viewer
-pytest -m slow              # default tier again, on larger bundles
+pytest -m slow              # default tier again, on larger bundles; heavy variants (real UMAP fit, full-size LDA)
 pytest --bundle /path/outs  # default tier on any other Xenium bundle
 ```
 
@@ -135,6 +135,7 @@ Unset or missing paths are skipped, never an error.
 | `viewer_src/test/joint_checks.mjs` | by hand | not wrapped by pytest: drives the Joint clustering tab in the real app in both renderers; `XJ_SAMPLES` names at least one further bundle that the suite adds through '+ Add sample' (refusal with one sample, the run and its diagnostics, the shared set under Cluster Set, WebGL categories without a per-sample prefix, the joint UMAP of all samples in the WebGL and the Plotly UMAP panel, Plotly map, CSV, Samples & conditions editor; usage in its header) |
 | `test_package_layout.py` | default | the split into `xenium_app/`: every global is defined in one module, no module copies another's globals, every `module.NAME` and every global a function reads exists, library modules do not import the start-up modules; rebinding a constant, a state dict, a counter and a function through `xe` (assignment, `monkeypatch`, `mock.patch.object`) and through the REPL namespace reaches the code that uses them |
 | `test_slow_bundles.py` | `slow` | the bundle-dependent default modules on each larger bundle |
+| `test_review_round4.py` | default | one regression test per finding of the fourth review round (corrected-counts coverage, p-value floor, cancel at publish, pseudobulk donors, control columns, …) |
 
 ## Tiers
 

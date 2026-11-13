@@ -206,6 +206,30 @@ def _iseg_classical_mask(image, diameter_px: float, expand_px: float = 0.0, thr_
     return _iseg_expand_labels(lab, expand_px) if expand_px and expand_px > 0 else lab
 
 
+def _iseg_cellpose_model(backend, n_channels: int = 1, models=None) -> "str | None":
+    """The Cellpose model a backend value resolves to ("cellpose:<model>", or "cellpose"
+    alone: nuclei for one channel when it is on disk, else the first model found)."""
+    kind, _, model = str(backend or "").partition(":")
+    if kind != "cellpose":
+        return None
+    if model:
+        return model
+    models = _iseg_cellpose_status()["models"] if models is None else models
+    if not models:
+        return None
+    return "nuclei" if "nuclei" in models and n_channels == 1 else next(iter(models))
+
+
+def _iseg_uses_second_channel(backend, models=None) -> bool:
+    """Whether the backend reads a membrane / cytoplasm channel beside the nuclear one: the
+    Cellpose cyto-type models (and any model that is not a nuclear one) do; the nuclei model
+    and the classical backend segment the nuclear channel alone. With two channels sopa
+    names them [cyto, nucleus] and Cellpose takes the first as its primary channel - for the
+    nuclei model that would be the membrane stain."""
+    model = _iseg_cellpose_model(backend, n_channels=2, models=models)
+    return bool(model) and not str(model).lower().startswith("nuclei")
+
+
 def _iseg_make_method(backend: str, diameter_px: float, n_channels: int = 1, expand_px: float = 0.0,
                       thr_scale: float = 1.0, gpu: bool = False, flow_threshold: float = 0.4,
                       cellprob_threshold: float = 0.0) -> tuple:
@@ -462,6 +486,8 @@ def _run_imgseg(backend: str = "classical", channels=None, diameter_um: float = 
         kind = str(backend or "classical").partition(":")[0]
         if kind == "classical":
             channels = channels[-1:]               # the classical backend reads the nuclear channel only
+        elif len(channels) > 1 and not _iseg_uses_second_channel(backend):
+            channels = channels[-1:]               # … and so does the Cellpose nuclei model
         px = float(core.PIXEL_SIZE_UM)
         p = {"backend": str(backend or "classical"), "channels": channels,
              "diameter_um": float(diameter_um or _ISEG_DIAMETER_UM),
@@ -535,8 +561,19 @@ def _run_imgseg(backend: str = "classical", channels=None, diameter_um: float = 
 
         # ── transcripts → polygons → counts ───────────────────────────────
         _set("running", f"Assigning transcripts to {n_poly:,} cells…")
+        # the denominator of "% of transcripts assigned" is the area that was segmented (the
+        # region, or the extent of the image patches of a whole-tissue run) - not the
+        # bounding box of the cells that happened to be found
+        seg_bounds = region_um
+        if seg_bounds is None:
+            try:
+                from sopa.constants import SopaKeys
+                _b = np.asarray(mini.shapes[SopaKeys.PATCHES].total_bounds, dtype=np.float64) * px
+                seg_bounds = (max(0.0, _b[0]), max(0.0, _b[1]), min(nx * px, _b[2]), min(ny * px, _b[3]))
+            except Exception:
+                seg_bounds = (0.0, 0.0, nx * px, ny * px)
         counts, n_tx, n_assigned = _iseg_assign_transcripts(
-            geoms, tx_path, qv_min=qv_min, bounds=region_um,
+            geoms, tx_path, qv_min=qv_min, bounds=seg_bounds,
             progress=lambda f: jobs._job_progress(fraction=0.72 + 0.18 * f))
         per_cell = np.zeros(n_poly, dtype=np.int64)
         if len(counts):

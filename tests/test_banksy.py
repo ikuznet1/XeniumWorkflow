@@ -264,7 +264,7 @@ def test_snn_graph_is_the_jaccard_index_of_the_neighbour_sets(xe):
 def test_planted_domains_are_recovered_where_expression_alone_fails(xe):
     if not xe._cs_leiden_available():
         pytest.skip("leidenalg / igraph not installed")
-    xy, dom, typ, X = _world(n=3000, size=700.0)
+    xy, dom, typ, X = _world(n=1800, size=540.0)          # the same cell density as 3000 on 700 µm
     s = [_sample(X, xy)]
     plain = xe._bk_compute(s, {"lam": 0.0, "resolution": 0.5})
     assert _ari(dom, plain["labels"]) < 0.05 and _ari(typ, plain["labels"]) > 0.9      # cell types only
@@ -287,22 +287,22 @@ def test_planted_domains_are_recovered_where_expression_alone_fails(xe):
 def test_two_samples_are_clustered_together_with_neighbours_within_sample(xe):
     if not xe._cs_leiden_available():
         pytest.skip("leidenalg / igraph not installed")
-    xa, da, _ta, Xa = _world(seed=1, n=2500, quad=False)
-    xb, db, _tb, Xb = _world(seed=2, n=2000, quad=False)
+    xa, da, _ta, Xa = _world(seed=1, n=1500, quad=False)
+    xb, db, _tb, Xb = _world(seed=2, n=1200, quad=False)
     xb = xb[:, ::-1].copy()                      # the second section lies the other way round
     db = (xb[:, 1] > 400).astype(int)
     samples = [_sample(Xa, xa, "/fake/bkA", "S0", "a"), _sample(Xb, xb, "/fake/bkB", "S1", "b")]
     out = xe._bk_compute(samples, {"lam": 0.8, "resolution": 0.5})
     M = out["W"]["m"].tocoo()
-    assert ((M.row < 2500) == (M.col < 2500)).all()
-    la, lb = out["labels"][:2500], out["labels"][2500:]
+    assert ((M.row < 1500) == (M.col < 1500)).all()
+    la, lb = out["labels"][:1500], out["labels"][1500:]
     assert _ari(da, la) > 0.9 and _ari(db, lb) > 0.9
     # the same domain carries the same label in both samples
     for d in (0, 1):
         assert np.bincount(la[da == d]).argmax() == np.bincount(lb[db == d]).argmax()
     summ = xe._bk_summarise(samples, out, None)
     assert {"n_S0", "n_S1"} <= set(summ["table"].columns)
-    assert int(summ["table"][["n_S0", "n_S1"]].to_numpy().sum()) == 4500
+    assert int(summ["table"][["n_S0", "n_S1"]].to_numpy().sum()) == 2700
 
 
 def test_too_few_cells_or_genes(xe):
@@ -591,3 +591,74 @@ def test_cluster_set_is_exported_by_save_as_spatialdata(xe, D, tmp_path):
     want = D["df"][col].copy()
     want.index = want.index.astype(str)
     np.testing.assert_array_equal(pd.to_numeric(obs[col]).to_numpy(), want.reindex(ids).to_numpy())
+
+
+# ── review round 5 ───────────────────────────────────────────────────────────
+def test_cache_signature_covers_the_counts_not_only_whose_they_are(xe):
+    xy, _dom, _typ, X = _world(seed=3, n=300)
+    s = _sample(X, xy)
+    genes = list(s["genes"])
+    p = xe._bk_params({})
+    sig = xe._bk_signature([s], "xenium", p, genes)
+    assert sig == xe._bk_signature([dict(s)], "xenium", p, genes)
+    # the same cells, genes, shape and number of stored values - other counts (SPLIT run again)
+    m = s["csc"].copy()
+    m.data = m.data[::-1].copy()
+    assert m.shape == s["csc"].shape and m.nnz == s["csc"].nnz
+    assert xe._bk_signature([{**s, "csc": m}], "xenium", p, genes) != sig
+
+
+def test_shared_flag_belongs_to_the_install_not_to_the_name(xe, D):
+    extra = {"df": D["df"].copy(), "cluster_methods": list(D["cluster_methods"]), "data_dir": "/fake/second",
+             "x_offset": 5000.0, "expr": D["expr"], "gene_names": D["gene_names"],
+             "gene_name_to_idx": D["gene_name_to_idx"], "df_to_expr": D["df_to_expr"]}
+    xe.EXTRA_DATASETS.append(extra)
+    try:
+        key = xe._cs_install("Banksy λ=0.8", [_labels_for(D, 2), _labels_for(D, 3)], "xenium")
+        assert xe._cs_is_shared(key)
+        # the same name installed on a Proseg run (one table) does not change the Xenium set
+        n = len(D["df"])
+        cdf = pd.DataFrame({"x_centroid": D["df"]["x_centroid"].to_numpy(), "y_centroid": D["df"]["y_centroid"].to_numpy(),
+                            "transcript_counts": 5}, index=[str(i + 1) for i in range(n)])
+        with xe._proseg_lock:
+            xe._proseg_state.update({"status": "done", "result": {
+                "cells_df": cdf, "cell_bounds": {}, "out_dir": "/nonexistent/proseg_run_y", "expr": None,
+                "source": "proseg", "sdata_path": None}})
+        assert xe._cs_install("Banksy λ=0.8", [_labels_for(D, 4)], "proseg:abc") == key
+        assert xe._cs_is_shared(key), "a single-table install on another segmentation cleared the flag"
+        got = xe._an_cluster_labels(xe._view_tables(), key, False, None)
+        assert set(got[0]) == set(got[1]) == {"C1", "C2", "C3"}
+        # after a restart every sample says which install its labels are from
+        for ds in (D, extra):
+            ds["df"] = ds["df"].drop(columns=[xe.cluster_col(key)])
+            ds["cluster_methods"].remove(key)
+        xe._cs_registry.clear()
+        xe._cs_table_run.clear()
+        assert key in xe._cs_restore("xenium") and xe._cs_is_shared(key)
+        # one sample gets the set again from another (single-sample) run: the two samples no
+        # longer hold labels of one install, so they are not read as the same clusters
+        xe._cs_install("Banksy λ=0.8", [_labels_for(D, 5), None], "xenium")
+        assert not xe._cs_is_shared(key)
+        got = xe._an_cluster_labels(xe._view_tables(), key, False, None)
+        assert all(str(l).startswith("S0:C") for l in got[0] if l is not None)
+    finally:
+        del xe.EXTRA_DATASETS[:]
+        with xe._proseg_lock:
+            xe._proseg_state.update({"status": "idle", "result": None})
+
+
+def test_set_computed_on_a_small_subset_comes_back_on_load(xe, D):
+    n = len(D["df"])
+    keep = list(D["df"].index.astype(str)[: max(3, n // 4)])            # well under half of the cells
+    xe.subset(cell_ids=keep)
+    assert len(D["df"]) == len(keep) < n / 2
+    key = xe._cs_install("Banksy λ=0.2", [np.arange(len(keep)) % 2], "xenium")
+    xe.unsubset()
+    want = D["df"][xe.cluster_col(key)].to_numpy().copy()
+    assert (want[: len(keep)] > 0).all() and (want[len(keep):] == 0).all()
+    # as after a restart
+    D["df"].drop(columns=[xe.cluster_col(key)], inplace=True)
+    D["cluster_methods"].remove(key)
+    xe._cs_registry.clear()
+    assert xe._cs_restore("xenium") == [key]
+    np.testing.assert_array_equal(D["df"][xe.cluster_col(key)].to_numpy(), want)

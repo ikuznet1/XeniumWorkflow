@@ -11,6 +11,7 @@ kept per dataset in ``<cache>/clustersets_<dataset>/`` and installed again on lo
 
 import os
 import re
+import uuid
 import json
 import hashlib
 import threading
@@ -174,12 +175,30 @@ def _cs_label(method) -> str:
     return ent["name"] if ent else ui.method_label(str(method))
 
 
+# (sample key, segmentation slug, set key) -> {"run": id of the install, "shared": bool}.
+# Whether labels are comparable across samples is a property of ONE install over several
+# tables, not of the set's name: a later install under the same name on another
+# segmentation, or on other samples, must not change how the first is read.
+_cs_table_run: dict = {}
+
+
 def _cs_is_shared(method) -> bool:
-    """True when the labels of this set mean the same in every sample (computed jointly):
-    the multi-sample view then does not prefix them per sample."""
+    """True when the labels of this set mean the same in every sample of the Xenium view:
+    every loaded sample carries the set from the same install, and that install was a
+    joint one. The multi-sample view then does not prefix the labels per sample."""
+    key = str(method)
     with _cs_lock:
-        ent = _cs_registry.get(str(method))
-    return bool(ent and ent.get("shared"))
+        if key not in _cs_registry:
+            return False
+    try:
+        keys = [t["key"] for t in stats._view_tables("xenium")]      # the loaded samples
+    except Exception:
+        return False
+    with _cs_lock:
+        recs = [_cs_table_run.get((k, "xenium", key)) for k in keys]
+    if not recs or any(r is None for r in recs):
+        return False
+    return bool(all(r["shared"] for r in recs) and len({r["run"] for r in recs}) == 1)
 
 
 def _cs_dir(ds) -> str:
@@ -290,14 +309,27 @@ def _cs_install(name, per_table_labels, seg_source, meta=None) -> str:
     alt = analysis._an_alt_res(seg_source)
     codes, levels = _cs_codes(per_table_labels)
     shared = bool((meta or {}).get("shared", len(tables) > 1))
-    ent = {"name": str(name), "shared": shared, "meta": dict(meta or {}), "levels": levels}
+    run = uuid.uuid4().hex[:12]
+    slug = _cs_seg_slug(alt, seg_source)
+    ent = {"name": str(name), "shared": shared, "meta": dict(meta or {}), "levels": levels, "run": run}
     with _cs_lock:
-        _cs_registry[key] = ent
+        if alt is None or key not in _cs_registry:
+            # a set of the same name installed on a Baysor / Proseg run does not replace
+            # the entry (meta, shared flag) of the one on the Xenium samples
+            _cs_registry[key] = ent
         for t, c in zip(tables, codes):
             if c is None:
+                _cs_table_run.pop((t["key"], slug, key), None)
                 continue
+            _cs_table_run[(t["key"], slug, key)] = {"run": run, "shared": shared}
             by_id = _cs_by_id(t["df"], c)
             _cs_write(t, alt, key, by_id)
+            # the cache holds the labels of every cell of the sample (0 outside an active
+            # subset), so that a set computed on a small subset comes back as well
+            full = (alt.get("_cells_df_original") if alt is not None else (t.get("ds") or core.DATA).get("_df_original"))
+            if full is not None:
+                by_id = pd.Series(_cs_onto(full, by_id), index=full.index.astype(str))
+                by_id = by_id[~by_id.index.duplicated(keep="first")]
             try:
                 d = _cs_dir(t["ds"])
                 os.makedirs(d, exist_ok=True)
@@ -348,16 +380,24 @@ def _cs_restore(seg_source="xenium") -> list:
                     key = info["key"]
                     col = dataview.cluster_col(key) if alt is None else f"cluster_{key}"
                     _cs_registry.setdefault(key, {"name": info.get("name", key), "shared": bool(info.get("shared")),
-                                                  "meta": info.get("meta") or {}, "levels": info.get("levels") or []})
+                                                  "meta": info.get("meta") or {}, "levels": info.get("levels") or [],
+                                                  "run": info.get("run")})
                     if col in df.columns:
                         continue
                     tab = pd.read_parquet(os.path.join(d, fn[:-5] + ".parquet"))
                     by_id = pd.Series(tab["label"].to_numpy(dtype=np.int64), index=tab["cell_id"].astype(str))
                     full = (alt.get("_cells_df_original") if alt is not None else ds.get("_df_original"))
                     ids = pd.Index((full if full is not None else df).index.astype(str))
-                    if not len(ids) or float(ids.isin(by_id.index).mean()) < 0.5:
-                        continue                # labels of other cells (another run under the same name)
+                    # labels of other cells (another run under the same name) are refused:
+                    # most of the file's cells must be cells of this table. (Not the reverse:
+                    # a set computed on a small subset covers few cells of the table.)
+                    if not len(ids) or not len(by_id) or float(by_id.index.isin(ids).mean()) < 0.5:
+                        continue
                     _cs_write(t, alt, key, by_id)
+                    # this table's own file says which install its labels come from
+                    _cs_table_run[(t["key"], slug, key)] = {
+                        "run": info.get("run") or f"legacy:{info.get('name', key)}",
+                        "shared": bool(info.get("shared"))}
                     df = (alt["cells_df"] if alt is not None else ds["df"])
                     added.append(key)
                 except Exception as exc:
@@ -390,6 +430,8 @@ def _cs_remove(name) -> bool:
     key = name if str(name) in _cs_registry else _cs_key(name)
     with _cs_lock:
         had = _cs_registry.pop(key, None) is not None
+        for k3 in [k3 for k3 in _cs_table_run if k3[2] == key]:
+            del _cs_table_run[k3]
         dsets = [core.DATA] + list(dataview.EXTRA_DATASETS)
         for ds in dsets:
             col = dataview.cluster_col(key)

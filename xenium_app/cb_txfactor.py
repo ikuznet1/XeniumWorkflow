@@ -92,7 +92,9 @@ def poll_txf(_, seen=None, gs_version=None):
         return msg, True, no_update, False, no_update
     if ver != seen:
         return msg, False, ver, True, (gs_version or 0) + 1
-    return no_update, False, no_update, True, no_update
+    # ended without a new result version (cancelled, or the thread died): the final message,
+    # not the last progress text
+    return msg, False, no_update, True, no_update
 
 
 @app_layout.app.callback(

@@ -39,15 +39,16 @@ def _stale_job(gen: int, status: str, message=None) -> bool:
     Also the job registry's hook into every job: a "running" report is a step
     boundary, so its *message* becomes the job's step text and a requested Cancel is
     honoured there (_JobCancelled); the "error" a cancelled job reports while it
-    unwinds is dropped (_job_finish writes "Cancelled" instead)."""
+    unwinds is dropped (_job_finish writes "Cancelled" instead). Every other report -
+    "done" above all - is a cancellation point too: a job that was cancelled during its
+    last step does not publish its result (unless it is shielded, i.e. already writing)."""
     job = _job_current()
     if job is not None:
         if job.cancel.is_set() and not job.shielded:
             if status == "error":
                 job.cancel_raised = True
                 return True
-            if status == "running":
-                _job_check()
+            _job_check()        # "running", "done", …: nothing is published after Cancel
         elif status == "running" and message:
             job.step = str(message)
     if gen == _dataset_gen:

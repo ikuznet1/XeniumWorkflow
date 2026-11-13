@@ -598,6 +598,21 @@ def _txf_col(name: str) -> str:
     return "txf_share_" + re.sub(r"[^A-Za-z0-9]+", "_", str(name)).strip("_")
 
 
+def _txf_cols(names) -> list:
+    """One per-cell column name per factor, unique: names that differ only in punctuation
+    ("CD4+ T", "CD4- T") sanitise to the same text, and the later ones get _2, _3, …"""
+    out, seen = [], {}
+    for nm in names:
+        base = _txf_col(nm)
+        col, k = base, 1
+        while col in seen:
+            k += 1
+            col = f"{base}_{k}"
+        seen[col] = True
+        out.append(col)
+    return out
+
+
 def _txf_area_of(df):
     for col in ("cell_area", "area"):
         if col in df.columns:
@@ -733,7 +748,9 @@ def _run_txfactor(seg_source, cluster_method, label_kind, method="nmf", params=N
     try:
         _t0 = _time.time()
         _set("running", "Collecting samples…")
+        analysis._an_require_seg(seg_source)
         tables = stats._view_tables(seg_source)
+        seg_tag = controls._seg_tag(seg_source)       # the run these tables belong to (checked at every write)
         usable = [i for i, t in enumerate(tables) if t["ds"].get("data_dir")]
         skipped = [tables[i]["label"] for i in range(len(tables)) if i not in usable]
         if not usable:
@@ -851,6 +868,7 @@ def _run_txfactor(seg_source, cluster_method, label_kind, method="nmf", params=N
                          "n_dom": int((s["n_tx"] >= p["min_tx"]).sum())})
         # the cells of the view against the bins
         dom_all, type_all = [], []
+        share_cols = _txf_cols(names)
         n_cells = n_under = 0
         mixed_all = []
         for ti, t in enumerate(tables):
@@ -859,7 +877,7 @@ def _run_txfactor(seg_source, cluster_method, label_kind, method="nmf", params=N
             n = len(df)
             n_cells += n
             with controls._ctl_columns_lock:
-                store = controls._ctl_columns.get((t["key"], controls._seg_tag(seg_source)))
+                store = controls._ctl_columns.get((t["key"], controls._ctl_check_tag(seg_source, seg_tag)))
                 for old in [c for c in (store or {}) if str(c).startswith("txf_")]:
                     del store[old]
             if s is None or not n:
@@ -871,8 +889,8 @@ def _run_txfactor(seg_source, cluster_method, label_kind, method="nmf", params=N
             cols = {"txf_dominant": dn, "txf_top_share": top.astype(np.float32), "txf_mixed": ent.astype(np.float32)}
             share = np.where(tot[:, None] > 0, M / np.maximum(tot, 1e-30)[:, None], np.nan)
             for j, nm in enumerate(names):
-                cols[_txf_col(nm)] = share[:, j].astype(np.float32)
-            controls._ctl_put(t, seg_source, cols)
+                cols[share_cols[j]] = share[:, j].astype(np.float32)
+            controls._ctl_put(t, seg_source, cols, tag=seg_tag)
             n_under += int((dom >= 0).sum())
             mixed_all.append(ent[np.isfinite(ent)])
             dom_all.append(dn)
@@ -897,8 +915,10 @@ def _run_txfactor(seg_source, cluster_method, label_kind, method="nmf", params=N
             row = {"factor": names[f], "share_tx": float(mass[f] / max(mass.sum(), 1e-30)),
                    "n_bins_dominant": int(sum(int(((s["W"].argmax(axis=1) == f) & (s["n_tx"] >= p["min_tx"])).sum())
                                               for s in smps)),
-                   "n_cells_dominant": int(ct.loc[names[f]].sum()) if ct.size and names[f] in ct.index else
-                   int(sum(int((d == names[f]).sum()) for d in dom_all)),
+                   # every cell the factor dominates, labelled or not (the cross-tab holds
+                   # the labelled ones only: n_cells_labelled, the base of top_type_share)
+                   "n_cells_dominant": int(sum(int((d == names[f]).sum()) for d in dom_all)),
+                   "n_cells_labelled": int(ct.loc[names[f]].sum()) if ct.size and names[f] in ct.index else 0,
                    "best_type": best[f][0], "cosine": best[f][1],
                    "top_type_of_cells": "", "top_type_share": np.nan, "top_genes": ", ".join(tg)}
             if ct.size and names[f] in ct.index and ct.loc[names[f]].sum() > 0:
@@ -909,7 +929,7 @@ def _run_txfactor(seg_source, cluster_method, label_kind, method="nmf", params=N
                "samples": smps, "skipped": skipped, "left_out_types": left, "info": info, "top": top,
                "factors": pd.DataFrame(frows), "crosstab": ct, "agreement": agree, "category": cat,
                "label_kind": label_kind, "seg_source": seg_source or "xenium",
-               "seg_tag": controls._seg_tag(seg_source), "from_cache": from_cache,
+               "seg_tag": seg_tag, "from_cache": from_cache, "share_cols": share_cols,
                "corrected": bool(use_corrected), "seconds": _time.time() - _t0, "uid": f"{_gen}-{_time.time():.3f}"}
         with _txf_mem_lock:
             _txf_mem.clear()
@@ -979,10 +999,12 @@ def _txf_color(name, seg_source="xenium", use_corrected: bool = False):
         col, label = "txf_top_share", "Factors: share of the dominant factor under the cell"
     elif what.startswith("share:"):
         try:
-            nm = res["names"][int(what.split(":", 1)[1])]
+            j = int(what.split(":", 1)[1])
+            nm = res["names"][j]
         except (ValueError, IndexError):
             return None
-        col, label = _txf_col(nm), f"Factors: share of {nm} under the cell"
+        col = (res.get("share_cols") or _txf_cols(res["names"]))[j]     # the column of THIS factor
+        label = f"Factors: share of {nm} under the cell"
     else:
         return None
     parts, have = [], False
@@ -1181,7 +1203,7 @@ def make_txf_fig(width=None, height=None):
 
 
 _TXF_COLS = [("factor", "Factor"), ("share_tx", "Share of tx"), ("n_bins_dominant", "Bins"),
-             ("n_cells_dominant", "Cells"), ("best_type", "Most similar type"), ("cosine", "Cosine"),
+             ("n_cells_dominant", "Cells"), ("n_cells_labelled", "Labelled cells"), ("best_type", "Most similar type"), ("cosine", "Cosine"),
              ("top_type_of_cells", "Commonest type of its cells"), ("top_type_share", "Share"),
              ("top_genes", "Top genes")]
 

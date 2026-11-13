@@ -14,6 +14,7 @@ const VERSION = '0.1.0';
 const SETTLE_MS = 150;
 const RETRY_MS = 2000; // delay before a failed cells load is retried
 const CELLS_RETRIES = 2; // automatic retries; after that the next state change retries
+const COLOR_RETRIES = 2; // the same for a failed colours request
 const HOVER_ID_MS = 200; // hover dwell before the cell id is looked up
 const CELL_RADIUS_UM = 3; // world-space radius; clamped in pixels by pointSize (see _cellsLayer)
 const NESTED = ['color', 'boundaries', 'transcripts', 'overlays', 'density'];
@@ -444,6 +445,8 @@ class Viewer {
     this._colorPendingKey = undefined;
     clearTimeout(this._retryTimer);
     this._retryTimer = null;
+    clearTimeout(this._colorRetryTimer);
+    this._colorRetryTimer = null;
     const ctrl = (this._cellsCtrl = new AbortController());
     const source = this.state.source;
     this._cellsLoading = true;
@@ -485,7 +488,9 @@ class Viewer {
           console.error('[XeniumViewer] colors', colorsRes.reason);
           this._colorKey = undefined; // retried by the next _sync
           this._setStatus('colorError', `failed to load colours: ${colorsRes.reason.message || colorsRes.reason}`);
+          this._retryColorsLater();
         } else {
+          this._colorRetries = 0;
           this._setStatus('colorError', null);
         }
       } else if (!(this._colors && this._colors.key === this._colorKey)) {
@@ -542,9 +547,24 @@ class Viewer {
     }
   }
 
+  // A failed colours request is asked for again a couple of times on its own: a transient
+  // network error or 5xx while the server is busy must not leave the cells in the colours
+  // of the previous selection (or without colours) until the user changes something.
+  _retryColorsLater() {
+    this._colorRetries = (this._colorRetries || 0) + 1;
+    if (this._colorRetries > COLOR_RETRIES) return;
+    clearTimeout(this._colorRetryTimer);
+    this._colorRetryTimer = setTimeout(() => {
+      this._colorRetryTimer = null;
+      if (!this._destroyed) this._scheduleSync(['color']);
+    }, RETRY_MS);
+  }
+
   async _loadColors(colorKey) {
     const seq = ++this._colorSeq;
     if (this._colorCtrl) this._colorCtrl.abort();
+    clearTimeout(this._colorRetryTimer);
+    this._colorRetryTimer = null;
     this._colorPendingKey = undefined;
     if (!colorKey) {
       this._colors = null;
@@ -561,6 +581,7 @@ class Viewer {
       if (seq !== this._colorSeq || this._destroyed) return;
       this._colorPendingKey = undefined;
       this._colors = {key: colorKey, header: colors.header, ...colors.arrays};
+      this._colorRetries = 0;
       this.stats.colorFetchMs = performance.now() - t0;
       this._setStatus('colorError', null);
       if (this._cellsLoading) return; // belongs to the cells in flight; their commit paints it
@@ -573,6 +594,7 @@ class Viewer {
       this._colorPendingKey = undefined;
       this._colorKey = undefined; // retried by the next _sync
       this._setStatus('colorError', `failed to load colours: ${err.message || err}`);
+      this._retryColorsLater();
     }
   }
 
@@ -937,7 +959,7 @@ class Viewer {
       let quiet = 0;
       const tick = () => {
         if (this._destroyed) return resolve();
-        const busy = this._pending > 0 || this._syncQueued || this._settleTimer || this._retryTimer ||
+        const busy = this._pending > 0 || this._syncQueued || this._settleTimer || this._retryTimer || this._colorRetryTimer ||
           this.deck.needsRedraw({clearRedrawFlags: false});
         quiet = busy ? 0 : quiet + 1;
         if (quiet >= 2) resolve();
@@ -1485,8 +1507,10 @@ class Viewer {
     window.removeEventListener('pointercancel', this._onCancel);
     this.canvas.removeEventListener('lostpointercapture', this._onCancel);
     clearTimeout(this._retryTimer);
+    clearTimeout(this._colorRetryTimer);
     clearTimeout(this._hoverIdTimer);
     this._retryTimer = null;
+    this._colorRetryTimer = null;
     // Chrome keeps at most 16 live WebGL contexts per page and evicts the oldest (which may be
     // a Plotly plot), so give this one back now instead of waiting for garbage collection.
     let gl = null;

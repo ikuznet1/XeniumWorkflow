@@ -104,7 +104,9 @@ def poll_joint(_, seen=None, cs_version=None, gs_version=None):
         ok = status == "done"
         return (msg, False, ver, True, (cs_version or 0) + 1 if ok else no_update,
                 (gs_version or 0) + 1 if ok else no_update)
-    return no_update, False, no_update, True, no_update, no_update
+    # ended without a new result version (cancelled, or the thread died): the final message,
+    # not the last progress text
+    return msg, False, no_update, True, no_update, no_update
 
 
 @app_layout.app.callback(

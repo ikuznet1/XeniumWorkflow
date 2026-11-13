@@ -197,15 +197,21 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
                         tbl.obs[method] = _map_na(cells_df[method])
                 # Embeddings computed in this session (Rerun UMAP, SPLIT UMAP) and any
                 # other numeric per-cell column the re-read table does not carry
+                # The columns of the registered providers (control / aggregate columns of
+                # this session) are always rewritten: the re-read table may carry them
+                # from an earlier export, and their text companions are rewritten above.
                 for _ncol in cells_df.columns:
-                    _always = _ncol in ("umap_1", "umap_2", "split_umap_1", "split_umap_2")
+                    _extra = _ncol in _extra_cols
+                    _always = _extra or _ncol in ("umap_1", "umap_2", "split_umap_1", "split_umap_2")
                     if not _always and (_ncol in tbl.obs.columns or _ncol in cluster_methods
                                         or str(_ncol).startswith("_")):
                         continue
+                    if _ncol in cluster_methods:
+                        continue                      # a text column, written above
                     if not pd.api.types.is_numeric_dtype(cells_df[_ncol]) \
                             or pd.api.types.is_bool_dtype(cells_df[_ncol]):
                         continue
-                    if _always and not cells_df[_ncol].notna().any():
+                    if _always and not _extra and not cells_df[_ncol].notna().any():
                         continue
                     tbl.obs[_ncol] = pd.to_numeric(_align(cells_df[_ncol]),
                                                    errors="coerce").to_numpy(dtype="float64")
@@ -425,9 +431,12 @@ def to_spatialdata(qv_threshold: int = 20, force: bool = False) -> None:
                     summary = _sdata_summary(sdata)
                     msg = f"Done (cached) — {summary}"
                     print(f"  to_spatialdata: {msg}", flush=True)
+                    jobs._check_dataset_gen(_gen)     # last cancellation point: nothing is installed after Cancel
                     core._sdata_version += 1
                     _set("done", msg, sdata=sdata)
                     return
+                except jobs._DatasetChanged:          # Cancel / dataset swap: not a cache read failure
+                    raise
                 except (KeyError, Exception) as cache_err:
                     print(f"  to_spatialdata: cache read failed ({cache_err}), "
                           f"rebuilding from raw files…", flush=True)
@@ -475,10 +484,11 @@ def to_spatialdata(qv_threshold: int = 20, force: bool = False) -> None:
             summary = _sdata_summary(sdata)
             msg = f"Done — {summary}"
             print(f"  to_spatialdata: {msg}", flush=True)
+            jobs._check_dataset_gen(_gen)             # last cancellation point (the cache stays for the next run)
             core._sdata_version += 1
             _set("done", msg, sdata=sdata)
 
-        except jobs._JobCancelled:
+        except jobs._DatasetChanged:
             raise
         except Exception as exc:
             import traceback

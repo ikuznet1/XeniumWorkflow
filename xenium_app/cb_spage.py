@@ -23,6 +23,10 @@ from . import compat, core, jobs, dataview, spage, subsetting, morph, app_layout
     prevent_initial_call=True,
 )
 def start_spage(n_clicks, rds_path, n_pv, genes_input, seg_source):
+    rds_path = (rds_path or core.REF_RDS_DEFAULT or "").strip()
+    _problem = core._ref_rds_problem(rds_path)
+    if _problem:                              # nothing is started: the poll stays off, Run stays enabled
+        return True, f"✗ {_problem}", f"✗ {_problem}", False
     with core._spage_lock:
         if core._spage_state["status"] == "running":
             return False, "Already running…", "Already running…", True
@@ -32,7 +36,6 @@ def start_spage(n_clicks, rds_path, n_pv, genes_input, seg_source):
             core._spage_state["result"] = None
             dataview._gene_expr_cache.clear()
             dataview._umap_fig_cache.clear()
-    rds_path = rds_path or "/Users/ikuz/Documents/XeniumWorkflow/snRV_ref.rds"
     n_pv = int(n_pv or 50)
     genes_str = genes_input or ""
     seg_src = seg_source or "xenium"

@@ -255,24 +255,34 @@ def _run_spatial_niches(n_clusters: int, n_neighbors: int, label_key: str | None
         # Write niche column to cells_df
         jobs._check_dataset_gen(_gen)
         jobs._job_shield()   # last cancellation point: the niche column is written below
-        cells_df = cells_df.copy()
-        cells_df["niche"] = niche_labels
+        # The labels are assigned by cell id to the frame that is live NOW: subset() /
+        # unsubset() may have replaced DATA["df"] since this job took its snapshot, and
+        # writing the snapshot back would undo that (a full frame beside a subset-sized
+        # df_to_expr). Cells the job did not see get no niche.
+        niche = pd.Series(niche_labels, index=cells_df.index, dtype=object)
+        if not niche.index.is_unique:
+            niche = niche[~niche.index.duplicated()]
+
+        def _with_niche(df):
+            out = df.copy()
+            out["niche"] = niche.reindex(out.index).values
+            return out
 
         def _niche_into_full(full_df):
             # subset() active: unsubset() restores this frame, so it gets the labels
             # too (by cell id; cells outside the subset have no niche)
             if full_df is not None:
-                full_df["niche"] = cells_df["niche"].reindex(full_df.index).values
+                full_df["niche"] = niche.reindex(full_df.index).values
 
         if alt_res is not None:
-            alt_res["cells_df"] = cells_df
+            alt_res["cells_df"] = _with_niche(alt_res["cells_df"])
             _niche_into_full(alt_res.get("_cells_df_original"))
         else:
             if "_df_original" in core.DATA:
                 _niche_into_full(core.DATA["_df_original"])
-                core.DATA["df"] = cells_df          # the subset slice itself is not written to
+                core.DATA["df"] = _with_niche(core.DATA["df"])   # the subset slice itself is not written to
             else:
-                core.DATA["df"]["niche"] = niche_labels
+                core.DATA["df"]["niche"] = niche.reindex(core.DATA["df"].index).values
             dataview._umap_df_cache.clear()   # cached dropna() copies lack the new column
 
         # Print proportion table if cell types available

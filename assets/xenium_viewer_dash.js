@@ -689,11 +689,13 @@
     if (u) {
       setTimeout(function () { u.resize(); }, 60);
       var corrected = countsMode === "corrected";
+      var jointEmb = tool === "xenium" && /^joint_clusters/.test(method || "");
       u.setState({
         // a joint cluster set brings its own embedding of all samples (served when it exists)
-        source: source + (corrected ? "|corr" : "") +
-          (tool === "xenium" && /^joint_clusters/.test(method || "") ? "|emb:" + method : ""),
-        dataVersion: [dataVersion, splitDone, corrected ? 1 : 0].join("|"),
+        source: source + (corrected ? "|corr" : "") + (jointEmb ? "|emb:" + method : ""),
+        // a joint re-run replaces the coordinates under the same source: its version (the
+        // one the poll bumps for the colours) is part of the cells key, so they are refetched
+        dataVersion: [dataVersion, splitDone, corrected ? 1 : 0, jointEmb ? an.gsVersion : 0].join("|"),
         color: {
           mode: colorBy || "cluster", method: method || "", gene: gene || "",
           corrected: corrected ? 1 : 0,

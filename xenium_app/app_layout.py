@@ -1011,7 +1011,8 @@ app.layout = html.Div([
                 dcc.Input(
                     id="annot-rds-path",
                     type="text",
-                    value="/Users/ikuz/Documents/XeniumWorkflow/snRV_ref.rds",
+                    value=core.REF_RDS_DEFAULT,
+                    placeholder=core.REF_RDS_PLACEHOLDER,
                     style={
                         "width": "100%", "backgroundColor": core.CARD_BG, "color": core.TEXT,
                         "border": f"1px solid {core.BORDER}", "borderRadius": "4px",
@@ -1121,7 +1122,8 @@ app.layout = html.Div([
             dcc.Input(
                 id="spage-rds-path",
                 type="text",
-                value="/Users/ikuz/Documents/XeniumWorkflow/snRV_ref.rds",
+                value=core.REF_RDS_DEFAULT,
+                    placeholder=core.REF_RDS_PLACEHOLDER,
                 debounce=True,
                 style={
                     "width": "100%", "backgroundColor": core.CARD_BG, "color": core.TEXT,
@@ -1146,7 +1148,8 @@ app.layout = html.Div([
             ),
             dcc.Textarea(
                 id="spage-genes",
-                placeholder="e.g. NPPA, MYH7, TNNT2",
+                value=core._impute_genes_default(),
+                placeholder="e.g. NPPA, MYH7, TNNT2 (default: the genes in the file $XENIUM_IMPUTE_GENES)",
                 style={
                     "width": "100%", "height": "100px", "backgroundColor": core.CARD_BG,
                     "color": core.TEXT, "border": f"1px solid {core.BORDER}", "borderRadius": "4px",
@@ -1339,7 +1342,7 @@ dbc.Modal([
         html.P("⚠ Peak RAM usage ~21 GB for a full Xenium slide.",
                style={"fontSize":"0.82rem","color":"#e85d04"}),
         dbc.Label("Seurat Reference RDS path"),
-        dbc.Input(id="split-rds-path", placeholder="/path/to/reference.rds",
+        dbc.Input(id="split-rds-path", value=core.REF_RDS_DEFAULT, placeholder=core.REF_RDS_PLACEHOLDER,
                   type="text", style={"fontSize":"0.82rem"}),
         html.Br(),
         dbc.Label("Cell-type label column"),

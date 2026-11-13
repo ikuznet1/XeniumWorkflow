@@ -24,6 +24,38 @@ import contextvars
 # ─── Configurable paths (override via env vars for cloud deployment) ─────────
 CACHE_BASE_DIR = os.environ.get("XENIUM_CACHE_DIR",
                                 os.path.join(os.path.expanduser("~"), ".xenium_explorer_cache"))
+# Defaults of the reference inputs (the .rds reference of Seurat kNN / RCTD / SPLIT / SpaGE,
+# and a file with the genes to impute): empty unless the environment names them. Nothing
+# machine-specific is built in.
+REF_RDS_DEFAULT = os.environ.get("XENIUM_REF_RDS", "").strip()
+IMPUTE_GENES_DEFAULT = os.environ.get("XENIUM_IMPUTE_GENES", "").strip()
+REF_RDS_PLACEHOLDER = "/path/to/reference.rds (a Seurat object with cell-type labels; default: $XENIUM_REF_RDS)"
+
+
+def _ref_rds_problem(path) -> "str | None":
+    """Why *path* cannot be used as the reference .rds file (None: it can)."""
+    path = str(path or "").strip()
+    if not path:
+        return ("Enter the path of the reference .rds file (a Seurat object with the cell-type labels). "
+                "Set the environment variable XENIUM_REF_RDS to prefill it.")
+    if not os.path.isfile(os.path.expanduser(path)):
+        return f"Reference .rds file not found: {path}"
+    return None
+
+
+def _impute_genes_default() -> str:
+    """Text for the 'Genes to Impute' box from the file XENIUM_IMPUTE_GENES names (one gene
+    per line or comma-separated); "" when it is unset or unreadable."""
+    if not IMPUTE_GENES_DEFAULT:
+        return ""
+    try:
+        with open(os.path.expanduser(IMPUTE_GENES_DEFAULT)) as fh:
+            return fh.read().strip()
+    except OSError as exc:
+        print(f"  XENIUM_IMPUTE_GENES: {IMPUTE_GENES_DEFAULT} could not be read ({exc})", flush=True)
+        return ""
+
+
 from concurrent.futures import ThreadPoolExecutor
 from dash import no_update, Patch
 import numpy as np

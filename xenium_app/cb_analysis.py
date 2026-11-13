@@ -359,7 +359,7 @@ def download_de_table(n_clicks):
         res = analysis._de_state.get("result")
     if not res:
         raise dash.exceptions.PreventUpdate
-    t = res["table"].sort_values(["padj", "pval"], kind="stable").drop(columns=["neg_log10_padj"])
+    t = analysis._de_sorted(res["table"])
     _safe = lambda v: re.sub(r"[^A-Za-z0-9_.-]+", "_", str(v))[:40]
     if res.get("kind") == "proximity":
         return dict(content=proximity._prox_csv_header(res) + t.to_csv(index=False),
@@ -379,7 +379,10 @@ def download_de_table(n_clicks):
               f"# median counts per cell: A {res.get('median_counts_a', float('nan')):.0f}, "
               f"B {res.get('median_counts_b', float('nan')):.0f}; pct_a / pct_b: cells with count >= 1 "
               f"transcript; rate_a / rate_b: sum of counts / sum of total counts of the group x 10,000; "
-              f"low_count: fewer than {analysis._DE_RATE_MIN_COUNT} transcripts of the gene over both groups\n")
+              f"low_count: fewer than {analysis._DE_RATE_MIN_COUNT} transcripts of the gene over both groups\n"
+              f"# {analysis._P_FLOOR_NOTE}\n")
+    if res.get("n_uncorrected"):
+        header += f"# {analysis._an_uncorrected_note(res['n_uncorrected'])}\n"
     if res.get("leak_summary"):
         header += "".join(f"# {ln}\n" for ln in str(res["leak_summary"]).splitlines())
     return dict(content=header + t.to_csv(index=False),
@@ -445,7 +448,7 @@ def run_geneset_score(n_clicks, name, text, seg_source, counts_mode):
         return False, True, "Paste at least 2 gene names."
     samples = analysis._an_samples(seg_source, counts_mode == "corrected")
     if not samples:
-        return False, True, "The active view has no expression matrix."
+        return False, True, analysis._an_no_matrix_msg(seg_source)
     found, missing = analysis._gs_match(genes, analysis._an_common_genes(samples))
     if len(found) < 2:
         return (False, True,

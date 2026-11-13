@@ -212,7 +212,11 @@ def loaded(xe, run):
     return run
 
 
-def test_the_modal_tab_lists_the_image_channels(xe, prepared_patches):
+def test_the_modal_tab_lists_the_image_channels(xe, prepared_patches, monkeypatch):
+    # the tab is tested without importing Cellpose (its probe imports torch: seconds); what
+    # the tab shows for each Cellpose situation is tested above with stand-in statuses
+    monkeypatch.setattr(xe, "_iseg_cellpose_status", lambda: {
+        "available": False, "version": None, "models": {}, "model_dir": None, "message": "not probed in this test"})
     chans = xe._iseg_channels()
     assert chans and chans == [str(c) for c in xe._iseg_image()[1].coords["c"].values]
     style, opts, value, note, ch_opts, ch, cyto_opts = xe.switch_imgseg_tab("imgseg", 1, None, None)
@@ -448,3 +452,132 @@ def test_cellpose_backend_runs_with_local_weights(xe, prepared_patches, raw):
     finally:
         import shutil
         shutil.rmtree(res["out_dir"], ignore_errors=True)
+
+
+# ── review round 5 ───────────────────────────────────────────────────────────
+def test_only_cyto_type_models_get_the_membrane_channel(xe, monkeypatch, prepared_patches):
+    models = {"nuclei": "/w/nucleitorch_0", "cyto3": "/w/cyto3"}
+    monkeypatch.setattr(xe, "_iseg_cellpose_status",
+                        lambda: {"available": True, "version": "3.1.0", "models": models, "model_dir": "/w", "message": ""})
+    assert not xe._iseg_uses_second_channel("classical") and not xe._iseg_uses_second_channel("cellpose:nuclei")
+    assert xe._iseg_uses_second_channel("cellpose:cyto3") and xe._iseg_uses_second_channel("cellpose:cyto2")
+    assert xe._iseg_cellpose_model("cellpose", 1) == "nuclei" and xe._iseg_cellpose_model("classical") is None
+    started = []
+    monkeypatch.setattr(xe, "_job_start", lambda kind, label, target, **kw: started.append(kw["kwargs"]))
+    for backend, want in (("cellpose:nuclei", ["DAPI"]), ("cellpose:cyto3", ["MEM", "DAPI"]), ("classical", ["DAPI"])):
+        with xe._imgseg_lock:
+            xe._imgseg_state.update({"status": "idle", "message": "", "result": None})
+        out = xe.run_imgseg_modal(1, "imgseg", 1, backend, "DAPI", "MEM", None, None, None, None,
+                                  8, 5, 5, 500, 1.0, 0.4, 0.0, [])
+        assert out[0] == "Image segmentation starting…", out
+        assert started[-1]["channels"] == want, (backend, started[-1]["channels"])
+    with xe._imgseg_lock:
+        xe._imgseg_state.update({"status": "idle", "message": "", "result": None})
+    # a programmatic call with two channels and the nuclei model: the nuclear channel alone
+    chans = xe._iseg_channels()
+    if len(chans) >= 2:
+        seen = {}
+
+        def stop(backend, diameter_px, n_channels=1, **kw):
+            seen["n"] = n_channels
+            raise RuntimeError("stop here")
+
+        monkeypatch.setattr(xe, "_iseg_make_method", stop)
+        nuc = xe._iseg_default_channel(chans)
+        other = next(c for c in chans if c != nuc)
+        for backend, want in (("cellpose:nuclei", 1), ("cellpose:cyto3", 2)):
+            xe._run_imgseg(backend=backend, channels=[other, nuc])
+            assert seen["n"] == want, backend
+        with xe._imgseg_lock:
+            xe._imgseg_state.update({"status": "idle", "message": "", "result": None})
+
+
+def test_sidebar_status_reports_the_run_of_the_active_segmentation(xe):
+    keep = {}
+    for tool, lock, state in xe._seg_states():
+        with lock:
+            keep[tool] = dict(state)
+    try:
+        with xe._baysor_lock:
+            xe._baysor_state.update({"status": "done", "message": "Loaded - 180,000 cells"})
+        with xe._imgseg_lock:
+            xe._imgseg_state.update({"status": "done", "message": "Done — 150 cells"})
+        assert xe.update_reseg_status(1, 2, "imgseg:abc") == "✓ Image segmentation: Done — 150 cells"
+        assert xe.update_reseg_status(1, 2, "baysor:def") == "✓ Baysor: Loaded - 180,000 cells"
+        assert xe.update_reseg_status(1, 2, "xenium") == "✓ Baysor: Loaded - 180,000 cells"
+        assert xe.update_reseg_status(1, 2, "proseg:zzz") == "✓ Baysor: Loaded - 180,000 cells"   # no Proseg run: the first loaded
+        with xe._baysor_lock:
+            xe._baysor_state.update({"status": "idle", "message": ""})
+        assert xe.update_reseg_status(1, 2, None) == "✓ Image segmentation: Done — 150 cells"
+        with xe._imgseg_lock:
+            xe._imgseg_state.update({"status": "idle", "message": ""})
+        assert xe.update_reseg_status(1, 2, "xenium") == ""
+    finally:
+        for tool, lock, state in xe._seg_states():
+            with lock:
+                state.clear()
+                state.update(keep[tool])
+
+
+def test_whole_tissue_run_counts_the_transcripts_of_the_segmented_extent(xe, prepared_patches, monkeypatch):
+    """Without a region the transcript denominator is the extent that was segmented (the
+    image patches), not the bounding box of the cells that happened to be found."""
+    seen = {}
+
+    def record(polys, tx_path, qv_min=20, tile_um=None, bounds=None, progress=None):
+        import shapely
+        seen["bounds"] = bounds
+        seen["cells"] = shapely.total_bounds(np.asarray(list(polys), dtype=object))
+        raise RuntimeError("stop after the bounds are known")
+
+    monkeypatch.setattr(xe, "_iseg_assign_transcripts", record)
+    with xe._imgseg_lock:
+        xe._imgseg_state.update({"status": "running", "message": "", "result": None})
+    try:
+        xe._run_imgseg(backend="classical", diameter_um=8, expand_um=5, min_tx=1, patch_um=200)
+    finally:
+        with xe._imgseg_lock:
+            xe._imgseg_state.update({"status": "idle", "message": "", "result": None})
+    assert seen.get("bounds") is not None, "a whole-tissue run passed no extent: the cells' bounding box was used"
+    px = float(xe.PIXEL_SIZE_UM)
+    image = xe._iseg_image()[1]
+    w, h = int(image.sizes["x"]) * px, int(image.sizes["y"]) * px
+    x0, y0, x1, y1 = seen["bounds"]
+    cx0, cy0, cx1, cy1 = seen["cells"]
+    assert 0 <= x0 < x1 <= w + 1e-6 and 0 <= y0 < y1 <= h + 1e-6        # inside the image (the patches over the tissue)
+    assert x0 <= cx0 + 1e-6 and y0 <= cy0 + 1e-6 and x1 >= cx1 - 1e-6 and y1 >= cy1 - 1e-6   # and around every cell
+    assert (x1 - x0) * (y1 - y0) >= (cx1 - cx0) * (cy1 - cy0)
+
+
+@pytest.mark.tools
+def test_cellpose_nuclei_model_runs_on_the_nuclear_channel_when_a_membrane_channel_is_picked(xe, prepared_patches):
+    st = xe._iseg_cellpose_status()
+    if not st["available"] or "nuclei" not in st["models"]:
+        pytest.skip("cellpose with local nuclei weights is not available: " + st["message"][:80])
+    pytest.importorskip("sopa")
+    chans = xe._iseg_channels()
+    nuc = xe._iseg_default_channel(chans)
+    others = [c for c in chans if c != nuc]
+    if not others:
+        pytest.skip("the image has one channel")
+    import shutil
+
+    def go(cyto):
+        with xe._imgseg_lock:
+            xe._imgseg_state.update({"status": "idle", "message": "", "result": None})
+        out = xe.run_imgseg_modal(1, "imgseg", 1, "cellpose:nuclei", nuc, cyto, None, None, None, None,
+                                  8, 5, 1, 300, 1.0, 0.4, 0.0, [])
+        assert out == ("Image segmentation starting…", False, False), out
+        tl.wait_state(xe._imgseg_state, xe._imgseg_lock, timeout=3600)
+        res = dict(xe._imgseg_state["result"])
+        with open(os.path.join(res["out_dir"], "params.json")) as f:
+            p = json.load(f)
+        snap = (p["channels"], p["model"], len(res["cells_df"]), int(res["cells_df"]["transcript_counts"].sum()),
+                sorted(res["cells_df"]["x_centroid"].round(2)))
+        shutil.rmtree(res["out_dir"], ignore_errors=True)
+        return snap
+
+    alone = go(None)
+    with_membrane = go(others[0])
+    assert alone[0] == [nuc] and with_membrane[0] == [nuc] and with_membrane[1] == "nuclei"
+    assert with_membrane[2:] == alone[2:] and alone[2] >= 3      # the same cells: the membrane stain was not segmented

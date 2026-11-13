@@ -172,6 +172,11 @@ def _get_expr_values(gene: str, alt_res=None, use_corrected: bool = False) -> "n
         idx = gni[lookup]
         if idx < expr.shape[1]:
             _col = expr.getcol(idx).toarray().ravel().astype(np.float32)
+            if expr is _corr and _corr is not None:
+                # a cell without corrected counts has no value (not a zero)
+                _cov = dataview._corrected_covered(alt_res if alt_res is not None else core.DATA)
+                if _cov is not None and len(_cov) == len(_col):
+                    _col[~_cov] = np.nan
             if alt_res is None:
                 _col = _align_expr_rows_to_df(_col)
             return np.log1p(_col)

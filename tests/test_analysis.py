@@ -216,8 +216,11 @@ def test_de_uses_the_active_counts_segmentation_and_samples(xe, D, view):
     assert cs[0]["corrected"] and not xe._an_samples("xenium", False)[0]["corrected"]
     got = xe._de_compute(cs, [a], [b])
     assert got["corrected"]
+    # cells left without any corrected count are not in the corrected view (not zeros)
+    a_cov = a & (cs[0]["rows"] >= 0)
+    assert got["n_a"] == int(a_cov.sum())
     np.testing.assert_allclose(got["table"]["pct_a"], 100 * np.asarray(
-        (corr[s["rows"][a]][:, [s["gni"][g] for g in s["genes"]]] > 0).mean(axis=0)).ravel(), atol=1e-9)
+        (corr[s["rows"][a_cov]][:, [s["gni"][g] for g in s["genes"]]] > 0).mean(axis=0)).ravel(), atol=1e-9)
     # a Proseg run: its own cells and matrix
     n = len(s["df"])
     keep = np.arange(n)[::-1]

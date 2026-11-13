@@ -750,7 +750,9 @@ class _UmapViewerProvider(_ViewerProvider):
         xy[1::2] = y
         return ({"n": int(len(x)), "bounds": self._xy_bounds(x, y),
                  "n_embedded": int(np.isfinite(x).sum()), "samples": len(jv["tables"]) if jv is not None else 1,
-                 "token": f"umap:{jobs._dataset_gen}:{core._subset_version}:{source}:{len(x)}"}, {"xy": xy})
+                 # a joint re-run puts other coordinates under the same source: its version is in the token
+                 "token": (f"umap:{jobs._dataset_gen}:{core._subset_version}:{source}:{len(x)}"
+                           + (f":j{joint._jc_state.get('version', 0)}" if jv is not None else ""))}, {"xy": xy})
 
     def colors(self, args):
         args = dict(args)

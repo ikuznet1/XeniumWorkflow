@@ -615,3 +615,61 @@ def test_estimator_test_handles_unusable_random_sets(xe):
     U3 = U.copy()
     U3[4] = np.nan
     assert xe._prox_test(U3, R, "cohort")["n_units"] == 4
+
+
+# ── review round 4 ───────────────────────────────────────────────────────────
+def test_auto_density_covariate_is_never_the_anchor_or_the_tested_type(xe, one):
+    prof = {"types": ["a", "b", "c"], "depth": np.array([5.0, 9.0, 1.0])}
+    assert xe._auto_source(prof) == "b" and xe._auto_source(prof, exclude=("b",)) == "a"
+    assert xe._auto_source(prof, exclude=("a", "b", "c")) is None and xe._auto_source({"types": [], "depth": []}) is None
+    s, lab, _d = one
+    # a section whose anchor type carries the most transcripts: "auto" used to pick it
+    counts = s["csc"].toarray()
+    counts[lab == X] *= 400
+    heavy = _sample(counts, s["df"][["x_centroid", "y_centroid"]].to_numpy(), GENES, "heavy")
+    labels = [lab]
+    assert xe._auto_source(xe._type_profiles([heavy], labels, GENES)) == X
+    res = xe._prox_compute([heavy], labels, T, X, params={"n_random": 8}, source="auto")
+    assert res["source"] not in (T, X, None)
+    with pytest.raises(ValueError, match="cannot be the anchor type"):
+        xe._prox_compute([heavy], labels, T, X, params={"n_random": 8}, source=X)
+
+
+def test_sample_without_a_condition_is_not_counted_in_the_result(xe, four):
+    samples, labels = [f[0] for f in four], [f[1] for f in four]
+    res = xe._prox_compute(samples, labels, T, X, params={"n_random": 6}, source="Other",
+                           conds=["A", "B", "A", ""], donors=["", "", "", ""])
+    rows = res["samples"]
+    assert [r["used"] for r in rows] == [True, True, True, False]
+    assert "no condition in the design" in rows[3]["note"]
+    assert res["info"]["n_units"] == 3 and res["n_samples"] == 3
+    assert res["n_target"] == sum(r["n_target"] for r in rows[:3])
+    assert res["n_a"] == sum(r["n_near"] for r in rows[:3]) and res["n_b"] == sum(r["n_far"] for r in rows[:3])
+    ref = xe._prox_compute(samples[:3], labels[:3], T, X, params={"n_random": 6}, source="Other",
+                           conds=["A", "B", "A"], donors=["", "", ""])
+    assert (res["n_a"], res["n_b"], res["n_target"], res["n_anchor"]) == (
+        ref["n_a"], ref["n_b"], ref["n_target"], ref["n_anchor"])
+    a, b = res["table"].set_index("gene"), ref["table"].set_index("gene")
+    np.testing.assert_allclose(a.loc[b.index, "log2fc"], b["log2fc"])
+    for col in ("leak_fraction", "leak_flag"):                       # the leak gate saw the same cells
+        if col in b.columns:
+            pd.testing.assert_series_equal(a.loc[b.index, col], b[col], check_names=False)
+
+
+def test_type_pickers_follow_the_segmentation_cluster_set_and_samples(xe, D):
+    from dash import no_update
+    cb = next(v for k, v in xe.app.callback_map.items() if "prox-target.options" in k)
+    ins = {(i["id"], i["property"]) for i in cb["inputs"]}
+    assert {("seg-source", "value"), ("cluster-method", "value"), ("extra-datasets-version", "data"),
+            ("prox-labels", "value")} <= ins
+    method = (D.get("cluster_methods") or [None])[0]
+    if not method:
+        pytest.skip("the bundle has no cluster set")
+    opts, _o2, src_opts, tv, av, sv = xe.update_prox_type_options("cluster", 0, 0, 0, "xenium", method, 0,
+                                                                  None, None, "auto")
+    have = [o["value"] for o in opts]
+    assert have and (tv, av, sv) == (no_update, no_update, no_update)
+    assert [o["value"] for o in src_opts][:2] == ["auto", "none"]
+    # a pick that exists stays; one from another cluster set / segmentation is cleared
+    out = xe.update_prox_type_options("cluster", 0, 0, 0, "xenium", method, 0, have[0], "no-such-type", "gone")
+    assert out[3] is no_update and out[4] is None and out[5] == "auto"

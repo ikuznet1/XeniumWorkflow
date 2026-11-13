@@ -56,13 +56,22 @@ const plotTraces = (id) => page.evaluate((i) => {
 // current value of a Dash prop through a throw-away clientside read of the React props
 const dropdownOptions = (id) => page.evaluate((i) => {
   const el = document.getElementById(i);
+  if (!el) return [];
   const key = Object.keys(el).find((k) => k.startsWith('__reactFiber'));
-  let f = el[key];
-  for (let d = 0; f && d < 30; d += 1, f = f.return) {
-    const p = f.memoizedProps;
-    if (p && Array.isArray(p.options)) return p.options.map((o) => (o && o.value !== undefined ? o.value : o));
-  }
-  return [];
+  // The fiber a DOM node points at may be the alternate of the committed one (React keeps
+  // two per component), whose props are those of the render before: both are read, and the
+  // one whose options differ from the other's older copy is taken - the longer list here,
+  // as the lists these checks wait for only grow from empty.
+  const walk = (f) => {
+    for (let d = 0; f && d < 30; d += 1, f = f.return) {
+      const p = f.memoizedProps;
+      if (p && Array.isArray(p.options)) return p.options.map((o) => (o && o.value !== undefined ? o.value : o));
+    }
+    return [];
+  };
+  const a = walk(el[key]);
+  const b = walk(el[key] && el[key].alternate);
+  return b.length > a.length ? b : a;
 }, id);
 
 if (await page.evaluate(() => getComputedStyle(document.querySelector('#umap-panel')).display === 'none')) {

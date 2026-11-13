@@ -310,7 +310,9 @@ def test_planted_batch_shift_is_removed_and_types_recovered(xe):
 @needs_harmony
 def test_job_installs_one_shared_cluster_set_with_harmony(xe, world):
     import harmonypy
-    st = _run(xe, {"integrate": "sample", "n_pcs": 20})
+    # no UMAP here (nothing below reads it; the embedding has its own test): the fit and its
+    # numba compilation were most of this test's time
+    st = _run(xe, {"integrate": "sample", "n_pcs": 20, "umap": False})
     assert st["status"] == "done", st["message"]
     res = xe._jc_result()
     assert res["name"] == "Joint clusters (Harmony)" and res["harmony"] and not res["from_cache"]
@@ -353,9 +355,19 @@ def test_job_installs_one_shared_cluster_set_with_harmony(xe, world):
 
 
 @needs_harmony
-def test_joint_umap_columns_and_umap_panel(xe, world, client):
-    if xe._jc_umap(np.random.default_rng(0).normal(size=(50, 5))) is None:
-        pytest.skip("umap-learn does not import")
+@pytest.mark.parametrize("real_umap", [False, pytest.param(True, marks=pytest.mark.slow)])
+def test_joint_umap_columns_and_umap_panel(xe, world, client, monkeypatch, real_umap):
+    """How the joint embedding reaches the per-cell columns, the UMAP panel, the WebGL viewer
+    and the cache. Default tier: a stand-in embedding (the first two components, spread by
+    cell), so that no UMAP is fitted; slow tier: the same checks on a real umap-learn fit."""
+    if real_umap:
+        if xe._jc_umap(np.random.default_rng(0).normal(size=(50, 5))) is None:
+            pytest.skip("umap-learn does not import")
+    else:
+        def stand_in(emb, seed=0):
+            emb = np.asarray(emb, dtype=np.float32)
+            return emb[:, :2] + np.random.default_rng(int(seed)).normal(0, 1e-3, size=(len(emb), 2)).astype(np.float32)
+        monkeypatch.setattr(xe, "_jc_umap", stand_in)
     st = _run(xe, {"integrate": "sample", "n_pcs": 20})
     assert st["status"] == "done", st["message"]
     res = xe._jc_result()
@@ -562,7 +574,9 @@ def test_callbacks_guards_and_poll(xe, world):
     tl.wait_state(xe._jc_state, xe._jc_lock)
     msg, disabled, ver, poll_off, cs_ver, gs_ver = xe.poll_joint(1, 0, 4, 9)
     assert "Joint clusters" in msg and disabled is False and poll_off is True and cs_ver == 5 and gs_ver == 10
-    assert xe.poll_joint(2, ver, 5, 10)[0] is dash.no_update
+    # no new version: the final message stays (a cancelled run shows "Cancelled", not its last step)
+    again = xe.poll_joint(2, ver, 5, 10)
+    assert again[0] == msg and again[2] is dash.no_update and again[4] is dash.no_update
     assert xe.download_joint(1)["filename"] == "joint_clusters.csv"
     fig, rows, cols = xe.update_jc_results(ver, 0, None, None)
     assert len(rows) >= 1 and [c["id"] for c in cols][-3:] == ["n_S0", "n_S1", "n_S2"]
@@ -575,3 +589,134 @@ def test_one_sample_callback_refusal(xe, D):
     assert out[0] is False and "at least two loaded samples" in out[2]
     summary, _ = xe.update_jc_design_summary("tab-joint", 0, 0, 0)
     assert summary.startswith("One sample loaded")
+
+
+# ── review round 5 ───────────────────────────────────────────────────────────
+def _fake_joint_set(xe, world, embedded, sample_keys=None, with_ids=True):
+    """A 'Joint clusters' set installed on the world's samples, with a cache entry holding a
+    UMAP for the cells *embedded* (per sample: positions in the frame the run saw)."""
+    tables = xe._view_tables("xenium")
+    code = np.concatenate([np.full(len(tk), i) for i, tk in enumerate(embedded)])
+    umap = np.column_stack([np.arange(len(code), dtype=np.float32), -np.arange(len(code), dtype=np.float32)])
+    arrays = {"sample": code, "umap": umap, **{f"take_{i}": np.asarray(tk) for i, tk in enumerate(embedded)}}
+    ids = [np.asarray(t["df"].index.astype(str))[np.asarray(tk)] for t, tk in zip(tables, embedded)]
+    if with_ids:
+        arrays.update({f"ids_{i}": v.astype(str) for i, v in enumerate(ids)})
+    xe._jc_cache_write("tagtest", arrays, {"sample_keys": sample_keys or [t["key"] for t in tables]})
+    key = xe._cs_install("Joint clusters", [np.zeros(len(t["df"]), dtype=int) for t in tables], "xenium",
+                         meta={"kind": "joint", "variant": "plain", "cache_tag": "tagtest"})
+    xe._jc_restore_seen.clear()
+    return key, tables, ids, umap, code
+
+
+def test_cached_joint_umap_is_reattached_by_cell_id_not_by_row(xe, world):
+    # the cached run embedded every second cell (as a run made under a subset did)
+    embedded = [np.arange(1, len(d["df"]), 2) for d in world.dsets]
+    key, tables, ids, umap, code = _fake_joint_set(xe, world, embedded)
+    # … and the frames are in another row order now (the subset was cleared, a store was re-read)
+    for d in world.dsets:
+        d["df"] = d["df"].iloc[::-1]
+    tables = xe._view_tables("xenium")
+    xe._jc_restore_umap(key, tables)
+    for si, t in enumerate(tables):
+        u1 = pd.Series(xe._ctl_get(t, "xenium", "joint_umap_1"), index=t["df"].index.astype(str))
+        want = pd.Series(umap[code == si, 0], index=ids[si])
+        np.testing.assert_array_equal(u1.loc[want.index].to_numpy(), want.to_numpy())    # each cell its own point
+        assert u1.drop(want.index).isna().all()                                         # the others: none
+
+
+@pytest.mark.parametrize("case", ["other_samples", "other_order", "other_cells", "no_ids"])
+def test_cached_joint_umap_is_not_attached_to_other_samples_or_cells(xe, world, case):
+    embedded = [np.arange(len(d["df"])) for d in world.dsets]
+    keys = [d["data_dir"] for d in world.dsets]
+    key, tables, _ids, _umap, _code = _fake_joint_set(
+        xe, world, embedded, with_ids=case != "no_ids",
+        sample_keys={"other_samples": ["/x/a", "/x/b", "/x/c"], "other_order": keys[::-1]}.get(case))
+    if case == "other_cells":                 # same sample key, another set of cells (another subset, a new run)
+        d = world.dsets[1]
+        d["df"] = d["df"].rename(index=lambda c: "other_" + str(c))
+        tables = xe._view_tables("xenium")
+    xe._jc_restore_umap(key, tables)
+    assert all(xe._ctl_get(t, "xenium", "joint_umap_1") is None for t in tables)
+    assert xe._jc_umap_view(key) is None
+
+
+def test_joint_umap_columns_are_written_only_after_the_set_is_installed(xe, world, monkeypatch):
+    tables = xe._view_tables("xenium")
+    old = [np.full(len(t["df"]), 7.0, dtype=np.float32) for t in tables]
+    for t, o in zip(tables, old):
+        xe._ctl_put(t, "xenium", {"joint_umap_1": o, "joint_umap_2": o})
+
+    def refuse(*a, **k):
+        raise ValueError("3 label arrays for 2 samples of the view")
+
+    monkeypatch.setattr(xe, "_cs_install", refuse)
+    st = _run(xe, {"integrate": "none", "n_pcs": 10, "umap": False})
+    assert st["status"] == "error" and "label arrays" in st["message"]
+    for t, o in zip(xe._view_tables("xenium"), old):
+        np.testing.assert_array_equal(xe._ctl_get(t, "xenium", "joint_umap_1"), o)       # the last run's embedding
+
+
+def test_cache_key_covers_matrix_content_and_available_backends(xe, world, monkeypatch):
+    samples, _t = _samples_of(world.dsets)
+    p = {"n_pcs": 10}
+    tag = xe._jc_cache_tag(samples, "xenium", p, [])
+    assert tag == xe._jc_cache_tag(_samples_of(world.dsets)[0], "xenium", p, [])
+    # the same cells, shape and number of stored values, other counts (SPLIT run again)
+    other = [dict(s) for s in samples]
+    m = other[0]["csc"].copy()
+    m.data = m.data[::-1].copy()
+    assert m.shape == samples[0]["csc"].shape and m.nnz == samples[0]["csc"].nnz
+    other[0]["csc"] = m
+    assert xe._jc_cache_tag(other, "xenium", p, []) != tag
+    assert xe._an_matrix_digest(m) != xe._an_matrix_digest(samples[0]["csc"])
+    assert xe._an_matrix_digest(samples[0]["csc"].copy()) == xe._an_matrix_digest(samples[0]["csc"])
+    # a run made without umap-learn / Leiden is not the run of a machine that has them
+    have = xe._jc_backends()
+    assert set(have) == {"umap", "leiden"}
+    monkeypatch.setattr(xe, "_jc_backends", lambda: {"umap": not have["umap"], "leiden": have["leiden"]})
+    assert xe._jc_cache_tag(samples, "xenium", p, []) != tag
+    monkeypatch.setattr(xe, "_jc_backends", lambda: {"umap": have["umap"], "leiden": not have["leiden"]})
+    assert xe._jc_cache_tag(samples, "xenium", p, []) != tag
+
+
+def test_joint_umap_by_gene_uses_corrected_counts_only_when_every_sample_has_them(xe, world, monkeypatch):
+    tables = xe._view_tables("xenium")
+    key = xe._cs_install("Joint clusters", [np.zeros(len(t["df"]), dtype=int) for t in tables], "xenium",
+                         meta={"kind": "joint", "variant": "plain"})
+    for t in tables:
+        v = np.arange(len(t["df"]), dtype=np.float32)
+        xe._ctl_put(t, "xenium", {"joint_umap_1": v, "joint_umap_2": v})
+    asked = []
+    monkeypatch.setattr(xe, "EXTRA_DATASETS", world.dsets[1:])
+    monkeypatch.setattr(xe, "_xenium_gene_values",
+                        lambda gene, corr=False: asked.append(("S0", corr)) or np.zeros(len(tables[0]["df"])))
+    monkeypatch.setattr(xe, "_extra_gene_values",
+                        lambda eds, gene, corr=False: asked.append(("extra", corr)) or np.zeros(len(eds["df"])))
+    for all_have, want in ((False, False), (True, True)):
+        asked.clear()
+        monkeypatch.setattr(xe, "_multi_use_corrected", lambda uc, _a=all_have: bool(uc) and _a)
+        fig = xe._jc_umap_fig("gene", key, "g0", 3, 0.8, use_corrected=True)
+        assert fig is not None and len(asked) == 3
+        assert {c for _w, c in asked} == {want}, asked           # never corrected for one sample and original for another
+
+
+def test_webgl_joint_umap_token_changes_with_a_joint_rerun(xe, world):
+    tables = xe._view_tables("xenium")
+    key = xe._cs_install("Joint clusters", [np.zeros(len(t["df"]), dtype=int) for t in tables], "xenium",
+                         meta={"kind": "joint", "variant": "plain"})
+    for t in tables:
+        v = np.arange(len(t["df"]), dtype=np.float32)
+        xe._ctl_put(t, "xenium", {"joint_umap_1": v, "joint_umap_2": v})
+    from xenium_app import viewer_provider
+    prov = viewer_provider._UmapViewerProvider()
+    src = f"xenium|emb:{key}"
+    tok = prov.cells(src)[0]["token"]
+    with xe._jc_lock:
+        xe._jc_state["version"] = xe._jc_state.get("version", 0) + 1      # what a finished run does
+    assert prov.cells(src)[0]["token"] != tok
+    assert prov.cells("xenium")[0]["token"] == prov.cells("xenium")[0]["token"]
+    # the page's cells key of the joint embedding carries the version the poll bumps
+    js = open(os.path.join(os.path.dirname(os.path.dirname(viewer_provider.__file__)), "assets",
+                           "xenium_viewer_dash.js")).read()
+    assert "jointEmb ? an.gsVersion : 0" in js

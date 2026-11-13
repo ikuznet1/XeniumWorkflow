@@ -8,7 +8,8 @@
 // Writes screenshots, out/tiles/* (raw uint16 tiles + manifest) and out/results.json.
 import { chromium } from "playwright";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -20,8 +21,10 @@ const arg = (name, def) => {
 };
 const SKIN = arg("skin", "http://127.0.0.1:8085");
 const TINY = arg("tiny", "http://127.0.0.1:8086");
-const SKIN_DIR = arg("skin-dir", "/Users/ikuz/Documents/XeniumTestData/prime_human_skin_ffpe");
-const TINY_DIR = arg("tiny-dir", "/Users/ikuz/Documents/XeniumTestData/prime_mouse_ileum_tiny");
+// bundles: --skin-dir / --tiny-dir, else XV_SKIN / XV_TINY, else <XV_TEST_DATA>/<name> (as test/lib.mjs)
+const TEST_DATA = process.env.XV_TEST_DATA || resolve(homedir(), "Documents", "XeniumTestData");
+const SKIN_DIR = arg("skin-dir", process.env.XV_SKIN || resolve(TEST_DATA, "prime_human_skin_ffpe"));
+const TINY_DIR = arg("tiny-dir", process.env.XV_TINY || resolve(TEST_DATA, "prime_mouse_ileum_tiny"));
 const VIEW = { width: 1200, height: 800 };
 const SPOT = [6800, 1700]; // µm, dense tissue in the skin dataset
 

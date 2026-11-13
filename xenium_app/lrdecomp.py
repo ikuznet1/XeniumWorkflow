@@ -667,7 +667,7 @@ def _run_lrdecomp(pairs_text, label_kind, seg_source, method, use_corrected, rad
             return
         samples = analysis._an_samples(seg_source, use_corrected)
         if not samples:
-            _set("error", "The active view has no expression matrix.")
+            _set("error", analysis._an_no_matrix_msg(seg_source))
             return
         labels, cat = stats._comp_labels(label_kind, samples, seg_source, method)
         if all(l is None for l in labels):
@@ -689,6 +689,7 @@ def _run_lrdecomp(pairs_text, label_kind, seg_source, method, use_corrected, rad
         jobs._check_dataset_gen(_gen)
         corrected = bool(samples[0]["corrected"])
         res.update({"gen": _gen, "category": cat, "corrected": corrected, "seg_source": seg_source or "xenium",
+                    "n_uncorrected": analysis._an_uncorrected(samples),
                     "n_samples": len(samples), "n_skipped_lines": n_skip, "seconds": _time.time() - _t0,
                     "samples": [{"label": s["label"], "name": s["name"], "cond": c, "donor": d,
                                  "n_cells": k, "n_adj": a, "used": i in res["samples_used"]}
@@ -733,6 +734,8 @@ def _run_lrdecomp(pairs_text, label_kind, seg_source, method, use_corrected, rad
             msg += f"\n⚠ {res['reason'][0].upper() + res['reason'][1:]}."
         if use_corrected and not corrected:
             msg += " Original counts were used: not every sample has SPLIT-corrected counts."
+        if res["n_uncorrected"]:
+            msg += " " + analysis._an_uncorrected_note(res["n_uncorrected"]) + "."
         if res["types_dropped"]:
             msg += (f"\nOnly the {_LRD_MAX_TYPES} most abundant groups were used; left out: "
                     f"{', '.join(res['types_dropped'][:10])}{'…' if len(res['types_dropped']) > 10 else ''}.")
@@ -899,6 +902,8 @@ def _lrd_csv(res) -> str:
                 (f"; d_* = log2 A ({nA}) / B ({nB}) of the pooled conditions; {res['reason']}" if res["mode"] == "ratio"
                  else f"; {res['reason']}")),
              "# why an exposure differs (expression vs contact vs geometry); not evidence of signalling"]
+    if res.get("n_uncorrected"):
+        lines.append(f"# {analysis._an_uncorrected_note(res['n_uncorrected'])}")
     for smp in res["samples"]:
         lines.append(f"# sample {smp['label']} ({smp['name']}): {smp['n_cells']} labelled cells, {smp['n_adj']} "
                      f"contact pairs; condition {smp['cond'] or '-'}; donor {smp['donor'] or '-'}"
