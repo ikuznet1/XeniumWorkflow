@@ -11,6 +11,7 @@ import pandas as pd
 import scipy.sparse as sp
 
 from . import core, jobs, caching, dataview, clustering, split, sdata_store, regions
+from . import provenance
 
 
 # Control / non-gene feature-name prefixes (used when transcripts.parquet has no is_gene column)
@@ -1075,6 +1076,8 @@ def _load_cached_baysor(out_dir: str) -> None:
                 core._baysor_state["result"] = result
             if status != "running":
                 core._baysor_state["loading_out_dir"] = None   # see load_seg_run_from_cache
+        if status == "done":
+            provenance._prov_record("baysor", "Baysor segmentation (cached run loaded)", seg_source=provenance._prov_run_source("baysor", result), params={"run": os.path.basename(str(out_dir).rstrip("/"))}, cache=True, message=message, result=result)
     print(f"Loading cached Baysor: {os.path.basename(out_dir)}…", flush=True)
     try:
         _set("running", "Loading cached Baysor result…")
@@ -1330,6 +1333,8 @@ def _load_cached_proseg(out_dir: str) -> None:
                 core._proseg_state["result"] = result
             if status != "running":
                 core._proseg_state["loading_out_dir"] = None   # see load_seg_run_from_cache
+        if status == "done":
+            provenance._prov_record("proseg", "Proseg segmentation (cached run loaded)", seg_source=provenance._prov_run_source("proseg", result), params={"run": os.path.basename(str(out_dir).rstrip("/"))}, cache=True, message=message, result=result)
     print(f"Loading cached Proseg: {os.path.basename(out_dir)}…", flush=True)
     try:
         _set("running", "Loading cached Proseg result…")
@@ -1682,6 +1687,8 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
             core._baysor_state["message"] = message
             if result is not None:
                 core._baysor_state["result"] = result
+        if status == "done":
+            provenance._prov_record("baysor", seg_source=provenance._prov_run_source("baysor", result), params={"scale": scale, "scale_std": scale_std, "min_molecules_per_cell": min_mol, "use_prior": use_prior, "prior_confidence": prior_conf, "prior_type": prior_type, "n_clusters": n_clusters, "use_patches": use_patches, "qv_min": qv_min, "region": [x_min, x_max, y_min, y_max]}, tools={"baysor": provenance._prov_tool_version("baysor")}, packages=("sopa", "spatialdata"), message=message, result=result)
 
     BAYSOR_CANDIDATES = [
         "baysor",
@@ -1699,6 +1706,7 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
             try:
                 r = subprocess.run([candidate, "--version"], capture_output=True, timeout=180)
                 if r.returncode == 0:
+                    provenance._prov_tool_seen("baysor", r.stdout or r.stderr)
                     return candidate
             except (FileNotFoundError, PermissionError, NotADirectoryError):
                 pass
@@ -2022,6 +2030,8 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
             core._proseg_state["message"] = message
             if result is not None:
                 core._proseg_state["result"] = result
+        if status == "done":
+            provenance._prov_record("proseg", seg_source=provenance._prov_run_source("proseg", result), params={"initial_voxel_size": voxel_size, "n_threads": n_threads, "n_samples": n_samples, "recorded_samples": recorded_samples, "schedule": schedule, "nuclear_reassignment_prob": nuclear_reassign_prob, "prior_seg_reassignment_prob": prior_seg_prob, "prior_type": prior_type, "use_patches": use_patches, "region": [x_min, x_max, y_min, y_max]}, tools={"proseg": provenance._prov_tool_version("proseg")}, packages=("sopa", "spatialdata"), message=message, result=result)
 
     PROSEG_CANDIDATES = [
         "proseg",
@@ -2033,11 +2043,13 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
         import shutil
         found = shutil.which("proseg")
         if found:
+            provenance._prov_tool_version("proseg", found)
             return found
         for candidate in PROSEG_CANDIDATES:
             try:
                 r = subprocess.run([candidate, "--version"], capture_output=True, timeout=10)
                 if r.returncode == 0:
+                    provenance._prov_tool_seen("proseg", r.stdout or r.stderr)
                     return candidate
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 pass

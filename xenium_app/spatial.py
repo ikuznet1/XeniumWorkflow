@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 from . import core, jobs, dataview
+from . import provenance
 
 
 def _build_raw_neighbor_matrix(label_arr, neighbor_indices, n_types):
@@ -148,6 +149,13 @@ def _run_spatial_analysis(label_key, n_neighbors, alt_res):
                 "niche_labels": niche_labels,
                 "umap_coords": umap_coords,
             }
+            _done_msg = core._spatial_state["message"]
+        provenance._prov_record(
+            "spatial", seg_source=provenance._prov_labels_source(label_key),
+            params={"n_neighbors": n_neighbors, "labels_key": label_key},
+            result={"n_cell_types": n_types, "n_cells": int(len(coords_valid)),
+                    "n_cells_unlabelled": int(len(coords) - len(coords_valid))},
+            message=_done_msg, labels=(label_key, None))
     except Exception as e:
         import traceback
         with core._spatial_lock:
@@ -305,6 +313,13 @@ def _run_spatial_niches(n_clusters: int, n_neighbors: int, label_key: str | None
             jobs._check_dataset_gen(_gen)
             core._niche_state["status"] = "done"
             core._niche_state["message"] = f"Done — {n_clusters} niches computed for {n_cells:,} cells"
+        provenance._prov_record(
+            "niches", seg_source=("xenium" if alt_res is None else str(alt_res.get("source") or "resegmentation")),
+            params={"n_clusters": n_clusters, "n_neighbors": n_neighbors, "labels_key": label_key,
+                    "features": ("cell-type composition of the neighbours" if labels_series is not None
+                                 else "see the status line")},
+            result={"n_niches": int(n_clusters), "n_cells": int(n_cells)},
+            message=f"Done — {n_clusters} niches computed for {n_cells:,} cells", labels=(label_key, None))
     except jobs._JobCancelled:
         raise
     except Exception as exc:

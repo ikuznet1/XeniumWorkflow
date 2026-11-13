@@ -6,6 +6,7 @@ import pandas as pd
 import scipy.sparse as sp
 
 from . import core, jobs, dataview, reseg
+from . import provenance
 
 
 # ─── Reseg clustering + UMAP ─────────────────────────────────────────────────
@@ -151,6 +152,8 @@ def _run_reseg_umap() -> None:
             core._umap_reseg_state["message"] = message
             if result is not None:
                 core._umap_reseg_state["result"] = result
+        if status == "done":
+            provenance._prov_record("umap", seg_source=core._umap_reseg_state.get("seg_source", "xenium"), params={}, packages=("umap-learn", "leidenalg", "igraph", "scanpy"), message=message, result=result)
 
     try:
         # Get the reseg result for the segmentation source selected in the UI

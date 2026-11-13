@@ -20,7 +20,7 @@ from . import core, jobs, stats, segfree, app_layout, cb_analysis, cb_controls
     State("sfree-labels",    "value"),
 )
 def update_sfree_label_options(active_tab, _annot, _ds, seg_source, _ex, color_by=None, current=None):
-    if active_tab != "tab-abundance":
+    if active_tab not in ("tab-segfree", "tab-abundance"):
         raise dash.exceptions.PreventUpdate
     opts = [o for o in stats._comp_category_options(seg_source, color_by) if o["value"] != "niche"]
     have = [o["value"] for o in opts]

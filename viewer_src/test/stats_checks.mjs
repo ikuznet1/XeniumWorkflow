@@ -9,6 +9,7 @@
 // with DESeq2 for the pseudobulk part and a cell-type annotation of every sample for the
 // composition / ligand-receptor parts (those checks are reported as SKIP otherwise).
 import {chromium} from 'playwright';
+import {openTab} from './lib.mjs';
 import fs from 'node:fs';
 
 const base = process.argv[2] || 'http://127.0.0.1:8050';
@@ -79,7 +80,7 @@ check(`${nS} samples loaded side by side`, /samples loaded/.test(await text('#ex
 check('counts mode note is empty when no sample has SPLIT-corrected counts', (await text('#counts-mode-note')) === '' || /SPLIT/.test(await text('#counts-mode-note')), await text('#counts-mode-note'));
 
 // ── the design, through the editor ───────────────────────────────────────────
-await setProp('plots-tabs', {active_tab: 'tab-de'});
+await openTab(page, 'tab-de');
 await page.waitForSelector('#de-run-btn', {state: 'visible'});
 check('cell-level mode shows the two group pickers and its caveat',
   await page.isVisible('#de-group-a') && !(await page.isVisible('#de-pb-population')) && /Wilcoxon/.test(await text('#de-caveat')));
@@ -176,7 +177,7 @@ if (noR) {
 }
 
 // ── composition between conditions ───────────────────────────────────────────
-await setProp('plots-tabs', {active_tab: 'tab-abundance'});
+await openTab(page, 'tab-composition');
 await page.waitForSelector('#comp-run-btn', {state: 'visible'});
 await page.waitForFunction(() => /A \(even\)/.test(document.querySelector('#comp-design-summary')?.innerText || ''), null, {timeout: 30000});
 await page.waitForTimeout(1200);
@@ -205,7 +206,7 @@ check('the compositional caveat is on the tab', /Proportions are compositional/.
 await shot('st_3_composition');
 
 // ── transcript density of the added samples, both renderers ──────────────────
-await setProp('plots-tabs', {active_tab: 'tab-density'});
+await openTab(page, 'tab-density');
 await page.waitForSelector('#density-run-btn', {state: 'visible'});
 const gene = process.env.XS_GENE || '__all__';
 await setProp('density-gene', {value: gene});
@@ -262,7 +263,7 @@ await setProp('renderer-mode', {value: 'webgl'});
 await page.waitForFunction(() => !(window.XeniumViewer.instance.deck.props.layers || []).flat(3).some((l) => l && /^xv-density/.test(l.id)), null, {timeout: 120000});
 
 // ── Moran's I ────────────────────────────────────────────────────────────────
-await setProp('plots-tabs', {active_tab: 'tab-moran'});
+await openTab(page, 'tab-moran');
 await page.waitForSelector('#moran-run-btn', {state: 'visible'});
 await page.click('#moran-run-btn');
 await waitText('#moran-status', /Moran's I, kNN graph|No sample|no expression matrix/);
@@ -282,7 +283,7 @@ await page.waitForTimeout(2500);
 await shot('st_6_moran_table_top_gene_on_map');
 
 // ── ligand-receptor scores ───────────────────────────────────────────────────
-await setProp('plots-tabs', {active_tab: 'tab-lr'});
+await openTab(page, 'tab-lr');
 await page.waitForSelector('#lr-run-btn', {state: 'visible'});
 await page.click('#lr-run-btn');
 await waitText('#lr-status', /No ligand–receptor pairs/);

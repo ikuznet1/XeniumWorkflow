@@ -55,3 +55,64 @@
 #sdata-section:hover .collapsible-details {
     max-height: 900px;
 }
+
+/* ── Two-level navigation of the plots panel (ui._nav_bar / cb_nav.py) ───────── */
+/* plots-tabs keeps every tab; its own flat strip of labels is replaced by the bar */
+#plots-tabs { display: none !important; }
+#plots-nav { flex-shrink: 0; margin-bottom: 4px; }
+#plots-nav .nav-row { display: flex; flex-wrap: wrap; gap: 2px; align-items: stretch; }
+#plots-nav .nav-row-sub { border-bottom: 1px solid #30363d; padding: 3px 0 0 0; }
+#plots-nav button { background: transparent; border: 1px solid transparent; color: #8b949e;
+    font-size: 12px; line-height: 1.2; cursor: pointer; white-space: nowrap; }
+#plots-nav .nav-group { padding: 4px 11px; border-radius: 5px; font-weight: 600; }
+#plots-nav .nav-group:hover, #plots-nav .nav-sub:hover { color: #e6edf3; }
+#plots-nav .nav-group.active { color: #e6edf3; background: #21262d; border-color: #30363d; }
+#plots-nav .nav-sub { padding: 3px 7px 4px 7px; font-size: 11.5px; border-bottom: 2px solid transparent;
+    margin-bottom: -1px; }
+#plots-nav .nav-sub.active { color: #e6edf3; border-bottom-color: #58a6ff; }
+#plots-nav .nav-hidden { display: none !important; }
+#plots-nav .nav-design-bar { display: flex; align-items: center; gap: 8px; padding: 4px 2px 0 2px;
+    font-size: 11px; color: #8b949e; min-width: 0; }
+#plots-nav .nav-design-btn { border: 1px solid #30363d; border-radius: 4px; color: #e6edf3;
+    background: #21262d; padding: 2px 8px; font-size: 11px; flex-shrink: 0; }
+#plots-nav .nav-design-summary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+#plots-nav .nav-design-summary:hover { white-space: normal; }
+#plots-nav .nav-notice { margin: 4px 2px 0 2px; padding: 5px 8px; font-size: 11px; line-height: 1.35;
+    color: #e3b341; background: rgba(187, 128, 9, 0.12); border: 1px solid rgba(187, 128, 9, 0.4);
+    border-radius: 4px; }
+/* one design entry (in the bar): the per-tab copies of the button stay in the page for
+   the callbacks that listen to them, but are not shown */
+#de-design-open-btn, #comp-design-open-btn, #coloc-design-open-btn, #prox-design-open-btn,
+#agg-design-open-btn, #lrd-design-open-btn, #jc-design-open-btn,
+#de-design-summary, #comp-design-summary, #coloc-design-summary, #prox-design-summary,
+#agg-design-summary, #lrd-design-summary { display: none !important; }
+/* ... and the rows that held only that button and summary take no room */
+#umap-panel .tab-content div:has(> #de-design-open-btn), #umap-panel .tab-content div:has(> #comp-design-open-btn),
+#umap-panel .tab-content div:has(> #coloc-design-open-btn), #umap-panel .tab-content div:has(> #prox-design-open-btn),
+#umap-panel .tab-content div:has(> #agg-design-open-btn), #umap-panel .tab-content div:has(> #lrd-design-open-btn) {
+    display: none !important; }
+
+/* "Options" disclosure of a tab (ui._options): secondary parameters, defaults in the summary */
+details.tab-options { flex-shrink: 0; margin: 0 8px 2px 8px; border: 1px solid #21262d; border-radius: 4px; }
+details.tab-options > summary { font-size: 11px; color: #8b949e; cursor: pointer; padding: 2px 6px;
+    user-select: none; list-style-position: inside; }
+details.tab-options > summary:hover { color: #e6edf3; }
+details.tab-options[open] > summary { color: #e6edf3; border-bottom: 1px solid #21262d; }
+details.tab-options .tab-options-body > div { padding-left: 4px !important; padding-right: 4px !important; }
+
+/* Method notes of the tabs: two lines, the rest on a click (assets/nav.js toggles .note-open) */
+#umap-panel .tab-content [id$="-note"], #umap-panel .tab-content [id$="-caveat"] {
+    max-height: 2.9em; overflow: hidden; cursor: pointer; position: relative; flex-shrink: 0; }
+#umap-panel .tab-content [id$="-note"]:not(.note-open):not(:empty)::after,
+#umap-panel .tab-content [id$="-caveat"]:not(.note-open):not(:empty)::after {
+    content: "… more"; position: absolute; right: 0; bottom: 0; padding: 0 8px 0 18px; color: #58a6ff;
+    background: linear-gradient(90deg, rgba(13,17,23,0), #0d1117 35%); }
+#umap-panel .tab-content [id$="-note"].note-open, #umap-panel .tab-content [id$="-caveat"].note-open {
+    max-height: none; }
+
+/* The open tab fills the plots panel and scrolls inside it. (The tab body used to take
+   its natural height inside a panel that hides its overflow: whatever was below the
+   panel's lower edge - the last table rows, the W x H inputs - could not be reached.) */
+#umap-panel > .tab-content { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; }
+#umap-panel > .tab-content > .tab-pane.active { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; }
+#umap-panel > .tab-content > .tab-pane.active > div { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; }

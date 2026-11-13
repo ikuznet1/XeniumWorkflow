@@ -18,6 +18,7 @@ import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 
 from . import core, jobs, dataview, ui, reseg, figures, analysis, stats, controls
+from . import provenance
 
 
 # ─── State ────────────────────────────────────────────────────────────────────
@@ -461,6 +462,8 @@ def _run_segfree(seg_source, method, label_kind, cell_type, markers_text, n_mark
                 _sfree_state["result"] = result
             if status in ("done", "error"):
                 _sfree_state["version"] += 1
+        if status == "done":
+            provenance._prov_record("segfree", seg_source=seg_source, corrected=use_corrected, params={"cell_type": cell_type, "markers": markers_text, "n_markers": n_markers, "bins": bins_text, "area_mode": area_mode, "hole_max_bins": hole_max_bins, "n_null": n_null, "seed": seed}, labels=(label_kind, method), seeds={"seed": seed}, uses_design=True, message=message, result=result)
 
     try:
         _t0 = _time.time()
@@ -763,7 +766,7 @@ def _sfree_csv(res) -> str:
         txt += f"\n# between conditions: {res['across_note']}\n" + res["across"].to_csv(index=False)
     elif res.get("across_note"):
         txt += f"\n# between conditions: {res['across_note']}\n"
-    return txt
+    return provenance._prov_csv_stamp(res, (txt))
 
 
 # ─── Layout ───────────────────────────────────────────────────────────────────
@@ -782,13 +785,13 @@ def _sfree_section():
                          style={"flex": "1", "minWidth": "170px", "fontSize": "11px"}),
             html.Span("Type:", style=L),
             dcc.Dropdown(id="sfree-type", options=[], value=None, placeholder="Cell type…",
-                         style={"width": "230px", "fontSize": "11px"}),
-            html.Span("Markers to derive:", style=L),
-            controls._num(id="sfree-n-markers", value=_SFREE_N_MARKERS, min=1, max=50, step=1),
+                         style={"width": "200px", "fontSize": "11px"}),
             dbc.Button("Run", id="sfree-run-btn", color="primary", size="sm", n_clicks=0,
                        style={"fontSize": "11px", "padding": "2px 12px"}),
         ], style=S),
-        html.Div([
+        ui._options([html.Div([
+            html.Span("Markers to derive:", style=L),
+            controls._num(id="sfree-n-markers", value=_SFREE_N_MARKERS, min=1, max=50, step=1),
             html.Span("Tile sizes (µm):", style=L),
             dcc.Input(id="sfree-bins", type="text", value=", ".join(f"{b:g}" for b in _SFREE_BINS), debounce=True,
                       style={**analysis._AN_INPUT_STYLE, "width": "130px"}),
@@ -806,7 +809,9 @@ def _sfree_section():
                      placeholder="Optional: marker genes, separated by commas or new lines (leave empty to "
                                  "derive them from the annotation of the chosen type)…",
                      style={**analysis._AN_INPUT_STYLE, "margin": "2px 8px", "height": "34px", "flexShrink": "0",
-                            "fontFamily": "monospace", "resize": "vertical"}),
+                            "fontFamily": "monospace", "resize": "vertical", "width": "calc(100% - 16px)"})],
+            summary=f"Options ({_SFREE_N_MARKERS} markers derived, tiles {', '.join(f'{b:g}' for b in _SFREE_BINS)} µm, area from cells, "
+                    f"{_SFREE_N_NULL} redistributions, own marker list)"),
         html.Div(id="sfree-status", style={**analysis._AN_STATUS_STYLE, "whiteSpace": "pre-wrap"}),
         html.Div(_SFREE_NOTE, id="sfree-note", style=analysis._AN_NOTE_STYLE),
         # the block has no height of its own (it sits in a scrolling column): the figure

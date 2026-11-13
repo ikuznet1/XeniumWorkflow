@@ -19,6 +19,7 @@ from dash import dcc, html
 import dash_bootstrap_components as dbc
 
 from . import core, jobs, ui, analysis, stats, controls
+from . import provenance
 
 # ─── Parameters ───────────────────────────────────────────────────────────────
 _PROX_NEAR_UM = 25.0          # near: nearest anchor at most this far
@@ -767,6 +768,8 @@ def _run_proximity_de(target, anchor, label_kind, seg_source, method, use_correc
             analysis._de_state["message"] = message
             if result is not None:
                 analysis._de_state["result"] = result
+        if status == "done":
+            provenance._prov_record("proximity", seg_source=seg_source, corrected=use_corrected, params={"target": target, "anchor": anchor, "source": source, **(params or {})}, labels=(label_kind, method), message=message, result=result)
 
     try:
         _t0 = _time.time()
@@ -915,7 +918,7 @@ def _prox_csv_header(res: dict) -> str:
         lines.append(f"# sample {r['label']} ({r['name']}): {r['n_target']} target cells, {r['n_anchor']} anchors, "
                      f"{r['n_near']} near, {r['n_far']} far; condition {r['cond'] or '-'}; donor {r['donor'] or '-'}"
                      + (f"; not used: {r['note']}" if not r["used"] else ""))
-    return "\n".join(lines) + "\n"
+    return provenance._prov_csv_stamp(res, ("\n".join(lines) + "\n"))
 
 
 # ─── Contact-group pseudobulk DE ──────────────────────────────────────────────
@@ -1151,6 +1154,8 @@ def _run_contact_de(target, anchor, label_kind, seg_source, method, use_correcte
             analysis._de_state["message"] = message
             if result is not None:
                 analysis._de_state["result"] = result
+        if status == "done":
+            provenance._prov_record("contact", seg_source=seg_source, corrected=use_corrected, params={"target": target, "anchor": anchor, "radius": radius, "min_cells": min_cells, "n_shuffle": n_shuffle, "min_count": min_count, "seed": seed, "leak_gate": leak_gate}, labels=(label_kind, method), seeds={"seed": seed}, uses_design=True, r_packages=("DESeq2", "edgeR"), message=message, result=result)
 
     try:
         _t0 = _time.time()
@@ -1278,7 +1283,7 @@ def _contact_csv_header(res: dict) -> str:
                      + (f"block {r['block']}" if r["testable"] else "not used"))
     if res.get("n_uncorrected"):
         lines.append(f"# {analysis._an_uncorrected_note(res['n_uncorrected'])}")
-    return "\n".join(lines) + "\n"
+    return provenance._prov_csv_stamp(res, ("\n".join(lines) + "\n"))
 
 
 def _prox_samples_view(res):
@@ -1322,7 +1327,7 @@ def _prox_controls() -> list:
             dcc.Dropdown(id="prox-anchor", options=[], value=None, placeholder="Anchor cell type…",
                          style={"flex": "1", "minWidth": "160px", "fontSize": "11px"}),
         ], style=S),
-        html.Div([
+        ui._options([html.Div([
             html.Span("Near ≤ (µm):", style=L), num(id="prox-near", value=_PROX_NEAR_UM, min=1, max=1000, step=1),
             html.Span("Far ≥ (µm):", style=L), num(id="prox-far", value=_PROX_FAR_UM, min=2, max=5000, step=1),
             html.Span("Random anchor sets:", style=L), num(id="prox-nrand", value=_PROX_N_RANDOM, min=1, max=2000, step=1),
@@ -1339,7 +1344,8 @@ def _prox_controls() -> list:
             html.Span("Contact radius (µm):", style=L), num(id="contact-radius", value=_CONTACT_R_UM, min=1, max=1000, step=1),
             html.Span("Min. cells / sample / group:", style=L), num(id="contact-min-cells", value=_CONTACT_MIN_CELLS, min=1, step=1),
             html.Span("Label shuffles:", style=L), num(id="contact-nshuffle", value=_CONTACT_N_SHUFFLE, min=0, max=5000, step=1),
-        ], id="de-contact-params", style={**S, "display": "none"}),
+        ], id="de-contact-params", style={**S, "display": "none"})],
+            summary="Options (distances, random anchor sets, covariate, minimum cells: defaults shown inside)"),
         html.Div([
             dbc.Button("Samples & conditions…", id="prox-design-open-btn", color="secondary", size="sm",
                        n_clicks=0, style={"fontSize": "11px", "padding": "2px 8px"}),

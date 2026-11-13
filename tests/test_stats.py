@@ -879,7 +879,8 @@ def test_morans_i_tab_runs_per_sample_as_a_job(xe, D, expressed_gene):
         xe.moran_pick_gene_from_table({"row": 40, "column": 1}, rows[:15], opts)
     out = xe.download_moran_table(1)
     head = [l for l in out["content"].splitlines() if l.startswith("#")]
-    assert "k = 6" in head[0] and "row-standardised" in head[0] and len(head) == 5
+    assert "k = 6" in head[0] and "row-standardised" in head[0] and len(head) == 6
+    assert head[-1].startswith("# provenance record: prov-")       # the record the table came from
     assert "unit of the p-values" in head[1] and "count >= 1" in head[1]
     assert "neg_log10_pval" in head[2] and "1e-300" in head[2]          # p below the float range is never 0
     body = pd.read_csv(io.StringIO(out["content"]), comment="#")

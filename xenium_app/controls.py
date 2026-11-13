@@ -21,6 +21,7 @@ import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 
 from . import core, jobs, caching, dataview, ui, annotation, reseg, figures, analysis, sdata_store, stats
+from . import provenance
 
 
 # ─── State ────────────────────────────────────────────────────────────────────
@@ -350,6 +351,8 @@ def _run_compartments(seg_source, method, label_kind, dominant, params=None) -> 
                 _comp_ctl_state["result"] = result
             if status in ("done", "error"):
                 _comp_ctl_state["version"] += 1
+        if status == "done":
+            provenance._prov_record("compartments", seg_source=seg_source, params={"dominant": dominant, **(params or {})}, labels=(label_kind, method), message=message, result=result)
 
     try:
         _t0 = _time.time()
@@ -716,6 +719,8 @@ def _run_spillover(seg_source, method, label_kind, source, markers_text, n_marke
                 _spill_state["result"] = result
             if status in ("done", "error"):
                 _spill_state["version"] += 1
+        if status == "done":
+            provenance._prov_record("spillover", seg_source=seg_source, corrected=use_corrected, params={"marker_source": source, "markers": markers_text, "n_markers": n_markers, "own_frac": own_frac}, labels=(label_kind, method), message=message, result=result)
 
     try:
         _t0 = _time.time()
@@ -1508,6 +1513,8 @@ def _run_segqc(method, sets_text, source_type, radius, run_values=None) -> None:
                 _segqc_state["result"] = result
             if status in ("done", "error"):
                 _segqc_state["version"] += 1
+        if status == "done":
+            provenance._prov_record("segqc", params={"annotation_method": method, "gene_sets": sets_text, "source_type": source_type, "radius": radius}, message=message, result=result)
 
     try:
         _t0 = _time.time()
@@ -2081,6 +2088,8 @@ def _run_coloc(seg_source, method, label_kind, radius, n_perm, placebo_focal=Non
                 _coloc_state["result"] = result
             if status in ("done", "error"):
                 _coloc_state["version"] += 1
+        if status == "done":
+            provenance._prov_record("coloc", seg_source=seg_source, params={"radius": radius, "n_perm": n_perm, "placebo_focal": placebo_focal, "seed": seed}, labels=(label_kind, method), seeds={"seed": seed}, uses_design=True, message=message, result=result)
 
     try:
         _t0 = _time.time()
@@ -2427,7 +2436,7 @@ def _spill_csv(res) -> str:
         lines.append(f"# distance {p['band']} um: {p['n']} non-source cells, mean marker share {p['mean_share']:.6g}")
     if res.get("n_uncorrected"):
         lines.append(f"# {analysis._an_uncorrected_note(res['n_uncorrected'])}")
-    return "\n".join(lines) + "\n" + res["ownership"].to_csv(index=False)
+    return provenance._prov_csv_stamp(res, ("\n".join(lines) + "\n" + res["ownership"].to_csv(index=False)))
 
 
 _SEGQC_COLS = [("id", "ID"), ("source", "Source"), ("counts", "Counts"), ("labels", "Labels"), ("n_cells", "Cells"),
@@ -2492,8 +2501,8 @@ def _segqc_csv(res) -> str:
         lines.append(f"# note: {nt}")
     body = res["table"].drop(columns=["value"]).to_csv(index=False)
     per = res["per_type"]
-    return ("\n".join(lines) + "\n" + body
-            + ("\n# per cell type\n" + per.to_csv(index=False) if len(per) else ""))
+    return provenance._prov_csv_stamp(res, ("\n".join(lines) + "\n" + body
+            + ("\n# per cell type\n" + per.to_csv(index=False) if len(per) else "")))
 
 
 def make_coloc_fig(width=None, height=None):
@@ -2589,7 +2598,7 @@ def _coloc_csv(res) -> str:
     if res.get("placebo") is not None:
         txt += (f"\n# placebo anchors for {res['placebo_focal']}: compartment-level expectation; random = "
                 f"count-matched random anchors within sample x compartment\n" + res["placebo"].to_csv(index=False))
-    return txt
+    return provenance._prov_csv_stamp(res, (txt))
 
 
 # ─── Layout ───────────────────────────────────────────────────────────────────
@@ -2631,21 +2640,24 @@ def _controls_tab():
         ], style=S),
         _section_title("Tissue compartments"),
         html.Div([
+            html.Span("Dense core of:", style=L),
+            dcc.Dropdown(id="ctl-dominant", options=[{"label": "auto (most abundant type)", "value": "auto"}],
+                         value="auto", clearable=False, style={"width": "220px", "fontSize": "11px"}),
+            html.Span(style={"flex": "1"}),
+            dbc.Button("Compute compartments", id="ctl-comp-run-btn", color="primary", size="sm", n_clicks=0,
+                       style={"fontSize": "11px", "padding": "2px 12px"}),
+        ], style=S),
+        ui._options([html.Div([
             html.Span("Bin (µm):", style=L), _num(id="ctl-bin", value=_EDGE_BIN_UM, min=5, max=1000, step=5),
             html.Span("Closing (bins):", style=L), _num(id="ctl-close", value=_EDGE_CLOSE_BINS, min=0, max=10, step=1),
             html.Span("Fill holes ≤ (bins):", style=L), _num(id="ctl-hole", value=_EDGE_HOLE_BINS, min=0, max=100000, step=1),
             html.Span("Density radius (µm):", style=L), _num(id="ctl-radius", value=_DENSITY_R_UM, min=5, max=2000, step=5),
-            dbc.Button("Compute compartments", id="ctl-comp-run-btn", color="primary", size="sm", n_clicks=0,
-                       style={"fontSize": "11px", "padding": "2px 12px"}),
         ], style=S),
         html.Div([
-            html.Span("Dense core of:", style=L),
-            dcc.Dropdown(id="ctl-dominant", options=[{"label": "auto (most abundant type)", "value": "auto"}],
-                         value="auto", clearable=False, style={"width": "220px", "fontSize": "11px"}),
-            html.Span("≥ neighbours:", style=L), _num(id="ctl-core-nb", value=_CORE_MIN_NB, min=1, max=10000, step=1),
+            html.Span("Core: ≥ neighbours:", style=L), _num(id="ctl-core-nb", value=_CORE_MIN_NB, min=1, max=10000, step=1),
             html.Span("≥ fraction of that type:", style=L), _num(id="ctl-core-frac", value=_CORE_MIN_FRAC, min=0, max=1, step=0.01),
             html.Span("> µm from edge:", style=L), _num(id="ctl-core-edge", value=_CORE_MIN_EDGE_UM, min=0, max=10000, step=10),
-        ], style=S),
+        ], style=S)], summary=f"Options ({_EDGE_BIN_UM:g} µm bins, density radius {_DENSITY_R_UM:g} µm, core thresholds)"),
         html.Div(id="ctl-comp-status", style={**analysis._AN_STATUS_STYLE, "whiteSpace": "pre-wrap"}),
         html.Div(_COMPARTMENT_NOTE, id="ctl-comp-note", style=analysis._AN_NOTE_STYLE),
         _section_title("Spillover score and gene ownership"),
@@ -2653,16 +2665,20 @@ def _controls_tab():
             html.Span("Source type:", style=L),
             dcc.Dropdown(id="spill-source", options=[{"label": "auto (type with the most transcripts)", "value": "auto"}],
                          value="auto", clearable=False, style={"width": "250px", "fontSize": "11px"}),
-            html.Span("Markers to derive:", style=L), _num(id="spill-n-markers", value=_SPILL_N_MARKERS, min=1, max=100, step=1),
-            html.Span("Co-owner ≥ fraction of top rate:", style=L), _num(id="spill-own-frac", value=_OWN_FRAC, min=0.01, max=1, step=0.01),
+            html.Span(style={"flex": "1"}),
             dbc.Button("Run", id="spill-run-btn", color="primary", size="sm", n_clicks=0,
                        style={"fontSize": "11px", "padding": "2px 12px"}),
+        ], style=S),
+        ui._options([html.Div([
+            html.Span("Markers to derive:", style=L), _num(id="spill-n-markers", value=_SPILL_N_MARKERS, min=1, max=100, step=1),
+            html.Span("Co-owner ≥ fraction of top rate:", style=L), _num(id="spill-own-frac", value=_OWN_FRAC, min=0.01, max=1, step=0.01),
         ], style=S),
         dcc.Textarea(id="spill-markers", value="",
                      placeholder="Optional: marker genes of the source type, separated by commas or new lines "
                                  "(leave empty to derive them from the annotation)…",
                      style={**analysis._AN_INPUT_STYLE, "margin": "2px 8px", "height": "38px", "flexShrink": "0",
-                            "fontFamily": "monospace", "resize": "vertical"}),
+                            "fontFamily": "monospace", "resize": "vertical", "width": "calc(100% - 16px)"})],
+            summary=f"Options ({_SPILL_N_MARKERS} markers derived from the annotation, co-owner fraction {_OWN_FRAC:g}, own marker list)"),
         html.Div(id="spill-status", style={**analysis._AN_STATUS_STYLE, "whiteSpace": "pre-wrap"}),
         html.Div(_SPILL_NOTE, id="spill-note", style=analysis._AN_NOTE_STYLE),
         html.Div(_LEAK_NOTE, id="leak-note", style=analysis._AN_NOTE_STYLE),
@@ -2697,19 +2713,23 @@ def _segqc_tab():
             html.Span("Annotation:", style=L),
             dcc.Dropdown(id="segqc-method", options=[], value=None, placeholder="Cell type annotation…",
                          style={"width": "200px", "fontSize": "11px"}),
+            html.Span(style={"flex": "1"}),
+            dbc.Button("Run", id="segqc-run-btn", color="primary", size="sm", n_clicks=0,
+                       style={"fontSize": "11px", "padding": "2px 12px"}),
+        ], style=S),
+        ui._options([html.Div([
             html.Span("Spillover source type:", style=L),
             dcc.Dropdown(id="segqc-source", options=[{"label": "auto (type with the most transcripts)", "value": "auto"}],
                          value="auto", clearable=False, style={"width": "250px", "fontSize": "11px"}),
             html.Span("Radius (µm):", style=L), _num(id="segqc-radius", value=_QC_RADIUS_UM, min=1, max=500, step=1),
-            dbc.Button("Run", id="segqc-run-btn", color="primary", size="sm", n_clicks=0,
-                       style={"fontSize": "11px", "padding": "2px 12px"}),
         ], style=S),
         dcc.Textarea(id="segqc-sets", value="",
                      placeholder="Optional identity marker sets, one per line: 'Type: gene, gene, …' (types as in "
                                  "the annotation); a line 'geneA, geneB' adds a pair of mutually exclusive markers. "
                                  "Leave empty to derive the sets from the annotation…",
                      style={**analysis._AN_INPUT_STYLE, "margin": "2px 8px", "height": "48px", "flexShrink": "0",
-                            "fontFamily": "monospace", "resize": "vertical"}),
+                            "fontFamily": "monospace", "resize": "vertical", "width": "calc(100% - 16px)"})],
+            summary=f"Options (source type: auto, radius {_QC_RADIUS_UM:g} µm, own marker sets)"),
         html.Div(id="segqc-status", style={**analysis._AN_STATUS_STYLE, "whiteSpace": "pre-wrap"}),
         html.Div(_SEGQC_NOTE, id="segqc-note", style=analysis._AN_NOTE_STYLE),
         _graph(id="segqc-plot", msg="No segmentation QC computed yet.", filename="xenium_segmentation_qc", min_h="280px"),
@@ -2738,14 +2758,16 @@ def _coloc_tab():
             dcc.Dropdown(id="coloc-labels", options=[{"label": "Cluster (active cluster set)", "value": "cluster"}],
                          value=None, placeholder="Cell type annotation / cluster…",
                          style={"flex": "1", "minWidth": "170px", "fontSize": "11px"}),
+            dbc.Button("Run", id="coloc-run-btn", color="primary", size="sm", n_clicks=0,
+                       style={"fontSize": "11px", "padding": "2px 12px"}),
+        ], style=S),
+        ui._options(html.Div([
             html.Span("Radius (µm):", style=L), _num(id="coloc-radius", value=_COLOC_RADIUS_UM, min=1, max=2000, step=1),
             html.Span("Permutations:", style=L), _num(id="coloc-nperm", value=_COLOC_N_PERM, min=0, max=5000, step=10),
             html.Span("Placebo anchors for:", style=L),
             dcc.Dropdown(id="coloc-placebo", options=[], value=None, placeholder="(none)",
                          style={"width": "190px", "fontSize": "11px"}),
-            dbc.Button("Run", id="coloc-run-btn", color="primary", size="sm", n_clicks=0,
-                       style={"fontSize": "11px", "padding": "2px 12px"}),
-        ], style=S),
+        ], style=S), summary=f"Options (radius {_COLOC_RADIUS_UM:g} µm, {_COLOC_N_PERM} permutations, placebo anchors: none)"),
         html.Div([
             dbc.Button("Samples & conditions…", id="coloc-design-open-btn", color="secondary", size="sm",
                        n_clicks=0, style={"fontSize": "11px", "padding": "2px 8px"}),

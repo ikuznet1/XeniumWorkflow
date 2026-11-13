@@ -21,6 +21,7 @@ import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 
 from . import core, jobs, ui, figures, analysis, stats
+from . import provenance
 
 
 _lrd_state: dict = {"status": "idle", "message": "", "result": None, "version": 0}
@@ -660,6 +661,8 @@ def _run_lrdecomp(pairs_text, label_kind, seg_source, method, use_corrected, rad
                 _lrd_state["result"] = result
             if status in ("done", "error"):
                 _lrd_state["version"] += 1
+        if status == "done":
+            provenance._prov_record("lrdecomp", seg_source=seg_source, corrected=use_corrected, params={"pairs": pairs_text, "radius": radius, "tile": tile, "own": own, "floor": floor, "binary": binary, "min_cells": min_cells}, labels=(label_kind, method), uses_design=True, message=message, result=result)
 
     try:
         _t0 = _time.time()
@@ -918,7 +921,7 @@ def _lrd_csv(res) -> str:
     if len(res["pairs"]):
         txt += ("\n# sender -> receiver pairs: mean over the pair's interactions per unit, tested across the units\n"
                 + res["pairs"].to_csv(index=False))
-    return txt
+    return provenance._prov_csv_stamp(res, (txt))
 
 
 # ─── Layout (rows added to the Ligand-Receptor tab by stats._lr_tab) ──────────
@@ -929,6 +932,12 @@ def _lrd_controls() -> list:
                                                   style={**ui._PLOT_CTRL_INPUT, "width": "58px"}, **kw)
     return [
         html.Div([
+            html.Span(f"Exposure decomposition (contact radius {_LRD_RADIUS_UM:g} µm; more under Options)",
+                      style={**L, "flex": "1"}),
+            dbc.Button("Run", id="lrd-run-btn", color="primary", size="sm", n_clicks=0,
+                       style={"fontSize": "11px", "padding": "2px 12px"}),
+        ], style=S),
+        ui._options(html.Div([
             html.Span("Contact radius (µm):", style=L), _num(_LRD_RADIUS_UM, id="lrd-radius", min=1, max=500, step=1),
             html.Span("Tile (µm; 0 = whole sample):", style=L), _num(_LRD_TILE_UM, id="lrd-tile", min=0, max=10000, step=5),
             html.Span("Ownership ≥:", style=L), _num(_LRD_OWN, id="lrd-own", min=0, max=1, step=0.05),
@@ -938,9 +947,7 @@ def _lrd_controls() -> list:
                          options=[{"label": "Rates: Σ counts / Σ depth", "value": "counts"},
                                   {"label": "Rates: detection (≥ 1) / cells", "value": "binary"}],
                          style={"width": "210px", "fontSize": "11px"}),
-            dbc.Button("Run", id="lrd-run-btn", color="primary", size="sm", n_clicks=0,
-                       style={"fontSize": "11px", "padding": "2px 12px"}),
-        ], style=S),
+        ], style=S), summary="Options (radius, tile, ownership, floor, minimum cells, rates)"),
         html.Div([
             dbc.Button("Samples & conditions…", id="lrd-design-open-btn", color="secondary", size="sm",
                        n_clicks=0, style={"fontSize": "11px", "padding": "2px 8px"}),

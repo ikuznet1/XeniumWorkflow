@@ -334,12 +334,13 @@ def test_guards_and_empty_states(xe, D, monkeypatch):
     assert xe._sfree_state["result"] is None
 
 
-def test_layout_has_the_block_in_the_abundance_tab(xe):
+def test_layout_has_the_block_in_its_own_tab(xe):
+    # (it sat in the Cell Type Abundance tab before the tabs were grouped: QC > Segmentation-free)
     ids = set()
 
     def walk(c, inside):
         cid = getattr(c, "id", None)
-        inside = inside or getattr(c, "tab_id", None) == "tab-abundance"
+        inside = inside or getattr(c, "tab_id", None) == "tab-segfree"
         if cid and inside:
             ids.add(cid)
         ch = getattr(c, "children", None)
@@ -349,8 +350,7 @@ def test_layout_has_the_block_in_the_abundance_tab(xe):
 
     walk(xe.app.layout, False)
     assert {"sfree-labels", "sfree-type", "sfree-markers", "sfree-bins", "sfree-area", "sfree-run-btn",
-            "sfree-status", "sfree-plot", "sfree-table", "sfree-download-btn", "sfree-download",
-            "cell-type-abundance-plot", "comp-plot"} <= ids
+            "sfree-status", "sfree-plot", "sfree-table", "sfree-download-btn", "sfree-download"} <= ids
     assert xe._JOB_KIND_NAMES["segfree"] == "segmentation-free abundance"
 
 

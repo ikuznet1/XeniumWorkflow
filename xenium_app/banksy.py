@@ -21,6 +21,7 @@ import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 
 from . import core, jobs, dataview, ui, figures, analysis, stats, controls, clustersets
+from . import provenance
 
 
 # ─── State ────────────────────────────────────────────────────────────────────
@@ -459,6 +460,8 @@ def _run_banksy(seg_source, use_corrected, params=None) -> None:
                 _bk_state["result"] = result
             if status in ("done", "error"):
                 _bk_state["version"] += 1
+        if status == "done":
+            provenance._prov_record("banksy", seg_source=seg_source, corrected=use_corrected, params=dict(params or {}), packages=("leidenalg", "igraph"), message=message, result=result)
 
     try:
         _t0 = _time.time()
@@ -663,8 +666,8 @@ def _bk_csv(res) -> str:
              "# cluster ids are the values of the cluster set (0 = no label)"]
     heat = pd.DataFrame(np.asarray(res["heat"], dtype=float), columns=res["heat_genes"])
     heat.insert(0, "domain", res["table"]["domain"].to_numpy())
-    return ("\n".join(lines) + "\n# clusters\n" + res["table"].to_csv(index=False)
-            + "\n# mean expression of the top genes, SD from the mean of all cells\n" + heat.to_csv(index=False))
+    return provenance._prov_csv_stamp(res, ("\n".join(lines) + "\n# clusters\n" + res["table"].to_csv(index=False)
+            + "\n# mean expression of the top genes, SD from the mean of all cells\n" + heat.to_csv(index=False)))
 
 
 # ─── Layout ───────────────────────────────────────────────────────────────────
@@ -686,21 +689,22 @@ def _bk_tab():
                                   {"label": "Custom λ", "value": "custom"}],
                          value="domains", clearable=False, style={"width": "210px", "fontSize": "11px"}),
             html.Span("λ:", style=L), num(id="bk-lambda", value=_BK_LAMBDA_DOMAINS, min=0, max=1, step=0.05),
-            html.Span("Spatial neighbours k:", style=L), num(id="bk-kgeom", value=_BK_K_GEOM, min=2, max=200, step=1),
-            chk(" AGF (gradient) block", True, id="bk-agf"),
             html.Span("Resolution:", style=L), num(id="bk-resolution", value=_BK_RESOLUTION, min=0.01, max=10, step=0.05),
+            html.Span("" if clustersets._cs_leiden_available() else "⚠ " + clustersets._CS_LEIDEN_HINT,
+                      id="bk-backend-note", style={**L, "color": "#d29922", "flex": "1"}),
             dbc.Button("Run", id="bk-run-btn", color="primary", size="sm", n_clicks=0,
                        style={"fontSize": "11px", "padding": "2px 12px"}),
         ], style=S),
-        html.Div([
+        ui._options([html.Div([
+            html.Span("Spatial neighbours k:", style=L), num(id="bk-kgeom", value=_BK_K_GEOM, min=2, max=200, step=1),
+            chk(" AGF (gradient) block", True, id="bk-agf"),
             html.Span("Genes ≤:", style=L), num(id="bk-maxgenes", value=_BK_MAX_GENES, min=10, max=20000, step=10, width="70px"),
             html.Span("PCs:", style=L), num(id="bk-npcs", value=_BK_N_PCS, min=2, max=100, step=1),
             html.Span("Graph neighbours:", style=L), num(id="bk-kexpr", value=_BK_K_EXPR, min=2, max=200, step=1),
             html.Span("Seed:", style=L), num(id="bk-seed", value=0, min=0, max=10 ** 6, step=1),
             chk(" log1p", False, id="bk-log1p"),
-            html.Span("" if clustersets._cs_leiden_available() else "⚠ " + clustersets._CS_LEIDEN_HINT,
-                      id="bk-backend-note", style={**L, "color": "#d29922"}),
-        ], style=S),
+        ], style=S)], summary=f"Options (k = {_BK_K_GEOM} spatial neighbours, AGF on, ≤ {_BK_MAX_GENES:,} genes, "
+                              f"{_BK_N_PCS} PCs, {_BK_K_EXPR} graph neighbours, seed 0)"),
         html.Div(id="bk-status", style={**analysis._AN_STATUS_STYLE, "whiteSpace": "pre-wrap"}),
         html.Div(_BK_NOTE, id="bk-note", style=analysis._AN_NOTE_STYLE),
         html.Div([

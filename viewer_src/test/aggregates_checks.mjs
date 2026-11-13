@@ -6,6 +6,7 @@
 // Needs a cell-type annotation of the Xenium segmentation in the cache. Without XA_CLASS
 // the third and fourth most abundant types are the class.
 import {chromium} from 'playwright';
+import {openTab} from './lib.mjs';
 
 const base = process.argv[2] || 'http://127.0.0.1:8050';
 const out = process.argv[3] || '.';
@@ -40,7 +41,7 @@ const waitText = async (sel, re, timeout = 600000) => {
 const shot = (name) => page.screenshot({path: `${out}/${name}.png`});
 const click = (sel) => page.evaluate((s) => document.querySelector(s).click(), sel);
 const tableRows = (id) => page.evaluate((i) => Math.max(0, document.querySelectorAll(`#${i} tbody tr`).length - 2), id);
-const tab = async (t) => { await setProp('plots-tabs', {active_tab: t}); await page.waitForTimeout(1200); };
+const tab = (t) => openTab(page, t);   // by tab id, through the two-level navigation (lib.mjs)
 const dropdownOptions = (id) => page.evaluate((i) => {
   const el = document.getElementById(i);
   if (!el) return [];

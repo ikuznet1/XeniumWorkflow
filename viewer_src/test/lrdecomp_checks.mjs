@@ -8,6 +8,7 @@
 // part runs: even samples to condition A, odd ones to B, first unpaired, then paired by
 // donor. XL_FLOOR: the transcript floor to type in (default: the app's default).
 import {chromium} from 'playwright';
+import {openTab} from './lib.mjs';
 import fs from 'node:fs';
 
 const base = process.argv[2] || 'http://127.0.0.1:8050';
@@ -86,7 +87,7 @@ for (let i = 0; i < extra.length; i++) {
 const nS = extra.length + 1;
 
 // ── the mode switch ──────────────────────────────────────────────────────────
-await setProp('plots-tabs', {active_tab: 'tab-lr'});
+await openTab(page, 'tab-lr');
 await page.waitForSelector('#lr-run-btn', {state: 'visible'});
 check('scores mode is the default: its controls and results are shown, the decomposition is hidden',
   await page.isVisible('#lr-k') && await page.isVisible('#lr-plot') && !(await page.isVisible('#lrd-run-btn')) && !(await page.isVisible('#lrd-plot')));

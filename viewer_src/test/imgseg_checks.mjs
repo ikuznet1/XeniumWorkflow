@@ -8,6 +8,7 @@
 // only reloads them). The run is deleted from the cache at the end unless XI_KEEP=1.
 // XI_QC: annotation method for the Segmentation QC step (skipped when not given).
 import {chromium} from 'playwright';
+import {openTab} from './lib.mjs';
 
 const base = process.argv[2] || 'http://127.0.0.1:8050';
 const out = process.argv[3] || '.';
@@ -157,7 +158,7 @@ if (process.env.XI_QC) {
   await setProp('seg-source', {value: 'xenium'});
   await page.waitForTimeout(3000);
   if (await page.evaluate(() => getComputedStyle(document.querySelector('#umap-panel')).display === 'none')) await click('#umap-toggle');
-  await setProp('plots-tabs', {active_tab: 'tab-segqc'});
+  await openTab(page, 'tab-segqc');
   await page.waitForTimeout(2000);
   await setProp('segqc-method', {value: process.env.XI_QC});
   await page.waitForTimeout(800);

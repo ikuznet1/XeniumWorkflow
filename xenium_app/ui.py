@@ -110,8 +110,10 @@ def method_label(m):
 
 # ─── Jobs panel (rendering) ───────────────────────────────────────────────────
 _JOBS_PANEL_STYLE = {
-    "position": "fixed", "right": "12px", "bottom": "12px", "width": "340px",
-    "maxHeight": "60vh", "overflowY": "auto", "zIndex": 2000,   # above dbc.Modal (1055)
+    # bottom left, beside the sidebar strip: over the map / cell-info corner, never over the
+    # plots panel (right half) or the footer of a modal, where the Run buttons are
+    "position": "fixed", "left": "256px", "bottom": "12px", "width": "340px",
+    "maxHeight": "40vh", "overflowY": "auto", "zIndex": 2000,   # above dbc.Modal (1055)
     "backgroundColor": core.PANEL_BG, "border": f"1px solid {core.BORDER}", "borderRadius": "6px",
     "boxShadow": "0 4px 16px rgba(0,0,0,0.5)", "padding": "8px 10px",
     "fontSize": "11px", "color": core.TEXT,
@@ -202,3 +204,74 @@ def _jobs_panel_summary(rows: list) -> list:
 
 def _jobs_panel_children(rows: list) -> list:
     return [_job_row(r) for r in rows]
+
+
+# ─── Two-level navigation of the plots panel ──────────────────────────────────
+# The panel is still ONE dbc.Tabs ("plots-tabs", every tab with its tab_id): callbacks
+# and tests keep reading / setting plots-tabs.active_tab. Its flat strip of tab labels is
+# hidden (assets/sidebar.css) and replaced by this bar: a row of groups and, below it,
+# the tabs of the open group (cb_nav.py keeps the two in step with active_tab).
+_NAV_GROUPS = [
+    ("overview", "Overview", [("tab-umap", "UMAP"), ("tab-abundance", "Cell types"),
+                              ("tab-composition", "Composition"), ("tab-roi-area", "ROI area")]),
+    ("qc", "QC", [("tab-segqc", "Segmentation QC"), ("tab-controls", "Compartments & spillover"),
+                  ("tab-segfree", "Segmentation-free"), ("tab-txf", "Transcript factors")]),
+    ("expression", "Expression", [("tab-de", "Differential expression"), ("tab-geneset", "Gene sets"),
+                                  ("tab-moran", "Spatial genes"), ("tab-density", "Transcript density")]),
+    ("neighbourhoods", "Neighbourhoods",
+     [("tab-cooccurrence", "Co-occurrence"), ("tab-enrichment", "Enrichment"),
+      ("tab-coloc", "Co-localisation"), ("tab-interaction", "Graph"),
+      ("tab-chord", "Chord"), ("tab-niche-umap", "Niches"), ("tab-agg", "Aggregates"),
+      ("tab-banksy", "Banksy-style"), ("tab-joint", "Joint clusters")]),
+    ("communication", "Communication", [("tab-lr", "Ligand–receptor"), ("tab-cellnest", "CellNEST")]),
+    ("provenance", "Provenance", [("tab-provenance", "Records & methods")]),
+]
+_NAV_TITLES = {"tab-interaction": "Interaction graph", "tab-chord": "Chord diagram", "tab-niche-umap": "Niche UMAP",
+               "tab-banksy": "Banksy-style spatial domains", "tab-joint": "Joint clustering across samples",
+               "tab-cooccurrence": "Co-occurrence", "tab-enrichment": "Neighbourhood enrichment",
+               "tab-coloc": "Stratified co-localisation with matched nulls",
+               "tab-abundance": "Cell type abundance", "tab-composition": "Composition between conditions",
+               "tab-segfree": "Segmentation-free abundance (marker transcripts per mm² of tissue)",
+               "tab-controls": "Confound controls: tissue compartments, spillover score, gene ownership",
+               "tab-moran": "Spatially variable genes (Moran's I)",
+               "tab-lr": "Ligand–receptor scores and exposure decomposition", "tab-cellnest": "CellNEST cell–cell communication",
+               "tab-provenance": "Methods and provenance record"}
+# tabs whose analyses read the sample design: the shared "Samples & conditions…" bar shows there
+_NAV_DESIGN_TABS = ("tab-de", "tab-composition", "tab-segfree", "tab-coloc", "tab-agg", "tab-joint", "tab-lr")
+
+
+def _options(children, summary: str = "Options", open_: bool = False, **kwargs):
+    """Secondary parameters of a tab behind a disclosure (closed: the defaults apply). The
+    inputs stay in the page with their ids, so callbacks read them as before."""
+    return html.Details([html.Summary(summary, className="tab-options-summary"),
+                         html.Div(children, className="tab-options-body")],
+                        className="tab-options", open=open_, **kwargs)
+
+
+def _nav_group_of(tab_id: str):
+    for gid, _label, tabs in _NAV_GROUPS:
+        if any(t == tab_id for t, _ in tabs):
+            return gid
+    return None
+
+
+def _nav_bar():
+    """Group row, sub-tab row, the shared design entry and the in-place availability note."""
+    first = _NAV_GROUPS[0]
+    return html.Div([
+        html.Div([html.Button(label, id=f"nav-group-{gid}", n_clicks=0, title=", ".join(l for _, l in tabs),
+                              className="nav-group" + (" active" if gid == first[0] else ""))
+                  for gid, label, tabs in _NAV_GROUPS], id="nav-groups", className="nav-row"),
+        html.Div([html.Button(label, id=f"nav-tab-{tid}", n_clicks=0, title=_NAV_TITLES.get(tid, label),
+                              className="nav-sub" + ("" if gid == first[0] else " nav-hidden")
+                                        + (" active" if tid == first[2][0][0] else ""))
+                  for gid, _label, tabs in _NAV_GROUPS for tid, label in tabs],
+                 id="nav-subtabs", className="nav-row nav-row-sub"),
+        html.Div([
+            html.Button("Samples & conditions…", id="nav-design-open-btn", n_clicks=0, className="nav-design-btn",
+                        title="Assign the loaded samples to conditions, donors and batches (one design for every analysis)"),
+            html.Span(id="nav-design-summary", className="nav-design-summary"),
+        ], id="nav-design-bar", className="nav-design-bar nav-hidden"),
+        html.Div(id="nav-notice", className="nav-notice", style={"display": "none"}),
+        dcc.Store(id="nav-last", storage_type="session", data={}),
+    ], id="plots-nav")

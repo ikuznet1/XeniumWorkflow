@@ -6,6 +6,7 @@ import dash
 from dash import Input, Output, State, ClientsideFunction
 import time as _time
 
+from . import provenance
 from . import core, jobs, dataview, analysis, stats, regions, proximity, app_layout, cb_spatial
 
 
@@ -385,7 +386,7 @@ def download_de_table(n_clicks):
         header += f"# {analysis._an_uncorrected_note(res['n_uncorrected'])}\n"
     if res.get("leak_summary"):
         header += "".join(f"# {ln}\n" for ln in str(res["leak_summary"]).splitlines())
-    return dict(content=header + t.to_csv(index=False),
+    return dict(content=provenance._prov_csv_stamp(res, header + t.to_csv(index=False)),
                 filename=f"de_{_safe(res['label_a'])}_vs_{_safe(res['label_b'])}.csv")
 
 

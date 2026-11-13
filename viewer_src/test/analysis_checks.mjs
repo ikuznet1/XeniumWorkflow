@@ -7,6 +7,7 @@
 // repeats the drawing part in the Plotly view. The groups and the gene set it creates are
 // deleted again at the end (the density grids stay in the cache directory).
 import {chromium} from 'playwright';
+import {openTab} from './lib.mjs';
 
 const base = process.argv[2] || 'http://127.0.0.1:8050';
 const out = process.argv[3] || '.';
@@ -54,7 +55,7 @@ const closeRoiDialog = async () => {
 if (await page.evaluate(() => getComputedStyle(document.querySelector('#umap-panel')).display === 'none')) {
   await page.evaluate(() => document.querySelector('#umap-toggle').click());   // (sidebar: may be scrolled out of view)
 }
-await setProp('plots-tabs', {active_tab: 'tab-de'});
+await openTab(page, 'tab-de');
 await page.waitForSelector('#de-run-btn', {state: 'visible'});
 check('DE tab: empty state (on a fresh server) and the statistical caveat',
   (/No differential expression computed yet/.test(await text('#de-plot-container')) || /FDR/.test(await text('#de-plot-container')))
@@ -185,7 +186,7 @@ await setProp('webgl-tool', {value: 'pan'});
 await page.evaluate(() => window.XeniumViewer.instance.fitView());
 
 // ── gene set from the top genes ──────────────────────────────────────────────
-await setProp('plots-tabs', {active_tab: 'tab-geneset'});
+await openTab(page, 'tab-geneset');
 await page.waitForSelector('#geneset-run-btn', {state: 'visible'});
 await page.fill('#geneset-name', TAG);
 await page.fill('#geneset-genes', topUp.join('\n') + '\nNOT_A_GENE_1, not_a_gene_2');
@@ -216,7 +217,7 @@ await page.waitForTimeout(900);
 const rng = await page.evaluate(() => [document.querySelector('#webgl-view .xv-min').textContent, document.querySelector('#webgl-view .xv-max').textContent]);
 check('WebGL: colour range inputs apply to the score', rng[0] === '-1' && rng[1] === '1', rng.join(' … '));
 await shot('an_2_webgl_geneset');
-await setProp('plots-tabs', {active_tab: 'tab-umap'});
+await openTab(page, 'tab-umap');
 await page.waitForTimeout(2500);
 const uGs = await page.evaluate(() => {
   const u = window.XeniumViewer.umapInstance && window.XeniumViewer.umapInstance._viewer;
@@ -227,7 +228,7 @@ await shot('an_3_webgl_geneset_umap');
 await page.evaluate(() => document.querySelector('#colorbar-reset-btn').click());
 
 // ── transcript density ───────────────────────────────────────────────────────
-await setProp('plots-tabs', {active_tab: 'tab-density'});
+await openTab(page, 'tab-density');
 await page.waitForSelector('#density-run-btn', {state: 'visible'});
 const gene = pt.gene;
 await setProp('density-gene', {value: gene});
@@ -339,7 +340,7 @@ await page.waitForTimeout(2500);
 await shot('an_9_plotly_density_20um_zoom');
 // Plotly lasso → current selection → group → DE against the rest
 await setProp('density-enable', {value: []});
-await setProp('plots-tabs', {active_tab: 'tab-de'});
+await openTab(page, 'tab-de');
 await page.waitForFunction(() => document.querySelector('#spatial-plot .js-plotly-plot')._fullData[0].type !== 'heatmap', null, {timeout: 120000});
 await page.evaluate(() => window.Plotly.relayout(document.querySelector('#spatial-plot .js-plotly-plot'), {dragmode: 'lasso'}));
 await page.waitForTimeout(1500);
@@ -384,7 +385,7 @@ for (const g of ['_A', '_B', '_P']) {
   await page.click('#de-delete-group-btn');
   await waitText('#de-status', new RegExp(`Deleted group '${TAG}${g}'`));
 }
-await setProp('plots-tabs', {active_tab: 'tab-geneset'});
+await openTab(page, 'tab-geneset');
 await setProp('geneset-select', {value: TAG});
 await page.waitForTimeout(500);
 await page.click('#geneset-delete-btn');

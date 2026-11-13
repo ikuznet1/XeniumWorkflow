@@ -17,6 +17,7 @@ import plotly.graph_objects as go
 import time as _time
 
 from . import core, jobs, dataview, ui, figures, analysis, spatial
+from . import provenance
 
 
 # ─── Samples and their conditions ─────────────────────────────────────────────
@@ -978,6 +979,8 @@ def _run_pseudobulk_de(population, seg_source, method, color_by, counts_correcte
             analysis._de_state["message"] = message
             if result is not None:
                 analysis._de_state["result"] = result
+        if status == "done":
+            provenance._prov_record("pseudobulk", seg_source=seg_source, corrected=counts_corrected, params={"population": population, "cluster_method": method, "color_by": color_by, "min_cells": min_cells, "min_count": min_count, "shrink": shrink, "engine": engine, "options": options}, labels=(color_by, method), uses_design=True, r_packages=("DESeq2", "edgeR", "apeglm", "ashr"), message=message, result=result)
 
     try:
         _t0 = _time.time()
@@ -1133,7 +1136,7 @@ def _pb_csv_header(res: dict) -> str:
                      + (f"; {r['note']}" if r["note"] else ""))
     for w in list(res.get("warnings") or []) + list(res.get("notes") or []):
         lines.append(f"# note: {w}")
-    return "\n".join(lines) + "\n"
+    return provenance._prov_csv_stamp(res, ("\n".join(lines) + "\n"))
 
 
 def _samples_table(rows, columns) -> "html.Table":
@@ -1177,6 +1180,8 @@ def _pb_controls() -> list:
             dcc.Dropdown(id="de-pb-population", options=[{"label": "All cells", "value": "all"}],
                          value="all", clearable=False, placeholder="Cell population…",
                          style={"flex": "1", "minWidth": "200px", "fontSize": "11px"}),
+        ], style=S),
+        ui._options(html.Div([
             html.Span("Min. cells / sample:", style=L),
             dcc.Input(id="de-pb-min-cells", type="number", min=1, step=1, value=_PB_MIN_CELLS,
                       debounce=True, style=ui._PLOT_CTRL_INPUT),
@@ -1189,7 +1194,8 @@ def _pb_controls() -> list:
                                     "value": "on"}],
                           value=["on"], inputStyle={"marginRight": "3px"},
                           style={"display": "inline-flex"}),
-        ], style=S),
+        ], style=S), summary=f"Options (min. {_PB_MIN_CELLS} cells / sample, min. total count {_PB_MIN_COUNT} / gene, "
+                             f"shrunken log2FC)"),
         html.Div([
             dbc.Button("Samples & conditions…", id="de-design-open-btn", color="secondary", size="sm",
                        n_clicks=0, style={"fontSize": "11px", "padding": "2px 8px"}),
@@ -1672,6 +1678,21 @@ def make_composition_fig(width=None, height=None):
     return fig
 
 
+def _comp_run(kind, seg_source="xenium", method=None, transform="logit", test="moderated") -> tuple:
+    """The composition analysis as the Run button and the batch mode run it: (result,
+    status line). Writes the provenance record. ValueError as _comp_compute."""
+    _t0 = _time.time()
+    res = _comp_compute(kind, seg_source or "xenium", method, transform, test)
+    msg = res.get("test_note", "")
+    for w in res["warnings"]:
+        msg += f"\n⚠ {w[0].upper() + w[1:]}."
+    provenance._prov_record("composition", seg_source=seg_source, result=res, message=msg,
+                            params={"proportions_of": kind, "cluster_method": method,
+                                    "transform": transform, "test": test},
+                            labels=(kind, method), uses_design=True, t0=_t0, cache=False)
+    return res, msg
+
+
 def _comp_table(res) -> tuple:
     """(columns, records) of the composition table: the test per category when one was
     run, and the proportion of every sample."""
@@ -1726,7 +1747,7 @@ def _comp_csv(res) -> str:
         if r["used"]:
             out[f"n_{r['label']}"] = res["counts"][r["label"]].to_numpy()
             out[f"prop_{r['label']}"] = res["props"][r["label"]].to_numpy()
-    return "\n".join(lines) + "\n" + out.to_csv(index=False)
+    return provenance._prov_csv_stamp(res, ("\n".join(lines) + "\n" + out.to_csv(index=False)))
 
 
 def _dark_table_style(page_size: int = 12) -> dict:
@@ -1755,6 +1776,10 @@ def _composition_section():
             dcc.Dropdown(id="comp-category", options=[{"label": "Cluster (active cluster set)", "value": "cluster"}],
                          value=None, placeholder="Cell type / cluster / niche…",
                          style={"flex": "1", "minWidth": "180px", "fontSize": "11px"}),
+            dbc.Button("Compute", id="comp-run-btn", color="primary", size="sm", n_clicks=0,
+                       style={"fontSize": "11px", "padding": "2px 12px"}),
+        ], style=S),
+        ui._options(html.Div([
             html.Span("Transform:", style=L),
             dcc.Dropdown(id="comp-transform", clearable=False, value="logit",
                          options=[{"label": "logit", "value": "logit"},
@@ -1766,9 +1791,7 @@ def _composition_section():
                                   {"label": "exact (sample-level: paired sign-flip / permutation)",
                                    "value": "exact"}],
                          style={"width": "250px", "fontSize": "11px"}),
-            dbc.Button("Compute", id="comp-run-btn", color="primary", size="sm", n_clicks=0,
-                       style={"fontSize": "11px", "padding": "2px 12px"}),
-        ], style=S),
+        ], style=S), summary="Options (transform: logit; test: moderated t, propeller-style)"),
         html.Div([
             dbc.Button("Samples & conditions…", id="comp-design-open-btn", color="secondary", size="sm",
                        n_clicks=0, style={"fontSize": "11px", "padding": "2px 8px"}),
@@ -1981,6 +2004,8 @@ def _run_moran(seg_source, use_corrected, k=_MORAN_K) -> None:
             _moran_state["message"] = message
             if result is not None:
                 _moran_state["result"] = result
+        if status == "done":
+            provenance._prov_record("moran", seg_source=seg_source, corrected=use_corrected, params={"k": k}, message=message, result=result)
 
     try:
         _t0 = _time.time()
@@ -2309,6 +2334,8 @@ def _run_lr(pairs_text, label_kind, seg_source, method, use_corrected, k, n_perm
             _lr_state["message"] = message
             if result is not None:
                 _lr_state["result"] = result
+        if status == "done":
+            provenance._prov_record("lr", seg_source=seg_source, corrected=use_corrected, params={"pairs": pairs_text, "k": k, "n_perm": n_perm, "seed": seed}, labels=(label_kind, method), seeds={"seed": seed}, message=message, result=result)
 
     try:
         _t0 = _time.time()
@@ -2477,6 +2504,7 @@ def _lr_tab(decomp_controls=None, decomp_results=None):
             html.Span("Permutations:", style=L),
             dcc.Input(id="lr-nperm", type="number", min=10, max=_LR_MAX_PERM, step=10, value=200,
                       debounce=True, style=ui._PLOT_CTRL_INPUT),
+            html.Span(style={"flex": "1"}),
             dbc.Button("Run", id="lr-run-btn", color="primary", size="sm", n_clicks=0,
                        style={"fontSize": "11px", "padding": "2px 12px"}),
         ], id="lr-scores-controls", style=S),

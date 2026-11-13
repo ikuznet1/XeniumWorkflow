@@ -8,6 +8,7 @@
 // XC_LABELS, default the first annotation offered) and, for the Segmentation QC rows beyond
 // Xenium, cached Baysor / Proseg runs.
 import {chromium} from 'playwright';
+import {openTab} from './lib.mjs';
 
 const base = process.argv[2] || 'http://127.0.0.1:8050';
 const out = process.argv[3] || '.';
@@ -48,7 +49,7 @@ const options = (id) => page.evaluate(async (i) => {
   return null;
 }, id);
 void options;
-const tab = async (t) => { await setProp('plots-tabs', {active_tab: t}); await page.waitForTimeout(1200); };
+const tab = (t) => openTab(page, t);   // by tab id, through the two-level navigation (lib.mjs)
 const plotTraces = (id) => page.evaluate((i) => {
   const gd = document.querySelector(`#${i} .js-plotly-plot`);
   return gd && gd.data ? gd.data.map((t) => ({name: t.name || '', type: t.type, n: (t.x || t.z || []).length})) : [];
@@ -216,7 +217,7 @@ await shot('cc_10_design_donor');
 await click('#design-close-btn');
 
 // ── composition test option, annotation report ───────────────────────────────
-await tab('tab-abundance');
+await tab('tab-composition');
 await page.waitForTimeout(1000);
 check('composition test offers the exact sample-level test', (await dropdownOptions('comp-test')).includes('exact'));
 await click('#annot-modal-open-btn');

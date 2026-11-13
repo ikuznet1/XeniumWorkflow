@@ -7,6 +7,7 @@ import pandas as pd
 import scipy.sparse as sp
 
 from . import core, jobs, caching, dataview, reseg, clustering
+from . import provenance
 
 
 def _compute_split_clusters_umap(cells_df: pd.DataFrame, corrected_mat,
@@ -292,6 +293,8 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
             core._split_state["message"] = message
             if result is not None:
                 core._split_state["result"] = result
+        if status == "done":
+            provenance._prov_record("split", seg_source=seg_source, params={"reference": os.path.basename(str(rds_path or '')), "label_col": label_col, "max_cores": max_cores, "min_umi": min_umi, "min_umi_sigma": min_umi_sigma, "purify_singlets": purify_singlets}, r_packages=("spacexr", "SPLIT", "Seurat", "SeuratObject"), message=message, result=result)
 
     try:
         import rpy2.robjects as ro

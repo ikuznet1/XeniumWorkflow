@@ -7,6 +7,7 @@
 // Needs a bundle with transcripts.parquet (or transcripts.zarr.zip). With a cell-type
 // annotation in the cache the markers are derived from it; otherwise from the clusters.
 import {chromium} from 'playwright';
+import {openTab} from './lib.mjs';
 
 const base = process.argv[2] || 'http://127.0.0.1:8050';
 const out = process.argv[3] || '.';
@@ -82,7 +83,7 @@ const run = async (re = /Markers \(|Pick a cell type|not a tile size|None of the
 if (await page.evaluate(() => getComputedStyle(document.querySelector('#umap-panel')).display === 'none')) {
   await click('#umap-toggle');
 }
-await setProp('plots-tabs', {active_tab: 'tab-abundance'});
+await openTab(page, 'tab-segfree');
 await page.waitForTimeout(2500);
 await page.evaluate(() => document.querySelector('#sfree-section').scrollIntoView());
 check('the block sits in the Cell Type Abundance tab, below the composition block',

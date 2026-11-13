@@ -7,6 +7,7 @@
 //     node test/joint_checks.mjs http://127.0.0.1:8171 /path/to/screenshot_dir
 // XJ_SAMPLES: at least one further Xenium bundle, added through the "+ Add sample" dialog.
 import {chromium} from 'playwright';
+import {openTab} from './lib.mjs';
 
 const base = process.argv[2] || 'http://127.0.0.1:8050';
 const out = process.argv[3] || '.';
@@ -48,7 +49,7 @@ const waitText = async (sel, re, timeout = 1800000) => {
 const shot = (name) => page.screenshot({path: `${out}/${name}.png`});
 const click = (sel) => page.evaluate((s) => document.querySelector(s).click(), sel);
 const tableRows = (id) => page.evaluate((i) => Math.max(0, document.querySelectorAll(`#${i} tbody tr`).length - 2), id);
-const tab = async (t) => { await setProp('plots-tabs', {active_tab: t}); await page.waitForTimeout(1200); };
+const tab = (t) => openTab(page, t);   // by tab id, through the two-level navigation (lib.mjs)
 const dropdown = (id) => page.evaluate((i) => {
   const el = document.getElementById(i);
   const key = Object.keys(el).find((k) => k.startsWith('__reactFiber'));

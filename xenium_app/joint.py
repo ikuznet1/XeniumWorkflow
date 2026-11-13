@@ -20,6 +20,7 @@ import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 
 from . import core, jobs, caching, dataview, ui, figures, analysis, stats, controls, clustering, clustersets
+from . import provenance
 
 
 # ─── State ────────────────────────────────────────────────────────────────────
@@ -535,6 +536,8 @@ def _run_joint(seg_source, use_corrected: bool = False, params=None) -> None:
                 _jc_state["result"] = result
             if status in ("done", "error"):
                 _jc_state["version"] += 1
+        if status == "done":
+            provenance._prov_record("joint", seg_source=seg_source, corrected=use_corrected, params=dict(params or {}), packages=("harmonypy", "leidenalg", "igraph", "umap-learn"), uses_design=True, message=message, result=result)
 
     try:
         _t0 = _time.time()
@@ -990,7 +993,7 @@ def _jc_csv(res) -> str:
              "# " + _jc_diag_text(d, res["var"] if res["var"] != "none" else "sample")]
     if res["harmony"]:
         lines.append("# " + _JC_CONFOUND_WARNING.replace("⚠ ", ""))
-    return "\n".join(lines) + "\n" + res["table"].to_csv(index=False)
+    return provenance._prov_csv_stamp(res, ("\n".join(lines) + "\n" + res["table"].to_csv(index=False)))
 
 
 # ─── Layout ───────────────────────────────────────────────────────────────────
@@ -1013,20 +1016,24 @@ def _jc_tab():
             html.Span("Integration:", style=L),
             dcc.Dropdown(id="jc-integrate", options=_jc_integrate_options(), value="sample", clearable=False,
                          style={"width": "250px", "fontSize": "11px"}),
-            html.Span("Genes:", style=L), num(id="jc-nhvg", value=_JC_N_HVG, min=50, max=20000, step=50, width="70px"),
-            html.Span("PCs:", style=L), num(id="jc-npcs", value=_JC_N_PCS, min=2, max=100, step=1),
-            html.Span("Neighbours:", style=L), num(id="jc-nn", value=_JC_N_NEIGHBORS, min=2, max=200, step=1),
             html.Span("Resolution:", style=L), num(id="jc-res", value=_JC_RESOLUTION, min=0.01, max=10, step=0.01),
-            html.Span("Seed:", style=L), num(id="jc-seed", value=_JC_SEED, min=0, max=10**6, step=1),
-            dcc.Checklist(id="jc-umap",
-                          options=[{"label": html.Span(" Joint UMAP", style={"fontSize": "11px", "color": core.TEXT}),
-                                    "value": "on"}],
-                          value=["on"], inputStyle={"marginRight": "3px"}, style={"display": "inline-flex"}),
+            html.Span(style={"flex": "1"}),
             dbc.Button("Run", id="jc-run-btn", color="primary", size="sm", n_clicks=0,
                        style={"fontSize": "11px", "padding": "2px 12px"}),
             dbc.Button("Samples & conditions…", id="jc-design-open-btn", color="secondary", size="sm", n_clicks=0,
                        style={"fontSize": "11px", "padding": "2px 8px"}),
         ], style=S),
+        ui._options(html.Div([
+            html.Span("Genes:", style=L), num(id="jc-nhvg", value=_JC_N_HVG, min=50, max=20000, step=50, width="70px"),
+            html.Span("PCs:", style=L), num(id="jc-npcs", value=_JC_N_PCS, min=2, max=100, step=1),
+            html.Span("Neighbours:", style=L), num(id="jc-nn", value=_JC_N_NEIGHBORS, min=2, max=200, step=1),
+            html.Span("Seed:", style=L), num(id="jc-seed", value=_JC_SEED, min=0, max=10**6, step=1),
+            dcc.Checklist(id="jc-umap",
+                          options=[{"label": html.Span(" Joint UMAP", style={"fontSize": "11px", "color": core.TEXT}),
+                                    "value": "on"}],
+                          value=["on"], inputStyle={"marginRight": "3px"}, style={"display": "inline-flex"}),
+        ], style=S), summary=f"Options ({_JC_N_HVG:,} genes, {_JC_N_PCS} PCs, {_JC_N_NEIGHBORS} neighbours, "
+                             f"seed {_JC_SEED}, joint UMAP on)"),
         html.Div(id="jc-design-summary", style={**L, "padding": "0 8px"}),
         html.Div(id="jc-status", style={**analysis._AN_STATUS_STYLE, "whiteSpace": "pre-wrap"}),
         html.Div(_JC_NOTE, id="jc-note", style=analysis._AN_NOTE_STYLE),

@@ -22,6 +22,7 @@ import numpy as np
 import pandas as pd
 from dash import dcc, html
 
+from . import provenance
 from . import core, jobs, caching, dataview, clustering, reseg, regions, ui
 
 
@@ -643,6 +644,19 @@ def _run_imgseg(backend: str = "classical", channels=None, diameter_um: float = 
         _set("done", msg, result={"cells_df": cells_df, "cell_bounds": cell_bounds, "out_dir": out_dir,
                                   "expr": expr_mat, "source": _ISEG_TOOL, "sdata_path": zarr_path})
         print(f"  Image segmentation: {msg} ({_time.time() - _t0:.0f} s)", flush=True)
+        provenance._prov_record(
+            "imgseg", f"Image-based segmentation ({info['label']})",
+            seg_source=provenance._prov_run_source(_ISEG_TOOL, {"out_dir": out_dir}),
+            params={"backend": backend, "channels": channels, "diameter_um": diameter_um,
+                    "expand_um": expand_um, "patch_um": patch_um, "overlap_um": overlap_um,
+                    "threshold_scale": thr_scale, "min_transcripts": min_tx, "qv_min": qv_min,
+                    "gpu": gpu, "flow_threshold": flow_threshold,
+                    "cellprob_threshold": cellprob_threshold, "region": [x_min, x_max, y_min, y_max],
+                    "resolved": p},
+            result={"n_cells": int(n_cells), "n_transcripts": int(n_tx),
+                    "n_transcripts_assigned": int(n_kept_tx), "n_patches_failed": int(n_failed)},
+            message=msg, cache=False, t0=_t0,
+            packages=("sopa", "spatialdata", "scikit-image") + (("cellpose", "torch") if backend == "cellpose" else ()))
     except jobs._JobCancelled:
         raise
     except jobs._DatasetChanged:
@@ -694,6 +708,11 @@ def _load_cached_imgseg(out_dir: str) -> None:
             "spage_result_genes": spage_genes,
             **(reseg._reseg_zarr_gene_index(zarr_path, expr_mat.shape[1]) if expr_mat is not None else {})})
         print(f"Loaded cached image segmentation: {n_cells:,} cells, {len(cell_bounds):,} boundaries", flush=True)
+        provenance._prov_record(
+            "imgseg", "Image-based segmentation (cached run loaded)",
+            seg_source=provenance._prov_run_source(_ISEG_TOOL, {"out_dir": out_dir}),
+            params={"run": os.path.basename(str(out_dir).rstrip("/"))},
+            result={"n_cells": int(n_cells)}, message=f"Loaded — {n_cells:,} cells", cache=True)
     except jobs._JobCancelled:
         raise
     except jobs._DatasetChanged:

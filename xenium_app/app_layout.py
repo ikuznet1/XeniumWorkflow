@@ -13,6 +13,8 @@ from . import banksy
 from . import segfree
 from . import txfactor
 from . import lrdecomp
+from . import provenance
+from . import figures
 
 
 with core._spage_lock:
@@ -1696,6 +1698,7 @@ dbc.Modal([
                 }),
 
                 html.Div([
+                    ui._nav_bar(),
                     dbc.Tabs(id="plots-tabs", active_tab="tab-umap",
                              style={"borderBottom": f"1px solid {core.BORDER}", "marginBottom": "6px"},
                              children=[
@@ -1715,16 +1718,30 @@ dbc.Modal([
                         dbc.Tab(label="Cell Type Abundance", tab_id="tab-abundance",
                                 label_style={"fontSize": "12px", "padding": "4px 12px"},
                                 children=[html.Div([
-                                    html.Div(dcc.Graph(id="cell-type-abundance-plot", responsive=True,
+                                    # the sizer gives the figure room for one row of bars per annotation
+                                    # (cb_nav.update_abundance_sizer); the tab body scrolls when that is
+                                    # more than the panel
+                                    html.Div(html.Div(dcc.Graph(id="cell-type-abundance-plot", responsive=True,
                                               config={"displayModeBar": "hover", "toImageButtonOptions": {"format": "svg", "filename": "xenium_abundance"}},
                                               style={"width": "100%", "height": "100%"}),
                                              id="abundance-plot-container",
                                              style={"flex": "1", "minHeight": "240px"}),
+                                             id="abundance-plot-sizer",
+                                             style={"display": "flex", "flexDirection": "column",
+                                                    "flex": "1 0 auto", "minHeight": "240px"}),
                                     ui._plot_dim_controls("abundance"),
-                                    stats._composition_section(),
-                                    segfree._sfree_section(),
                                 ], style={"display": "flex", "flexDirection": "column", "flex": "1", "minHeight": "0",
                                           "overflowY": "auto"})]),
+                        dbc.Tab(label="Composition", tab_id="tab-composition",
+                                label_style={"fontSize": "12px", "padding": "4px 12px"},
+                                children=[html.Div([stats._composition_section()],
+                                                   style={"display": "flex", "flexDirection": "column", "flex": "1",
+                                                          "minHeight": "0", "overflowY": "auto"})]),
+                        dbc.Tab(label="Segmentation-free abundance", tab_id="tab-segfree",
+                                label_style={"fontSize": "12px", "padding": "4px 12px"},
+                                children=[html.Div([segfree._sfree_section()],
+                                                   style={"display": "flex", "flexDirection": "column", "flex": "1",
+                                                          "minHeight": "0", "overflowY": "auto"})]),
                         dbc.Tab(label="Co-occurrence", tab_id="tab-cooccurrence",
                                 label_style={"fontSize": "12px", "padding": "4px 12px"},
                                 children=[html.Div([
@@ -1860,10 +1877,10 @@ dbc.Modal([
                                     ], style={"display": "flex", "alignItems": "center", "padding": "4px 8px",
                                               "borderBottom": f"1px solid {core.BORDER}", "flexShrink": "0"}),
                                     html.Div([
-                                        dcc.Graph(id="cellnest-bar-plot", responsive=True,
+                                        dcc.Graph(id="cellnest-bar-plot", responsive=True, figure=figures._make_placeholder_fig("No CellNEST results loaded."),
                                                   config={"displayModeBar": "hover", "modeBarButtons": [["toImage"]], "toImageButtonOptions": {"format": "svg", "filename": "xenium_cellnest_bar"}},
                                                   style={"flex": "1", "minWidth": "200px"}),
-                                        dcc.Graph(id="cellnest-spatial-plot", responsive=True,
+                                        dcc.Graph(id="cellnest-spatial-plot", responsive=True, figure=figures._make_placeholder_fig("No CellNEST results loaded."),
                                                   config={"displayModeBar": "hover", "modeBarButtons": [["toImage"]], "toImageButtonOptions": {"format": "svg", "filename": "xenium_cellnest_chord"}},
                                                   style={"flex": "2", "minWidth": "200px"}),
                                     ], id="cellnest-plots-container",
@@ -1886,13 +1903,13 @@ dbc.Modal([
                                                 html.Span("(Annotation column controls heatmap & dotplot)", style={"fontSize": "10px", "color": core.MUTED, "marginLeft": "10px"}),
                                             ], style={"display": "flex", "alignItems": "center", "padding": "4px 8px", "flexShrink": "0"}),
                                             html.Div([
-                                                dcc.Graph(id="cellnest-lr-heatmap", responsive=True,
+                                                dcc.Graph(id="cellnest-lr-heatmap", responsive=True, figure=figures._make_placeholder_fig(""),
                                                           config={"displayModeBar": "hover", "modeBarButtons": [["toImage"]], "toImageButtonOptions": {"format": "svg", "filename": "xenium_cellnest_lr_heatmap"}},
                                                           style={"flex": "1", "minWidth": "200px", "height": "320px"}),
-                                                dcc.Graph(id="cellnest-ligtarget-heatmap", responsive=True,
+                                                dcc.Graph(id="cellnest-ligtarget-heatmap", responsive=True, figure=figures._make_placeholder_fig(""),
                                                           config={"displayModeBar": "hover", "modeBarButtons": [["toImage"]], "toImageButtonOptions": {"format": "svg", "filename": "xenium_cellnest_ligtarget_heatmap"}},
                                                           style={"flex": "1", "minWidth": "200px", "height": "320px"}),
-                                                dcc.Graph(id="cellnest-dotplot", responsive=True,
+                                                dcc.Graph(id="cellnest-dotplot", responsive=True, figure=figures._make_placeholder_fig(""),
                                                           config={"displayModeBar": "hover", "modeBarButtons": [["toImage"]], "toImageButtonOptions": {"format": "svg", "filename": "xenium_cellnest_dotplot"}},
                                                           style={"flex": "1", "minWidth": "200px", "height": "320px"}),
                                             ], style={"display": "flex", "gap": "6px", "padding": "0 8px 8px"}),
@@ -1933,7 +1950,7 @@ dbc.Modal([
                                                                  multi=True, placeholder="Select TF(s) to plot…",
                                                                  style={"flex": "1", "fontSize": "11px"}),
                                                 ], style={"display": "flex", "alignItems": "center", "padding": "4px 8px"}),
-                                                dcc.Graph(id="cellnest-downstream-plot", responsive=True,
+                                                dcc.Graph(id="cellnest-downstream-plot", responsive=True, figure=figures._make_placeholder_fig(""),
                                                           config={"displayModeBar": "hover", "modeBarButtons": [["toImage"]], "toImageButtonOptions": {"format": "svg", "filename": "xenium_cellnest_downstream"}},
                                                           style={"height": "220px"}),
                                             ], id="cellnest-downstream-results",
@@ -1965,6 +1982,7 @@ dbc.Modal([
                         txfactor._txf_tab(),
                         banksy._bk_tab(),
                         joint._jc_tab(),
+                        provenance._prov_tab(),
                     ]),
                 ], id="umap-panel", style={"display": "none"}),
             ], id="plots-row", style={"display": "flex", "flex": "1", "gap": "10px", "minHeight": "0"}),

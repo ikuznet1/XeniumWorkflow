@@ -7,6 +7,7 @@ import pandas as pd
 import scipy.sparse as sp
 
 from . import compat, core, jobs, caching, loading, dataview, reseg
+from . import provenance
 
 
 # ─── SpaGE imputation ─────────────────────────────────────────────────────────
@@ -258,6 +259,8 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                 # '<gene> [imp]' vectors of a previous run must not be served again
                 dataview._gene_expr_cache.clear()
                 dataview._umap_fig_cache.clear()
+        if status == "done":
+            provenance._prov_record("spage", seg_source=seg_source, corrected=use_corrected, params={"reference": os.path.basename(str(rds_path or '')), "n_pv": n_pv, "genes": genes_input}, r_packages=("Seurat", "SeuratObject"), message=message, result=result)
 
     try:
         import tempfile

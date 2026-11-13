@@ -8,6 +8,7 @@ import pandas as pd
 import scipy.sparse as sp
 
 from . import core, jobs, caching, dataview, split
+from . import provenance
 
 
 def _labels_key_for_method(method: str, alt_res=None) -> str:
@@ -76,6 +77,8 @@ def _run_celltypist(model_name: str, labels_key: str = "labels",
             core._annot_state["message"] = message
             if labels is not None:
                 core._annot_state[labels_key] = labels
+        if status == "done":
+            provenance._prov_record("annotation", "Cell type annotation: CellTypist", seg_source=provenance._prov_labels_source(labels_key), params={"method": "celltypist", "model": model_name, "labels_key": labels_key}, packages=("celltypist", "scanpy", "anndata"), message=message, result=provenance._prov_labels_summary(labels))
 
     try:
         # imports inside the try so a missing package reports an error instead of
@@ -203,6 +206,8 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
                 core._annot_state[labels_key] = labels
                 if mode_labels_key and mode_labels_key != labels_key:
                     core._annot_state[mode_labels_key] = labels
+        if status == "done":
+            provenance._prov_record("annotation", "Cell type annotation: RCTD", seg_source=provenance._prov_labels_source(labels_key), params={"method": "rctd", "reference": os.path.basename(str(rds_path or '')), "label_col": label_col, "mode": mode, "n_cores": n_cores, "umi_min": umi_min, "umi_min_sigma": umi_min_sigma, "labels_key": labels_key}, r_packages=("spacexr", "Seurat", "SeuratObject"), message=message, result=provenance._prov_labels_summary(labels))
 
     ro = None       # set once R is used; the finally below cleans up after it
     tmpdir = None
@@ -507,6 +512,8 @@ def _run_seurat_annotation(rds_path: str, label_col: str = "Names", labels_key: 
             core._annot_state["message"] = message
             if labels is not None:
                 core._annot_state[labels_key] = labels
+        if status == "done":
+            provenance._prov_record("annotation", "Cell type annotation: Seurat kNN", seg_source=provenance._prov_labels_source(labels_key), params={"method": "seurat", "reference": os.path.basename(str(rds_path or '')), "label_col": label_col, "labels_key": labels_key}, r_packages=("Seurat", "SeuratObject"), message=message, result=provenance._prov_labels_summary(labels))
 
     tmpdir = None        # MatrixMarket export of the reference; removed in the finally
     _r_loaded = False    # the reference was put into R's global env

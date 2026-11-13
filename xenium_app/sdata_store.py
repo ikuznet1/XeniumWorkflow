@@ -5,6 +5,7 @@ import json
 import hashlib
 import pandas as pd
 
+from . import provenance
 from . import compat, core, jobs, caching, annotation
 
 
@@ -96,6 +97,8 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
             core._save_sdata_state["message"] = msg
         if status == "running":
             jobs._job_progress(msg)
+        if status == "done":
+            provenance._prov_record("save", seg_source=seg_source, params={"file": os.path.basename(str(save_path).rstrip("/")), "roi_only": roi_only}, packages=("spatialdata", "anndata", "zarr"), message=msg)
 
     try:
         import spatialdata as sd
@@ -396,6 +399,8 @@ def to_spatialdata(qv_threshold: int = 20, force: bool = False) -> None:
                     # (decides which transcripts count towards a patch)
                     core._sdata_state["qv"] = qv_threshold
                     core.DATA["sdata"] = sdata
+            if status == "done":
+                provenance._prov_record("patches", "SpatialData store of the dataset (sopa.io.xenium)", params={"qv_threshold": qv_threshold, "force": force}, packages=("sopa", "spatialdata", "spatialdata-io"), message=message)
 
         try:
             if not core.DATA.get("data_dir"):
@@ -665,6 +670,11 @@ def segment_tissue_roi() -> None:
                                                + (" (cached)" if _cached_roi else ""))
                 core._sdata_version += 1
                 print(f"  segment_tissue_roi: done, {len(roi_shapes)} region(s)", flush=True)
+                provenance._prov_record(
+                    "patches", "Tissue ROI (sopa.segmentation.tissue)", params={"mode": "staining"},
+                    result={"n_regions": int(len(roi_shapes))}, cache=bool(_cached_roi),
+                    message=f"ROI done — {len(roi_shapes)} region(s)" + (" (cached)" if _cached_roi else ""),
+                    packages=("sopa", "spatialdata"))
             else:
                 print("  segment_tissue_roi: no ROI shapes found in sdata", flush=True)
                 with core._sdata_lock:
@@ -756,6 +766,12 @@ def create_patches(width_um: float = 1000.0, min_transcripts: int = 10) -> None:
                     core._sdata_state["message"] = f"Patches done — {len(patches)} patches"
                 core._sdata_version += 1
                 print(f"  create_patches: {len(patches)} patches created", flush=True)
+                provenance._prov_record(
+                    "patches", "Transcript patches (sopa.make_transcript_patches)",
+                    params={"patch_width_um": width_um, "min_transcripts_per_patch": min_transcripts,
+                            "qv_threshold": _qv},
+                    result={"n_patches": int(len(patches))}, cache=False,
+                    message=f"Patches done — {len(patches)} patches", packages=("sopa", "spatialdata"))
             else:
                 print("  create_patches: no patch shapes found in sdata", flush=True)
                 with core._sdata_lock:

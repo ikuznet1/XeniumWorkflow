@@ -233,6 +233,16 @@ def subset(cluster=None, cell_type=None,
 
     # Update active data
     core.DATA["df"] = df_sub
+    # what was asked for, for the provenance record of the analyses run on the subset
+    # (a second subset() narrows the first: one entry per call)
+    _asked = dict(cluster=cluster, cell_type=cell_type, gene=gene, min_expr=min_expr, max_expr=max_expr,
+                  min_transcripts=min_transcripts, max_transcripts=max_transcripts,
+                  min_cell_area=min_cell_area, max_cell_area=max_cell_area,
+                  min_nucleus_area=min_nucleus_area, max_nucleus_area=max_nucleus_area, method=method,
+                  n_cell_ids=(len(cell_ids) if cell_ids is not None else None))
+    core.DATA.setdefault("_subset_desc", []).append(
+        {k: (v if isinstance(v, (int, float, str, bool)) else [str(x) for x in list(v)[:50]] if isinstance(v, (list, tuple, set)) else str(v))
+         for k, v in _asked.items() if v is not None})
 
     # Rebuild df_to_expr for the subset (map subset row → expr matrix row)
     orig_to_expr = core.DATA["_df_to_expr_orig"]
@@ -273,6 +283,7 @@ def unsubset():
         return
 
     core.DATA["df"]         = core.DATA.pop("_df_original")
+    core.DATA.pop("_subset_desc", None)
     core.DATA["df_to_expr"] = core.DATA.pop("_df_to_expr_orig")
 
     # Restore reseg originals if subset was applied there too

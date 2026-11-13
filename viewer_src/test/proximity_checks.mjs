@@ -8,6 +8,7 @@
 // is checked for its refusal of a single sample; with further bundles (added through
 // "+ Add sample") it is run with R (DESeq2 or edgeR) and XP_SHUFFLES label shuffles.
 import {chromium} from 'playwright';
+import {openTab} from './lib.mjs';
 
 const base = process.argv[2] || 'http://127.0.0.1:8050';
 const out = process.argv[3] || '.';
@@ -74,7 +75,7 @@ const dropdownOptions = (id) => page.evaluate((i) => {
 if (await page.evaluate(() => getComputedStyle(document.querySelector('#umap-panel')).display === 'none')) {
   await click('#umap-toggle');
 }
-await setProp('plots-tabs', {active_tab: 'tab-de'});
+await openTab(page, 'tab-de');
 await page.waitForFunction(() => { const e = document.querySelector('#de-group-a'); return e && e.getClientRects().length > 0; }, null, {timeout: 30000}).catch(() => {});
 await page.waitForTimeout(1500);
 check('nothing runs on load (n_clicks = 0)', (await text('#de-status')) === '', await text('#de-status'));
@@ -154,7 +155,7 @@ if (!extra.length) {
   }
   await page.keyboard.press('Escape');
   await page.waitForTimeout(3000);
-  await setProp('plots-tabs', {active_tab: 'tab-de'});
+  await openTab(page, 'tab-de');
   await setProp('prox-labels', {value: labels});
   await page.waitForTimeout(2500);
   const types2 = await dropdownOptions('prox-target');

@@ -29,6 +29,7 @@ import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 
 from . import core, jobs, dataview, ui, figures, analysis, reseg, stats, controls
+from . import provenance
 
 
 # ─── State ────────────────────────────────────────────────────────────────────
@@ -744,6 +745,8 @@ def _run_txfactor(seg_source, cluster_method, label_kind, method="nmf", params=N
                 _txf_state["result"] = result
             if status in ("done", "error"):
                 _txf_state["version"] += 1
+        if status == "done":
+            provenance._prov_record("txfactor", seg_source=seg_source, corrected=use_corrected, params={"method": method, **(params or {})}, labels=(label_kind, cluster_method), message=message, result=result)
 
     try:
         _t0 = _time.time()
@@ -1238,7 +1241,7 @@ def _txf_csv(res) -> str:
            + "\n# top genes per factor\n" + top.to_csv(index=False))
     if res["crosstab"] is not None and res["crosstab"].size:
         out += "\n# cells by dominant factor (rows) and label (columns)\n" + res["crosstab"].to_csv()
-    return out
+    return provenance._prov_csv_stamp(res, (out))
 
 
 # ─── Layout ───────────────────────────────────────────────────────────────────
@@ -1255,6 +1258,11 @@ def _txf_tab():
             dcc.Dropdown(id="txf-method", options=[{"label": v, "value": k} for k, v in _TXF_METHODS.items()],
                          value="nmf", clearable=False, style={"width": "210px", "fontSize": "11px"}),
             html.Span("K:", style=L), num(id="txf-k", value=_TXF_K, min=2, max=_TXF_MAX_K, step=1),
+            html.Span(style={"flex": "1"}),
+            dbc.Button("Run", id="txf-run-btn", color="primary", size="sm", n_clicks=0,
+                       style={"fontSize": "11px", "padding": "2px 12px"}),
+        ], style=S),
+        ui._options(html.Div([
             html.Span("Bin (µm):", style=L), num(id="txf-bin", value=_TXF_BIN_UM, min=2, max=200, step=1),
             dcc.Dropdown(id="txf-shape", options=[{"label": "square", "value": "square"},
                                                   {"label": "hexagon", "value": "hex"}],
@@ -1264,9 +1272,8 @@ def _txf_tab():
             html.Span("Fit on ≤ bins:", style=L),
             num(id="txf-maxfit", value=_TXF_MAX_FIT, min=200, max=2_000_000, step=100, width="76px"),
             html.Span("Seed:", style=L), num(id="txf-seed", value=_TXF_SEED, min=0, max=10 ** 6, step=1),
-            dbc.Button("Run", id="txf-run-btn", color="primary", size="sm", n_clicks=0,
-                       style={"fontSize": "11px", "padding": "2px 12px"}),
-        ], style=S),
+        ], style=S), summary=f"Options ({_TXF_BIN_UM:g} µm square bins, ≥ {_TXF_MIN_TX} transcripts per bin, "
+                             f"fit on ≤ {_TXF_MAX_FIT:,} bins, seed {_TXF_SEED})"),
         html.Div([
             html.Span("Cell types from:", style=L),
             dcc.Dropdown(id="txf-labels", options=[{"label": "Cluster (active cluster set)", "value": "cluster"}],

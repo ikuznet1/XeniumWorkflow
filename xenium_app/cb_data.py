@@ -5,6 +5,7 @@ from dash import no_update, Patch
 import dash
 from dash import html, Input, Output, State, callback_context, ALL
 
+from . import provenance
 from . import (
     core, jobs, caching, ui, loading, dataview, annotation, spage, morph, figures, analysis,
     stats, controls, sdata_store, regions, app_layout,
@@ -710,6 +711,8 @@ def _h5ad_job(path, mapping) -> None:
     def _set(status, message, result=None):
         with h5ad._h5ad_lock:
             h5ad._h5ad_state.update({"status": status, "message": message, "result": result})
+        if status == "done":
+            provenance._prov_record("h5ad", params={"file": os.path.basename(str(path or '')), "mapping": mapping}, packages=("anndata", "h5py"), message=message)
 
     def _progress(fraction, message):
         jobs._job_progress(step=message, fraction=fraction)

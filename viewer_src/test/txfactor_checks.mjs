@@ -7,6 +7,7 @@
 // Needs a bundle with transcripts.parquet (or transcripts.zarr.zip). The first run on a
 // bundle bins all transcripts (minutes on tens of millions); the counts are then cached.
 import {chromium} from 'playwright';
+import {openTab} from './lib.mjs';
 
 const base = process.argv[2] || 'http://127.0.0.1:8050';
 const out = process.argv[3] || '.';
@@ -99,7 +100,7 @@ if (await page.evaluate(() => getComputedStyle(document.querySelector('#umap-pan
   await click('#umap-toggle');
 }
 await setProp('renderer-mode', {value: 'plotly'});
-await setProp('plots-tabs', {active_tab: 'tab-txf'});
+await openTab(page, 'tab-txf');
 await page.waitForSelector('#txf-run-btn', {state: 'visible'});
 await page.waitForTimeout(2500);
 check('the tab says what this is and what it is not',

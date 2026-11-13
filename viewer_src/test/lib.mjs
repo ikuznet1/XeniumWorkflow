@@ -177,3 +177,68 @@ export class Checks {
     return this.results.filter((r) => !r.pass);
   }
 }
+
+// ── Navigation of the app's plots panel ──────────────────────────────────────
+// The panel has two levels (groups, then tabs); a tab is still identified by the tab_id
+// it has in plots-tabs ('tab-de', 'tab-moran', ...). openTab() opens a tab by that id the
+// way a user does - it shows the plots panel if it is hidden, clicks the group that holds
+// the tab, then the tab - and so keeps working whatever the nesting is. With
+// {options: true} (the default) the "Options" disclosures of the tab are opened too, so
+// their inputs can be clicked and filled.
+export async function showPlotsPanel(page) {
+  const hidden = await page.evaluate(() => {
+    const p = document.querySelector('#umap-panel');
+    return !p || getComputedStyle(p).display === 'none';
+  });
+  if (hidden) {
+    await page.evaluate(() => document.querySelector('#umap-toggle')?.click());
+    await page.waitForFunction(() => {
+      const p = document.querySelector('#umap-panel');
+      return p && getComputedStyle(p).display !== 'none';
+    }, null, {timeout: 15000});
+  }
+}
+
+export async function openTab(page, tabId, {options = true, settle = 1200, show = true} = {}) {
+  if (show) await showPlotsPanel(page);
+  await page.waitForSelector(`#nav-tab-${tabId}`, {state: 'attached', timeout: 60000});
+  const group = await page.evaluate((t) => {
+    const cur = [...document.querySelectorAll('#nav-subtabs .nav-sub.active')].map((e) => e.id);
+    if (cur.includes(`nav-tab-${t}`)) return 'already';
+    // the group whose row holds the tab: sub-tabs are listed group by group, in the order of the groups
+    const subs = [...document.querySelectorAll('#nav-subtabs .nav-sub')];
+    const btn = document.getElementById(`nav-tab-${t}`);
+    if (!btn) return null;
+    if (!btn.classList.contains('nav-hidden')) { btn.click(); return 'same-group'; }
+    return 'other-group';
+  }, tabId);
+  if (group === null) throw new Error(`openTab: no tab '${tabId}' in the navigation`);
+  if (group === 'other-group') {
+    // open each group in turn until the tab's button is shown, then click it
+    const groups = await page.evaluate(() => [...document.querySelectorAll('#nav-groups .nav-group')].map((e) => e.id));
+    let found = false;
+    for (const g of groups) {
+      await page.evaluate((id) => document.getElementById(id).click(), g);
+      try {
+        await page.waitForFunction(([gid, t]) => document.getElementById(gid).classList.contains('active')
+          && !document.getElementById(`nav-tab-${t}`).classList.contains('nav-hidden') , [g, tabId], {timeout: 1500});
+        found = true;
+        break;
+      } catch { /* not this group */ }
+    }
+    if (!found) throw new Error(`openTab: no group shows the tab '${tabId}'`);
+    await page.evaluate((t) => document.getElementById(`nav-tab-${t}`).click(), tabId);
+  }
+  await page.waitForFunction((t) => document.getElementById(`nav-tab-${t}`).classList.contains('active'), tabId, {timeout: 15000});
+  if (options) {
+    await page.evaluate(() => {
+      document.querySelectorAll('#umap-panel .tab-pane.active details.tab-options').forEach((d) => { d.open = true; });
+    });
+  }
+  if (settle) await page.waitForTimeout(settle);
+}
+
+/** tab_id of the tab that is open (read from the navigation bar). */
+export async function activeTab(page) {
+  return page.evaluate(() => (document.querySelector('#nav-subtabs .nav-sub.active')?.id || '').replace(/^nav-tab-/, ''));
+}

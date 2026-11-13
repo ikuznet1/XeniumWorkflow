@@ -7,6 +7,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.colors import qualitative
 
+from . import provenance
 from . import core, jobs
 
 
@@ -141,6 +142,10 @@ def _load_cellnest_data(folder: str, dataset_name: str, strip_suffix: str = ""):
             }
             core._cellnest_state["status"] = "done"
             core._cellnest_state["message"] = f"Loaded {len(ccc_df):,} interactions"
+        provenance._prov_record(
+            "cellnest", params={"dataset_name": dataset_name, "strip_suffix": strip_suffix},
+            result={"n_interactions": int(len(ccc_df))},
+            message=f"Loaded {len(ccc_df):,} interactions", cache=False)
     except jobs._JobCancelled:
         raise
     except Exception as exc:

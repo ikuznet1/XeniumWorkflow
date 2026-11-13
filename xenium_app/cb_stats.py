@@ -6,6 +6,7 @@ import dash
 from dash import no_update
 from dash import Input, Output, State, ALL
 
+from . import provenance
 from . import core, jobs, dataview, analysis, stats, proximity, app_layout, cb_analysis
 
 
@@ -178,7 +179,7 @@ def update_de_table_columns(_done, _ds_version):
 )
 def update_comp_category_options(active_tab, _annot, _niche, _ds, seg_source, _ex, color_by=None,
                                  current=None):
-    if active_tab != "tab-abundance":
+    if active_tab not in ("tab-composition", "tab-abundance"):
         raise dash.exceptions.PreventUpdate
     opts = stats._comp_category_options(seg_source, color_by)
     have = [o["value"] for o in opts]
@@ -205,16 +206,13 @@ def run_composition(n_clicks, kind, transform, seg_source, method, version, test
     if not kind:
         return no_update, "Pick what the proportions are computed of."
     try:
-        res = stats._comp_compute(kind, seg_source or "xenium", method,
-                                  "asin" if transform == "asin" else "logit",
-                                  "exact" if test == "exact" else "moderated")
+        res, msg = stats._comp_run(kind, seg_source or "xenium", method,
+                                   "asin" if transform == "asin" else "logit",
+                                   "exact" if test == "exact" else "moderated")
     except ValueError as exc:
         with stats._comp_lock:
             stats._comp_state.update({"result": None, "message": str(exc)})
         return (version or 0) + 1, str(exc)
-    msg = res.get("test_note", "")
-    for w in res["warnings"]:
-        msg += f"\n⚠ {w[0].upper() + w[1:]}."
     with stats._comp_lock:
         stats._comp_state.update({"result": res, "message": msg})
         stats._comp_state["version"] += 1
@@ -362,7 +360,7 @@ def download_moran_table(n_clicks):
     for i in res["samples"]:
         header += (f"# sample {i['label']} ({i['name']}): {i['n_cells']} cells; E[I] = "
                    f"{i['expected']:.6g}; Var[I] = {i['variance']:.6g}\n")
-    return dict(content=header + t.to_csv(index=False), filename="spatially_variable_genes_moran.csv")
+    return dict(content=provenance._prov_csv_stamp(res, header + t.to_csv(index=False)), filename="spatially_variable_genes_moran.csv")
 
 
 # ─── Ligand-receptor scores ───────────────────────────────────────────────────
@@ -523,7 +521,7 @@ def download_lr_table(n_clicks):
               f"frac_ligand / frac_receptor: cells with count >= 1 transcript\n")
     if res.get("n_uncorrected"):
         header += f"# {analysis._an_uncorrected_note(res['n_uncorrected'])}\n"
-    return dict(content=header + t.to_csv(index=False), filename="ligand_receptor_scores.csv")
+    return dict(content=provenance._prov_csv_stamp(res, header + t.to_csv(index=False)), filename="ligand_receptor_scores.csv")
 
 
 # ─── Counts mode with several samples ─────────────────────────────────────────

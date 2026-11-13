@@ -1,0 +1,42 @@
+# Headless batch run on the tiny test bundle (23 cells; shows the mechanics, not biology).
+#
+# The app writes a SpatialData store into the bundle directory the first time it loads it,
+# so run the example on a COPY of the fixture, from the repository root:
+#
+#   cp -R tests/data/prime_mouse_ileum_tiny /tmp/xenium_tiny
+#   python -m xenium_app.batch examples/batch_tiny.yaml --dry-run    # validate only
+#   python -m xenium_app.batch examples/batch_tiny.yaml              # run
+#
+# Paths are relative to the directory the command is started from (or absolute).
+# `python -m xenium_app.batch --list-steps examples/batch_tiny.yaml` prints every step kind
+# with its parameters and their defaults (the defaults of the controls in the app).
+
+data:
+  path: /tmp/xenium_tiny            # a Xenium bundle directory, a .zarr store, or an .h5ad file
+  # extra_samples: [/data/section2, /data/section3]
+  # design:                         # needed by pseudobulk, composition tests, contact DE …
+  #   names: {A: treated, B: control}
+  #   samples:
+  #     - {sample: S0, condition: treated, donor: d1}
+  #     - {sample: S1, condition: control, donor: d1}
+cache_dir: /tmp/xenium_tiny_cache   # the app's cache (also holds the provenance records)
+output_dir: /tmp/xenium_tiny_out    # one folder per step, plus provenance.json and methods.md
+
+# shared by every step (optional): seg_source (xenium | baysor:<tag> | proseg:<tag> | imgseg:<tag>),
+# counts (original | corrected), cluster_method, color_by
+seg_source: xenium
+counts: original
+continue_on_error: false            # true: a failed step is reported and the next one runs
+
+steps:
+  - kind: moran                     # spatially variable genes
+    params: {k: 6}
+  - kind: compartments              # edge distance and local density per cell
+    params: {bin_um: 25}
+  - kind: composition               # proportions of each cluster per sample
+    params: {labels: cluster}
+  - kind: transcript_factors        # segmentation-free NMF of binned transcripts
+    name: factors_k3
+    params: {k: 3, seed: 0}
+  - kind: export_spatialdata        # written into this step's output folder
+    params: {fname: tiny_analysis.zarr}

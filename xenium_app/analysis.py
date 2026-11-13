@@ -16,6 +16,7 @@ import time as _time
 from collections import OrderedDict as _OrderedDict
 
 from . import core, jobs, caching, ui, dataview, annotation, reseg, figures, regions
+from . import provenance
 
 
 # ─── Analysis: differential expression, gene-set scores, transcript density ───
@@ -832,6 +833,8 @@ def _run_de(spec_a, spec_b, seg_source, method, color_by, use_corrected, options
             _de_state["message"] = message
             if result is not None:
                 _de_state["result"] = result
+        if status == "done":
+            provenance._prov_record("de", seg_source=seg_source, corrected=use_corrected, params={"group_a": spec_a, "group_b": spec_b, "cluster_method": method, "color_by": color_by, "options": options}, labels=(color_by, method), message=message, result=result)
 
     try:
         _t0 = _time.time()
@@ -1325,6 +1328,8 @@ def _run_geneset_score(name, seg_source, use_corrected) -> None:
                 return
             _geneset_state["status"] = status
             _geneset_state["message"] = message
+        if status == "done":
+            provenance._prov_record("geneset", f"Gene-set score: {name}", seg_source=seg_source, corrected=use_corrected, params={"gene_set": name}, message=message)
 
     try:
         _set("running", f"Scoring gene set '{name}'…")
@@ -1759,6 +1764,8 @@ def _run_density(genes, _unused=None) -> None:
                 return
             _density_state["status"] = status
             _density_state["message"] = message
+        if status == "done":
+            provenance._prov_record("density", params={"genes": genes}, message=message)
 
     try:
         # every sample of the view that has its transcripts (a sample loaded from a .zarr
@@ -1885,7 +1892,7 @@ def _de_tab(pseudobulk_controls=None, extra_modes=None, extra_controls=None):
                  style={"display": "none", "flexShrink": "0"}),
         html.Div(extra_controls or [], id="de-prox-controls",
                  style={"display": "none", "flexShrink": "0"}),
-        html.Div([
+        ui._options(html.Div([
             dcc.Checklist(id="de-leak-gate",
                           options=[{"label": html.Span(" Gene ownership + leak gate (needs a cell-type "
                                                        "annotation)", style={"fontSize": "11px", "color": core.TEXT}),
@@ -1898,7 +1905,7 @@ def _de_tab(pseudobulk_controls=None, extra_modes=None, extra_controls=None):
                            inputStyle={"marginRight": "3px"},
                            labelStyle={"marginRight": "10px", "cursor": "pointer", "fontSize": "11px",
                                        "color": core.TEXT}),
-        ], style=_AN_ROW_STYLE),
+        ], style=_AN_ROW_STYLE), summary="Options (leak gate: on; volcano x axis: log2FC)"),
         html.Div(id="de-status", style={**_AN_STATUS_STYLE, "whiteSpace": "pre-wrap"}),
         html.Div(id="de-pb-samples", style={"padding": "0 8px", "flexShrink": "0"}),
         html.Div(_DE_CAVEAT, id="de-caveat", style=_AN_NOTE_STYLE),

@@ -18,6 +18,7 @@ import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 
 from . import core, jobs, dataview, ui, figures, analysis, stats, controls
+from . import provenance
 
 
 # ─── State ────────────────────────────────────────────────────────────────────
@@ -460,6 +461,8 @@ def _run_aggregates(seg_source, method, label_kind, classes, params=None) -> Non
                 _agg_state["result"] = result
             if status in ("done", "error"):
                 _agg_state["version"] += 1
+        if status == "done":
+            provenance._prov_record("aggregates", seg_source=seg_source, params={"classes": classes, **(params or {})}, labels=(label_kind, method), uses_design=True, message=message, result=result)
 
     try:
         _t0 = _time.time()
@@ -813,10 +816,10 @@ def _agg_csv(res) -> str:
                          + (f"no test ({tt['why']})" if tt["p"] is None else
                             f"A - B = {tt['effect']:.4g}; p = {tt['p']:.4g}; {tt['test']}; {tt['units_note']}; "
                             f"smallest achievable p {tt['min_p']:.4g}"))
-    return ("\n".join(lines) + "\n# samples\n" + res["samples"].to_csv(index=False)
+    return provenance._prov_csv_stamp(res, ("\n".join(lines) + "\n# samples\n" + res["samples"].to_csv(index=False)
             + "\n# aggregates\n" + res["aggregates"].to_csv(index=False)
             + "\n# composition per aggregate\n" + res["oe"].to_csv(index=False)
-            + "\n# composition pooled over the aggregates\n" + res["pooled"].to_csv(index=False))
+            + "\n# composition pooled over the aggregates\n" + res["pooled"].to_csv(index=False)))
 
 
 # ─── Layout ───────────────────────────────────────────────────────────────────
@@ -841,7 +844,7 @@ def _agg_tab():
             dbc.Button("Run", id="agg-run-btn", color="primary", size="sm", n_clicks=0,
                        style={"fontSize": "11px", "padding": "2px 12px"}),
         ], style=S),
-        html.Div([
+        ui._options(html.Div([
             html.Span("Radius (µm):", style=L), num(id="agg-radius", value=_AGG_RADIUS_UM, min=5, max=1000, step=1),
             html.Span("≥ class cells:", style=L), num(id="agg-nmin", value=_AGG_MIN_CLASS, min=2, max=100000, step=1),
             html.Span("Link ≤ (µm):", style=L), num(id="agg-link", value=_AGG_LINK_UM, min=1, max=1000, step=1),
@@ -857,7 +860,8 @@ def _agg_tab():
                                                        style={"fontSize": "11px", "color": core.TEXT}),
                                     "value": "on"}],
                           value=["on"], inputStyle={"marginRight": "3px"}, style={"display": "inline-flex"}),
-        ], style=S),
+        ], style=S), summary=f"Options (radius {_AGG_RADIUS_UM:g} µm, ≥ {_AGG_MIN_CLASS} class cells, link ≤ {_AGG_LINK_UM:g} µm, "
+                             f"{_AGG_N_NULL} permutations, α {_AGG_ALPHA:g}, outlines on)"),
         html.Div([
             dbc.Button("Samples & conditions…", id="agg-design-open-btn", color="secondary", size="sm",
                        n_clicks=0, style={"fontSize": "11px", "padding": "2px 8px"}),
