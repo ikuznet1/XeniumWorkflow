@@ -45,6 +45,7 @@ _moran_state: dict = {"status": "idle", "message": "", "result": None}
 _moran_lock = threading.Lock()
 _MORAN_K = 6               # neighbours per cell of the spatial graph
 _MORAN_CHUNK_BYTES = 64e6  # dense block of expression values handled at a time
+_MORAN_THREADS = max(1, min(4, (os.cpu_count() or 2) // 2))   # gene blocks computed at a time
 
 _lr_state: dict = {"status": "idle", "message": "", "result": None}
 _lr_lock = threading.Lock()
@@ -432,7 +433,7 @@ def _sl_units(conds, donors=None) -> dict:
         out["n_units"] = len(groups)
         n_d = len({d for (d, _c) in groups})
         out["note"] = (f"n = {len(inc)} samples" + (f" ({n_d} donors)" if named else "")
-                       + (f", {len(groups)} independent units after averaging samples of one donor"
+                       + (f", {len(groups)} independent units after combining the samples of one donor"
                           if len(groups) != len(inc) else ""))
         if both:
             out["note"] += ("; a donor occurs in both conditions but the design is not paired "
@@ -573,20 +574,70 @@ def _pb_population_masks(spec, samples, seg_source, method, color_by) -> tuple:
     return analysis._de_group_masks(spec, samples, seg_source, method, color_by, False)
 
 
+_PB_NONINTEGER_NOTE = ("the count matrix holds non-integer values (corrected, not raw, counts): they "
+                       "were summed per pseudobulk column and the sums rounded to whole numbers, as the file's "
+                       "mapping allows; the count model of DESeq2 / edgeR is then an approximation")
+
+
+def _counts_are_integer(s: dict) -> bool:
+    """True when the count matrix of analysis sample *s* holds whole numbers only. Checked
+    once per matrix (the result is kept on the dataset dict the sample comes from)."""
+    data = s["csc"].data
+    if data.dtype.kind in "iu" or not len(data):
+        return True
+    ds = s.get("ds")
+    memo = ds.get("_counts_integer") if isinstance(ds, dict) else None
+    if memo is not None and memo[0] is data:
+        return memo[1]
+    ok = True
+    for a in range(0, len(data), 8_000_000):           # in blocks: no full-size temporary
+        blk = data[a:a + 8_000_000]
+        if not np.array_equal(blk, np.rint(blk)):
+            ok = False
+            break
+    if isinstance(ds, dict):
+        ds["_counts_integer"] = (data, ok)
+    return ok
+
+
+def _counts_round_sums(s: dict) -> bool:
+    """Non-integer counts of this sample may be summed and the sums rounded: an explicit
+    choice made when the data was loaded ("noninteger_counts": "round_sums" in the mapping
+    of an .h5ad whose only counts are corrected ones). Never on by default."""
+    return (s.get("ds") or {}).get("counts_noninteger") == "round_sums"
+
+
 def _pb_sum_counts(s: dict, mask) -> tuple:
     """(count per matrix column summed over the masked cells of sample *s*, number of
-    cells summed). The counts must be whole numbers."""
+    cells summed). The counts must be whole numbers (see _counts_round_sums for the one
+    exception, which rounds the sums)."""
     csc = s["csc"]
     rows = np.asarray(s["rows"])
     sel = rows[np.asarray(mask, dtype=bool) & (rows >= 0)]
-    data = csc.data
-    if data.dtype.kind not in "iu" and len(data) and not np.array_equal(data, np.rint(data)):
+    if not _counts_are_integer(s) and not _counts_round_sums(s):
         raise ValueError(f"The count matrix of {s['label']} holds non-integer values: pseudobulk "
-                         f"differential expression needs raw counts.")
+                         f"differential expression needs raw counts."
+                         + (" This sample comes from an .h5ad: name the matrix with the raw counts "
+                            "in the mapping, or, when the file only has corrected counts, set "
+                            "\"noninteger_counts\": \"round_sums\" there to sum them per sample and "
+                            "round the sums." if (s.get("ds") or {}).get("h5ad") else ""))
+    tot, n = _pb_sum_values(s, mask)
+    return np.rint(tot).astype(np.int64), n
+
+
+def _pb_sum_values(s: dict, mask) -> tuple:
+    """(sum per matrix column over the masked cells of sample *s* as float64, number of
+    cells summed), without the integer check and without rounding: whole numbers for raw
+    counts (exact in float64), fractions for corrected counts. _pb_prepare rounds once,
+    after the samples of a donor were added up, so that a donor column is round(Σ over its
+    sections) and not Σ round(section)."""
+    csc = s["csc"]
+    rows = np.asarray(s["rows"])
+    sel = rows[np.asarray(mask, dtype=bool) & (rows >= 0)]
     w = np.zeros(csc.shape[0], dtype=np.float64)
     w[sel] = 1.0
     tot = np.asarray(csc.T @ w, dtype=np.float64).ravel()
-    return np.rint(tot).astype(np.int64), int(len(sel))
+    return tot, int(len(sel))
 
 
 def _pb_design_matrix(conds, batches) -> np.ndarray:
@@ -665,11 +716,13 @@ def _pb_prepare(samples, masks, conds, batches, min_cells=_PB_MIN_CELLS,
         raise ValueError("The samples of this comparison share no measured genes.")
     rows, cols, used = [], [], []
     for i, s in enumerate(samples):
-        tot, n = _pb_sum_counts(s, masks[i])
+        if not _counts_are_integer(s):
+            _pb_sum_counts(s, np.zeros(len(s["df"]), dtype=bool))    # raises unless rounding is allowed
+        tot, n = _pb_sum_values(s, masks[i])
         v = tot[np.array([s["gni"][g] for g in genes if g in s["gni"]], dtype=np.int64)]
         row = {"label": s["label"], "name": s["name"], "cond": conds[i], "batch": batches[i],
                "donor": (donors[i] if donors is not None else "") or "",
-               "n_cells": n, "lib_size": int(v.sum()), "used": False, "note": ""}
+               "n_cells": n, "lib_size": int(np.rint(v.sum())), "used": False, "note": ""}
         if conds[i] not in ("A", "B"):
             row["note"] = "excluded"
         elif n < min_cells:
@@ -745,6 +798,8 @@ def _pb_prepare(samples, masks, conds, batches, min_cells=_PB_MIN_CELLS,
                 u_block = [""] * len(groups)
                 pre_warn.append("batch labels differ between the samples summed into one donor column "
                                 "and were not used")
+    if any(not _counts_are_integer(samples[i]) for i in used):
+        pre_warn.append(_PB_NONINTEGER_NOTE)
     try:
         u_batch, warn = _design_check(u_cond, u_block)
         warn = pre_warn + warn
@@ -753,7 +808,8 @@ def _pb_prepare(samples, masks, conds, batches, min_cells=_PB_MIN_CELLS,
         extra = (" Dropped: " + "; ".join(f"{r['label']} ({r['n_cells']} cells)" for r in dropped) + "."
                  if dropped else "")
         raise ValueError(str(exc) + extra) from None
-    counts = np.column_stack(cols).astype(np.int64)
+    # rounded here, once per model column (a no-op for raw counts, whose sums are whole)
+    counts = np.rint(np.column_stack(cols)).astype(np.int64)
     keep = counts.sum(axis=1) >= min_count
     if int(keep.sum()) < 2:
         raise ValueError(f"Fewer than 2 genes have a total count of at least {min_count} over "
@@ -767,6 +823,7 @@ def _pb_prepare(samples, masks, conds, batches, min_cells=_PB_MIN_CELLS,
             "units_note": _sl_units([r["cond"] if r["used"] else "" for r in rows],
                                     [r["donor"] for r in rows])["note"] if any(u_donor) else
                           f"n = {len(used)} samples",
+            "by_donor": bool(any(u_donor)),
             "warnings": warn, "n_filtered": int((~keep).sum()), "n_genes_all": len(genes),
             "min_cells": min_cells, "min_count": min_count}
 
@@ -860,7 +917,10 @@ def _pb_fit(prep: dict, shrink: bool = True, engine: str = "auto") -> dict:
             res = ro.globalenv[".xe_pb_deseq2"](*args, bool(shrink))
         else:
             res = ro.globalenv[".xe_pb_edger"](*args)
-        get = lambda k: np.asarray(res.rx2(k), dtype=np.float64)
+        # a copy: np.asarray() of an R numeric vector is a view of R's memory, which R
+        # reuses once the vector is collected (size factors read after a later R call
+        # came back as garbage)
+        get = lambda k: np.array(res.rx2(k), dtype=np.float64, copy=True)
         txt = lambda k: str(res.rx2(k)[0])
         sf = get("size_factors")
         out = {"log2fc": get("log2FoldChange"), "stat": get("stat"), "pval": get("pvalue"),
@@ -976,14 +1036,17 @@ def _run_pseudobulk_de(population, seg_source, method, color_by, counts_correcte
                          "integer counts")
         if bool(shrink) and not shrunk and fit["engine"] == "deseq2":
             notes.append("no shrinkage estimator ran: log2 fold changes are unshrunken")
-        _unit_word = "donors" if prep["design"].startswith("~ donor") else "samples"
+        # a model column is a donor whenever donor labels are used (paired or not)
+        _unit_word = "donors" if prep.get("by_donor") else "samples"
         res = {"kind": "pseudobulk", "table": table, "population": pop_label,
                "label_a": names["A"], "label_b": names["B"], "n_a": n_a, "n_b": n_b,
                "title": (f"Pseudobulk, {pop_label}: A {names['A']} ({n_a} {_unit_word}) vs "
                          f"B {names['B']} ({n_b} {_unit_word}) — {fit['method_label']}, {prep['design']}; "
                          f"{prep['units_note']}"),
                "lfc_col": lfc_col, "lfc_title": "log2 fold change (A / B), unshrunken (MLE)",
-               "units_note": prep["units_note"], "median_counts_a": med_a, "median_counts_b": med_b,
+               "units_note": prep["units_note"], "unit_word": _unit_word,
+               "counts_rounded": _PB_NONINTEGER_NOTE in prep["warnings"],
+               "median_counts_a": med_a, "median_counts_b": med_b,
                "depth_ratio": analysis._depth_ratio(med_a, med_b),
                "stat_name": fit["stat_name"], "shrink": fit["shrink"], "engine": fit["engine"],
                "method_label": fit["method_label"], "mean_unit": fit["mean_unit"],
@@ -1013,8 +1076,11 @@ def _run_pseudobulk_de(population, seg_source, method, color_by, counts_correcte
                f"{prep['min_count']} not tested"
                + (f"; {n_na:,} without an adjusted p-value after independent filtering / outlier "
                   f"flagging" if n_na else "")
-               + f"), {n_sig:,} with FDR < 0.05 ({res['seconds']:.1f} s). Original counts."
-               + f"\nUnit of the p-values: {prep['units_note']} (the samples, not the cells)."
+               + f"), {n_sig:,} with FDR < 0.05 ({res['seconds']:.1f} s). "
+               + ("Counts as loaded: NOT raw counts (see the warning)." if res["counts_rounded"] else "Original counts.")
+               + f"\nUnit of the p-values: {prep['units_note']} "
+               + ("(the donors: not their sections, not the cells)." if prep.get("by_donor")
+                  else "(the samples, not the cells).")
                + "\n" + analysis._depth_note(med_a, med_b)
                + ("\n" + res["leak_summary"] if res.get("leak_summary") else ""))
         if dropped:
@@ -1041,11 +1107,15 @@ def _run_pseudobulk_de(population, seg_source, method, color_by, counts_correcte
 def _pb_csv_header(res: dict) -> str:
     """Comment lines of the CSV download of a pseudobulk result."""
     lines = [f"# Pseudobulk differential expression; population: {res['population']}",
-             f"# A: {res['label_a']} ({res['n_a']} samples); B: {res['label_b']} ({res['n_b']} samples); "
+             f"# A: {res['label_a']} ({res['n_a']} {res.get('unit_word', 'samples')}); "
+             f"B: {res['label_b']} ({res['n_b']} {res.get('unit_word', 'samples')}); "
              f"log2fc = A / B",
              f"# method: {res['method_label']}; design: {res['design']}; "
              f"log2fc: unshrunken MLE" + (f"; log2fc_shrunk: {res['shrink']}" if res["shrink"] != "none" else ""),
-             f"# counts: original integer counts summed per sample; segmentation: {res['seg_source']}; "
+             (f"# counts: NOT raw counts - non-integer values summed per pseudobulk column, sums rounded; "
+              if res.get("counts_rounded") else
+              f"# counts: original integer counts summed per {'donor and condition' if res.get('unit_word') == 'donors' else 'sample'}; ")
+             + f"segmentation: {res['seg_source']}; "
              f"means: {res['mean_unit']}",
              f"# genes: {res['n_genes']} tested, {res['n_filtered']} with total count < {res['min_count']} "
              f"not tested, {res['n_padj_na']} without adjusted p-value",
@@ -1207,8 +1277,11 @@ _COMP_NOTE = ("Proportions are compositional: they sum to 1 within a sample, so 
               "square-root-transformed, a linear model (~ condition, or ~ batch + condition) is "
               "fitted per category and tested with a moderated t-test (limma-style empirical "
               "Bayes shrinkage of the variances, non-robust); Welch's t-test on the same values "
-              "(ignores batch labels) is given beside it; Benjamini–Hochberg FDR over the "
-              f"categories. With fewer than {_COMP_MIN_SAMPLES} samples in a condition no test is "
+              "(ignores batch labels and pairing) is given beside it; Benjamini–Hochberg FDR over the "
+              "categories. With a donor on every included sample the units are the donors: the "
+              "samples of a donor within a condition are averaged (after the transformation) into "
+              "one value, and the model is ~ donor + condition when the design is paired. "
+              f"With fewer than {_COMP_MIN_SAMPLES} units (samples, or donors) in a condition no test is "
               "run: only the proportions are shown. Cluster and niche ids are comparable across "
               "samples only when the samples were clustered together. Test 'exact (sample-level)': "
               "the same transformed proportions, tested without a variance model - the paired "
@@ -1305,19 +1378,26 @@ def _comp_transform(counts, transform: str = "logit") -> np.ndarray:
     return np.log(pp / (1.0 - pp))
 
 
-def _comp_test(counts, conds, batches=None, transform: str = "logit") -> pd.DataFrame:
+def _comp_test(counts, conds, batches=None, transform: str = "logit", y=None, props=None) -> pd.DataFrame:
     """Test each category's proportion between conditions A and B.
 
     counts: categories × samples cell counts; conds: "A" / "B" per sample; batches:
-    labels per sample or None. Returns per category: mean_prop_a, mean_prop_b,
+    labels per sample or None. With *y* / *props* (categories × units) the columns are
+    independent units whose values were computed by the caller (the samples of one donor
+    averaged) and *counts* is not used. Returns per category: mean_prop_a, mean_prop_b,
     prop_ratio (A / B), coef (difference A − B of the transformed proportions, batch-
     adjusted), t_mod / df_mod / p_mod / fdr_mod (moderated t-test) and t_welch /
     df_welch / p_welch / fdr_welch (Welch's t-test on the transformed proportions)."""
     from scipy import stats as _st
-    counts = np.asarray(counts, dtype=np.float64)
     a = np.array([c == "A" for c in conds])
-    props = counts / counts.sum(axis=0, keepdims=True)
-    y = _comp_transform(counts, transform)
+    if y is None:
+        counts = np.asarray(counts, dtype=np.float64)
+        props = counts / counts.sum(axis=0, keepdims=True)
+        y = _comp_transform(counts, transform)
+    else:
+        # one column per independent unit (a donor within a condition): the transformed
+        # proportions and the proportions of its samples, averaged by the caller
+        y, props = np.asarray(y, dtype=np.float64), np.asarray(props, dtype=np.float64)
     X = _pb_design_matrix(conds, batches)
     n, p = X.shape
     df = n - p
@@ -1372,9 +1452,10 @@ def _comp_exact(sub, t_idx, n_tables, conds, donors, transform, names, cat_name)
         pfull[t_idx] = props[ci]
         r = _sl_test(full, c_use, donors, units=u)
         first = first or r
-        used_a = [i for _n, c, ix in u["units"] if c == "A" for i in ix]
-        used_b = [i for _n, c, ix in u["units"] if c == "B" for i in ix]
-        ma, mb = float(np.nanmean(pfull[used_a])), float(np.nanmean(pfull[used_b]))
+        # mean proportion per condition over the units that are tested (a donor's samples
+        # averaged first), so that the descriptive columns and the test use the same n
+        ma = float(np.nanmean([np.nanmean(pfull[ix]) for _n, c, ix in u["units"] if c == "A"]))
+        mb = float(np.nanmean([np.nanmean(pfull[ix]) for _n, c, ix in u["units"] if c == "B"]))
         rows.append({"mean_prop_a": ma, "mean_prop_b": mb, "prop_ratio": ma / mb if mb > 0 else np.nan,
                      "effect": r["effect"], "p_exact": r["p"], "n_units": r["n_units"]})
     tests = pd.DataFrame(rows)
@@ -1460,39 +1541,70 @@ def _comp_compute(kind, seg_source="xenium", method=None, transform="logit", tes
         res["test_note"] = ("One sample: its proportions are shown; a test between conditions "
                             "needs several samples.")
         return res
+    sub = counts[[tables[i]["label"] for i in t_idx]]
+    sub = sub.loc[sub.sum(axis=1) > 0]
+    t_donor = [donors[i] for i in t_idx]
+    t_batch_in = [batches[i] for i in t_idx]
+    by_donor = bool(t_idx) and all(t_donor)
+    unit_note, dropped, paired = f"n = {n_a + n_b} samples", [], False
+    y_u = p_u = None
+    u_cond, u_block = t_cond, t_batch_in
+    if by_donor and len(sub) >= 2:
+        # The shared rule of the sample-level tests (_sl_units): the samples of a donor
+        # within a condition are ONE unit (their transformed proportions are averaged, as
+        # in the exact test), and the donor is the blocking factor when the design is
+        # paired. Sections of one donor are never counted as independent replicates.
+        u = _sl_units(t_cond, t_donor)
+        paired, dropped, unit_note = u["paired"], u["dropped"], u["note"]
+        units = u["units"]
+        y_s = _comp_transform(sub.to_numpy(), transform)
+        p_s = sub.to_numpy() / sub.to_numpy().sum(axis=0, keepdims=True)
+        y_u = np.column_stack([y_s[:, ix].mean(axis=1) for _n, _c, ix in units])
+        p_u = np.column_stack([p_s[:, ix].mean(axis=1) for _n, _c, ix in units])
+        u_cond = [c for _n, c, _ix in units]
+        if paired:
+            u_block = [d for d, _c, _ix in units]
+        else:
+            ub = [sorted({t_batch_in[j] for j in ix}) for _n, _c, ix in units]
+            u_block = [b[0] for b in ub] if all(len(b) == 1 for b in ub) else [""] * len(units)
+        n_a, n_b = u_cond.count("A"), u_cond.count("B")
+        res["n_a"], res["n_b"] = n_a, n_b
+    what = "independent units (donors)" if by_donor else "samples"
     if n_a < _COMP_MIN_SAMPLES or n_b < _COMP_MIN_SAMPLES:
         res["test_note"] = (f"No test was run: condition A has {n_a} and condition B has {n_b} "
-                            f"samples with {cat_name} labels; at least {_COMP_MIN_SAMPLES} per "
-                            f"condition are needed. The proportions are shown.")
+                            f"{what} with {cat_name} labels; at least {_COMP_MIN_SAMPLES} per "
+                            f"condition are needed. The proportions are shown."
+                            + (f" ({unit_note}.)" if by_donor else ""))
         return res
     try:
-        t_batch, _warn = _design_check(t_cond, [batches[i] for i in t_idx], _COMP_MIN_SAMPLES)
+        t_batch, _warn = _design_check(u_cond, u_block, _COMP_MIN_SAMPLES)
     except ValueError as exc:
         res["test_note"] = f"No test was run: {exc}"
         return res
-    sub = counts[[tables[i]["label"] for i in t_idx]]
-    sub = sub.loc[sub.sum(axis=1) > 0]
     if len(sub) < 2:
         res["test_note"] = "No test was run: fewer than 2 categories have cells in the tested samples."
         return res
-    tests = _comp_test(sub.to_numpy(), t_cond, t_batch, transform)
+    tests = _comp_test(sub.to_numpy(), u_cond, t_batch, transform, y=y_u, props=p_u)
     tests.insert(0, "category", list(sub.index))
     tests.insert(1, "n_cells", sub.sum(axis=1).to_numpy())
     res["tests"] = tests
-    res["design"] = "~ batch + condition" if t_batch else "~ condition"
+    block = "donor" if paired else "batch"
+    res["design"] = f"~ {block} + condition" if t_batch else "~ condition"
+    res["units_note"] = unit_note
     df0 = float(tests["prior_df"].iloc[0])
     res["test_note"] = (
-        f"{len(tests)} categories tested between A {names['A']} ({n_a} samples) and B "
-        f"{names['B']} ({n_b} samples): {'logit' if transform != 'asin' else 'arcsine-square-root'}"
+        f"{len(tests)} categories tested between A {names['A']} ({n_a} {what}) and B "
+        f"{names['B']} ({n_b} {what}): {'logit' if transform != 'asin' else 'arcsine-square-root'}"
         f"-transformed proportions, {res['design']}, moderated t-test (prior df "
         f"{'∞' if not np.isfinite(df0) else f'{df0:.1f}'}"
         f"{'; fewer than 2 usable variances: ordinary t-test' if df0 == 0 else ''}), BH FDR. "
         f"{int((tests['fdr_mod'] < 0.05).sum())} with FDR < 0.05."
-        + (" Welch's t-test ignores the batch labels." if t_batch else "")
-        + f" Unit of the p-values: n = {n_a + n_b} samples."
-        + (" Donor labels are set but this test does not use them (samples of one donor are "
-           "treated as independent): choose 'exact (sample-level)' for the paired test."
-           if any(donors[i] for i in t_idx) else ""))
+        + (" Welch's t-test ignores the batch labels." if t_batch and not paired else "")
+        + (" Welch's t-test ignores the pairing." if paired else "")
+        + f" Unit of the p-values: {unit_note}."
+        + (" The samples of one donor within a condition are one unit: their transformed "
+           "proportions were averaged before the test." if by_donor and len(u_cond) < len(t_idx) else "")
+        + (f" Donors with samples in one condition only were left out: {', '.join(dropped)}." if dropped else ""))
     return res
 
 
@@ -1772,24 +1884,76 @@ def _moran_sample(s: dict, k: int = _MORAN_K, progress=None, chunk_bytes: float 
     I = np.full(len(cols), np.nan)
     pct = np.zeros(len(cols))
     mean = np.zeros(len(cols))
-    for c0 in range(0, len(cols), step):
-        jobs._job_check()
-        if progress is not None:
-            progress(c0 / len(cols))
-        cc = cols[c0:c0 + step]
-        block = csc[:, cc].toarray().astype(np.float64, copy=False)
+    # position in the tested cells of every matrix row (-1: not tested). The stored values
+    # are transformed where they are (log1p of a zero is a zero) and scattered into the
+    # dense block; a matrix with repeated entries or cells that share a row goes the plain way.
+    inv = None
+    if csc.format == "csc" and csc.has_canonical_format and len(np.unique(sel)) == n:
+        inv = np.arange(n, dtype=np.int64) if identity else np.full(csc.shape[0], -1, dtype=np.int64)
         if not identity:
-            block = block[sel]
-        pct[c0:c0 + step] = 100.0 * (block >= analysis._DETECT_MIN).sum(axis=0) / n
-        block *= sf_sel[:, None]
-        np.log1p(block, out=block)
+            inv[sel] = np.arange(n, dtype=np.int64)
+    ip = csc.indptr
+
+    def _block(c0):
+        cc = cols[c0:c0 + step]
+        if inv is not None:
+            segs = [(int(ip[x]), int(ip[x + 1])) for x in cc]
+            if len(cc) and cc[-1] - cc[0] + 1 == len(cc) and (np.diff(cc) == 1).all():
+                a0, a1 = segs[0][0], segs[-1][1]
+                r, d = csc.indices[a0:a1], csc.data[a0:a1]
+            else:
+                r = np.concatenate([csc.indices[a0:a1] for a0, a1 in segs])
+                d = np.concatenate([csc.data[a0:a1] for a0, a1 in segs])
+            j = np.repeat(np.arange(len(cc)), [a1 - a0 for a0, a1 in segs])
+            pos = inv[r]
+            if not identity:
+                keep = pos >= 0
+                pos, d, j = pos[keep], d[keep], j[keep]
+            p_blk = 100.0 * np.bincount(j[d >= analysis._DETECT_MIN], minlength=len(cc)) / n
+            v = d.astype(np.float64) * sf_sel[pos]
+            np.log1p(v, out=v)
+            block = np.zeros((n, len(cc)), dtype=np.float64)
+            block[pos, j] = v
+        else:
+            block = csc[:, cc].toarray().astype(np.float64, copy=False)
+            if not identity:
+                block = block[sel]
+            p_blk = 100.0 * (block >= analysis._DETECT_MIN).sum(axis=0) / n
+            block *= sf_sel[:, None]
+            np.log1p(block, out=block)
+            block = np.ascontiguousarray(block)
         mu = block.mean(axis=0)
-        mean[c0:c0 + step] = mu
         block -= mu
         den = np.einsum("ij,ij->j", block, block)
         num = np.einsum("ij,ij->j", block, W @ block)
         with np.errstate(divide="ignore", invalid="ignore"):
-            I[c0:c0 + step] = np.where(den > 0, (n / s0) * num / den, np.nan)
+            return c0, np.where(den > 0, (n / s0) * num / den, np.nan), p_blk, mu
+
+    starts = list(range(0, len(cols), step))
+    n_thr = int(max(1, min(_MORAN_THREADS, len(starts))))
+    if n_thr > 1:
+        # the blocks are independent and the work is in numpy / scipy routines that release
+        # the GIL: a few threads, the same numbers
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=n_thr) as pool:
+            futs = [pool.submit(_block, c0) for c0 in starts]
+            try:
+                for done, f in enumerate(as_completed(futs)):
+                    jobs._job_check()
+                    c0, i_blk, p_blk, mu = f.result()
+                    I[c0:c0 + step], pct[c0:c0 + step], mean[c0:c0 + step] = i_blk, p_blk, mu
+                    if progress is not None:
+                        progress((done + 1) / len(starts))
+            finally:
+                for f in futs:
+                    f.cancel()
+    else:
+        for c0 in starts:
+            jobs._job_check()
+            if progress is not None:
+                progress(c0 / len(cols))
+            c0, i_blk, p_blk, mu = _block(c0)
+            I[c0:c0 + step], pct[c0:c0 + step], mean[c0:c0 + step] = i_blk, p_blk, mu
     if progress is not None:
         progress(1.0)
     z = (I - ei) / np.sqrt(var)

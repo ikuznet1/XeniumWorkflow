@@ -31,6 +31,56 @@ _CS_LEIDEN_HINT = ("Leiden needs the packages leidenalg and igraph (pip install 
 
 
 # ─── Graph clustering of an embedding ─────────────────────────────────────────
+# ─── Size guard of the graph clustering ───────────────────────────────────────
+# What clustering n cells on a k-neighbour graph costs, from runs on 0.1 to 0.35 million
+# cells (README, "Performance at study scale"): the graph handed to Leiden holds about
+# n × k edges, and igraph / leidenalg keep Python-level lists of them.
+_CS_GB_PER_M_EDGES = 0.40          # memory of the edge lists, the graph and the partition
+_CS_MIN_PER_M_EDGES = 0.25         # neighbours + shared-neighbour graph + Leiden
+_CS_RAM_SHARE = 0.5                # a job estimated above this share of the machine's memory is refused
+
+
+def _cs_ram_gb() -> float:
+    """Physical memory of the machine in GB (0.0 when it cannot be read)."""
+    try:
+        return float(os.sysconf("SC_PAGE_SIZE")) * float(os.sysconf("SC_PHYS_PAGES")) / 1e9
+    except (ValueError, OSError, AttributeError):
+        return 0.0
+
+
+def _cs_cost(n_cells: int, k: int, passes: int = 1, matrix_gb: float = 0.0, extra_minutes: float = 0.0) -> dict:
+    """Rough cost of a clustering job: {"edges" (millions), "gb" (memory above the loaded
+    data), "minutes"}. *passes*: clusterings run one after the other (time adds up, memory
+    does not); *matrix_gb*: working copies of the count matrix the job makes;
+    *extra_minutes*: the part before the graph (PCA, Harmony, neighbourhood features)."""
+    edges = float(n_cells) * float(k) / 1e6
+    return {"edges": edges, "gb": edges * _CS_GB_PER_M_EDGES + float(matrix_gb),
+            "minutes": edges * _CS_MIN_PER_M_EDGES * max(1, int(passes)) + float(extra_minutes)}
+
+
+def _cs_size_guard(what: str, n_cells: int, k: int, passes: int = 1, matrix_gb: float = 0.0,
+                   extra_minutes: float = 0.0) -> tuple:
+    """(refusal text or None, one-line estimate or "") for a clustering job.
+
+    The estimate is given for anything above a minute or a gigabyte. The job is refused
+    when its estimated memory exceeds _CS_RAM_SHARE of the machine's memory, unless
+    XENIUM_ALLOW_LARGE_JOBS=1 is set: better a number up front than a machine that swaps
+    for an hour."""
+    c = _cs_cost(n_cells, k, passes, matrix_gb, extra_minutes)
+    ram = _cs_ram_gb()
+    est = (f"estimated for {int(n_cells):,} cells with {int(k)} graph neighbours: about {c['gb']:.0f} GB of "
+           f"memory above the loaded data and about {max(1, round(c['minutes'])):,} min "
+           f"(a graph of ~{c['edges']:.0f} million edges)")
+    if c["gb"] < 1.0 and c["minutes"] < 1.0:
+        return None, ""
+    allow = os.environ.get("XENIUM_ALLOW_LARGE_JOBS", "").strip().lower() in ("1", "true", "yes", "on")
+    if ram > 0 and c["gb"] > _CS_RAM_SHARE * ram and not allow:
+        return (f"{what} was not started: {est}; this machine has {ram:.0f} GB. Cluster fewer cells "
+                f"(subset() in the REPL, or fewer samples), lower the number of graph neighbours, or set "
+                f"XENIUM_ALLOW_LARGE_JOBS=1 to run it anyway."), est
+    return None, est[0].upper() + est[1:] + "."
+
+
 def _cs_leiden_available() -> bool:
     try:
         import leidenalg  # noqa: F401
@@ -163,8 +213,16 @@ def _cs_graph_cluster(X, n_neighbors=15, resolution=1.0, seed=0, progress=None, 
 # ─── Names, keys, files ───────────────────────────────────────────────────────
 def _cs_key(name: str) -> str:
     """The method key of a set name: lower-case ASCII, usable as a column suffix."""
-    s = str(name).replace("λ", "lambda").replace("=", " ")
+    # "Banksy-style λ=0.8" keeps the key of the sets installed as "Banksy λ=0.8" before the
+    # feature was relabelled: banksy_lambda_0.8 (cached sets and their columns stay readable)
+    s = re.sub(r"^Banksy-style\b", "Banksy", str(name)).replace("λ", "lambda").replace("=", " ")
     return re.sub(r"[^0-9a-z.]+", "_", s.lower()).strip("_") or "set"
+
+
+def _cs_display_name(name) -> str:
+    """The name a set is shown under: sets cached as "Banksy λ=…" (before the relabelling)
+    read "Banksy-style λ=…"."""
+    return re.sub(r"^Banksy(?= λ=)", "Banksy-style", str(name))
 
 
 def _cs_label(method) -> str:
@@ -172,7 +230,7 @@ def _cs_label(method) -> str:
     app derives from a Xenium analysis directory."""
     with _cs_lock:
         ent = _cs_registry.get(str(method))
-    return ent["name"] if ent else ui.method_label(str(method))
+    return _cs_display_name(ent["name"]) if ent else ui.method_label(str(method))
 
 
 # (sample key, segmentation slug, set key) -> {"run": id of the install, "shared": bool}.

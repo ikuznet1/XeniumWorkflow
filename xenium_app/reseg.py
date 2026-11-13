@@ -1714,7 +1714,7 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
     try:
         if not core.DATA.get("data_dir"):
             _set("error", "Resegmentation needs the original Xenium output directory "
-                          "(transcripts.parquet); this dataset was loaded from a .zarr.")
+                          "(transcripts.parquet); this dataset was " + dataview._origin_phrase() + ".")
             return
         baysor_bin = _find_baysor()
         if baysor_bin is None:
@@ -2050,7 +2050,7 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
         prior_type = _proseg_prior_type(prior_type)
         if not core.DATA.get("data_dir"):
             _set("error", "Resegmentation needs the original Xenium output directory "
-                          "(transcripts.parquet); this dataset was loaded from a .zarr.")
+                          "(transcripts.parquet); this dataset was " + dataview._origin_phrase() + ".")
             return
         proseg_bin = _find_proseg()
         if proseg_bin is None:

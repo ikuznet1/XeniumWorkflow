@@ -180,6 +180,18 @@ def test_de_rank_sums_on_two_matrices_with_ties_in_many_chunks(xe):
         assert u[j] == pytest.approx(u_ref, abs=1e-6)
         assert log10p[j] == pytest.approx(np.log10(p_ref), abs=1e-7)
         assert r["nnz_a"][j] == (va > 0).sum() and r["nnz_b"][j] == (vb > 0).sum()
+    # the chunks of genes are computed by a few threads: every number is the same as with one
+    parts = [{"csc": m, "cols": c, "grp": g, "sf": f} for m, c, g, f in zip(mats, cols, grp, sf)]
+    saved = xe._DE_THREADS
+    try:
+        xe._DE_THREADS = 1
+        one = xe._de_rank_sums(parts, ng, chunk_nnz=900)
+        xe._DE_THREADS = 4
+        four = xe._de_rank_sums(parts, ng, chunk_nnz=900)
+    finally:
+        xe._DE_THREADS = saved
+    for k, v in one.items():
+        assert np.array_equal(v, four[k]) and np.array_equal(v, r[k]), k
 
 
 def test_de_groups_overlap_complement_and_minimum_size(xe, view):

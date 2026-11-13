@@ -73,6 +73,34 @@ def _install_dataset(new_data: dict) -> None:
     if _vp is not None:
         _vp.forget()
 
+# ─── Size limit of the Plotly renderer ────────────────────────────────────────
+# The Plotly map sends every cell of the view to the browser inside one figure (tens of
+# bytes of JSON per cell, rebuilt on every change of colour). Above this many cells it is
+# not built: the app starts in the WebGL view, and the Plotly view says why it is empty.
+# XENIUM_PLOTLY_MAX_CELLS changes the limit (0: no limit).
+try:
+    PLOTLY_MAX_CELLS = int(os.environ.get("XENIUM_PLOTLY_MAX_CELLS", "").strip() or 500_000)
+except ValueError:
+    PLOTLY_MAX_CELLS = 500_000
+
+
+def _loaded_cell_count() -> int:
+    """Cells of the loaded samples (the primary one and the extra ones)."""
+    return int(len(core.DATA["df"]) + sum(len(e["df"]) for e in EXTRA_DATASETS))
+
+
+def _plotly_too_large(n_cells=None) -> "str | None":
+    """Why the Plotly map is not drawn for a view of *n_cells* cells (default: the loaded
+    samples); None when it is within the limit."""
+    n = _loaded_cell_count() if n_cells is None else int(n_cells)
+    if PLOTLY_MAX_CELLS <= 0 or n <= PLOTLY_MAX_CELLS:
+        return None
+    return (f"{n:,} cells are too many for the Plotly renderer (limit {PLOTLY_MAX_CELLS:,}): a figure "
+            f"of this size is about {n * 60 / 1e6:.0f} MB per redraw and can freeze the browser tab. "
+            f"Use the WebGL view (the switch under the map), which draws all cells. "
+            f"XENIUM_PLOTLY_MAX_CELLS raises the limit.")
+
+
 # ─── Extra datasets for multi-sample display ──────────────────────────────────
 # Each entry is like DATA but with an added "x_offset" key (µm shift on x-axis).
 EXTRA_DATASETS: list = []
@@ -107,9 +135,20 @@ def _ds_key(ds: dict) -> str:
 
 
 def _ds_name(ds: dict) -> str:
-    """Short display name of a dataset dict: the last path component of its key."""
+    """Short display name of a dataset dict: the last path component of its key (the
+    section's name for a sample that comes from an .h5ad)."""
+    if (ds.get("h5ad") or {}).get("section"):
+        return str(ds["h5ad"]["section"])          # a section of an .h5ad (h5ad._h5ad_load_stores)
     key = _ds_key(ds)
     return os.path.basename(key.rstrip("/")) or key
+
+
+def _origin_phrase(ds: "dict | None" = None) -> str:
+    """How a dataset without a Xenium output directory was loaded, for the messages of the
+    features that need transcripts or images: "loaded from a .zarr", or "loaded from an
+    .h5ad (cells only)" for a section of an AnnData file."""
+    ds = core.DATA if ds is None else ds
+    return "loaded from an .h5ad (cells only)" if (ds or {}).get("h5ad") else "loaded from a .zarr"
 
 
 def _ds_corrected(ds: dict):

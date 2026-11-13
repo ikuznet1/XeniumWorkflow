@@ -97,6 +97,12 @@ def _plot_range_and_dim_controls(prefix: str):
               "padding": "4px 6px", "flexShrink": "0", "borderTop": f"1px solid {core.BORDER}"})
 
 
+def h5ad_field(label, component):
+    """A labelled picker of the .h5ad column mapping (Load Sample dialog)."""
+    return html.Div([html.Div(label, style={"fontSize": "11px", "color": core.MUTED}), component],
+                    style={"flex": "1 1 30%", "minWidth": "180px"})
+
+
 def method_label(m):
     return (m.replace("gene_expression_", "")
              .replace("_clusters", "")

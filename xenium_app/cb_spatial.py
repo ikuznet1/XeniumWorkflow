@@ -695,6 +695,19 @@ def _refresh_colorby_options(current_options) -> list:
         rois = list(core._roi_state["rois"])
     classes = list(dict.fromkeys(r["cls"] for r in rois))  # preserve order, deduplicate
     options = []
+    # cell-type entries follow the registered methods: the columns of a loaded .h5ad come
+    # and go with the file (h5ad._h5ad_register)
+    current_options = [o for o in (current_options or [])
+                       if not str(o["value"]).startswith("cell_type:")
+                       or str(o["value"]).split(":")[1] in core._ANNOT_METHODS]
+    _have = {str(o["value"]).split(":")[1] for o in current_options if str(o["value"]).startswith("cell_type:")}
+    _new = [{"label": f"Cell Type ({lab})", "value": f"cell_type:{m}", "disabled": True}
+            for m, lab in core._ANNOT_METHODS.items()
+            if m not in _have and m not in ("celltypist", "seurat", "rctd")]   # (those are in the layout)
+    if _new:
+        _at = max([i for i, o in enumerate(current_options) if str(o["value"]).startswith("cell_type:")],
+                  default=min(1, len(current_options) - 1)) + 1
+        current_options = current_options[:_at] + _new + current_options[_at:]
     for opt in (current_options or []):
         val = opt["value"]
         if val.startswith("roi_") or val.startswith("geneset:"):

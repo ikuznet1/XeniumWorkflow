@@ -376,3 +376,26 @@ def test_callbacks_ignore_zero_clicks_and_validate_inputs(xe):
     with pytest.raises(dash.exceptions.PreventUpdate):
         xe.open_design_modal(0, 0, 0, 0, 0)           # a re-created button, not a click
     assert xe.open_design_modal(None, None, None, None, 1)[0] is True
+
+
+def test_permutation_within_strata_is_the_same_with_or_without_threads(xe, monkeypatch):
+    """The replicates are sorted by a few threads above 20,000 cells. The random numbers are
+    still drawn in sequence, so the permutations are those of the plain definition: cells
+    ordered by (stratum, random number), one draw per replicate."""
+    rng0 = np.random.default_rng(4)
+    n = 30_000
+    strata = rng0.integers(0, 37, n)
+    y = (rng0.random(n) < 0.1).astype(np.float32)
+    monkeypatch.setattr(xe, "_AGG_THREADS", 4)
+    thr = xe._agg_perm_within(strata, y, np.random.default_rng(9), 6)
+    monkeypatch.setattr(xe, "_AGG_THREADS", 1)
+    one = xe._agg_perm_within(strata, y, np.random.default_rng(9), 6)
+    assert np.array_equal(thr, one)
+    ref_rng = np.random.default_rng(9)
+    base = np.argsort(strata, kind="stable")
+    for b in range(6):
+        order = np.lexsort((ref_rng.random(n), strata))
+        ref = np.empty(n, dtype=np.float32)
+        ref[base] = y[order]
+        assert np.array_equal(thr[:, b], ref)
+    assert (np.bincount(strata, weights=thr[:, 0]) == np.bincount(strata, weights=y)).all()

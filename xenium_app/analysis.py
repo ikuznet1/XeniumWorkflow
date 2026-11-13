@@ -39,6 +39,7 @@ _DETECT_MIN = 1.0
 _DETECT_RULE = ("detected = count ≥ 1 transcript (the same as > 0 for integer counts; a fractional "
                 "SPLIT-corrected residue below 1 is not a detection); rate = Σ counts / Σ total "
                 "counts of the group, per 10,000")
+_DE_THREADS = max(1, min(4, (os.cpu_count() or 2) // 2))   # gene chunks of the rank sums computed at a time
 _DE_DEPTH_RATIO = 1.5      # median counts per cell of the two groups differing by more is flagged
 _DE_RATE_MIN_COUNT = 100   # Σ counts of a gene over both groups below which its rate is unstable
 _DE_PB_KINDS = ("pseudobulk", "contact")     # results fitted on pseudobulks: same table and volcano rules
@@ -529,9 +530,8 @@ def _de_rank_sums(parts, n_genes: int, progress=None, chunk_nnz: int = 6_000_000
     det_a = np.zeros(n_genes); det_b = np.zeros(n_genes)
     raw_a = np.zeros(n_genes); raw_b = np.zeros(n_genes)
     _1, _33 = np.uint64(1), np.uint64(33)
-    for g0, g1 in zip(edges[:-1], edges[1:]):
-        if progress is not None:
-            progress(g0 / max(1, n_genes))
+    def _chunk(g0, g1):
+        """The sums and rank statistics of the genes [g0, g1): independent of every other chunk."""
         ng = g1 - g0
         keys = []
         sums = np.zeros(2 * ng); cnts = np.zeros(2 * ng)
@@ -570,12 +570,9 @@ def _de_rank_sums(parts, n_genes: int, progress=None, chunk_nnz: int = 6_000_000
             keys.append((col_local.astype(np.uint64) << _33)
                         | (v.view(np.uint32).astype(np.uint64) << _1)
                         | isa.astype(np.uint64))
-        sum_b[g0:g1], sum_a[g0:g1] = sums[0::2], sums[1::2]
-        nnz_b[g0:g1], nnz_a[g0:g1] = cnts[0::2], cnts[1::2]
-        det_b[g0:g1], det_a[g0:g1] = dets[0::2], dets[1::2]
-        raw_b[g0:g1], raw_a[g0:g1] = raws[0::2], raws[1::2]
+        out = {"sums": sums, "cnts": cnts, "dets": dets, "raws": raws, "rank_a": None, "tie": None}
         if not keys:
-            continue
+            return out
         key = keys[0] if len(keys) == 1 else np.concatenate(keys)
         del keys
         key.sort()
@@ -594,8 +591,39 @@ def _de_rank_sums(parts, n_genes: int, progress=None, chunk_nnz: int = 6_000_000
         nz = n - nnz_col                                  # zeros of the gene: ranks 1..nz
         rank_run = nz[col_run] + (rs - col_start[col_run]) + (t + 1.0) / 2.0
         a_run = np.add.reduceat(isa, rs)
-        rank_a[g0:g1] = np.bincount(col_run, weights=rank_run * a_run, minlength=ng)
-        tie[g0:g1] = np.bincount(col_run, weights=t ** 3 - t, minlength=ng)
+        out["rank_a"] = np.bincount(col_run, weights=rank_run * a_run, minlength=ng)
+        out["tie"] = np.bincount(col_run, weights=t ** 3 - t, minlength=ng)
+        return out
+
+    def _store(g0, g1, out):
+        sum_b[g0:g1], sum_a[g0:g1] = out["sums"][0::2], out["sums"][1::2]
+        nnz_b[g0:g1], nnz_a[g0:g1] = out["cnts"][0::2], out["cnts"][1::2]
+        det_b[g0:g1], det_a[g0:g1] = out["dets"][0::2], out["dets"][1::2]
+        raw_b[g0:g1], raw_a[g0:g1] = out["raws"][0::2], out["raws"][1::2]
+        if out["rank_a"] is not None:
+            rank_a[g0:g1], tie[g0:g1] = out["rank_a"], out["tie"]
+
+    chunks = list(zip(edges[:-1], edges[1:]))
+    n_thr = int(max(1, min(_DE_THREADS, len(chunks))))
+    if n_thr > 1:
+        # the chunks of genes are independent and their work is sorting and array passes
+        # that release the GIL: a few threads at a time, the same numbers
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=n_thr) as pool:
+            futs = {pool.submit(_chunk, g0, g1): (g0, g1) for g0, g1 in chunks}
+            try:
+                for done, f in enumerate(as_completed(futs)):
+                    _store(*futs[f], f.result())
+                    if progress is not None:
+                        progress((done + 1) / len(chunks))
+            finally:
+                for f in futs:
+                    f.cancel()
+    else:
+        for g0, g1 in chunks:
+            if progress is not None:
+                progress(g0 / max(1, n_genes))
+            _store(g0, g1, _chunk(g0, g1))
     nz = n - (nnz_a + nnz_b)
     rank_a += (n_a - nnz_a) * (nz + 1.0) / 2.0
     tie += nz ** 3 - nz
@@ -1740,7 +1768,7 @@ def _run_density(genes, _unused=None) -> None:
         skipped = [s["label"] for s in smps if not s["data_dir"]]
         if not todo:
             _set("error", "Transcript density needs the Xenium output directory "
-                          "(transcripts.parquet); this dataset was loaded from a .zarr.")
+                          "(transcripts.parquet); this dataset was " + dataview._origin_phrase() + ".")
             return
         multi = len(smps) > 1
         _t0 = _time.time()

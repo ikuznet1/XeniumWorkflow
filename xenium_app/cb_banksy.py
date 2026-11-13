@@ -1,4 +1,4 @@
-"""Callbacks: Banksy spatial domains."""
+"""Callbacks: Banksy-style spatial domains."""
 
 import dash
 from dash import no_update
@@ -51,11 +51,11 @@ def run_banksy(n_clicks, lam, k_geom, agf, resolution, max_genes, n_pcs, k_expr,
         if v is None or v <= 0:
             return False, no_update, f"The {name} must be positive."
     if not cb_analysis._an_job_claim(banksy._bk_state, banksy._bk_lock):
-        return True, False, "Banksy is already running."
+        return True, False, "Banksy-style clustering is already running."
     params = {"lam": lam, "k_geom": k_geom, "agf": "on" in (agf or []), "resolution": resolution,
               "max_genes": max_genes, "n_pcs": n_pcs, "k_expr": k_expr, "seed": seed or 0,
               "log1p": "on" in (log1p or [])}
-    jobs._job_start("banksy", f"Banksy λ={float(lam):g}", banksy._run_banksy,
+    jobs._job_start("banksy", f"Banksy-style λ={float(lam):g}", banksy._run_banksy,
                     args=(seg_source or "xenium", counts_mode == "corrected", params),
                     state=banksy._bk_state, lock=banksy._bk_lock)
     return True, False, "Running…"

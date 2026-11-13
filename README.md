@@ -110,8 +110,10 @@ Useful start-up variants:
 
 ```bash
 XENIUM_RENDERER=webgl python xenium_explorer.py <bundle>     # start in the WebGL view
+XENIUM_PLOTLY_MAX_CELLS=800000 python xenium_explorer.py …   # cells the Plotly map may draw (default 500,000)
 XENIUM_ENABLE_REPL=1  python xenium_explorer.py <bundle>     # enable the in-app Python REPL
 python xenium_explorer.py path/to/exported.zarr              # open a store written by "Save as SpatialData"
+python xenium_explorer.py path/to/study.h5ad                 # an AnnData file, one sample per section (see below)
 ```
 
 To stop the server:
@@ -140,6 +142,90 @@ Without clustering the app starts with no cluster sets (Color By falls back to t
 **Control features.** Only features of type `Gene Expression` are loaded as genes. Negative-control probes and codewords, unassigned and deprecated codewords, and genomic controls are dropped when the store is first built. On a Xenium Prime 5K run this is the difference between 5,006 genes and 13,780 features.
 
 **Processed deposits (e.g. GEO).** Public deposits often contain only a matrix, a per-cell table and transcripts per section. `functions/geo_to_bundle.py` assembles a loadable bundle from those; see [Standalone Functions](#standalone-functions-functions).
+
+### AnnData `.h5ad` (processed cells, one or several sections)
+
+A processed AnnData file can be loaded in place of a Xenium output directory: a cell × gene
+matrix with coordinates in obs, optionally a column that says which section (sample) each cell
+belongs to. Each section becomes a sample of the multi-sample view (the first one primary, the
+others as with "+ Add sample"), so everything that works on cells works: the map in both
+renderers, Color By cell type / cluster / gene, differential expression, pseudobulk, composition,
+co-localisation, compartments, spillover / ownership / leak gate, proximity and contact DE,
+ligand–receptor scores and decomposition, aggregates, Moran's I, Banksy-style domains, joint
+clustering, Save as SpatialData.
+
+**The column mapping** says where things are in the file:
+
+| Key | Meaning |
+|-----|---------|
+| `x`, `y` | obs columns with the cell coordinates **in µm** (or `spatial`: an obsm key; default `obsm["spatial"]` when no x / y columns are found) |
+| `section` | obs column naming the section / sample of each cell; without it the file is one sample |
+| `cell_types` | obs columns with cell-type labels (any number); each appears under Color By as "Cell Type (<column>)" and as a grouping wherever cell types are used |
+| `clusters` | obs columns to show as cluster sets (Clustering Method); the same id means the same cluster in every section |
+| `condition`, `donor` | obs columns that prefill **Samples and conditions**: the donor of every section, and A / B for the two levels compared (`cond_a`, `cond_b`; with exactly two levels they are taken as they are; with more, name the two, or assign in the dialog). Sections of other levels are excluded |
+| `counts` | the matrix with the **raw counts**: `X` or the name of a layer (default: the layer `counts` when there is one) |
+| `umap` | obsm key of a 2-D embedding shown in the UMAP panel (default `X_umap`) |
+| `noninteger_counts` | `refuse` (default) or `round_sums`, see below |
+
+Give it either way:
+
+```bash
+# 1. a JSON file beside the data (study.h5ad.json), or anywhere via XENIUM_H5AD_MAPPING
+echo '{"x": "x", "y": "y", "section": "sample", "cell_types": ["cell_type"],
+       "condition": "group", "donor": "donor", "counts": "counts",
+       "cond_a": "treated", "cond_b": "control"}' > study.h5ad.json
+python xenium_explorer.py study.h5ad
+
+# 2. environment variables (override the JSON; lists are comma-separated)
+XENIUM_H5AD_SECTION=sample XENIUM_H5AD_CELLTYPES=cell_type,subtype \
+XENIUM_H5AD_CONDITION=group XENIUM_H5AD_DONOR=donor XENIUM_H5AD_COUNTS=counts \
+python xenium_explorer.py study.h5ad
+# also: XENIUM_H5AD_X, XENIUM_H5AD_Y, XENIUM_H5AD_CLUSTERS, XENIUM_H5AD_UMAP,
+#       XENIUM_H5AD_COND_A, XENIUM_H5AD_COND_B, XENIUM_H5AD_NONINTEGER
+```
+
+Without either, common column names are recognised (`x` / `y`, `sample` / `section`,
+`cell_type…`, `condition` / `group`, `donor` / `patient…`, layer `counts`). In the app:
+**Load Different Sample → AnnData .h5ad**: enter the path, *Read columns*, choose the columns in
+the pickers, *Load .h5ad*. A mapping that does not fit the file is refused with the list of
+columns the file has. `_h5ad_design("a", "b")` in the REPL refills the design for another pair
+of condition levels of the same file.
+
+**How it is loaded, and what it costs.** The file is converted once into one SpatialData store
+per section under the cache directory (`h5ad_<name>_<hash>/<section>.zarr` and a
+`manifest.json`); later starts with the same file and mapping read those stores. The matrix is
+never read whole: it is read in blocks of rows straight from the HDF5 file (about 24 million
+stored values, ~0.3 GB, at a time), each block is split by section, and a section is written
+and released as soon as its last row has passed. With the sections stored one after the other
+the peak is one section plus one block; with interleaved sections the pieces are held until
+each section is complete (up to the whole matrix as float32). A CSC-encoded matrix cannot be
+read by rows and is read whole once (the log says how much memory that takes). In the app every
+sample holds its own rows as CSR (float32 values, int32 columns: 8 bytes per stored value in
+total, no shared or duplicated copy), plus a CSC copy of a sample the first time a gene of it
+is coloured or tested. As an order of magnitude, a file with over a million cells and a few
+hundred million stored values in a few dozen sections converts in about a minute into roughly
+1 GB of cache on an SSD, starts in well under a minute afterwards and takes about 5 GB of
+memory once loaded. Converting once (rather than slicing the .h5ad at every start) is what makes
+every sample an ordinary store, with its own cached design, cluster sets and exports. To convert
+again (or to free the space), delete the `h5ad_…` directory in the cache directory; *Clean* in
+the app does not touch it.
+
+**Counts are checked.** Every stored value of the chosen matrix is tested for being a
+non-negative whole number during the conversion. If it is not (log-normalised `X`, or counts
+corrected for ambient RNA), the load says so, with the number of offending values, in the
+terminal, in the dialog and in the tissue info; the data is still loaded, and pseudobulk
+differential expression refuses the matrix. A file that has *only* corrected counts can be
+used with `"noninteger_counts": "round_sums"`: the pseudobulk tests then sum the values per
+sample and round the sums, and every such result carries a warning that the count model is an
+approximation. Nothing is rounded per cell.
+
+**What is not available.** A file has cells only. Transcript density, segmentation-free
+abundance, transcript factors, Baysor / Proseg and image-based resegmentation, the morphology
+overlay, cell / nucleus outlines and the "fraction of transcripts assigned" metric need the
+transcript file or the images of a Xenium output directory: they are disabled or answer with
+that reason. Cells without finite coordinates are left out (and counted in the load message).
+A sample is one section: when the condition or donor column is not constant within a section
+its most frequent value is used, with a warning.
 
 ### SpatialData zarr store
 
@@ -200,6 +286,14 @@ All color modes work on Xenium, Baysor, and Proseg cells after switching the seg
 Click the **📏** button in the bottom-right corner of the spatial map to activate measure mode. Click any two cells to display the Euclidean distance between them in µm. The result appears next to the button. Click the button again to exit measure mode. Cell-click-to-select is suppressed while the tool is active.
 
 ### WebGL view (beta)
+
+**Large data starts here.** The Plotly map ships every cell to the browser inside one figure and
+rebuilds it on every change of colour, which stops being usable somewhere above half a million
+cells. When the loaded samples hold more than `XENIUM_PLOTLY_MAX_CELLS` cells (default 500,000;
+0 = no limit) the app starts in the WebGL view, an `.h5ad` loaded from the dialog switches to
+it, and choosing Plotly shows a message with the cell count instead of building the figure.
+`XENIUM_RENDERER=plotly` still selects the Plotly switch position at start; the limit applies
+all the same.
 
 The Plotly view rebuilds and resends every cell on each recolour, which becomes slow as datasets grow. The WebGL view (deck.gl) keeps cell positions on the GPU and asks the server only for what changes: one value per cell on a recolour, and boundaries, transcripts and image tiles for the current viewport.
 
@@ -325,7 +419,7 @@ Tests that compare **samples** (pseudobulk differential expression, composition)
 2. Pick the **cells** whose counts are summed: all cells, a cell type, a cluster, a ROI class (all its ROIs — draw one per sample), a single ROI, a saved group or the current selection.
 3. **Run**. The result uses the same volcano plot, table and **Download CSV** as the cell-level test; title, status line and CSV header name the method, the design and the samples. A table under the status line lists, per sample, the cells summed, the library size and the size factor.
 
-- **Counts**: the raw integer counts of the chosen cells are summed per sample over the measured panel genes. Imputed genes are never used. **The original counts are always used, also when Active Counts is "SPLIT Corrected"** (the status line says so): SPLIT-corrected counts are modified, non-integer values, which a count model must not be given.
+- **Counts**: the raw integer counts of the chosen cells are summed per sample over the measured panel genes. A matrix with non-integer values is refused; the one exception is an `.h5ad` loaded with `"noninteger_counts": "round_sums"` (a file that only has corrected counts): the values are then summed per pseudobulk column — per donor and condition when donors are given — and each sum is rounded once, and the result, its status line and its CSV say that the counts are not raw. Imputed genes are never used. **The original counts are always used, also when Active Counts is "SPLIT Corrected"** (the status line says so): SPLIT-corrected counts are modified, non-integer values, which a count model must not be given.
 - **Donors**: with donors on every included sample, the samples of one donor within a condition are summed into one pseudobulk column first (named in the status line), so a donor is one unit. The donor is a blocking factor (`~ donor + condition`) only when the design is **paired** by the rule of *Samples and conditions* (at least 2 donors with samples in both conditions); donors seen in one condition only are then left out and listed. Otherwise (each donor in one condition, or fewer than 2 donors in both) the model is `~ condition` on the per-donor sums — `~ batch + condition` when batch labels are given and every donor column has one batch; a donor that occurs in both conditions of an unpaired design is named in a warning and its two columns are treated as independent.
 - **Genes**: the genes shared by the samples assigned to A or B are tested; a sample marked *excluded* does not change the gene list. When the used samples share fewer genes than the largest panel among them, the status line says so.
 - **Volcano**: points are coloured by **FDR < 0.05 alone**, and the x axis is the unshrunken (MLE) log2FC by default; **Volcano x axis** switches to the shrunken estimate. (Before, the shrunken estimate was plotted and a significant gene shrunk to ~0 was drawn as not significant.)
@@ -380,7 +474,7 @@ Tests that compare **samples** (pseudobulk differential expression, composition)
 - **Compute** shows, for every sample that has the labels, the proportion of each category: a plot with **one point per sample**, grouped and coloured by condition (bars: condition means; `*`: FDR < 0.05), a table (test results and each sample's proportion) and **Download CSV** (adds the cell counts).
 - **Method (propeller-style, Phipson et al. 2022)**: per-sample proportions are **logit**-transformed (0.5 pseudocount per category, as `speckle`) or **arcsine-square-root**-transformed; a linear model (`~ condition`, or `~ batch + condition`) is fitted per category and tested with a **moderated t-test** — limma-style empirical Bayes shrinkage of the category variances towards a common prior (non-robust, no trend), implemented in Python. **Welch's t-test** on the same transformed values is given beside it (it ignores batch labels). Benjamini–Hochberg FDR over the categories.
 - **With fewer than 3 samples in a condition no test is run** — the tab says so and shows the proportions only. With one sample its proportions are shown.
-- **Test: exact (sample-level)** tests the same transformed proportions without a variance model: paired sign-flip over donors when the design is paired, otherwise label permutation over the independent units (see *Samples and conditions*). The moderated t-test does not use donor labels and says so when they are set.
+- **Test: exact (sample-level)** tests the same transformed proportions without a variance model: paired sign-flip over donors when the design is paired, otherwise label permutation over the independent units (see *Samples and conditions*). The moderated t-test follows the same rule for what a unit is: with a donor on every included sample, the samples of one donor within a condition are one unit (their transformed proportions are averaged), the model is `~ condition` over the donors, or `~ donor + condition` when the design is paired, and at least 3 donors per condition (3 pairs) are needed. Several sections of one donor are never counted as replicates. Without donor labels each sample is a unit.
 - **Validation**: Welch's t, its degrees of freedom and p-value equal `scipy.stats.ttest_ind(equal_var=False)`; the moderated t, its p-value, the prior variance and the prior and total degrees of freedom equal `limma::lmFit` + `eBayes(robust = FALSE)` on the same transformed proportions (relative difference < 10⁻⁵), with and without a batch term. `speckle::propeller` itself was not installed: its default uses `robust = TRUE`, which can differ when one category's variance is an outlier. A quasi-binomial / beta-binomial GLM is not implemented.
 
 **Caveats**
@@ -682,7 +776,7 @@ With **Gene ownership + leak gate** ticked (default) and a cell-type annotation 
 
 - **O** = B cells within R of each A cell. **E** = the mean of that count around the *pool* cells (labelled cells that are neither A nor B) of the same **stratum**: sample × compartment × edge-distance bin (50, 100, 150, 200, 300, 500, 1000 µm) × local-density quintile; a coarser stratum when fewer than 3 pool cells share it. **Effect** per sample = log2((ΣO + 0.5) / (ΣE + 0.5)). The unstratified value (`effect_naive`, pool = the whole sample) is given beside it: the difference is what "both types live in the same region" contributed.
 - **Bias and within-sample p**: the A label is permuted among A and pool cells within each finest stratum (B fixed, default 200 permutations, fixed seed); the mean permuted effect is subtracted (`effect_corrected`), p = (1 + permutations at least as far from that mean) / (1 + permutations).
-- **Across samples**: with ≥ 3 independent units (donors when given, else samples) the bias-corrected effect is tested with the exact sign-flip test, and between conditions A and B with the paired sign-flip or label-permutation test of the design. With fewer units the tab says **SINGLE-SAMPLE / PER-SAMPLE RESULT**: the within-sample p treats the cells of one section as exchangeable and says nothing about other sections or donors.
+- **Across samples**: with ≥ 3 independent units (donors when given, else samples) the bias-corrected effect is tested with the exact sign-flip test, and between conditions A and B with the paired sign-flip or label-permutation test of the design. A pair that is not testable in every sample is tested on the units where it is (at least 3): the table gives the units behind each p (**Units**, **Units (A vs B)**), the status line gives their range and the smallest achievable p of a pair tested on every unit, and donors seen in one condition only — which a paired test cannot use — are listed. With fewer units the tab says **SINGLE-SAMPLE / PER-SAMPLE RESULT**: the within-sample p treats the cells of one section as exchangeable and says nothing about other sections or donors.
 - **Placebo anchors** (optional focal type): the same statistic for count-matched random anchor cells drawn within each sample × compartment (mean, 95 % range, p), and for the other types within 3× the focal type's abundance that share its most common compartment. The verdict is "specific" only when the focal type lies beyond both. Without a placebo, "X sits near Y" cannot be told from "X is a cell of that compartment".
 - Heatmap (focal × target, `*` FDR < 0.05 of the test named in the title), table, CSV (per sample and pair, with the pair-level tests). Only types with ≥ 20 cells; a pair needs ≥ 20 focal and ≥ 10 target cells in a sample; the 40 most abundant types at most. Compartments come from the Confound Controls tab; when absent, edge distance and density are computed with the defaults and there is no core.
 - **Speed** (measured): 112,551 labelled cells, 11 types, R = 50 µm, 200 permutations, placebo: 5.4 s, about 60 MB above the loaded dataset.
@@ -733,13 +827,18 @@ original's numbers exactly on fabricated data, and every value of that study is 
   memory (about 100 neighbours per cell at 50 µm in dense tissue). Registered job with progress
   and Cancel.
 
-### Banksy spatial domains
+### Banksy-style spatial domains
 
-**Plots panel → Banksy.** Clusters the cells on their own expression *and* on the expression
-around them, after BANKSY (Singhal et al., *Nat Genet* 56, 431-441, 2024). With a large weight
-on the surroundings the clusters are tissue domains; with a small one they are cell types
-informed by their neighbourhood. The result is a **cluster set** ("Banksy λ=0.8"): pick it under
-**Color By → Cluster → Clustering Method**.
+**Plots panel → Banksy-style domains.** Clusters the cells on their own expression *and* on the
+expression around them, after BANKSY (Singhal et al., *Nat Genet* 56, 431-441, 2024). With a
+large weight on the surroundings the clusters are tissue domains; with a small one they are cell
+types informed by their neighbourhood. The result is a **cluster set** ("Banksy-style λ=0.8"):
+pick it under **Color By → Cluster → Clustering Method**.
+
+**Status.** This is a native implementation, not the Banksy package: it follows the published
+method's construction (the three feature blocks and their λ scaling) but has not been validated
+against the reference implementation. Hence the name "Banksy-style". Sets cached under the
+earlier name ("Banksy λ=…") keep their key and are shown under the new name.
 
 | Control | What it does |
 |---------|--------------|
@@ -897,6 +996,38 @@ sample as `ctl_…` columns. Cells without counts have no cluster.
   second run with the same input is read from the cache.
 
 Optional packages: `harmonypy` (Harmony), `leidenalg` + `igraph` (Leiden), `umap-learn` (UMAP).
+
+### Working at study scale (a million cells and more)
+
+Everything cell-level runs on a multi-sample view of more than a million cells; three things
+are different at that size.
+
+- **The map.** The app starts in the WebGL view (see *WebGL view*); the Plotly map is not
+  built above `XENIUM_PLOTLY_MAX_CELLS` cells and says so.
+- **Memory.** A loaded sample holds its counts once, row-wise (8 bytes per stored value). The
+  first test or gene colour that reads expression adds a column-wise copy of every sample it
+  touches, so count on about twice the matrix plus working space: for half a billion stored
+  values, roughly 5 GB after loading and 10–13 GB while a test over all samples runs.
+- **Time.** Tests whose cost is linear in the stored values (cell-level DE, pseudobulk,
+  spillover, ligand–receptor scores and decomposition, proximity DE) and the spatial ones
+  (compartments, stratified co-localisation, aggregates, Moran's I of every gene) each take
+  from seconds to about a minute at 1–1.5 million cells on a 16-core machine. Moran's I, the
+  rank sums of cell-level DE and the permutations of the aggregates are computed by up to four
+  threads; the numbers are the same with one thread (tests assert it).
+
+**Graph clustering is the exception** (joint clustering, Banksy-style domains): the graph
+handed to Leiden has about *cells × graph neighbours* edges, and igraph / leidenalg hold them
+in Python lists. Before such a job starts it states its estimated cost, e.g. "estimated for
+1,400,000 cells with 15 graph neighbours: about 20 GB of memory above the loaded data and
+about 22 min (a graph of ~21 million edges)", and it is **not started** when the estimated
+memory exceeds half of the machine's memory; the refusal carries the same numbers. The estimate
+is 0.4 GB and 0.25 min per million edges (twice the time when Harmony runs: the clusters are
+computed before and after) plus the working copies of the count matrix (joint: ~8 GB and
+~2 min per million cells, Harmony ~6 min, the UMAP ~15 min; Banksy-style: ~6 GB and ~12 min
+per million cells for the neighbourhood features). These constants come from runs on 0.1 and
+0.35 million cells and are deliberately on the high side. To cluster more cells than fit:
+`subset()` in the REPL, fewer samples, fewer graph neighbours (Banksy-style: *Graph
+neighbours* 15 instead of 50), or `XENIUM_ALLOW_LARGE_JOBS=1` to run regardless.
 
 ### CellNEST Cell-Cell Communication
 
@@ -1544,6 +1675,7 @@ or the command line, builds the Dash app and registers the callbacks.
 | `morph` | morphology image overlay of the Plotly view |
 | `figures` | Plotly figure builders (spatial map, UMAP, analysis plots) |
 | `analysis` | differential expression, gene-set scores, transcript density |
+| `h5ad` | AnnData `.h5ad` input: column mapping, one-time conversion into per-section stores, design prefill |
 | `stats` | sample → condition / donor design (persisted), exact sample-level tests, pseudobulk differential expression (DESeq2 / edgeR), composition test, Moran's I, ligand–receptor scores |
 | `controls` | confound controls: tissue compartments, spillover score, gene ownership, leak gate, segmentation QC metrics, stratified co-localisation, annotation label report |
 | `proximity` | proximity differential expression (near vs far from an anchor cell type, matched random anchors) and contact-group pseudobulk differential expression |
@@ -1551,7 +1683,7 @@ or the command line, builds the Dash app and registers the callbacks.
 | `aggregates` | aggregates: connected groups of cells of a chosen class, outlines, composition, per-sample density |
 | `segfree` | segmentation-free abundance: marker transcripts per mm² of tissue from the transcript file, area-bin sweep, concentration against a redistribution null |
 | `clustersets` | cluster sets computed in the app: nearest-neighbour graph → Leiden (KMeans fallback) on an embedding, installing the labels as a cluster set of the view, their cache |
-| `banksy` | Banksy spatial domains: neighbourhood mean and azimuthal Gabor filter features, PCA of the neighbour-augmented matrix, the job and its tab |
+| `banksy` | Banksy-style spatial domains: neighbourhood mean and azimuthal Gabor filter features, PCA of the neighbour-augmented matrix, the job and its tab |
 | `txfactor` | transcript factors: bin × gene counts of the transcript file on a square or hexagonal grid, NMF (KL) / online LDA / reference profiles, projection of every bin, map layer, per-cell factor mixture |
 | `joint` | joint clustering across samples: joint normalisation, gene selection and PCA, Harmony (harmonypy), mixing diagnostics, the joint UMAP of the UMAP panel |
 | `cellnest` | CellNEST loading, filters and plots |

@@ -275,7 +275,7 @@ def _txf_counts(ds: dict, genes, bin_um: float, shape: str, progress=None) -> di
     bins and genes ("cached": True)."""
     data_dir = ds.get("data_dir")
     if not data_dir:
-        raise ValueError("This sample was loaded from a .zarr: it has no transcript file.")
+        raise ValueError(f"This sample was {dataview._origin_phrase(ds)}: it has no transcript file.")
     path = _txf_counts_file(ds, genes, bin_um, shape)
     if os.path.exists(path):
         try:
@@ -756,7 +756,7 @@ def _run_txfactor(seg_source, cluster_method, label_kind, method="nmf", params=N
         if not usable:
             _set("error", "Transcript factors need the Xenium output directory (transcripts.parquet or "
                           "transcripts.zarr.zip); " + ("this dataset was" if len(tables) == 1 else "these samples were")
-                          + " loaded from a .zarr, which has cells but no transcripts.")
+                          + f" {dataview._origin_phrase(tables[0]['ds'])}, which has cells but no transcripts.")
             return
         genes = analysis._ds_panel_genes(tables[usable[0]]["ds"])
         for i in usable[1:]:

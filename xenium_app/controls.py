@@ -2030,19 +2030,37 @@ def _coloc_across(e_corr, testable, conds, donors, labels) -> dict:
                  else min(sum(1 for _n, c, _ix in u["units"] if c == x) for x in ("A", "B")))
             if k >= stats._SL_MIN_UNITS:
                 out["p_diff"], out["effect_diff"] = np.full((T, T), np.nan), np.full((T, T), np.nan)
-                first = None
+                # units a pair is tested on (donor pairs when paired, else units of A + B):
+                # a pair that is not testable in every sample is tested on fewer units,
+                # and its smallest achievable p is larger
+                out["n_units_diff"] = np.zeros((T, T), dtype=np.int64)
+                first, floors = None, []
                 for a in range(T):
                     for b in range(T):
                         if a == b or not np.isfinite(ev[:, a, b]).any():
                             continue
                         r = stats._sl_test(ev[:, a, b], c_use, dn, units=u)
-                        full = (len(r["per_unit"]) == len(u["pairs"]) if u["paired"]
+                        # paired: r["n"] counts the donors with the pair testable in both conditions
+                        full = (True if u["paired"]
                                 else r.get("n_a", 0) >= stats._SL_MIN_UNITS and r.get("n_b", 0) >= stats._SL_MIN_UNITS)
                         if r["n"] >= stats._SL_MIN_UNITS and full:
                             out["p_diff"][a, b], out["effect_diff"][a, b] = r["p"], r["effect"]
+                            out["n_units_diff"][a, b] = r["n"]
+                            floors.append(r["min_p"])
                             first = first or r
-                out["min_p_diff"] = first["min_p"] if first else np.nan
+                # the floor of the family is that of its best-covered pair, not of whichever
+                # pair happens to come first
+                out["min_p_diff"] = float(np.nanmin(floors)) if floors else np.nan
                 out["diff_note"] = f"A − B: {(first or {}).get('test', 'sample-level')} test, {u['note']}"
+                if u["dropped"]:
+                    out["diff_note"] += ("; donors with samples in one condition only were left out: "
+                                         + ", ".join(u["dropped"]))
+                tested = out["n_units_diff"][out["n_units_diff"] > 0]
+                if len(tested) and tested.min() != tested.max():
+                    what = "donors" if u["paired"] else "units"
+                    out["diff_note"] += (f"; a pair is tested on the {what} in which it is testable in both "
+                                         f"conditions: {int(tested.min())} to {int(tested.max())} per pair (column "
+                                         f"'Units (A vs B)'), and its own smallest p is larger with fewer")
             else:
                 out["diff_note"] = (f"no test between conditions: fewer than {stats._SL_MIN_UNITS} "
                                     f"independent units per condition ({u['note']})")
@@ -2148,6 +2166,7 @@ def _run_coloc(seg_source, method, label_kind, radius, n_perm, placebo_focal=Non
             summ["fdr_enrich"] = stats._bh(summ["p_enrich"].to_numpy())
             if ac["p_diff"] is not None:
                 summ["effect_diff"] = ac["effect_diff"][ai, bi]
+                summ["n_units_diff"] = ac["n_units_diff"][ai, bi]
                 summ["p_diff"] = ac["p_diff"][ai, bi]
                 summ["fdr_diff"] = stats._bh(summ["p_diff"].to_numpy())
         if S == 1:
@@ -2184,7 +2203,8 @@ def _run_coloc(seg_source, method, label_kind, radius, n_perm, placebo_focal=Non
                 msg += f"\n⚠ {reach[0].upper() + reach[1:]}."
             if ac["p_diff"] is not None:
                 msg += (f"\nBetween conditions ({ac['diff_note']}): smallest achievable p "
-                        f"{ac['min_p_diff']:.3g}; {int((summ['fdr_diff'] < 0.05).sum()):,} pairs with FDR < 0.05.")
+                        f"{ac['min_p_diff']:.3g} (for a pair tested on every unit); "
+                        f"{int((summ['fdr_diff'] < 0.05).sum()):,} pairs with FDR < 0.05.")
                 reach = stats._sl_reach(ac["min_p_diff"], int(summ["p_diff"].notna().sum()))
                 if reach:
                     msg += f"\n⚠ {reach[0].upper() + reach[1:]}."
@@ -2512,8 +2532,9 @@ def _coloc_columns(res=None) -> list:
             _col("effect", "log2 O/E (corr.)"), _col("fold", "Fold"), _col("effect_naive", "Naive log2 O/E")]
     s = None if not res else res["summary"]
     if s is not None:
-        for cid, name in (("n_positive", "> 0"), ("p_enrich", "p (sign-flip)"), ("fdr_enrich", "FDR"),
-                          ("effect_diff", "A − B"), ("p_diff", "p (A vs B)"), ("fdr_diff", "FDR (A vs B)"),
+        for cid, name in (("n_positive", "> 0"), ("n_units", "Units"), ("p_enrich", "p (sign-flip)"),
+                          ("fdr_enrich", "FDR"), ("effect_diff", "A − B"), ("n_units_diff", "Units (A vs B)"),
+                          ("p_diff", "p (A vs B)"), ("fdr_diff", "FDR (A vs B)"),
                           ("p_within", "p (within sample)"), ("fdr_within", "FDR (within)")):
             if cid in s.columns:
                 cols.append(_col(cid, name))

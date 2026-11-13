@@ -17,7 +17,7 @@ from dash import dash_table
 import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 
-from . import core, jobs, ui, reseg, figures, analysis, stats, controls
+from . import core, jobs, dataview, ui, reseg, figures, analysis, stats, controls
 
 
 # ─── State ────────────────────────────────────────────────────────────────────
@@ -305,7 +305,7 @@ def _sfree_ensure_grids(ds: dict, genes, progress=None) -> list:
     analysis._density_scan."""
     data_dir = ds.get("data_dir")
     if not data_dir:
-        raise ValueError("This sample was loaded from a .zarr: it has no transcript file.")
+        raise ValueError(f"This sample was {dataview._origin_phrase(ds)}: it has no transcript file.")
     missing = [g for g in dict.fromkeys(genes) if not os.path.exists(analysis._density_cache_file(g, ds))]
     if not missing:
         if progress is not None:
@@ -519,7 +519,7 @@ def _run_segfree(seg_source, method, label_kind, cell_type, markers_text, n_mark
             _set("error", "Segmentation-free abundance needs the Xenium output directory "
                           "(transcripts.parquet or transcripts.zarr.zip); "
                           + ("this dataset was" if len(tables) == 1 else "these samples were")
-                          + " loaded from a .zarr, which has cells but no transcripts.")
+                          + f" {dataview._origin_phrase(tables[0]['ds'])}, which has cells but no transcripts.")
             return
         rows, gene_rows, scanned = [], [], []
         for k, i in enumerate(usable):

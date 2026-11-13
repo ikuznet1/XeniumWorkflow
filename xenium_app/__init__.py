@@ -18,7 +18,7 @@ MODULES = (
     # 1. libraries
     "core", "jobs", "caching", "ui", "loading", "dataview", "annotation", "reseg",
     "clustering", "split", "spage", "subsetting", "spatial", "morph", "figures",
-    "analysis", "cellnest", "sdata_store", "regions", "imgseg", "stats", "controls",
+    "analysis", "cellnest", "sdata_store", "regions", "imgseg", "stats", "h5ad", "controls",
     "proximity", "lrdecomp", "aggregates", "segfree", "txfactor", "clustersets", "banksy",
     "joint",
     # 2. import-time work
@@ -31,7 +31,7 @@ from . import compat  # noqa: E402,F401
 from . import (  # noqa: E402,F401
     core, jobs, caching, ui, loading, dataview, annotation, reseg, clustering, split,
     spage, subsetting, spatial, morph, figures, analysis, cellnest, sdata_store, regions, imgseg,
-    stats, controls, proximity, lrdecomp, aggregates, segfree, txfactor, clustersets, banksy,
+    stats, h5ad, controls, proximity, lrdecomp, aggregates, segfree, txfactor, clustersets, banksy,
 )
 from . import (  # noqa: E402,F401
     startup, app_layout, cb_plots, cb_tools, cb_reseg, cb_spage, cb_data, cb_spatial,

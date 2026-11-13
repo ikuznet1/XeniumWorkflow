@@ -1112,3 +1112,42 @@ def test_new_tabs_are_in_the_layout_with_their_caveats(xe):
                    "rank by I, not by the p-value", "no test is run"):
         assert needle in text, needle
     assert xe._JOB_KIND_NAMES["moran"] and xe._JOB_KIND_NAMES["lr"]
+
+
+def test_morans_i_block_paths_give_the_same_numbers(xe, monkeypatch):
+    """The gene blocks are filled from the stored values (transformed where they are) and
+    computed by a few threads. Neither changes a number: one thread, several threads,
+    several block sizes and the plain dense path (a matrix with repeated entries) agree
+    to rounding, and with the dense formula."""
+    counts, xy = _spatial_counts()
+    s = _hand_sample(counts, xy)
+    ref = xe._moran_sample(s, 6)["table"]
+    monkeypatch.setattr(xe, "_MORAN_THREADS", 1)
+    one = xe._moran_sample(s, 6, chunk_bytes=8 * len(xy) * 3)["table"]
+    monkeypatch.setattr(xe, "_MORAN_THREADS", 4)
+    four = xe._moran_sample(s, 6, chunk_bytes=8 * len(xy) * 3)["table"]
+    for col in ("moran_i", "z", "pval", "padj", "pct_cells", "mean"):
+        np.testing.assert_array_equal(one[col].to_numpy(), four[col].to_numpy())       # threads: identical
+        np.testing.assert_allclose(one[col], ref[col], rtol=1e-11, atol=1e-300, equal_nan=True)
+    # repeated entries (not canonical): the dense path, which sums them as the matrix means them
+    m = s["csc"].tocoo()
+    half = sp.coo_matrix((np.r_[m.data * 0.5, m.data * 0.5], (np.r_[m.row, m.row], np.r_[m.col, m.col])),
+                         shape=m.shape).tocsc()
+    dup = sp.csc_matrix((half.data, half.indices, half.indptr), shape=m.shape)
+    if dup.has_canonical_format:                       # scipy summed them on conversion: undo
+        dup = sp.csc_matrix(s["csc"])
+        dup.has_canonical_format = False
+    plain = xe._moran_sample(dict(s, csc=dup), 6)["table"]
+    for col in ("moran_i", "pct_cells", "mean"):
+        np.testing.assert_allclose(plain[col], ref[col], rtol=1e-9, atol=1e-12, equal_nan=True)
+    # rows in another order than the cells, and cells without a row
+    perm = np.random.default_rng(5).permutation(len(xy))
+    rows = perm.copy()
+    rows[::7] = -1
+    s3 = dict(s, rows=rows)
+    keep = rows >= 0
+    got = xe._moran_sample(s3, 5)["table"]
+    lib = counts[rows[keep]].sum(axis=1)
+    I, z, _ = _moran_dense(np.log1p(counts[rows[keep], 3] / lib * 1e4), _brute_knn_w(xy[keep], 5))
+    np.testing.assert_allclose([got["moran_i"][3], got["z"][3]], [I, z], rtol=2e-6)
+    np.testing.assert_allclose(got["pct_cells"], 100 * (counts[rows[keep]] > 0).mean(axis=0))

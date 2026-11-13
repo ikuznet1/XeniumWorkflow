@@ -94,6 +94,9 @@ sidebar = html.Div([
             {"label": "Cell Type (CellTypist)",     "value": "cell_type:celltypist", "disabled": True},
             {"label": "Cell Type (Seurat)",         "value": "cell_type:seurat",     "disabled": True},
             {"label": "Cell Type (RCTD)",           "value": "cell_type:rctd",       "disabled": True},
+            # cell-type columns of an .h5ad given at start-up (h5ad._h5ad_register)
+            *[{"label": f"Cell Type ({_lab})", "value": f"cell_type:{_m}", "disabled": True}
+              for _m, _lab in core._ANNOT_METHODS.items() if _m not in ("celltypist", "seurat", "rctd")],
             {"label": "Transcript Counts",          "value": "transcript_counts"},
             {"label": "Cell Area",         "value": "cell_area"},
             {"label": "Nucleus Area",      "value": "nucleus_area"},
@@ -475,9 +478,15 @@ _REPL_ENABLED      = _REPL_MODE in ("1", "true", "yes", "on", "remote")
 _REPL_ALLOW_REMOTE = _REPL_MODE == "remote"
 
 
-# Spatial renderer shown at startup: "plotly" (default) or "webgl" (deck.gl view, beta).
-_DEFAULT_RENDERER = ("webgl" if os.environ.get("XENIUM_RENDERER", "").strip().lower() == "webgl"
-                     else "plotly")
+# Spatial renderer shown at startup: "plotly" or "webgl" (deck.gl view, beta), as
+# XENIUM_RENDERER says; without it Plotly, unless the loaded samples exceed what the Plotly
+# map can draw (dataview.PLOTLY_MAX_CELLS), in which case the app starts in the WebGL view.
+_RENDERER_ENV = os.environ.get("XENIUM_RENDERER", "").strip().lower()
+_DEFAULT_RENDERER = (_RENDERER_ENV if _RENDERER_ENV in ("webgl", "plotly")
+                     else ("webgl" if dataview._plotly_too_large() else "plotly"))
+if _DEFAULT_RENDERER == "webgl" and _RENDERER_ENV != "webgl":
+    print(f"  {dataview._loaded_cell_count():,} cells: starting in the WebGL view (the Plotly map is "
+          f"limited to {dataview.PLOTLY_MAX_CELLS:,} cells; XENIUM_PLOTLY_MAX_CELLS changes that)", flush=True)
 
 app.layout = html.Div([
     dcc.Store(id="selected-cell",    data=None),
@@ -1399,13 +1408,63 @@ dbc.Modal([
             dcc.Input(
                 id="sample-custom-path",
                 type="text",
-                placeholder="/path/to/output-XETG\u2026",
+                placeholder="/path/to/output-XETG\u2026, a SpatialData .zarr, or an AnnData .h5ad",
                 style={"width": "100%", "backgroundColor": core.CARD_BG, "color": core.TEXT,
                        "border": f"1px solid {core.BORDER}", "borderRadius": "4px",
                        "padding": "6px 10px", "fontSize": "12px", "boxSizing": "border-box"},
             ),
             html.Div(id="sample-load-status",
                      style={"fontSize": "11px", "color": core.MUTED, "marginTop": "8px", "minHeight": "16px"}),
+            # AnnData .h5ad: the column mapping (filled by "Read columns" from the path above)
+            html.Details([
+                html.Summary("AnnData .h5ad (processed cells of one or several sections)",
+                             style={"fontSize": "12px", "color": core.TEXT, "cursor": "pointer"}),
+                html.Div("Enter the path of the .h5ad above and read its columns. Each section becomes "
+                         "a sample. The file is converted once into one store per section in the cache "
+                         "directory (the matrix is read in row blocks, never whole); later loads reuse "
+                         "them. A file has cells only: transcript- and image-based features stay "
+                         "unavailable.",
+                         style={"fontSize": "11px", "color": core.MUTED, "margin": "6px 0"}),
+                html.Button("Read columns", id="h5ad-inspect-btn", n_clicks=0,
+                            style={"padding": "4px 14px", "backgroundColor": core.CARD_BG, "color": core.TEXT,
+                                   "border": f"1px solid {core.BORDER}", "borderRadius": "4px",
+                                   "cursor": "pointer", "fontSize": "12px"}),
+                html.Div([
+                    ui.h5ad_field("x (µm)", dcc.Dropdown(id="h5ad-x", options=[], multi=False, placeholder="obs column",
+                                                       style={"fontSize": "12px"})),
+                    ui.h5ad_field("y (µm)", dcc.Dropdown(id="h5ad-y", options=[], multi=False, placeholder="obs column",
+                                                       style={"fontSize": "12px"})),
+                    ui.h5ad_field("Raw counts", dcc.Dropdown(id="h5ad-counts", options=[], multi=False, placeholder="X or a layer",
+                                                       style={"fontSize": "12px"})),
+                    ui.h5ad_field("Section / sample (optional)", dcc.Dropdown(id="h5ad-section", options=[], multi=False, placeholder="one sample if empty",
+                                                       style={"fontSize": "12px"})),
+                    ui.h5ad_field("Cell-type columns (optional)", dcc.Dropdown(id="h5ad-celltypes", options=[], multi=True, placeholder="obs columns",
+                                                       style={"fontSize": "12px"})),
+                    ui.h5ad_field("Cluster columns (optional)", dcc.Dropdown(id="h5ad-clusters", options=[], multi=True, placeholder="obs columns",
+                                                       style={"fontSize": "12px"})),
+                    ui.h5ad_field("Condition (optional)", dcc.Dropdown(id="h5ad-condition", options=[], multi=False, placeholder="obs column",
+                                                       style={"fontSize": "12px"})),
+                    ui.h5ad_field("Donor (optional)", dcc.Dropdown(id="h5ad-donor", options=[], multi=False, placeholder="obs column",
+                                                       style={"fontSize": "12px"})),
+                    ui.h5ad_field("Compare: A", dcc.Dropdown(id="h5ad-cond-a", options=[], multi=False, placeholder="level of the condition",
+                                                       style={"fontSize": "12px"})),
+                    ui.h5ad_field("Compare: B", dcc.Dropdown(id="h5ad-cond-b", options=[], multi=False, placeholder="level of the condition",
+                                                       style={"fontSize": "12px"})),
+                    ui.h5ad_field("Non-integer counts", dcc.Dropdown(
+                        id="h5ad-noninteger", clearable=False, value="refuse", style={"fontSize": "12px"},
+                        options=[{"label": "pseudobulk tests refuse them (default)", "value": "refuse"},
+                                 {"label": "corrected counts: sum per sample, round the sums", "value": "round_sums"}])),
+                ], style={"display": "flex", "flexWrap": "wrap", "gap": "8px", "marginTop": "8px"}),
+                html.Button("Load .h5ad (replace)", id="h5ad-load-btn", n_clicks=0,
+                            style={"padding": "6px 16px", "backgroundColor": "#1f6feb", "color": "#fff",
+                                   "border": "none", "borderRadius": "5px", "cursor": "pointer",
+                                   "fontSize": "12px", "fontWeight": "600", "marginTop": "10px"}),
+                html.Div(id="h5ad-status",
+                         style={"fontSize": "11px", "color": core.MUTED, "marginTop": "8px",
+                                "minHeight": "16px", "whiteSpace": "pre-wrap"}),
+                dcc.Interval(id="h5ad-poll", interval=1000, disabled=True),
+            ], id="h5ad-details", style={"marginTop": "12px", "borderTop": f"1px solid {core.BORDER}",
+                                         "paddingTop": "8px"}),
         ]),
         dbc.ModalFooter([
             html.Button("Load (Replace)", id="sample-load-btn", n_clicks=0,

@@ -38,6 +38,13 @@ _JC_MIN_COUNTS = 1           # a cell needs at least this many counts over the s
 _JC_LISI_K = 30              # neighbours of the mixing index
 _JC_LISI_QUERY = 5000        # cells the mixing index is computed for (random, fixed seed)
 _JC_CACHE_VERSION = 2          # 2: matrix content and backend availability in the key; cell ids stored
+# cost of the part before the graph, per million cells (measured, README "Performance at
+# study scale"): working copies of the count matrix; normalisation, gene selection and
+# PCA; Harmony; the UMAP
+_JC_MATRIX_GB_PER_M_CELLS = 8.0
+_JC_MIN_PER_M_CELLS = 2.0
+_JC_HARMONY_MIN_PER_M_CELLS = 6.0
+_JC_UMAP_MIN_PER_M_CELLS = 15.0
 
 # variant → (cluster set name, prefix of the per-cell UMAP columns)
 _JC_VARIANTS = {"plain": ("Joint clusters", "joint_umap"),
@@ -597,6 +604,19 @@ def _run_joint(seg_source, use_corrected: bool = False, params=None) -> None:
                 _set("running", msg)
                 if frac is not None:
                     jobs._job_progress(fraction=frac)
+            # the cost up front (two clusterings when Harmony runs: before and after)
+            _n = int(sum(int((np.asarray(smp["rows"])[:len(smp["df"])] >= 0).sum()) for smp in samples))
+            _stop, _est = clustersets._cs_size_guard(
+                "Joint clustering", _n, p["n_neighbors"], passes=2 if harmony else 1,
+                matrix_gb=_JC_MATRIX_GB_PER_M_CELLS * _n / 1e6,
+                extra_minutes=(_JC_MIN_PER_M_CELLS + (_JC_HARMONY_MIN_PER_M_CELLS if harmony else 0.0)
+                               + (_JC_UMAP_MIN_PER_M_CELLS if p["umap"] else 0.0)) * _n / 1e6)
+            if _stop:
+                _set("error", _stop)
+                return
+            if _est:
+                print(f"  Joint clustering: {_est}", flush=True)
+                _set("running", _est)
             r = _jc_compute(samples, levels, p, harmony, step=_step)
         code = r["sample"]
         jobs._check_dataset_gen(_gen)

@@ -549,7 +549,7 @@ def run_density(n_clicks, gene):
         return False, True, "This layer is not a gene's transcript grid: it is computed in its own tab."
     if not any(s["data_dir"] for s in analysis._density_samples()):
         return False, True, ("Transcript density needs the Xenium output directory "
-                             "(transcripts.parquet); this dataset was loaded from a .zarr.")
+                             "(transcripts.parquet); this dataset was " + dataview._origin_phrase() + ".")
     if gene != analysis._DENSITY_ALL and gene not in set(dataview._panel_gene_names()):
         return False, True, f"'{gene}' is not a measured gene of this dataset."
     if not _an_job_claim(analysis._density_state, analysis._density_lock):

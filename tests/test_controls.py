@@ -208,7 +208,97 @@ def test_composition_exact_test_is_the_sample_level_test(xe, D, tmp_path):
     # the moderated t-test says what its unit is, and that it ignores donors
     xe._design_set(rows)
     res = xe._comp_compute("celltype:celltypist", "xenium", None, "logit", "moderated")
-    assert "Unit of the p-values: n = 8 samples" in res["test_note"] and "does not use them" in res["test_note"]
+    # (4 donors in both conditions: the donor is the blocking factor, as in pseudobulk)
+    assert res["design"] == "~ donor + condition" and (res["n_a"], res["n_b"]) == (4, 4)
+    assert "Unit of the p-values: n = 8 samples (4 donors, paired)" in res["test_note"]
+    ref = xe._comp_test(res["counts"][[f"S{i + 1}" for i in range(8)]].loc[list(t.index)].to_numpy(),
+                        ["A", "B"] * 4, [f"d{i // 2}" for i in range(8)])
+    assert np.allclose(res["tests"]["p_mod"], ref["p_mod"]) and np.allclose(res["tests"]["coef"], ref["coef"])
+
+
+def test_composition_counts_donors_not_sections(xe, D, tmp_path):
+    """Regression (found on a real multi-donor design): a donor with several sections in
+    one condition is ONE unit of the moderated test, as it is of the exact test and of
+    pseudobulk. Before, every section was a replicate ("n = 9 samples" for 6 donors)."""
+    types = ("Alpha", "Beta", "Gamma", "Delta")
+    # condition A: donors a1 (3 sections), a2, a3; condition B: b1 (2 sections), b2, b3
+    donors = ["a1", "a1", "a1", "a2", "a3", "b1", "b1", "b2", "b3"]
+    conds = ["A"] * 5 + ["B"] * 4
+    rng = np.random.default_rng(11)
+    extras = [_fab_ds(D, 300, i, str(tmp_path / f"u{i}"), types, rng.dirichlet([4, 3, 2, 1])) for i in range(9)]
+    xe.EXTRA_DATASETS.extend(extras)
+    xe._design_set([{"key": xe._ds_key(e), "cond": c, "batch": "", "donor": d}
+                    for e, c, d in zip(extras, conds, donors)])
+    res = xe._comp_compute("celltype:celltypist", "xenium", None, "logit", "moderated")
+    t = res["tests"].set_index("category")
+    assert res["design"] == "~ condition" and (res["n_a"], res["n_b"]) == (3, 3)
+    assert "A A (3 independent units (donors))" in res["test_note"]
+    assert "Unit of the p-values: n = 9 samples (6 donors), 6 independent units after combining" in res["test_note"]
+    assert "their transformed proportions were averaged before the test" in res["test_note"]
+    # independent computation: logit proportions per section, mean per donor, then the
+    # moderated t-test of 3 vs 3 donors
+    cnt = res["counts"][[f"S{i + 1}" for i in range(9)]].loc[list(t.index)].to_numpy()
+    y = xe._comp_transform(cnt)
+    pr = cnt / cnt.sum(axis=0, keepdims=True)
+    groups = [[0, 1, 2], [3], [4], [5, 6], [7], [8]]
+    yu = np.column_stack([y[:, g].mean(axis=1) for g in groups])
+    pu = np.column_stack([pr[:, g].mean(axis=1) for g in groups])
+    ref = xe._comp_test(None, ["A"] * 3 + ["B"] * 3, None, "logit", y=yu, props=pu)
+    for col in ("coef", "t_mod", "p_mod", "df_mod", "mean_prop_a", "mean_prop_b", "p_welch"):
+        assert np.allclose(t[col].to_numpy(), ref[col].to_numpy()), col
+    assert np.allclose(t["coef"], yu[:, :3].mean(axis=1) - yu[:, 3:].mean(axis=1))
+    # … which is not the test of 5 vs 4 sections
+    sec = xe._comp_test(cnt, conds)
+    assert not np.allclose(t["p_mod"].to_numpy(), sec["p_mod"].to_numpy())
+    assert float(t["df_mod"].iloc[0]) < float(sec["df_mod"].iloc[0])
+    # the exact test reports the same per-unit means
+    ex = xe._comp_compute("celltype:celltypist", "xenium", None, "logit", "exact")["tests"].set_index("category")
+    assert np.allclose(ex.loc[t.index, "mean_prop_a"], pu[:, :3].mean(axis=1))
+    assert np.allclose(ex.loc[t.index, "effect"], t["coef"])
+    # fewer than 3 donors in a condition: no test, however many sections
+    xe._design_set([{"key": xe._ds_key(e), "cond": c, "batch": "", "donor": d}
+                    for e, c, d in zip(extras, conds, ["a1", "a1", "a1", "a2", "a2", "b1", "b1", "b2", "b3"])])
+    res = xe._comp_compute("celltype:celltypist", "xenium", None, "logit", "moderated")
+    assert res["tests"] is None and "condition A has 2 and condition B has 3 independent units (donors)" in res["test_note"]
+    # without donor labels the sections are the samples, as before
+    xe._design_set([{"key": xe._ds_key(e), "cond": c, "batch": "", "donor": ""} for e, c in zip(extras, conds)])
+    res = xe._comp_compute("celltype:celltypist", "xenium", None, "logit", "moderated")
+    assert (res["n_a"], res["n_b"]) == (5, 4) and "Unit of the p-values: n = 9 samples." in res["test_note"]
+    assert np.allclose(res["tests"]["p_mod"], sec["p_mod"])
+
+
+def test_pseudobulk_rounds_corrected_counts_once_per_donor_column(xe, D, tmp_path):
+    """Regression (found on a real file whose only counts are ambient-corrected): with
+    "noninteger_counts": "round_sums" the sections of a donor are added up BEFORE
+    rounding - round(0.4 + 0.4 + 0.4) = 1, not 0 + 0 + 0 - and the result says that the
+    counts were rounded. Raw counts are unaffected."""
+    extras = [_fab_ds(D, 50, i, str(tmp_path / f"r{i}")) for i in range(7)]
+    for e in extras:
+        m = e["expr"].astype(np.float64).tolil()
+        m[:, 0] = 0.0
+        m[0, 0] = 0.4                                   # gene 0: 0.4 in one cell of every section
+        e["expr"] = sp.csr_matrix(m, dtype=np.float32)
+        e["h5ad"] = {"section": "x"}
+    xe.EXTRA_DATASETS.extend(extras)
+    conds = ["A", "A", "A", "B", "A", "B", "B"]
+    donors = ["d1", "d1", "d1", "d1", "d2", "d2", "d3"]
+    xe._design_set([{"key": xe._ds_key(e), "cond": c, "batch": "", "donor": d}
+                    for e, c, d in zip(extras, conds, donors)])
+    samples = xe._an_samples("xenium", False)
+    masks = [np.ones(len(s["df"]), bool) for s in samples]
+    cd, bt = xe._design_of(samples)
+    dn = xe._design_donors(samples)
+    with pytest.raises(ValueError, match="non-integer values.*round_sums"):
+        xe._pb_prepare(samples, masks, cd, bt, 1, 0, donors=dn)
+    for e in extras:
+        e["counts_noninteger"] = "round_sums"
+    prep = xe._pb_prepare(samples, masks, cd, bt, 1, 0, donors=dn)
+    g0 = prep["genes"].index(D["gene_names"][0])
+    assert prep["labels"][0] == "S1+S2+S3" and prep["counts"][g0].tolist() == [1, 0, 0, 0]   # 1.2 → 1; 0.4 → 0
+    assert any("sums rounded to whole numbers" in w for w in prep["warnings"])
+    # every other gene holds whole numbers: its donor column is the plain sum of the sections
+    g5 = prep["genes"].index(D["gene_names"][5])
+    assert prep["counts"][g5, 0] == sum(int(e["expr"][:, 5].sum()) for e in extras[:3])
 
 
 def test_pseudobulk_blocks_on_the_donor_and_sums_its_samples(xe, D, tmp_path):
@@ -970,6 +1060,54 @@ def test_across_sample_inference_and_single_sample_statement(xe):
     # fewer than the minimum number of units: no test across samples
     ac = xe._coloc_across(e[:2], ok[:2], ["", ""], ["", ""], ["a", "b"])
     assert ac["mode"] == "per-sample" and np.isnan(ac["p_enrich"]).all() and ac["p_diff"] is None
+
+
+def test_condition_floor_is_that_of_the_best_covered_pair(xe):
+    """Regression (found on a real paired design): a pair of rare types is testable in
+    few donors and is tested on those. The smallest achievable p reported for the family
+    was the floor of whichever pair came first (2 / 2^3 here) although other pairs were
+    tested on every donor (2 / 2^5); the number of donors behind each p was not given."""
+    T, n_d = 3, 5
+    rng = np.random.default_rng(3)
+    e = rng.normal(0, 0.05, size=(2 * n_d, T, T))
+    conds = ["A", "B"] * n_d
+    donors = [f"d{i // 2}" for i in range(2 * n_d)]
+    e[0::2, 1, 2] += 1.0                                # A − B = +1 in every donor
+    e[0::2, 0, 1] += 1.0
+    ok = np.ones((2 * n_d, T, T), bool)
+    ok[6:, 0, 1] = False                                # pair (0, 1): testable in donors d0-d2 only
+    ac = xe._coloc_across(e, ok, conds, donors, [f"S{i}" for i in range(2 * n_d)])
+    assert ac["n_units_diff"][0, 1] == 3 and ac["n_units_diff"][1, 2] == 5
+    assert ac["p_diff"][0, 1] == 2 / 2 ** 3 and ac["p_diff"][1, 2] == 2 / 2 ** 5
+    assert ac["min_p_diff"] == 2 / 2 ** 5               # not 0.25, the floor of the first pair
+    assert "3 to 5 per pair" in ac["diff_note"] and "5 donors, paired" in ac["diff_note"]
+    # every p respects the floor of its own number of donors
+    nd = ac["n_units_diff"]
+    tested = nd > 0
+    assert (ac["p_diff"][tested] >= 2.0 / 2.0 ** nd[tested] - 1e-15).all()
+    # all pairs on all donors: no range in the note
+    full = xe._coloc_across(e, np.ones_like(ok), conds, donors, [f"S{i}" for i in range(2 * n_d)])
+    assert "per pair" not in full["diff_note"] and (full["n_units_diff"][~np.eye(T, dtype=bool)] == 5).all()
+
+
+def test_paired_condition_tests_list_the_donors_they_leave_out(xe):
+    """A donor with samples in one condition only cannot be in a paired test: stratified
+    co-localisation and the aggregates density test left it out without saying so."""
+    conds = ["A", "B", "A", "B", "A", "B", "A"]
+    donors = ["d1", "d1", "d2", "d2", "d3", "d3", "solo"]
+    got = xe._agg_across([3.0, 1.0, 2.5, 1.5, 4.0, 1.0, 9.0], conds, donors)
+    assert got["dropped"] == ["solo"] and got["p"] == 0.25 and got["min_p"] == 0.25
+    assert got["units_note"] == ("n = 6 samples (3 donors, paired); donors with samples in one condition "
+                                 "only were left out: solo")
+    T = 2
+    e = np.zeros((7, T, T))
+    e[0::2, 0, 1] = 1.0
+    ac = xe._coloc_across(e, np.ones((7, T, T), bool), conds, donors, [f"S{i}" for i in range(7)])
+    assert "3 donors, paired" in ac["diff_note"] and ac["diff_note"].endswith("were left out: solo")
+    assert ac["n_units_diff"][0, 1] == 3 and ac["p_diff"][0, 1] == 0.25
+    # unpaired designs drop nobody
+    assert xe._agg_across([3.0, 1.0, 2.5, 1.5, 4.0, 1.0], list("AAABBB"), [""] * 6)["dropped"] == []
+
 
 
 def test_placebo_anchors_separate_a_specific_neighbour_from_a_compartment_effect(xe):

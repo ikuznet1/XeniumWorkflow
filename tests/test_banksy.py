@@ -328,8 +328,8 @@ def test_install_makes_a_cluster_set_of_the_view(xe, D, client):
     lab = _labels_for(D)
     lab[5] = None
     n_methods = len(D["cluster_methods"])
-    key = xe._cs_install("Banksy λ=0.8", [lab], "xenium", meta={"params": {"lam": 0.8}})
-    assert key == "banksy_lambda_0.8" and xe._cs_label(key) == "Banksy λ=0.8"
+    key = xe._cs_install("Banksy-style λ=0.8", [lab], "xenium", meta={"params": {"lam": 0.8}})
+    assert key == "banksy_lambda_0.8" and xe._cs_label(key) == "Banksy-style λ=0.8"
     assert D["cluster_methods"][-1] == key and len(D["cluster_methods"]) == n_methods + 1
     col = D["df"][xe.cluster_col(key)]
     assert col.dtype.kind == "i" and col.iloc[5] == 0
@@ -338,7 +338,7 @@ def test_install_makes_a_cluster_set_of_the_view(xe, D, client):
     assert xe._cs_meta(key)["params"] == {"lam": 0.8} and not xe._cs_is_shared(key)
     # the dropdown, the label helpers, both renderers
     opts, value = xe.update_cluster_options(1, 1, "xenium", 0, 0, 0, D["cluster_methods"][0])
-    assert {"label": "Banksy λ=0.8", "value": key} in opts and value is dash.no_update
+    assert {"label": "Banksy-style λ=0.8", "value": key} in opts and value is dash.no_update
     labs = xe._an_cluster_labels(xe._an_samples(), key, False, None)[0]
     assert labs[5] is None and set(labs[6:]) == {"1", "2", "3"}                 # a cell without a label is in no group
     raw = xe._raw_cluster_labels(xe._view_tables(), key, None)[0]
@@ -352,7 +352,7 @@ def test_install_makes_a_cluster_set_of_the_view(xe, D, client):
     d = xe._cs_dir(D)
     assert sorted(os.listdir(d)) == [f"{key}__xenium.json", f"{key}__xenium.parquet"]
     # removing it takes it out of the table, the list and the cache
-    assert xe._cs_remove("Banksy λ=0.8")
+    assert xe._cs_remove("Banksy-style λ=0.8")
     assert key not in D["cluster_methods"] and xe.cluster_col(key) not in D["df"].columns
     assert os.listdir(d) == [] and xe._cs_methods() == []
 
@@ -390,7 +390,7 @@ def test_install_with_a_subset_active(xe, D):
     xe.subset(min_transcripts=lo)
     sub = D["df"]
     assert 0 < len(sub) < n
-    key = xe._cs_install("Banksy λ=0.2", [np.zeros(len(sub), dtype=int)], "xenium")
+    key = xe._cs_install("Banksy-style λ=0.2", [np.zeros(len(sub), dtype=int)], "xenium")
     assert (D["df"][xe.cluster_col(key)] == 1).all() and len(D["df"]) == len(sub)
     xe.unsubset()
     col = D["df"][xe.cluster_col(key)]
@@ -454,7 +454,7 @@ def test_cluster_set_on_a_resegmentation_run(xe, D, client, small_view):
     bdf = xe._proseg_state["result"]["cells_df"]
     assert f"cluster_{key}" in bdf.columns and key not in D["cluster_methods"]       # on the run, not on Xenium
     assert xe._cs_methods(src) == [key] and xe._cs_methods("xenium") == []
-    assert {"label": "Banksy λ=0.8", "value": key} in xe.update_cluster_options(1, 1, src, 0, 0, 0, None)[0]
+    assert {"label": "Banksy-style λ=0.8", "value": key} in xe.update_cluster_options(1, 1, src, 0, 0, 0, None)[0]
     assert key not in [o["value"] for o in xe._cs_options("xenium")]
     want = bdf[f"cluster_{key}"].astype(str).to_numpy()
     # picked in Clustering Method: the set; any other method: the run's own clusters
@@ -494,18 +494,18 @@ def _run(xe, **kw):
 
 
 def test_job_installs_the_cluster_set_and_caches_it(xe, D, small_view):
-    assert xe._JOB_KIND_NAMES["banksy"] == "Banksy clustering"
+    assert xe._JOB_KIND_NAMES["banksy"] == "Banksy-style clustering"
     _run(xe)
     res = xe._bk_result()
     key = res["key"]
-    assert res["name"] == "Banksy λ=0.8" and key in D["cluster_methods"] and not res["cached"]
+    assert res["name"] == "Banksy-style λ=0.8" and key in D["cluster_methods"] and not res["cached"]
     col = D["df"][xe.cluster_col(key)].to_numpy()
     assert col.min() >= 0 and col.max() == len(res["table"]) >= 1
     assert int(res["table"]["n_cells"].sum()) == int((col > 0).sum())
     msg = xe._bk_state["message"]
-    assert "Banksy λ=0.8" in msg and "Spatial coherence" in msg and "Clustering Method" in msg
+    assert "Banksy-style λ=0.8" in msg and "Spatial coherence" in msg and "Clustering Method" in msg
     job = [j for j in xe._jobs.values() if j.kind == "banksy"][-1]
-    assert job.state == "done" and job.name == "Banksy clustering"
+    assert job.state == "done" and job.name == "Banksy-style clustering"
     # poll: reports the end once, bumps the cluster-set version and the redraw version
     out = xe.poll_banksy(1, 0, 3, 7)
     assert out[1] is False and out[3] is True and out[4] == 4 and out[5] == 8
@@ -521,7 +521,7 @@ def test_job_installs_the_cluster_set_and_caches_it(xe, D, small_view):
     # other parameters: another run, and for another λ another set
     _run(xe, lam=0.2, agf=[])
     r2 = xe._bk_result()
-    assert r2["name"] == "Banksy λ=0.2" and not r2["cached"] and r2["key"] != key
+    assert r2["name"] == "Banksy-style λ=0.2" and not r2["cached"] and r2["key"] != key
     assert {key, r2["key"]} <= set(D["cluster_methods"])
     assert "own expression and neighbourhood mean of" in xe._bk_state["message"]
 
@@ -563,7 +563,7 @@ def test_job_can_be_cancelled_and_rerun(xe, D, monkeypatch, small_view):
     args = (1, 0.8, 5, ["on"], 0.5, 300, 5, 5, 0, [], "xenium", "original")
     assert xe.run_banksy(*args) == (True, False, "Running…")
     assert entered.wait(60)
-    assert xe.run_banksy(*args)[2] == "Banksy is already running."
+    assert xe.run_banksy(*args)[2] == "Banksy-style clustering is already running."
     job = [j for j in xe._jobs.values() if j.kind == "banksy"][-1]
     assert xe._job_cancel(job.id)
     release.set()
@@ -580,7 +580,7 @@ def test_job_can_be_cancelled_and_rerun(xe, D, monkeypatch, small_view):
 def test_cluster_set_is_exported_by_save_as_spatialdata(xe, D, tmp_path):
     spatialdata = pytest.importorskip("spatialdata")
     lab = _labels_for(D, 5)
-    key = xe._cs_install("Banksy λ=0.8", [lab], "xenium")
+    key = xe._cs_install("Banksy-style λ=0.8", [lab], "xenium")
     msg, poll_disabled, btn_disabled = xe.start_save_sdata(1, str(tmp_path), "bk", [], "xenium")
     assert (poll_disabled, btn_disabled) == (False, True), msg
     tl.wait_state(xe._save_sdata_state, xe._save_sdata_lock, timeout=600)
@@ -614,7 +614,7 @@ def test_shared_flag_belongs_to_the_install_not_to_the_name(xe, D):
              "gene_name_to_idx": D["gene_name_to_idx"], "df_to_expr": D["df_to_expr"]}
     xe.EXTRA_DATASETS.append(extra)
     try:
-        key = xe._cs_install("Banksy λ=0.8", [_labels_for(D, 2), _labels_for(D, 3)], "xenium")
+        key = xe._cs_install("Banksy-style λ=0.8", [_labels_for(D, 2), _labels_for(D, 3)], "xenium")
         assert xe._cs_is_shared(key)
         # the same name installed on a Proseg run (one table) does not change the Xenium set
         n = len(D["df"])
@@ -624,7 +624,7 @@ def test_shared_flag_belongs_to_the_install_not_to_the_name(xe, D):
             xe._proseg_state.update({"status": "done", "result": {
                 "cells_df": cdf, "cell_bounds": {}, "out_dir": "/nonexistent/proseg_run_y", "expr": None,
                 "source": "proseg", "sdata_path": None}})
-        assert xe._cs_install("Banksy λ=0.8", [_labels_for(D, 4)], "proseg:abc") == key
+        assert xe._cs_install("Banksy-style λ=0.8", [_labels_for(D, 4)], "proseg:abc") == key
         assert xe._cs_is_shared(key), "a single-table install on another segmentation cleared the flag"
         got = xe._an_cluster_labels(xe._view_tables(), key, False, None)
         assert set(got[0]) == set(got[1]) == {"C1", "C2", "C3"}
@@ -637,7 +637,7 @@ def test_shared_flag_belongs_to_the_install_not_to_the_name(xe, D):
         assert key in xe._cs_restore("xenium") and xe._cs_is_shared(key)
         # one sample gets the set again from another (single-sample) run: the two samples no
         # longer hold labels of one install, so they are not read as the same clusters
-        xe._cs_install("Banksy λ=0.8", [_labels_for(D, 5), None], "xenium")
+        xe._cs_install("Banksy-style λ=0.8", [_labels_for(D, 5), None], "xenium")
         assert not xe._cs_is_shared(key)
         got = xe._an_cluster_labels(xe._view_tables(), key, False, None)
         assert all(str(l).startswith("S0:C") for l in got[0] if l is not None)
@@ -652,7 +652,7 @@ def test_set_computed_on_a_small_subset_comes_back_on_load(xe, D):
     keep = list(D["df"].index.astype(str)[: max(3, n // 4)])            # well under half of the cells
     xe.subset(cell_ids=keep)
     assert len(D["df"]) == len(keep) < n / 2
-    key = xe._cs_install("Banksy λ=0.2", [np.arange(len(keep)) % 2], "xenium")
+    key = xe._cs_install("Banksy-style λ=0.2", [np.arange(len(keep)) % 2], "xenium")
     xe.unsubset()
     want = D["df"][xe.cluster_col(key)].to_numpy().copy()
     assert (want[: len(keep)] > 0).all() and (want[len(keep):] == 0).all()
@@ -662,3 +662,57 @@ def test_set_computed_on_a_small_subset_comes_back_on_load(xe, D):
     xe._cs_registry.clear()
     assert xe._cs_restore("xenium") == [key]
     np.testing.assert_array_equal(D["df"][xe.cluster_col(key)].to_numpy(), want)
+
+
+def test_cluster_sets_cached_before_the_relabelling_stay_readable(xe):
+    """The feature was relabelled "Banksy-style": the set key did not change, and a set
+    stored under the old name is shown under the new one."""
+    assert xe._bk_name(0.8) == "Banksy-style λ=0.8"
+    assert xe._cs_key("Banksy-style λ=0.8") == xe._cs_key("Banksy λ=0.8") == "banksy_lambda_0.8"
+    assert xe._cs_display_name("Banksy λ=0.2") == "Banksy-style λ=0.2"
+    assert xe._cs_display_name("Banksy-style λ=0.2") == "Banksy-style λ=0.2"
+    assert xe._cs_display_name("Joint clusters") == "Joint clusters"
+    with xe._cs_lock:
+        xe._cs_registry["banksy_lambda_0.8"] = {"name": "Banksy λ=0.8", "shared": False, "meta": {},
+                                                "levels": [], "run": None}
+    try:
+        assert xe._cs_label("banksy_lambda_0.8") == "Banksy-style λ=0.8"
+    finally:
+        with xe._cs_lock:
+            xe._cs_registry.pop("banksy_lambda_0.8", None)
+    assert "not been validated against the reference implementation" in xe._BK_NOTE
+    assert "not the Banksy package" in xe._BK_NOTE
+
+
+def test_clustering_size_guard_gives_an_estimate_and_refuses_what_cannot_fit(xe, monkeypatch):
+    """Graph clustering of very many cells is limited by the edge lists of the Leiden graph.
+    The job states its estimated memory and time before it starts and is refused when the
+    estimate exceeds half of the machine's memory (XENIUM_ALLOW_LARGE_JOBS=1 overrides)."""
+    monkeypatch.delenv("XENIUM_ALLOW_LARGE_JOBS", raising=False)
+    c = xe._cs_cost(1_000_000, 15)
+    assert c["edges"] == 15.0 and c["gb"] == pytest.approx(15 * xe._CS_GB_PER_M_EDGES)
+    assert xe._cs_cost(1_000_000, 15, passes=2)["minutes"] == pytest.approx(2 * c["minutes"])
+    assert xe._cs_cost(1_000_000, 15, matrix_gb=4.0)["gb"] == pytest.approx(c["gb"] + 4.0)
+    assert xe._cs_size_guard("Joint clustering", 5_000, 15) == (None, "")           # small: nothing to say
+    monkeypatch.setattr(xe, "_cs_ram_gb", lambda: 16.0)
+    stop, est = xe._cs_size_guard("Joint clustering", 300_000, 15)
+    assert stop is None and est.startswith("Estimated for 300,000 cells with 15 graph neighbours: about ")
+    assert "GB of memory above the loaded data" in est and "min" in est and "million edges" in est
+    stop, est = xe._cs_size_guard("Banksy-style clustering", 2_000_000, 50)
+    assert stop.startswith("Banksy-style clustering was not started: estimated for 2,000,000 cells")
+    assert "this machine has 16 GB" in stop and "XENIUM_ALLOW_LARGE_JOBS=1" in stop and "subset()" in stop
+    monkeypatch.setenv("XENIUM_ALLOW_LARGE_JOBS", "1")
+    stop, est = xe._cs_size_guard("Banksy-style clustering", 2_000_000, 50)
+    assert stop is None and "2,000,000 cells" in est
+    monkeypatch.setattr(xe, "_cs_ram_gb", lambda: 0.0)                               # unknown memory: never refused
+    monkeypatch.delenv("XENIUM_ALLOW_LARGE_JOBS")
+    assert xe._cs_size_guard("Joint clustering", 2_000_000, 50)[0] is None
+
+
+def test_a_refused_clustering_job_ends_with_the_estimate_as_its_error(xe, D, monkeypatch):
+    monkeypatch.setattr(xe, "_cs_size_guard", lambda what, *a, **k: (f"{what} was not started: too large", ""))
+    monkeypatch.setattr(xe, "_bk_cache_file", lambda sig: "/nonexistent/none.npz")
+    xe._run_banksy("xenium", False, {"lam": 0.37})
+    assert xe._bk_state["status"] == "error"
+    assert xe._bk_state["message"] == "Banksy-style clustering was not started: too large"
+    assert "banksy_lambda_0.37" not in (D.get("cluster_methods") or [])

@@ -432,3 +432,16 @@ def test_mode_switch_and_layout(xe):
     with xe._lrd_lock:
         xe._lrd_state["result"] = {"gen": -1}
     assert xe._lrd_result() is None
+
+
+def test_paired_design_names_the_donors_it_leaves_out(xe):
+    """A donor with samples in one condition only is not part of the paired test: the unit
+    statement lists it (found on a real design, where it was dropped without a word)."""
+    worlds = [_world(60 + i, lig=8.0) for i in range(4)] + [_world(70 + i) for i in range(4)]
+    conds = ["A"] * 4 + ["B"] * 4
+    donors = ["d0", "d1", "d2", "solo"] + ["d0", "d1", "d2", "d2"]
+    res = xe._lrd_decompose(_sums(xe, worlds), ["S", "T", "U"], PAIRS, conds=conds, donors=donors)
+    assert res["mode"] == "paired" and res["n_units"] == 3 and np.isclose(res["min_p"], 2 / 8)
+    assert res["units_note"] == ("n = 7 samples (3 donors, paired); donors with samples in one condition "
+                                 "only were left out: solo")
+    assert 3 not in res["samples_used"] and len(res["samples_used"]) == 7

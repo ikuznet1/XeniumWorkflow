@@ -1,4 +1,4 @@
-"""Banksy spatial domains (compute + layout): clustering of the cells on their own
+"""Banksy-style spatial domains (compute + layout): clustering of the cells on their own
 expression augmented with the mean expression of their spatial neighbours and its azimuthal
 Gabor filter (Singhal et al., Nat Genet 2024), implemented with numpy / scipy / sklearn.
 
@@ -41,9 +41,20 @@ _BK_CHUNK = 8192             # cells per dense block
 _BK_KEEP_BYTES = 1.2e9       # neighbourhood blocks up to this size are kept instead of recomputed
 _BK_CACHE_VERSION = 2          # 2: the signature includes the content of the count matrix
 _BK_TOP_GENES = 5
+# cost of the part before the graph, per million cells (measured, README "Performance at
+# study scale"): the normalised matrix and its gene selection; the three passes over the
+# neighbourhood features and the Gram matrix of the augmented features
+_BK_MATRIX_GB_PER_M_CELLS = 6.0
+_BK_MIN_PER_M_CELLS = 12.0
+
+# the one sentence on what this implementation is, shown in the tab, the status line, the
+# CSV header and the README
+_BK_UNVALIDATED = ("This is a native implementation, not the Banksy package: it follows the published "
+                   "method's construction (the three feature blocks and their λ scaling) but has not "
+                   "been validated against the reference implementation.")
 
 _BK_NOTE = (
-    "Banksy (Singhal et al., Nat Genet 2024) clusters every cell on three blocks of features: its "
+    "Banksy-style spatial domains. Banksy (Singhal et al., Nat Genet 2024) clusters every cell on three blocks of features: its "
     "own expression, the weighted mean expression of its k nearest cells in space, and the azimuthal "
     "Gabor filter (AGF) of its 2k nearest cells - the magnitude of the expression gradient around it, "
     "which does not change when the section is rotated. Neighbour weights are Gaussian in the distance, "
@@ -54,8 +65,7 @@ _BK_NOTE = (
     "graph of the cells in PC space and Leiden clustering. Counts are scaled to the median total per "
     "cell; with a panel larger than the gene cap the most variable genes are used. Spatial neighbours "
     "are always cells of the same sample; with several samples the features are scaled and clustered "
-    "together, so a domain has the same number in every sample. This is a native implementation of the "
-    "published method, not the Banksy package; clusters depend on λ, k, the resolution and the seed, "
+    "together, so a domain has the same number in every sample. " + _BK_UNVALIDATED + " Clusters depend on λ, k, the resolution and the seed, "
     "and are an exploratory partition, not a test. The result is a cluster set: Color By → Cluster → "
     "Clustering Method. Recompute after changing the subset, the segmentation or the counts.")
 
@@ -308,7 +318,7 @@ def _bk_select_genes(X, max_genes: int = _BK_MAX_GENES, min_cells: int = 10) -> 
 
 
 def _bk_name(lam: float) -> str:
-    return f"Banksy λ={float(lam):g}"
+    return f"Banksy-style λ={float(lam):g}"
 
 
 # ─── Summaries of a partition ─────────────────────────────────────────────────
@@ -387,7 +397,7 @@ def _bk_compute(samples, params, progress=None) -> dict:
     X, pos, med = _bk_matrix(samples, genes_all, p["log1p"])
     n = X.shape[0]
     if n < _BK_MIN_CELLS:
-        raise ValueError(f"Banksy needs at least {_BK_MIN_CELLS} cells with counts; the view has {n:,}.")
+        raise ValueError(f"Banksy-style clustering needs at least {_BK_MIN_CELLS} cells with counts; the view has {n:,}.")
     jobs._job_check()
     sel = _bk_select_genes(X, p["max_genes"])
     if len(sel) < 2:
@@ -436,7 +446,7 @@ def _bk_summarise(samples, out, tables_labels) -> dict:
 
 def _run_banksy(seg_source, use_corrected, params=None) -> None:
     """Background job: Banksy clusters of the cells of the active view, installed as the
-    cluster set "Banksy λ=…"."""
+    cluster set "Banksy-style λ=…"."""
     _gen = jobs._dataset_gen
     seg_source = seg_source or "xenium"
 
@@ -481,6 +491,17 @@ def _run_banksy(seg_source, use_corrected, params=None) -> None:
                 _set("running", m)
 
         if cached is None:
+            # the cost up front: the graph of k_expr neighbours of every cell is what limits it
+            _n = int(sum(int((np.asarray(smp["rows"])[:len(smp["df"])] >= 0).sum()) for smp in samples))
+            _stop, _est = clustersets._cs_size_guard(
+                "Banksy-style clustering", _n, p["k_expr"],
+                matrix_gb=_BK_MATRIX_GB_PER_M_CELLS * _n / 1e6, extra_minutes=_BK_MIN_PER_M_CELLS * _n / 1e6)
+            if _stop:
+                _set("error", _stop)
+                return
+            if _est:
+                print(f"  Banksy: {_est}", flush=True)
+                _set("running", _est)
             out = _bk_compute(samples, p, _progress)
             jobs._check_dataset_gen(_gen)
             summ = _bk_summarise(samples, out, None)
@@ -548,7 +569,8 @@ def _run_banksy(seg_source, use_corrected, params=None) -> None:
                  f"are in its own cluster ({100 * summary['purity_expected']:.0f} % expected if the labels were "
                  f"scattered at random)."
                + f"\nShown as cluster set '{name}': Color By → Cluster, Clustering Method → {name}. "
-                 f"0 marks cells without a label.")
+                 f"0 marks cells without a label."
+               + "\n" + _BK_UNVALIDATED)
         if ci["backend"] != "leiden":
             msg += "\n⚠ " + clustersets._CS_LEIDEN_HINT
         if len(samples) > 1:
@@ -582,7 +604,7 @@ def make_bk_fig(width=None, height=None):
     from plotly.subplots import make_subplots
     res = _bk_result()
     if not res:
-        return figures._make_placeholder_fig("No Banksy clusters computed yet.")
+        return figures._make_placeholder_fig("No Banksy-style domains computed yet.")
     t = res["table"]
     fig = make_subplots(rows=1, cols=2, column_widths=[0.3, 0.7], horizontal_spacing=0.08,
                         subplot_titles=("Cells per cluster", "Top genes (SD from the mean of all cells)"))
@@ -633,7 +655,9 @@ def _bk_csv(res) -> str:
              f"{', centred' if p['agf'] and p['center'] else ''}); {s['n_genes']} of {s['n_genes_all']} genes; "
              f"{p['n_pcs']} PCs; clustering: {s['cluster']['backend']}, k_expr {p['k_expr']}, resolution "
              f"{p['resolution']:g}, seed {p['seed']}",
-             "# native implementation of Banksy (Singhal et al., Nat Genet 2024); neighbours within sample",
+             "# Banksy-style spatial domains: native implementation following the construction of Banksy "
+             "(Singhal et al., Nat Genet 2024), not validated against the reference implementation; "
+             "neighbours within sample",
              f"# neighbour_purity: mean share of a cell's {p['k_geom']} nearest cells in its own cluster; "
              f"purity_expected: the share of the cluster among all cells",
              "# cluster ids are the values of the cluster set (0 = no label)"]
@@ -651,7 +675,7 @@ def _bk_tab():
     chk = lambda text, on, id=None: dcc.Checklist(
         id=id, options=[{"label": html.Span(text, style={"fontSize": "11px", "color": core.TEXT}), "value": "on"}],
         value=["on"] if on else [], inputStyle={"marginRight": "3px"}, style={"display": "inline-flex"})
-    return dbc.Tab(label="Banksy", tab_id="tab-banksy",
+    return dbc.Tab(label="Banksy-style domains", tab_id="tab-banksy",
                    label_style={"fontSize": "12px", "padding": "4px 12px"},
                    children=[html.Div([
         html.Div([
@@ -680,7 +704,7 @@ def _bk_tab():
         html.Div(id="bk-status", style={**analysis._AN_STATUS_STYLE, "whiteSpace": "pre-wrap"}),
         html.Div(_BK_NOTE, id="bk-note", style=analysis._AN_NOTE_STYLE),
         html.Div([
-            controls._graph(id="bk-plot", msg="No Banksy clusters computed yet.", filename="xenium_banksy",
+            controls._graph(id="bk-plot", msg="No Banksy-style domains computed yet.", filename="xenium_banksy",
                             min_h="320px"),
             html.Div([
                 dash_table.DataTable(id="bk-table", data=[], columns=cols, **stats._dark_table_style(12)),

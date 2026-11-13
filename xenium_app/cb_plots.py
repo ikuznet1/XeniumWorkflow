@@ -7,7 +7,7 @@ import pandas as pd
 from dash import dcc, html, Input, Output, State, callback_context
 import plotly.graph_objects as go
 
-from . import core, ui, dataview, morph, figures, cellnest, app_layout
+from . import core, ui, dataview, morph, figures, cellnest, stats, app_layout
 
 
 app_layout.app.clientside_callback(
@@ -164,6 +164,16 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
     # this callback (renderer-mode is an Input) and rebuilds both.
     if renderer_mode == "webgl":
         return no_update, no_update
+    # Too many cells for a Plotly figure: say so instead of building it (minutes of work
+    # and a figure the browser cannot hold)
+    _too_large = dataview._plotly_too_large(sum(len(t["df"]) for t in stats._view_tables(seg_source or "xenium")))
+    if _too_large:
+        if {t["prop_id"].split(".")[0] for t in callback_context.triggered} == {"spatial-relayout"}:
+            return no_update, no_update
+        _msg = _too_large.replace(": a figure", ":<br>a figure").replace(". Use", ".<br>Use").replace(
+            ". XENIUM", ".<br>XENIUM")
+        return figures._make_placeholder_fig(_msg), figures._make_placeholder_fig(
+            "The UMAP of this many cells is drawn in the WebGL view.")
 
     # (sole trigger only: Load Sample resets the stored viewport together with
     # dataset-version, and that must rebuild the figure)

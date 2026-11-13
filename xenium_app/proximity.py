@@ -660,16 +660,30 @@ def _prox_compute(samples, labels, target, anchor, strata=None, source="auto", c
         k = (len(u["pairs"]) if u["paired"] else min(sum(1 for _n, c, _ix in u["units"] if c == x) for x in ("A", "B")))
         if k >= stats._SL_MIN_UNITS:
             ed, pd_ = np.full(G, np.nan), np.full(G, np.nan)
-            first = None
+            nd = np.zeros(G, dtype=np.int64)        # units a gene's difference is tested on
+            first, floor = None, np.nan
             for g in range(G):
                 if g % 500 == 0:
                     jobs._job_check()
                 r = stats._sl_test(E_obs["nearfar"][:, g], c_use, donors, units=u)
                 ed[g], pd_[g] = r["effect"] / ln2, r["p"]
+                if np.isfinite(r["p"]):
+                    nd[g] = r["n"]
+                    # the floor of the family is that of its best-covered gene (a gene without an
+                    # effect in some unit is tested on fewer units and has a larger floor of its own)
+                    floor = r["min_p"] if not np.isfinite(floor) else min(floor, r["min_p"])
                 first = first or r
-            table["effect_diff"], table["p_diff"], table["fdr_diff"] = ed, pd_, stats._bh(pd_)
+            table["effect_diff"], table["n_units_diff"] = ed, nd
+            table["p_diff"], table["fdr_diff"] = pd_, stats._bh(pd_)
             diff_note = (f"A − B of the effect: {first['test']} test, {u['note']}; smallest achievable p "
-                         f"{first['min_p']:.3g}; BH FDR in column fdr_diff")
+                         f"{floor:.3g}; BH FDR in column fdr_diff")
+            tested = nd[nd > 0]
+            if len(tested) and tested.min() != tested.max():
+                diff_note += (f"; a gene is tested on the units in which its effect is defined: "
+                              f"{int(tested.min())} to {int(tested.max())} per gene (column n_units_diff)")
+            if u["dropped"]:
+                diff_note += ("; donors with samples in one condition only were left out: "
+                              + ", ".join(u["dropped"]))
         else:
             diff_note = (f"no test of the effect between conditions: fewer than {stats._SL_MIN_UNITS} "
                          f"independent units per condition ({u['note']})")
@@ -721,7 +735,7 @@ _PROX_COLUMNS = [("gene", "Gene", "text"), ("log2fc", "Near − far", "num"), ("
                  ("n_pos", "Units > 0", "num"), ("z_random", "z vs random", "num"),
                  ("random_mean", "Random anchors", "num"), ("pval", "p", "num"), ("padj", "Emp. FDR", "num"),
                  ("p_slope", "p (slope)", "num"), ("p_nearfar", "p (near − far)", "num"), ("specific", "Specific", "text"),
-                 ("effect_diff", "A − B", "num"), ("p_diff", "p (A vs B)", "num"), ("fdr_diff", "FDR (A vs B)", "num"),
+                 ("effect_diff", "A − B", "num"), ("n_units_diff", "Units (A vs B)", "num"), ("p_diff", "p (A vs B)", "num"), ("fdr_diff", "FDR (A vs B)", "num"),
                  ("L_um", "L (µm)", "num"), ("r2", "R² (L)", "num"), ("detection", "% cells", "num"),
                  ("owner", "Owner", "text"), ("anchor_ratio", "X ÷ T rate", "num"),
                  ("leak_fraction", "Leak fraction", "num"), ("leak_flag", "Leak gate", "text")]

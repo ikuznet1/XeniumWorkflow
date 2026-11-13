@@ -8,6 +8,7 @@ view offsets samples in x only for drawing).
 
 import threading
 import time as _time
+import os
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
@@ -36,6 +37,7 @@ _AGG_TILE_REACH_UM = 20.0    # ... and the furthest a grid point may be from its
 _AGG_HULL_ALPHA_UM = 30.0    # alpha hull: Delaunay triangles with every edge at most this long
 _AGG_OE_MIN_POOL = 20        # outside cells a stratum needs to give the expected composition
 _AGG_BATCH = 25              # permutations per sparse product (and per cancellation point)
+_AGG_THREADS = max(1, min(4, (os.cpu_count() or 2) // 2))   # replicates of the permutation sorted at a time
 _AGG_OUTLINE_COLOR = "#f0c040"
 _AGG_COLUMNS = ("aggregate_id", "aggregate_hotspot", "aggregate_p")   # per-cell columns of a run
 _AGG_COLOR_KEY = "agg#id"    # Color By value "geneset:agg#id"
@@ -95,15 +97,30 @@ def _agg_perm_within(strata, y, rng, n_rep: int) -> np.ndarray:
     if len(strata) and 0 <= strata.min() and strata.max() < 65536:
         strata = strata.astype(np.uint16)          # a stable sort of 16-bit keys is a radix sort
     base = np.argsort(strata, kind="stable")
-    out = np.empty((len(y), int(n_rep)), dtype=np.float32)
-    for b in range(int(n_rep)):
+    n_rep = int(n_rep)
+    out = np.empty((len(y), n_rep), dtype=np.float32)
+    # the random numbers are drawn one replicate after the other, as before (the same
+    # stream, the same permutations); only the sorting of each replicate, which is all the
+    # time, runs in a few threads
+    draws = [rng.random(len(y)) for _ in range(n_rep)]
+
+    def _one(b):
         # cells ordered by (stratum, random number): the order np.lexsort((r, strata)) gives,
         # as a sort by r followed by a stable sort by stratum (several times faster)
-        o1 = np.argsort(rng.random(len(y)))
+        o1 = np.argsort(draws[b])
         order = o1[np.argsort(strata[o1], kind="stable")]
         yp = np.empty(len(y), dtype=np.float32)
         yp[base] = y[order]
         out[:, b] = yp
+
+    n_thr = int(max(1, min(_AGG_THREADS, n_rep))) if len(y) >= 20_000 else 1
+    if n_thr > 1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=n_thr) as pool:
+            list(pool.map(_one, range(n_rep)))
+    else:
+        for b in range(n_rep):
+            _one(b)
     return out
 
 
@@ -416,8 +433,12 @@ def _agg_across(values, conds, donors) -> dict:
         return {"p": None, "why": (f"{len(bad)} sample(s) assigned to a condition have no value (fewer than 3 "
                                    f"cells, or no tissue area)")}
     r = stats._sl_test(vals, c_use, donors, units=u)
+    note = r["units_note"]
+    if r.get("dropped"):
+        # a paired test uses the donors seen in both conditions: say who is not in it
+        note += "; donors with samples in one condition only were left out: " + ", ".join(r["dropped"])
     return {"p": float(r["p"]), "effect": float(r["effect"]), "min_p": float(r["min_p"]),
-            "test": r["test"], "exact": bool(r["exact"]), "units_note": r["units_note"]}
+            "test": r["test"], "exact": bool(r["exact"]), "units_note": note, "dropped": list(r.get("dropped") or [])}
 
 
 def _run_aggregates(seg_source, method, label_kind, classes, params=None) -> None:

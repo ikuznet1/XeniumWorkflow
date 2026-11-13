@@ -465,7 +465,7 @@ def _run_imgseg(backend: str = "classical", channels=None, diameter_um: float = 
         tx_path = os.path.join(data_dir, "transcripts.parquet") if data_dir else None
         if not tx_path or not os.path.exists(tx_path):
             _set("error", "Resegmentation needs the original Xenium output directory "
-                          "(transcripts.parquet); this dataset was loaded from a .zarr.")
+                          "(transcripts.parquet); this dataset was " + dataview._origin_phrase() + ".")
             return
         with core._sdata_lock:
             sdata = core._sdata_state.get("sdata")

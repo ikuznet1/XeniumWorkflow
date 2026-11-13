@@ -100,7 +100,7 @@ _JOB_KIND_NAMES = {
     "segqc": "segmentation QC", "coloc": "stratified co-localisation",
     "proximity": "proximity differential expression", "contact": "contact-group differential expression",
     "lrdecomp": "ligand-receptor exposure decomposition", "aggregates": "aggregates",
-    "segfree": "segmentation-free abundance", "txfactor": "transcript factors", "banksy": "Banksy clustering", "joint": "joint clustering",
+    "segfree": "segmentation-free abundance", "txfactor": "transcript factors", "banksy": "Banksy-style clustering", "h5ad": "loading an .h5ad", "joint": "joint clustering",
 }
 
 _jobs: dict = {}                       # job id → _Job, in start order

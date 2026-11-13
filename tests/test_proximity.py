@@ -673,3 +673,26 @@ def test_type_pickers_follow_the_segmentation_cluster_set_and_samples(xe, D):
     # a pick that exists stays; one from another cluster set / segmentation is cleared
     out = xe.update_prox_type_options("cluster", 0, 0, 0, "xenium", method, 0, have[0], "no-such-type", "gone")
     assert out[3] is no_update and out[4] is None and out[5] == "auto"
+
+
+def test_condition_difference_reports_its_units_floor_and_the_donors_left_out(xe):
+    """Regression (found on a real paired design): the test of the effect between
+    conditions is paired over the donors seen in both; the donor seen in one condition
+    only takes part in the near-far test but not in this one, which the note now says,
+    with the number of units behind each gene and the floor of the best-covered gene."""
+    secs = [_section(40 + i, n_t=700, n_o=200, label=f"S{i}") for i in range(7)]
+    samples, labels = [f[0] for f in secs], [f[1] for f in secs]
+    conds = ["A", "B", "A", "B", "A", "B", "A"]
+    donors = ["d1", "d1", "d2", "d2", "d3", "d3", "solo"]
+    res = xe._prox_compute(samples, labels, T, X, params={"n_random": 3}, source="Other",
+                           conds=conds, donors=donors)
+    t = res["table"]
+    assert res["info"]["n_units"] == 4 and res["info"]["by_donor"]         # near vs far: 4 donors
+    tested = t["p_diff"].notna()
+    assert tested.any() and (t.loc[tested, "n_units_diff"] == 3).all()     # A vs B: the 3 paired donors
+    assert (t.loc[tested, "p_diff"] >= 2 / 2 ** 3).all()
+    note = res["diff_note"]
+    assert "paired sign-flip test" in note and "3 donors, paired" in note
+    assert "smallest achievable p 0.25" in note
+    assert note.endswith("donors with samples in one condition only were left out: solo")
+    assert "n_units_diff" in [c["id"] for c in xe._de_table_columns(res)] or "n_units_diff" in t.columns

@@ -471,6 +471,9 @@ def _lrd_decompose(sums, types, kept, conds=None, donors=None, binary: bool = Fa
                        + [(nm, c, ix) for nm, c, ix in u["units"] if c == "B"])
             k = min(sum(1 for x in unit_ix if x[1] == "A"), sum(1 for x in unit_ix if x[1] == "B"))
         out["units_note"] = u["note"]
+        if u["dropped"]:
+            out["units_note"] += ("; donors with samples in one condition only were left out: "
+                                  + ", ".join(u["dropped"]))
         if k >= stats._SL_MIN_UNITS:
             mode, reason = ("paired" if u["paired"] else "unpaired"), ""
         else:

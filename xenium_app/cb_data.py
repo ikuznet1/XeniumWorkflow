@@ -11,6 +11,7 @@ from . import (
 )
 from . import segfree
 from . import clustersets
+from . import h5ad
 
 
 # ─── SpatialData / Sopa callbacks ─────────────────────────────────────────────
@@ -242,6 +243,7 @@ def update_tissue_info(_, seg_source, _split_done):
                      style={"fontSize": "13px", "color": core.TEXT, "fontWeight": "600"}),
             html.Div(meta.get("region_name", ""),
                      style={"fontSize": "11px", "color": core.MUTED}),
+            *_h5ad_info_rows(),
         ], style={"marginBottom": "10px"}),
 
         html.Div([
@@ -287,6 +289,21 @@ def update_tissue_info(_, seg_source, _split_done):
             ], style={"display": "flex", "alignItems": "center"}),
         ], className="tissue-details"),
     ], id="tissue-info-section", style={"marginBottom": "14px"})
+
+
+def _h5ad_info_rows() -> list:
+    """Lines of the tissue info for a view that comes from an .h5ad: what it is, what the
+    counts are, and (as a tooltip) which features are unavailable."""
+    man = h5ad._h5ad_loaded.get("manifest")
+    if not man or not (core.DATA.get("h5ad") or {}):
+        return []
+    out = [html.Div(f"AnnData file: {len(man['sections'])} section(s), cells only — no transcripts, "
+                    f"no images (hover for what is unavailable)",
+                    title=h5ad._h5ad_unavailable_note(),
+                    style={"fontSize": "10px", "color": core.MUTED, "marginTop": "3px"})]
+    for w in h5ad._h5ad_warnings(man):
+        out.append(html.Div("\u26a0 " + w, style={"fontSize": "10px", "color": "#d29922", "marginTop": "3px"}))
+    return out
 
 
 @app_layout.app.callback(
@@ -417,6 +434,60 @@ def toggle_sample_modal(open_clicks, close_clicks, is_open):
     return False, no_update
 
 
+def _reset_dataset_state() -> None:
+    """After DATA was replaced (Load Sample, an .h5ad): reset every per-dataset state and
+    re-run the autoloads for the new dataset."""
+    # Reset all per-dataset state
+    with core._baysor_lock:
+        core._baysor_state.update({"status": "idle", "message": "", "result": None})
+    with core._proseg_lock:
+        core._proseg_state.update({"status": "idle", "message": "", "result": None})
+    with core._imgseg_lock:
+        core._imgseg_state.update({"status": "idle", "message": "", "result": None})
+    with core._annot_lock:
+        core._annot_state.update({"status": "idle", "message": "", "labels": None,
+                              "labels_proseg": None, "labels_baysor": None})
+        # Per-method label / weight keys (labels_celltypist, rctd_weights_…) too
+        for _k in list(core._annot_state):
+            if _k not in ("status", "message"):
+                core._annot_state[_k] = None
+    with core._spage_lock:
+        core._spage_state.update({"status": "idle", "message": "", "result": None,
+                              "result_path": None, "result_genes": None})
+    with core._sdata_lock:
+        core._sdata_state.update({"status": "idle", "message": "", "sdata": None,
+                              "roi": None, "patches": None})
+    with core._umap_reseg_lock:
+        core._umap_reseg_state.update({"status": "idle", "message": "", "result": None})
+    with core._split_lock:
+        core._split_state.update({"status": "idle", "message": "", "result": None})
+    with core._niche_lock:
+        core._niche_state.update({"status": "idle", "message": ""})
+    with core._spatial_lock:
+        core._spatial_state.update({"status": "idle", "message": "", "result": None})
+    with core._roi_lock:
+        core._roi_state["rois"] = []
+        core._roi_state["pending_hull"] = None
+    # CellNEST results (edges drawn from their own coordinates) and the extra
+    # side-by-side samples (offsets computed against the previous primary)
+    # belong to the previous dataset.
+    with core._cellnest_lock:
+        core._cellnest_state.update({"status": "idle", "message": "", "data": None})
+    if dataview.EXTRA_DATASETS:
+        print(f"  Removed {len(dataview.EXTRA_DATASETS)} extra sample(s) of the previous dataset",
+              flush=True)
+        dataview.EXTRA_DATASETS.clear()
+    # Re-run autoloads for the new dataset
+    regions._auto_load_rois()
+    analysis._an_autoload()
+    stats._stats_reset()
+    controls._controls_reset()
+    segfree._sfree_reset()
+    annotation._annot_autoload()
+    sdata_store._sdata_autoload()
+    spage._spage_autoload()
+
+
 @app_layout.app.callback(
     Output("sample-load-status",  "children"),
     Output("sample-modal",        "is_open",       allow_duplicate=True),
@@ -445,6 +516,8 @@ def load_sample(n_clicks, picked_path, custom_path, ds_version, roi_done,
     if not new_dir:
         return ("Select a sample or enter a path.", no_update, no_update) + _nu3
     new_dir = os.path.abspath(new_dir)
+    if h5ad._is_h5ad_path(new_dir):
+        return (_H5AD_ROUTE_MSG, no_update, no_update) + _nu3
     is_zarr = new_dir.rstrip("/").endswith(".zarr")
     if is_zarr:
         if not _is_zarr_store(new_dir):
@@ -467,55 +540,9 @@ def load_sample(n_clicks, picked_path, custom_path, ds_version, roi_done,
         new_data = loading.load_from_sdata_zarr(new_dir) if is_zarr else loading.load_xenium_data(new_dir)
         # Swap DATA and rebuild everything derived from it (expr_csc, gene lists, caches)
         dataview._install_dataset(new_data)
-        # Reset all per-dataset state
-        with core._baysor_lock:
-            core._baysor_state.update({"status": "idle", "message": "", "result": None})
-        with core._proseg_lock:
-            core._proseg_state.update({"status": "idle", "message": "", "result": None})
-        with core._imgseg_lock:
-            core._imgseg_state.update({"status": "idle", "message": "", "result": None})
-        with core._annot_lock:
-            core._annot_state.update({"status": "idle", "message": "", "labels": None,
-                                  "labels_proseg": None, "labels_baysor": None})
-            # Per-method label / weight keys (labels_celltypist, rctd_weights_…) too
-            for _k in list(core._annot_state):
-                if _k not in ("status", "message"):
-                    core._annot_state[_k] = None
-        with core._spage_lock:
-            core._spage_state.update({"status": "idle", "message": "", "result": None,
-                                  "result_path": None, "result_genes": None})
-        with core._sdata_lock:
-            core._sdata_state.update({"status": "idle", "message": "", "sdata": None,
-                                  "roi": None, "patches": None})
-        with core._umap_reseg_lock:
-            core._umap_reseg_state.update({"status": "idle", "message": "", "result": None})
-        with core._split_lock:
-            core._split_state.update({"status": "idle", "message": "", "result": None})
-        with core._niche_lock:
-            core._niche_state.update({"status": "idle", "message": ""})
-        with core._spatial_lock:
-            core._spatial_state.update({"status": "idle", "message": "", "result": None})
-        with core._roi_lock:
-            core._roi_state["rois"] = []
-            core._roi_state["pending_hull"] = None
-        # CellNEST results (edges drawn from their own coordinates) and the extra
-        # side-by-side samples (offsets computed against the previous primary)
-        # belong to the previous dataset.
-        with core._cellnest_lock:
-            core._cellnest_state.update({"status": "idle", "message": "", "data": None})
-        if dataview.EXTRA_DATASETS:
-            print(f"  Removed {len(dataview.EXTRA_DATASETS)} extra sample(s) of the previous dataset",
-                  flush=True)
-            dataview.EXTRA_DATASETS.clear()
-        # Re-run autoloads for the new dataset
-        regions._auto_load_rois()
-        analysis._an_autoload()
-        stats._stats_reset()
-        controls._controls_reset()
-        segfree._sfree_reset()
-        annotation._annot_autoload()
-        sdata_store._sdata_autoload()
-        spage._spage_autoload()
+        _reset_dataset_state()
+        # a view that came from an .h5ad is gone: forget its cell-type columns
+        h5ad._h5ad_register(None)
         print(f"  Loaded new dataset: {new_dir}", flush=True)
         # {}: the stored viewport belongs to the previous dataset
         return ("Loaded.", False, (ds_version or 0) + 1,
@@ -544,6 +571,9 @@ def add_sample(n_clicks, picked_path, custom_path, extra_ver):
     if not new_dir:
         return "Select a sample or enter a path.", no_update, no_update, no_update
     new_dir = os.path.abspath(new_dir)
+    if h5ad._is_h5ad_path(new_dir):
+        return (_H5AD_ROUTE_MSG + " (An .h5ad replaces the loaded samples; it cannot be added beside them.)",
+                no_update, no_update, no_update)
     is_zarr = new_dir.rstrip("/").endswith(".zarr")
     if is_zarr:
         if not _is_zarr_store(new_dir):
@@ -588,6 +618,208 @@ def add_sample(n_clicks, picked_path, custom_path, extra_ver):
         import traceback
         traceback.print_exc()
         return f"Error: {exc}", no_update, no_update, no_update
+
+
+# ─── AnnData .h5ad ────────────────────────────────────────────────────────────
+_H5AD_ROUTE_MSG = ("This is an AnnData .h5ad: open 'AnnData .h5ad' below, read its columns, choose "
+                   "the mapping and use 'Load .h5ad'.")
+_h5ad_inspected: dict = {}          # path -> _h5ad_inspect result of the last "Read columns"
+
+
+def _h5ad_form_mapping(x, y, counts, section, celltypes, clusters, condition, donor, cond_a, cond_b,
+                       info=None, noninteger="refuse") -> dict:
+    """The mapping the dialog's pickers describe."""
+    m = {"x": x, "y": y, "counts": counts or "X", "section": section, "cell_types": celltypes or [],
+         "clusters": clusters or [], "condition": condition, "donor": donor,
+         "cond_a": cond_a if condition else None, "cond_b": cond_b if condition else None,
+         "noninteger_counts": noninteger or "refuse"}
+    g = (info or {}).get("guess") or {}
+    if not x and not y and g.get("spatial"):
+        m["spatial"] = g["spatial"]
+    if g.get("umap"):
+        m["umap"] = g["umap"]
+    return h5ad._h5ad_clean_mapping(m)
+
+
+@app_layout.app.callback(
+    Output("h5ad-status",    "children"),
+    Output("h5ad-x",         "options"), Output("h5ad-x",         "value"),
+    Output("h5ad-y",         "options"), Output("h5ad-y",         "value"),
+    Output("h5ad-counts",    "options"), Output("h5ad-counts",    "value"),
+    Output("h5ad-section",   "options"), Output("h5ad-section",   "value"),
+    Output("h5ad-celltypes", "options"), Output("h5ad-celltypes", "value"),
+    Output("h5ad-clusters",  "options"), Output("h5ad-clusters",  "value"),
+    Output("h5ad-condition", "options"), Output("h5ad-condition", "value"),
+    Output("h5ad-donor",     "options"), Output("h5ad-donor",     "value"),
+    Input("h5ad-inspect-btn", "n_clicks"),
+    State("sample-custom-path", "value"),
+    prevent_initial_call=True,
+)
+def h5ad_read_columns(n_clicks, path):
+    """Fill the column pickers from the obs columns, layers and obsm keys of the file."""
+    _nu = (no_update,) * 16
+    if not n_clicks:
+        raise dash.exceptions.PreventUpdate
+    path = (path or "").strip()
+    if not h5ad._is_h5ad_path(path):
+        return ("Enter the path of an .h5ad file in the box above first.",) + _nu
+    try:
+        info = h5ad._h5ad_inspect(path)
+    except Exception as exc:
+        return (f"Could not read {path}: {exc}",) + _nu
+    _h5ad_inspected.clear()
+    _h5ad_inspected[info["path"]] = info
+    g = info["guess"]
+    num = [{"label": c["name"], "value": c["name"]} for c in info["obs_columns"] if c["kind"] == "numeric"]
+    lab = lambda c: f"{c['name']} ({c['n_levels']:,} levels)"
+    cat = [{"label": lab(c), "value": c["name"]} for c in info["obs_columns"]
+           if c["kind"] == "categorical" or c["n_levels"] <= h5ad._H5AD_MAX_LEVELS]
+    mats = [{"label": (f"{k} — {v['encoding']}, {v['dtype']}, {v['nnz']:,} stored values"),
+             "value": k} for k, v in info["matrices"].items()]
+    est = h5ad._h5ad_estimate(info, h5ad._h5ad_clean_mapping(g))
+    msg = (f"{info['n_cells']:,} cells × {info['n_genes']:,} genes, file {info['size_bytes'] / 1e9:.2f} GB. "
+           f"Loading '{g['counts']}' takes about {est['ram_gb']:.1f} GB of memory for the count matrices "
+           f"and about {est['disk_gb']:.1f} GB in the cache directory (one-time conversion)."
+           + ("" if g.get("x") else (" Coordinates: obsm['spatial'] is used unless x / y are picked."
+                                     if g.get("spatial") else " Pick the x and y columns (µm).")))
+    return (msg, num, g.get("x"), num, g.get("y"), mats, g.get("counts"), cat, g.get("section"),
+            cat, g.get("cell_types") or [], cat, [], cat, g.get("condition"), cat, g.get("donor"))
+
+
+@app_layout.app.callback(
+    Output("h5ad-cond-a", "options"), Output("h5ad-cond-a", "value"),
+    Output("h5ad-cond-b", "options"), Output("h5ad-cond-b", "value"),
+    Input("h5ad-condition", "value"),
+    State("sample-custom-path", "value"),
+    prevent_initial_call=True,
+)
+def h5ad_condition_levels(condition, path):
+    """The levels of the condition column: the two to compare (A, B)."""
+    info = _h5ad_inspected.get(os.path.abspath(os.path.expanduser((path or "").strip())))
+    col = next((c for c in (info or {}).get("obs_columns", []) if c["name"] == condition), None)
+    if not col or not col["levels"]:
+        return [], None, [], None
+    opts = [{"label": v, "value": v} for v in col["levels"]]
+    two = col["levels"] if len(col["levels"]) == 2 else [None, None]
+    return opts, two[0], opts, two[1]
+
+
+def _h5ad_job(path, mapping) -> None:
+    """Background job of the dialog: convert (when not cached) and load the stores; the
+    poll installs them."""
+    def _set(status, message, result=None):
+        with h5ad._h5ad_lock:
+            h5ad._h5ad_state.update({"status": status, "message": message, "result": result})
+
+    def _progress(fraction, message):
+        jobs._job_progress(step=message, fraction=fraction)
+        _set("running", message)
+
+    try:
+        _set("done", "Loaded.", result=h5ad._h5ad_load(path, mapping, progress=_progress))
+    except jobs._JobCancelled:
+        raise
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        _set("error", f"Error: {exc}"[:600])
+
+
+@app_layout.app.callback(
+    Output("h5ad-status", "children", allow_duplicate=True),
+    Output("h5ad-poll",   "disabled"),
+    Output("jobs-poll",   "disabled", allow_duplicate=True),
+    Input("h5ad-load-btn", "n_clicks"),
+    State("sample-custom-path", "value"),
+    State("h5ad-x", "value"), State("h5ad-y", "value"), State("h5ad-counts", "value"),
+    State("h5ad-section", "value"), State("h5ad-celltypes", "value"), State("h5ad-clusters", "value"),
+    State("h5ad-condition", "value"), State("h5ad-donor", "value"),
+    State("h5ad-cond-a", "value"), State("h5ad-cond-b", "value"), State("h5ad-noninteger", "value"),
+    prevent_initial_call=True,
+)
+def h5ad_start_load(n_clicks, path, x, y, counts, section, celltypes, clusters, condition, donor,
+                    cond_a, cond_b, noninteger="refuse"):
+    if not n_clicks:
+        raise dash.exceptions.PreventUpdate
+    path = os.path.abspath(os.path.expanduser((path or "").strip()))
+    info = _h5ad_inspected.get(path)
+    if info is None:
+        return "Read the columns of the file first ('Read columns').", no_update, no_update
+    mapping = _h5ad_form_mapping(x, y, counts, section, celltypes, clusters, condition, donor,
+                                 cond_a, cond_b, info, noninteger)
+    try:
+        h5ad._h5ad_check_mapping(info, mapping)
+    except ValueError as exc:
+        return str(exc), no_update, no_update
+    _busy = _running_jobs()
+    if _busy:
+        return (f"Still running: {', '.join(_busy)}. Wait for it to finish before loading another "
+                f"dataset."), no_update, no_update
+    with h5ad._h5ad_lock:
+        if h5ad._h5ad_state.get("status") == "running":
+            return "An .h5ad is already being loaded.", False, False
+        h5ad._h5ad_state.update({"status": "running", "message": "Starting…", "result": None})
+    jobs._job_start("h5ad", "Load .h5ad", _h5ad_job, args=(path, mapping),
+                    state=h5ad._h5ad_state, lock=h5ad._h5ad_lock)
+    return "Starting…", False, False
+
+
+def _h5ad_install(datasets, man, cache_dir) -> str:
+    """Make the sections of a converted file the loaded samples (the first one primary);
+    the status text."""
+    dataview._install_dataset(datasets[0])
+    h5ad._h5ad_register(man, cache_dir)
+    _reset_dataset_state()
+    dataview.EXTRA_DATASETS[:] = list(datasets[1:])
+    h5ad._h5ad_primary_labels()
+    msg = h5ad._h5ad_design(force=False)
+    print(f"  Loaded .h5ad: {man['source']} ({len(datasets)} sample(s))", flush=True)
+    return h5ad._h5ad_summary(man) + "\n" + msg
+
+
+@app_layout.app.callback(
+    Output("h5ad-status",         "children",      allow_duplicate=True),
+    Output("h5ad-poll",           "disabled",      allow_duplicate=True),
+    Output("dataset-version",     "data",          allow_duplicate=True),
+    Output("seg-source",          "value",         allow_duplicate=True),
+    Output("gene-selector",       "value",         allow_duplicate=True),
+    Output("roi-done",            "data",          allow_duplicate=True),
+    Output("spatial-relayout",    "data",          allow_duplicate=True),
+    Output("extra-datasets-version", "data",       allow_duplicate=True),
+    Output("cellnest-version",    "data",          allow_duplicate=True),
+    Output("extra-samples-status", "children",     allow_duplicate=True),
+    Output("renderer-mode",       "value",         allow_duplicate=True),
+    Input("h5ad-poll",            "n_intervals"),
+    State("dataset-version",      "data"),
+    State("roi-done",             "data"),
+    State("extra-datasets-version", "data"),
+    State("cellnest-version",     "data"),
+    prevent_initial_call=True,
+)
+def h5ad_poll(_, ds_version, roi_done, extra_ver, cellnest_ver):
+    _nu = (no_update,) * 9
+    with h5ad._h5ad_lock:
+        status, msg = h5ad._h5ad_state["status"], h5ad._h5ad_state["message"]
+        res = h5ad._h5ad_state.get("result") if status == "done" else None
+        if status == "done":
+            h5ad._h5ad_state.update({"status": "idle", "result": None})
+    if status == "running":
+        return (msg, False) + _nu
+    if res is None:
+        return (msg, True) + _nu
+    try:
+        text = _h5ad_install(*res)
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        return (f"Error: {exc}", True) + _nu
+    # more cells than the Plotly map draws: switch to the WebGL view (and say so)
+    _big = dataview._plotly_too_large()
+    if _big:
+        text += "\nSwitched to the WebGL view: " + _big
+    return (text, True, (ds_version or 0) + 1, "xenium", dataview._default_gene, (roi_done or 0) + 1, {},
+            (extra_ver or 0) + 1, (cellnest_ver or 0) + 1, f"{len(res[0])} samples loaded",
+            "webgl" if _big else no_update)
 
 
 @app_layout.app.callback(

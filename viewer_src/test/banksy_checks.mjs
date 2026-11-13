@@ -65,7 +65,7 @@ if (await page.evaluate(() => getComputedStyle(document.querySelector('#umap-pan
 // ── run ──────────────────────────────────────────────────────────────────────
 await tab('tab-banksy');
 await shot('banksy_0_empty_state');
-check('empty state before the first run', /No Banksy clusters computed yet/.test(await text('#bk-plot')) && (await tableRows('bk-table')) === 0);
+check('empty state before the first run', /No Banksy-style domains computed yet/.test(await text('#bk-plot')) && (await tableRows('bk-table')) === 0);
 check('the tab says what the method is and that it is a native implementation',
       /Singhal et al\., Nat Genet 2024/.test(await text('#bk-note')) && /not the Banksy package/.test(await text('#bk-note')));
 const before = (await dropdownOptions('cluster-method')).map((o) => o[0]);
@@ -102,7 +102,7 @@ await shot('banksy_1_result_tab');
 // ── the cluster set ──────────────────────────────────────────────────────────
 const after = await dropdownOptions('cluster-method');
 const added = after.filter((o) => !before.includes(o[0]));
-const want = after.find((o) => String(o[1]) === `Banksy λ=${lam}`);
+const want = after.find((o) => String(o[1]) === `Banksy-style λ=${lam}`);
 check('Clustering Method lists the new cluster set', !!want, JSON.stringify(added.length ? added : after.slice(-2)));
 const key = want ? want[0] : null;
 await setProp('color-by', {value: 'cluster'});

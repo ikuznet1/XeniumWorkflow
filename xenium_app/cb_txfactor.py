@@ -4,7 +4,7 @@ import dash
 from dash import no_update
 from dash import Input, Output, State
 
-from . import jobs, stats, txfactor, app_layout, cb_analysis
+from . import jobs, dataview, stats, txfactor, app_layout, cb_analysis
 
 
 @app_layout.app.callback(
@@ -60,7 +60,7 @@ def run_txfactor(n_clicks, method, k, bin_um, shape, min_tx, max_fit, seed, labe
         return False, no_update, "The bin size must be positive."
     if not any(t["ds"].get("data_dir") for t in stats._view_tables(seg_source or "xenium")):
         return False, no_update, ("Transcript factors need the Xenium output directory (transcripts.parquet or "
-                                  "transcripts.zarr.zip); this dataset was loaded from a .zarr.")
+                                  "transcripts.zarr.zip); this dataset was " + dataview._origin_phrase() + ".")
     if not cb_analysis._an_job_claim(txfactor._txf_state, txfactor._txf_lock):
         return True, False, "Transcript factors are already being computed."
     params = {"k": k, "bin": bin_um, "shape": shape, "min_tx": min_tx, "max_fit": max_fit, "seed": seed}
