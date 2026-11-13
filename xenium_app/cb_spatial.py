@@ -147,7 +147,7 @@ def update_counts_options(_, seg_source, _bd, _pd, _startup, _ds_version, _extra
     elif _tool == "proseg":
         alt_res = pres
     else:
-        alt_res = None
+        alt_res = core._seg_result(seg_source, done_only=True)
     if alt_res is not None:
         has_corrected = alt_res.get("split_corrected_expr") is not None
     else:
@@ -221,7 +221,7 @@ def run_niche(n_clicks, n_clusters, n_neighbors, label_key, seg_source):
         bres = core._baysor_state["result"] if tool == "baysor" and core._baysor_state["result"] else None
     with core._proseg_lock:
         pres = core._proseg_state["result"] if tool == "proseg" and core._proseg_state["result"] else None
-    alt_res = pres or bres
+    alt_res = pres or bres or (core._seg_result(seg_source) if tool == "imgseg" else None)
 
     # Label keys are per segmentation (Xenium ids vs the ids of one Baysor/Proseg
     # run): use the chosen method's labels for the active one, or refuse.
@@ -305,6 +305,8 @@ def run_spatial_analysis(n_clicks, label_key, n_neighbors, seg_source):
     elif tool == "proseg":
         with core._proseg_lock:
             alt_res = core._proseg_state.get("result")
+    elif tool == "imgseg":
+        alt_res = core._seg_result(seg_source)
     # Label keys are per segmentation: use the chosen method's labels for the active one
     label_key = annotation._label_key_for_active_seg(label_key, alt_res)
     if label_key is None:
@@ -376,7 +378,7 @@ def update_niche_umap(_niche_done, _spatial_done, _ds_version, w, h, seg_source)
     _tool = core._seg_tool(seg_source)
     return figures.make_niche_umap_fig(width=w, height=h,
                                baysor_active=(_tool == "baysor"),
-                               proseg_active=(_tool == "proseg"))
+                               proseg_active=(_tool == "proseg"), alt_tool=_tool)
 
 
 @app_layout.app.callback(
@@ -418,6 +420,9 @@ def capture_lasso_selection(selected_data, seg_source, roi_done):
     elif tool == "proseg":
         with core._proseg_lock:
             result = core._proseg_state.get("result")
+        src_df = result["cells_df"] if result else None
+    elif tool == "imgseg":
+        result = core._seg_result(seg_source)
         src_df = result["cells_df"] if result else None
     else:
         src_df = None
@@ -681,7 +686,7 @@ def _refresh_colorby_options(current_options) -> list:
                    for k, v in core._annot_state.items())
         }
     has_niche = "niche" in core.DATA["df"].columns
-    for _lock, _state in ((core._baysor_lock, core._baysor_state), (core._proseg_lock, core._proseg_state)):
+    for _tool_i, _lock, _state in core._seg_states():
         with _lock:
             _cdf = (_state.get("result") or {}).get("cells_df")
         has_niche = has_niche or (_cdf is not None and "niche" in _cdf.columns)

@@ -234,14 +234,15 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
     seg_source  = seg_source or "xenium"
     baysor_on   = (core._seg_tool(seg_source) == "baysor")
     proseg_on   = (core._seg_tool(seg_source) == "proseg")
-    if not (baysor_on or proseg_on):
+    alt_tool    = core._seg_tool(seg_source)
+    if alt_tool == "xenium":
         # After Load Sample the dropdown State can still hold the previous dataset's
         # selections for one callback round; fall back to this dataset's defaults.
         if method is not None and method not in _cm:
             method = _cm[0] if _cm else None
         # (a gene this dataset does not have is not replaced here: the figure builders
         # draw transcript counts for it, as the WebGL view and the reseg sources do)
-    if color_by == "cluster" and method is None and not (baysor_on or proseg_on):
+    if color_by == "cluster" and method is None and alt_tool == "xenium":
         color_by = "transcript_counts"   # dataset has no Xenium cluster sets
 
     # Morphology image overlay
@@ -269,7 +270,7 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
             print(f"  [update_plots] subset-version triggered, _subset_ver={_subset_ver}", flush=True)
 
     # UMAP cache: skip rebuild when only spatial-related inputs changed
-    _umap_key = (color_by, method, gene, size, opacity, baysor_on, proseg_on, use_corr,
+    _umap_key = (color_by, method, gene, size, opacity, baysor_on, proseg_on, alt_tool, use_corr,
                  _annot_done, _spage_done, _ds_version, _extra_ds_version,
                  _baysor_done, _proseg_done, _split_done, _subset_ver, _niche_done,
                  _roi_done, cbar_min, cbar_max, _geneset_ver)
@@ -281,7 +282,7 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
     else:
         umap_fig = figures.make_umap_fig(color_by, method, gene, size, opacity,
                                  baysor_active=baysor_on, proseg_active=proseg_on,
-                                 use_corrected=use_corr, cbar_range=cbar_range)
+                                 use_corrected=use_corr, cbar_range=cbar_range, alt_tool=alt_tool)
         dataview._umap_fig_cache.clear()  # keep only latest entry
         dataview._umap_fig_cache[_umap_key] = umap_fig
 
@@ -291,7 +292,7 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
                                    baysor_active=baysor_on, proseg_active=proseg_on,
                                    use_corrected=use_corr, cbar_range=cbar_range,
                                    sdata_roi_on=sdata_roi_on, sdata_patches_on=sdata_patches_on,
-                                   density=density_spec if density_active else None)
+                                   density=density_spec if density_active else None, alt_tool=alt_tool)
     # Re-add CellNEST overlay so it persists through pan/zoom rebuilds
     with core._cellnest_lock:
         _cn_status = core._cellnest_state.get("status")
@@ -553,6 +554,7 @@ def show_cell_info(cell_id, method):
         for src_name, state, lock in (
             ("Proseg", core._proseg_state, core._proseg_lock),
             ("Baysor", core._baysor_state, core._baysor_lock),
+            ("Image segmentation", core._imgseg_state, core._imgseg_lock),
         ):
             with lock:
                 res = state.get("result")

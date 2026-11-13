@@ -227,6 +227,24 @@ def _format_seg_label(tool: str, params: dict) -> str:
         if n:
             parts.append(f"{n:,} cells")
         return "Baysor: " + ", ".join(parts)
+    elif tool == "imgseg":
+        parts = [str(params.get("backend_label") or params.get("backend") or "?"),
+                 f"channel={'+'.join(params.get('channels') or ['?'])}",
+                 f"d={params.get('diameter_um', '?')}µm"]
+        if params.get("expand_um"):
+            parts.append(f"expand={params['expand_um']}µm")
+        x_min, x_max = params.get("x_min"), params.get("x_max")
+        y_min, y_max = params.get("y_min"), params.get("y_max")
+        if any(v is not None for v in [x_min, x_max, y_min, y_max]):
+            parts.append(f"x={x_min}-{x_max} y={y_min}-{y_max}µm")
+        else:
+            parts.append("full slide")
+        if params.get("n_patches"):
+            parts.append(f"{params['n_patches']} patches")
+        n = params.get("n_cells")
+        if n:
+            parts.append(f"{n:,} cells")
+        return "Image: " + ", ".join(parts)
     else:
         parts = []
         vs = params.get("voxel_size")
@@ -277,6 +295,14 @@ def _list_cached_seg_runs() -> list:
                 "cell-metadata.csv.gz" in files
                 for _, _, files in os.walk(out_dir)
             )
+        elif entry.startswith(f"imgseg_{dataset}_"):
+            tool = "imgseg"
+            param_tag = _seg_run_tag(entry, tool)
+            if param_tag is None:
+                continue
+            # an image-segmentation run is its SpatialData store plus params.json
+            complete = (os.path.isdir(os.path.join(out_dir, "spatialdata_imgseg.zarr"))
+                        and os.path.exists(os.path.join(out_dir, "params.json")))
         else:
             continue
         if not complete:
@@ -319,7 +345,8 @@ def _clean_cache_for_dataset() -> str:
         _run_entry = (entry[:-len(_SEG_STAGE_SUFFIX)] if entry.endswith(_SEG_STAGE_SUFFIX)
                       else entry)
         if tag in entry or (os.path.isdir(full) and (
-                _seg_run_tag(_run_entry, "baysor") or _seg_run_tag(_run_entry, "proseg"))):
+                _seg_run_tag(_run_entry, "baysor") or _seg_run_tag(_run_entry, "proseg")
+                 or _seg_run_tag(_run_entry, "imgseg"))):
             try:
                 if os.path.isdir(full):
                     shutil.rmtree(full)

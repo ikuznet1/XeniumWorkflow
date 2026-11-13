@@ -18,6 +18,9 @@ def _loaded_reseg_results() -> list:
     with core._baysor_lock:
         if core._baysor_state.get("result") is not None:
             out.append(("baysor", core._baysor_state["result"]))
+    with core._imgseg_lock:
+        if core._imgseg_state.get("result") is not None:
+            out.append(("imgseg", core._imgseg_state["result"]))
     return out
 
 
@@ -88,7 +91,8 @@ def subset(cluster=None, cell_type=None,
 
     # ── Cell type filter ──────────────────────────────────────────────────
     if cell_type is not None:
-        _reseg_active = core._proseg_state["status"] == "done" or core._baysor_state["status"] == "done"
+        _reseg_active = (core._proseg_state["status"] == "done" or core._baysor_state["status"] == "done"
+                         or core._imgseg_state["status"] == "done")
         with core._annot_lock:
             # Only use Xenium-specific labels (exact key "labels_{method}") — not reseg-suffixed ones.
             # Reseg annotation labels (labels_{method}_proseg_xxx) have reseg cell IDs, not barcodes.
@@ -313,7 +317,7 @@ def retry_split_zarr_write(seg_source: str = None) -> None:
         with core._proseg_lock:
             res = core._proseg_state.get("result")
     else:
-        res = None  # Xenium uses DATA directly
+        res = core._seg_result(seg_source)  # None: Xenium uses DATA directly
 
     # The in-memory matrix is already expanded to one row per cell (reseg: per
     # cells_df row; Xenium: per DATA["expr"] row), while split_corrected_cell_ids

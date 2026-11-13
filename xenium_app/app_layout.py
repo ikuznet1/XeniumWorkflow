@@ -7,7 +7,11 @@ import dash_bootstrap_components as dbc
 
 from . import compat, core, ui, dataview, morph, analysis, stats, controls, proximity, sdata_store, startup
 from . import aggregates
+from . import imgseg
+from . import joint
+from . import banksy
 from . import segfree
+from . import txfactor
 from . import lrdecomp
 
 
@@ -143,6 +147,8 @@ sidebar = html.Div([
                  "value": "proseg", "disabled": True},
                 {"label": html.Span(" Baysor Boundaries",  style={"color": "#a29bfe", "fontSize": "13px"}),
                  "value": "baysor", "disabled": True},
+                {"label": html.Span(" Image-segmentation Boundaries", style={"color": "#ff6b9d", "fontSize": "13px"}),
+                 "value": "imgseg", "disabled": True},
             ],
             value=[],
             inputStyle={"marginRight": "6px"},
@@ -307,8 +313,12 @@ sidebar = html.Div([
     # Hidden status divs for existing poll callbacks
     html.Div(id="baysor-status", style={"display": "none"}),
     html.Div(id="proseg-status", style={"display": "none"}),
+    html.Div(id="imgseg-status", style={"display": "none"}),
     dcc.Interval(id="baysor-poll", interval=3000, disabled=True),
     dcc.Interval(id="proseg-poll", interval=3000, disabled=True),
+    dcc.Interval(id="imgseg-poll", interval=3000, disabled=True),
+    dcc.Store(id="iseg-run-request", data=0),
+    dcc.Store(id="iseg-load-request", data=None),
 
     html.Hr(style={"borderColor": core.BORDER, "margin": "14px 0"}),
 
@@ -516,7 +526,12 @@ app.layout = html.Div([
     dcc.Store(id="lrd-done", data=0),
     dcc.Interval(id="lrd-poll", interval=700, disabled=True),
     dcc.Store(id="agg-done", data=0),
+    dcc.Store(id="clusterset-version", data=0),   # bumped when a cluster set is installed (Banksy, joint clusters)
+    dcc.Store(id="bk-done", data=0),
+    dcc.Interval(id="bk-poll", interval=700, disabled=True),
     dcc.Interval(id="agg-poll", interval=700, disabled=True),
+    dcc.Store(id="jc-done", data=0),
+    dcc.Interval(id="jc-poll", interval=700, disabled=True),
     dcc.Store(id="sfree-done", data=0),
     dcc.Interval(id="sfree-poll", interval=700, disabled=True),
     dcc.Store(id="counts-mode-store", data="original"),
@@ -676,6 +691,9 @@ app.layout = html.Div([
                                 selected_style={"color": "#fff", "backgroundColor": "#1f6feb", "fontWeight": "600"}),
                         dcc.Tab(label="Proseg", value="proseg", style={"color": core.TEXT, "backgroundColor": core.CARD_BG},
                                 selected_style={"color": "#fff", "backgroundColor": "#2d6a4f", "fontWeight": "600"}),
+                        dcc.Tab(label="Image (Cellpose / classical)", value="imgseg",
+                                style={"color": core.TEXT, "backgroundColor": core.CARD_BG},
+                                selected_style={"color": "#fff", "backgroundColor": "#9c3d6b", "fontWeight": "600"}),
                     ], style={"marginBottom": "16px"}),
 
                     # ── Baysor settings panel ────────────────────────────────────
@@ -924,6 +942,9 @@ app.layout = html.Div([
                            "boxSizing": "border-box"},
                 ),
             ], style={"display": "none"}),  # hidden by default; shown when proseg tab is active
+
+            # ── Image-segmentation settings panel (Cellpose / classical) ─
+            imgseg._iseg_panel(),
                 ]),  # end reseg-step2-content
             ]),  # end Step 2 div
         ]),
@@ -1879,6 +1900,9 @@ dbc.Modal([
                         controls._segqc_tab(),
                         controls._coloc_tab(),
                         aggregates._agg_tab(),
+                        txfactor._txf_tab(),
+                        banksy._bk_tab(),
+                        joint._jc_tab(),
                     ]),
                 ], id="umap-panel", style={"display": "none"}),
             ], id="plots-row", style={"display": "flex", "flex": "1", "gap": "10px", "minHeight": "0"}),

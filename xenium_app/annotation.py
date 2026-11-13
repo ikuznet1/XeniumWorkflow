@@ -27,7 +27,7 @@ def _label_key_for_active_seg(label_key, alt_res=None):
     if not label_key or not label_key.startswith("labels_"):
         return label_key
     if alt_res is None:
-        if "_baysor_" not in label_key and "_proseg_" not in label_key:
+        if not any(f"_{_t}_" in label_key for _t in core._SEG_TOOL_LABELS):
             return label_key
     elif _labels_key_for_method("", alt_res)[len("labels_"):] in label_key:
         return label_key
@@ -862,7 +862,7 @@ def _annot_cached_labels(dataset_key: str) -> dict:
         else:
             key = "labels_celltypist"
         parts = key.split("_")
-        if len(parts) < 2 or parts[1] not in core._ANNOT_METHODS or "baysor" in parts or "proseg" in parts:
+        if len(parts) < 2 or parts[1] not in core._ANNOT_METHODS or any(_t in parts for _t in core._SEG_TOOL_LABELS):
             continue                      # labels of a Baysor / Proseg run: other cells
         try:
             labels = pd.read_parquet(fpath)["label"].astype(str)

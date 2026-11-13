@@ -18,22 +18,24 @@ MODULES = (
     # 1. libraries
     "core", "jobs", "caching", "ui", "loading", "dataview", "annotation", "reseg",
     "clustering", "split", "spage", "subsetting", "spatial", "morph", "figures",
-    "analysis", "cellnest", "sdata_store", "regions", "stats", "controls",
-    "proximity", "lrdecomp", "aggregates", "segfree",
+    "analysis", "cellnest", "sdata_store", "regions", "imgseg", "stats", "controls",
+    "proximity", "lrdecomp", "aggregates", "segfree", "txfactor", "clustersets", "banksy",
+    "joint",
     # 2. import-time work
     "startup", "app_layout", "cb_plots", "cb_tools", "cb_reseg", "cb_spage", "cb_data",
     "cb_spatial", "cb_analysis", "cb_stats", "cb_controls", "cb_proximity", "cb_lrdecomp",
-    "cb_aggregates", "cb_segfree", "viewer_provider",
+    "cb_aggregates", "cb_segfree", "cb_txfactor", "cb_banksy", "cb_joint", "viewer_provider",
 )
 
 from . import compat  # noqa: E402,F401
 from . import (  # noqa: E402,F401
     core, jobs, caching, ui, loading, dataview, annotation, reseg, clustering, split,
-    spage, subsetting, spatial, morph, figures, analysis, cellnest, sdata_store, regions,
-    stats, controls, proximity, lrdecomp, aggregates, segfree,
+    spage, subsetting, spatial, morph, figures, analysis, cellnest, sdata_store, regions, imgseg,
+    stats, controls, proximity, lrdecomp, aggregates, segfree, txfactor, clustersets, banksy,
 )
 from . import (  # noqa: E402,F401
     startup, app_layout, cb_plots, cb_tools, cb_reseg, cb_spage, cb_data, cb_spatial,
-    cb_analysis, cb_stats, cb_controls, cb_proximity, cb_lrdecomp, cb_aggregates, cb_segfree,
-    viewer_provider,
+    cb_analysis, cb_stats, cb_controls, cb_proximity, cb_lrdecomp, cb_aggregates, cb_segfree, cb_txfactor,
+    cb_banksy, viewer_provider,
 )
+from . import joint, cb_joint  # noqa: E402,F401

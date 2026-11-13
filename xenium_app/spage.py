@@ -289,6 +289,8 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                 with core._proseg_lock:
                     if core._proseg_state["status"] == "done":
                         _alt_res = core._proseg_state["result"]
+            else:
+                _alt_res = core._seg_result(seg_source, done_only=True)
 
         # ── Load reference gene list ─────────────────────────────────────
         from rpy2.rinterface_lib import openrlib
@@ -383,7 +385,7 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                     _json_sc.dump({"path": _path, "genes": list(_genes)}, _sjf)
             except Exception as _sje:
                 print(f"  SpaGE: could not persist result ref: {_sje}", flush=True)
-            _alock = core._baysor_lock if core._seg_tool(seg_source or "") == "baysor" else core._proseg_lock
+            _alock = core._seg_state(core._seg_tool(seg_source or ""))[1] or core._proseg_lock
             with _alock:
                 _alt_res["spage_result_path"]  = _path
                 _alt_res["spage_result_genes"] = list(_genes)
@@ -407,7 +409,7 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                                 _json_sc.dump(_sj, _sjf)
                         except Exception:
                             pass
-                        _alock = core._baysor_lock if core._seg_tool(seg_source or "") == "baysor" else core._proseg_lock
+                        _alock = core._seg_state(core._seg_tool(seg_source or ""))[1] or core._proseg_lock
                         with _alock:
                             _alt_res["spage_result_path"]  = zarr_cache
                             _alt_res["spage_result_genes"] = _genes_c
@@ -590,7 +592,7 @@ writeLines(colnames(mat_sub), "{cells_file}")
                         _json_sc.dump(_sj, _sjf)
                 except Exception as _sje:
                     print(f"  SpaGE: could not persist result ref: {_sje}", flush=True)
-                _alock = core._baysor_lock if core._seg_tool(seg_source or "") == "baysor" else core._proseg_lock
+                _alock = core._seg_state(core._seg_tool(seg_source or ""))[1] or core._proseg_lock
                 with _alock:
                     _alt_res["spage_result_path"]  = zarr_cache
                     _alt_res["spage_result_genes"] = genes_to_predict
@@ -618,7 +620,7 @@ writeLines(colnames(mat_sub), "{cells_file}")
                     _json_sc.dump(_sj, _sjf)
             except Exception as _sje:
                 print(f"  SpaGE: could not persist result ref: {_sje}", flush=True)
-            _alock = core._baysor_lock if core._seg_tool(seg_source or "") == "baysor" else core._proseg_lock
+            _alock = core._seg_state(core._seg_tool(seg_source or ""))[1] or core._proseg_lock
             with _alock:
                 _alt_res["spage_result_path"]  = cache_file
                 _alt_res["spage_result_genes"] = genes_to_predict
@@ -904,6 +906,12 @@ def run_spage(rds_path: str, genes_file: str = None, n_pv: int = 50,
                 _res_od = core._baysor_state["result"].get("out_dir", "")
                 _tag = os.path.basename(_res_od).rsplit("_", 1)[-1] if _res_od else ""
                 seg_source = f"baysor:{_tag}" if _tag else "baysor"
+    if seg_source is None:
+        with core._imgseg_lock:
+            if core._imgseg_state["status"] == "done" and core._imgseg_state.get("result"):
+                _res_od = core._imgseg_state["result"].get("out_dir", "")
+                _tag = os.path.basename(_res_od).rsplit("_", 1)[-1] if _res_od else ""
+                seg_source = f"imgseg:{_tag}" if _tag else "imgseg"
     if seg_source:
         print(f"  SpaGE: reseg mode — imputing against {core._seg_tool(seg_source)} cells", flush=True)
 

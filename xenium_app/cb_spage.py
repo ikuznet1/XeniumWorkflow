@@ -139,7 +139,7 @@ def update_gene_options(_spage_version, _ds_version, seg_source):
             with core._proseg_lock:
                 res = core._proseg_state.get("result") if core._proseg_state["status"] == "done" else None
         else:
-            res = None
+            res = core._seg_result(seg_source, done_only=True)
         if res:
             imp_genes = res.get("imputed_genes", [])
             if imp_genes:

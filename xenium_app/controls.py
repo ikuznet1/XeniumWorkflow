@@ -64,6 +64,7 @@ _LEAK_N_MARKERS = 25
 _LEAK_MIN_MARKERS = 10       # fewer genes passing the specificity rule: fallback to the top _LEAK_N_MARKERS
 _LEAK_SHARE_MAX = 0.5
 _LEAK_EXPLAIN_MIN = 0.5
+_LEAK_CHANGE_MIN_LFC = 0.5   # the change rule applies to a gene whose change is called, or is at least this large (|log2|)
 _LEAK_FLOOR = 1e-9
 _LEAK_MIN_PURITY = 0.8       # share of a group's labelled cells its largest type must reach
 _LEAK_MIN_CELLS = 50         # a neighbour type with fewer cells in a section is not a leak source there
@@ -792,7 +793,9 @@ _LEAK_NOTE = (
     "to the profile of the focal cells; the predicted leaked signal of a gene is Σ over the "
     "neighbour types of leak(L) × its counts per million in L. A gene is flagged when the "
     "predicted leak is more than half of its observed signal in either group, or when the leak "
-    "alone predicts at least half of the observed log fold change. Measuring leak(L): the focal "
+    "alone predicts at least half of the observed log fold change; the second rule is applied only "
+    "to genes whose change is called by the test (FDR below its threshold) or is at least 0.5 in "
+    "log2 - explaining half of a change that is noise around zero means nothing. Measuring leak(L): the focal "
     "÷ L ratio of any gene is the leak plus whatever the focal type itself expresses, so the "
     "leak cannot exceed the lowest ratios; it is taken as the median of the 25 lowest focal ÷ L "
     "ratios among L's own genes (≥ 50 counts per million in L and ≥ 10× every third type). A "
@@ -858,15 +861,21 @@ def _leak_predict(leaks: dict, xLs: dict) -> tuple:
 
 
 def _leak_gate(O0, O1, P0, P1, share_max: float = _LEAK_SHARE_MAX,
-               explain_min: float = _LEAK_EXPLAIN_MIN, d_obs=None) -> dict:
+               explain_min: float = _LEAK_EXPLAIN_MIN, d_obs=None, called=None,
+               min_abs: float = _LEAK_CHANGE_MIN_LFC) -> dict:
     """The gate on observed (O) and predicted leaked (P) CPM of two arms (0 = reference /
     B, 1 = A); each array genes × sections of that arm, averaged over the sections.
 
     share = P / O per arm; e1: a share above *share_max*. Intrinsic signal i = max(O − P,
     0). d_obs = log2 O1 − log2 O0; d_leak = the change the leak alone predicts, the mean
     of (intrinsic of arm 0 with the leak of arm 1 vs arm 0) and (arm 1 vs intrinsic of
-    arm 1 with the leak of arm 0); f = d_leak / d_obs; e2: f ≥ *explain_min*. flag = e1
-    or e2."""
+    arm 1 with the leak of arm 0); f = d_leak / d_obs; e2_all: f ≥ *explain_min*.
+
+    The change rule needs a change: f is a ratio of two small numbers when d_obs is noise
+    around 0. e2 = e2_all for the genes whose change is *called* (boolean per gene: the
+    test of the calling mode passed its significance threshold) or whose |d_obs| is at
+    least *min_abs* (log2); the other genes are judged by the signal rule alone. flag =
+    e1 or e2 (flag_all = e1 or e2_all: the rule without that restriction, for reporting)."""
     o0, o1 = np.asarray(O0, dtype=np.float64).mean(axis=1), np.asarray(O1, dtype=np.float64).mean(axis=1)
     p0, p1 = np.asarray(P0, dtype=np.float64).mean(axis=1), np.asarray(P1, dtype=np.float64).mean(axis=1)
     s0, s1 = p0 / np.maximum(o0, _LEAK_FLOOR), p1 / np.maximum(o1, _LEAK_FLOOR)
@@ -876,9 +885,14 @@ def _leak_gate(O0, O1, P0, P1, share_max: float = _LEAK_SHARE_MAX,
     d_leak = 0.5 * ((_lg(i0 + p1) - _lg(o0)) + (_lg(o1) - _lg(i1 + p0)))
     with np.errstate(divide="ignore", invalid="ignore"):
         f = np.where(d_o != 0, d_leak / d_o, np.nan)
-    e2 = np.nan_to_num(f, nan=-np.inf) >= explain_min
+    e2_all = np.nan_to_num(f, nan=-np.inf) >= explain_min
+    change_ok = np.abs(np.nan_to_num(d_o, nan=0.0)) >= float(min_abs)
+    if called is not None:
+        change_ok = change_ok | np.asarray(called, dtype=bool)
+    e2 = e2_all & change_ok
     return {"O0": o0, "O1": o1, "P0": p0, "P1": p1, "share0": s0, "share1": s1, "e1": e1,
-            "d_obs": d_o, "d_leak": d_leak, "f": f, "e2": e2, "flag": e1 | e2}
+            "d_obs": d_o, "d_leak": d_leak, "f": f, "e2": e2, "e2_all": e2_all, "change_ok": change_ok,
+            "flag": e1 | e2, "flag_all": e1 | e2_all}
 
 
 def _group_profile(samples, masks, genes) -> tuple:
@@ -911,7 +925,8 @@ def _group_purity(labels, masks) -> tuple:
 
 
 def _leak_gate_groups(samples, labels, masks_a, masks_b, genes, prof=None, per_sample: bool = False,
-                      n_markers: int = _LEAK_N_MARKERS, min_purity: float = _LEAK_MIN_PURITY) -> dict:
+                      n_markers: int = _LEAK_N_MARKERS, min_purity: float = _LEAK_MIN_PURITY,
+                      called=None) -> dict:
     """The leak gate for two groups of cells (A = arm 1, B = arm 0) of the view.
 
     per_sample False: every group is one pooled section, the neighbour profiles are those
@@ -919,7 +934,13 @@ def _leak_gate_groups(samples, labels, masks_a, masks_b, genes, prof=None, per_s
     of that group's arm, with the neighbour profiles of that sample (types with at least
     _LEAK_MIN_CELLS cells there). Returns {applicable, reason, focal, mode, table (gene,
     leak_share_a, leak_share_b, leak_change_frac, leak_fraction, leak_flag,
-    top_leak_type), leaks: {type: {a, b, markers, rule}}, n_flag, n_e1, n_e2}."""
+    top_leak_type), leaks: {type: {a, b, markers, rule}}, n_flag, n_e1, n_e2, n_e2_all,
+    n_flag_all}.
+
+    called: boolean per gene of *genes* - the change of the gene passed the significance
+    threshold of the calling mode. The change rule (e2) is applied to those genes and to
+    genes whose pooled |log2 change| is at least _LEAK_CHANGE_MIN_LFC; see _leak_gate.
+    n_e2_all / n_flag_all count what the change rule would flag without that restriction."""
     prof = prof if prof is not None else _type_profiles(samples, labels, genes)
     out = {"applicable": False, "reason": "", "focal": None, "mode": None}
     ta, pa, na = _group_purity(labels, masks_a)
@@ -996,17 +1017,25 @@ def _leak_gate_groups(samples, labels, masks_a, masks_b, genes, prof=None, per_s
             leaks[L]["a" if arm == 1 else "b"] = float(np.nanmedian(lk[L])) if np.isfinite(lk[L]).any() else np.nan
     for L in marks:
         leaks[L].update({"markers": marks[L][1], "rule": "specific", "n_candidates": marks[L][2]})
-    g = _leak_gate(O[0], O[1], P[0], P[1])
+    called_all = None
+    if called is not None:
+        called_all = np.zeros(len(prof["genes"]), dtype=bool)
+        called_all[gsel] = np.nan_to_num(np.asarray(called, dtype=np.float64), nan=0.0) > 0
+    g = _leak_gate(O[0], O[1], P[0], P[1], called=called_all)
     contrib = np.column_stack([parts_all[1][L].mean(axis=1) + parts_all[0][L].mean(axis=1) for L in marks])
     top = np.array(list(marks), dtype=object)[contrib.argmax(axis=1)]
     top = np.where(contrib.sum(axis=1) > 0, top, "")
-    frac = np.fmax(np.fmax(g["share1"], g["share0"]), np.where(np.isfinite(g["f"]), g["f"], -np.inf))
+    # the change fraction counts towards the displayed leak fraction only where the change rule applies
+    frac = np.fmax(np.fmax(g["share1"], g["share0"]),
+                   np.where(np.isfinite(g["f"]) & g["change_ok"], g["f"], -np.inf))
     frac = np.clip(frac, 0.0, None)
     tab = pd.DataFrame({"gene": prof["genes"], "leak_share_a": g["share1"], "leak_share_b": g["share0"],
                         "leak_change_frac": g["f"], "leak_fraction": frac, "leak_flag": g["flag"],
                         "top_leak_type": top}).iloc[gsel].reset_index(drop=True)
     out.update({"applicable": True, "table": tab, "leaks": leaks, "n_flag": int(tab["leak_flag"].sum()),
                 "n_e1": int(g["e1"][gsel].sum()), "n_e2": int(g["e2"][gsel].sum()),
+                "n_e2_all": int(g["e2_all"][gsel].sum()), "n_flag_all": int(g["flag_all"][gsel].sum()),
+                "n_change_ok": int(g["change_ok"][gsel].sum()),
                 "n_sections_a": len(arms[1]), "n_sections_b": len(arms[0])})
     return out
 
@@ -1044,7 +1073,9 @@ def _de_leak_annotate(res: dict, ctx: dict) -> None:
         A.append(a)
         B.append(b & ~a)
     name = core._ANNOT_METHODS.get(am, am)
-    g = _leak_gate_groups(samples, labels, A, B, genes, prof, per_sample=bool(ctx.get("per_sample")))
+    called = np.nan_to_num(t["padj"].to_numpy(dtype=float), nan=1.0) < 0.05
+    g = _leak_gate_groups(samples, labels, A, B, genes, prof, per_sample=bool(ctx.get("per_sample")),
+                          called=called)
     n_own = int((t["owner"] != "").sum())
     head = (f"Gene ownership ({name} labels): {n_own:,} of {len(t):,} genes have an owner (highest "
             f"Σ counts / Σ depth; ≥ {_OWN_MIN_COUNT} transcripts).")
@@ -1067,7 +1098,8 @@ def _de_leak_annotate(res: dict, ctx: dict) -> None:
         head + f" Leak gate (focal type {g['focal']}, {g['mode']} modelled; "
         f"{g['n_sections_a']} + {g['n_sections_b']} section(s)): {g['n_flag']:,} of {len(t):,} genes "
         f"flagged ({g['n_e1']:,} with predicted leak > {100 * _LEAK_SHARE_MAX:.0f} % of the signal, "
-        f"{g['n_e2']:,} with ≥ {100 * _LEAK_EXPLAIN_MIN:.0f} % of the change explained); of the "
+        f"{g['n_e2']:,} with ≥ {100 * _LEAK_EXPLAIN_MIN:.0f} % of the change explained - a rule applied to the "
+        f"{g['n_change_ok']:,} genes with FDR < 0.05 or |log2 change| ≥ {_LEAK_CHANGE_MIN_LFC:g}); of the "
         f"{int(sig.sum()):,} genes with FDR < 0.05, {int((sig & fl).sum()):,} are flagged and "
         f"{int(not_owned.sum()):,} are not owned by {g['focal']}. Leak into the focal cells (median "
         f"of the {_LEAK_N_MARKERS} lowest focal ÷ neighbour ratios among the neighbour's genes): "
@@ -1367,8 +1399,7 @@ def _segqc_sources(run_values=None) -> list:
         if run_values is not None and o["value"] not in run_values:
             continue
         tool = o["value"].split(":")[0]
-        state, lock = ((core._baysor_state, core._baysor_lock) if tool == "baysor"
-                       else (core._proseg_state, core._proseg_lock))
+        state, lock = core._seg_state(tool)
         with lock:
             loaded = state.get("result")
         if loaded is not None and os.path.realpath(str(loaded.get("out_dir", ""))) == os.path.realpath(o["out_dir"]):
@@ -1455,7 +1486,7 @@ def _run_segqc(method, sets_text, source_type, radius, run_values=None) -> None:
                 src["short"] = "Xenium"
             else:
                 n_tool[src["tool"]] = n_tool.get(src["tool"], 0) + 1
-                src["short"] = f"{src['tool'].capitalize()} {n_tool[src['tool']]}"
+                src["short"] = f"{'Image' if src['tool'] == 'imgseg' else src['tool'].capitalize()} {n_tool[src['tool']]}"
         n_steps = sum(1 + (s["corrected"] is not None) for s in srcs if s["sample"] is not None)
         step = 0
         # the denominator of "fraction of transcripts assigned": all gene transcripts of the

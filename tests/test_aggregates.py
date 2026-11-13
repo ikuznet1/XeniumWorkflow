@@ -370,4 +370,9 @@ def test_callbacks_ignore_zero_clicks_and_validate_inputs(xe):
         xe.toggle_agg_outlines(["on"], 3)             # nothing changed
     fig, rows, srows = xe.update_agg_results(0, 0, None, None)
     assert rows == [] and srows == []
-    assert "Samples and conditions" in xe.update_agg_design_summary(0, 0, 0)
+    assert xe.update_agg_design_summary(0, 0, 0) == xe._design_summary()
+    # the tab has its own "Samples & conditions…" button, which opens the shared editor
+    assert "agg-design-open-btn" in str(xe._agg_tab()) and "agg-design-open-btn" in str(xe.app.layout)
+    with pytest.raises(dash.exceptions.PreventUpdate):
+        xe.open_design_modal(0, 0, 0, 0, 0)           # a re-created button, not a click
+    assert xe.open_design_modal(None, None, None, None, 1)[0] is True

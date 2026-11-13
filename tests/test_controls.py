@@ -501,8 +501,19 @@ def test_leak_fraction_prediction_and_gate_equal_the_reference_formulas(xe):
     g = xe._leak_gate(xF[:, :S], xF[:, S:], P[:, :S], P[:, S:])
     s0, s1, f, flag = _reference_gate(np.stack([xF[:, :S], xF[:, S:]], 2), np.stack([P[:, :S], P[:, S:]], 2))
     assert np.allclose(g["share0"], s0) and np.allclose(g["share1"], s1)
-    assert np.allclose(g["f"], f, equal_nan=True) and np.array_equal(g["flag"], flag)
-    assert 0.1 < flag.mean() < 0.95 and g["e1"].any() and (g["e2"] & ~g["e1"]).any()
+    # the formulas are unchanged: "flag_all" is the reference rule on every gene
+    assert np.allclose(g["f"], f, equal_nan=True) and np.array_equal(g["flag_all"], flag)
+    assert 0.1 < flag.mean() < 0.95 and g["e1"].any() and (g["e2_all"] & ~g["e1"]).any()
+    # the change rule (e2) is restricted to genes with a change: called, or |log2| >= the minimum
+    big = np.abs(g["d_obs"]) >= xe._LEAK_CHANGE_MIN_LFC
+    assert np.array_equal(g["change_ok"], big) and np.array_equal(g["e2"], g["e2_all"] & big)
+    assert np.array_equal(g["flag"], g["e1"] | (g["e2_all"] & big)) and (g["flag_all"] & ~g["flag"]).any()
+    called = rng.random(G) < 0.5
+    gc = xe._leak_gate(xF[:, :S], xF[:, S:], P[:, :S], P[:, S:], called=called)
+    assert np.array_equal(gc["flag"], g["e1"] | (g["e2_all"] & (big | called)))
+    for k in ("share0", "share1", "f", "d_obs", "d_leak", "e1", "e2_all"):
+        assert np.array_equal(gc[k], g[k], equal_nan=True)
+    assert np.array_equal(xe._leak_gate(xF[:, :S], xF[:, S:], P[:, :S], P[:, S:], called=np.ones(G, bool))["flag"], flag)
     # a marker absent from a section is skipped; a section without any gives NaN → no leak
     z = np.zeros((G, 1))
     assert np.isnan(xe._leak_fraction(xF[:, :1], z, M["P"])[0])
@@ -593,6 +604,46 @@ def test_leak_gate_modes_and_refusals(xe):
     none1, none2 = np.zeros(len(typ), bool), np.zeros(len(typ2), bool)
     g = xe._leak_gate_groups([s, s2], [typ, typ2], [A | B, none2], [none1, A2 | B2], genes, per_sample=True)
     assert g["applicable"] and g["n_sections_a"] == 1 and g["n_sections_b"] == 1 and g["mode"] == "both groups"
+
+
+def test_leak_gate_change_rule_needs_a_change(xe):
+    """A gene whose change is noise around 0 is not flagged by the change rule; a called
+    gene whose change the bleed explains is; so is an uncalled gene with a large change."""
+    #             null     called   large    real change
+    O0 = np.array([100.0, 100.0, 100.0, 100.0])[:, None]
+    O1 = np.array([101.0, 101.0, 160.0, 300.0])[:, None]
+    P0 = np.array([1.0, 1.0, 0.0, 1.0])[:, None]
+    P1 = np.array([2.0, 2.0, 60.0, 2.0])[:, None]
+    called = np.array([False, True, False, True])
+    g = xe._leak_gate(O0, O1, P0, P1, called=called)
+    assert not g["e1"].any()                                   # no share above one half: only the change rule can flag
+    assert abs(g["d_obs"][0]) < 0.02 and g["f"][0] > 0.9 and g["e2_all"][0]      # the old rule fired on the null gene
+    assert g["flag"].tolist() == [False, True, True, False]
+    assert g["flag_all"].tolist() == [True, True, True, False]
+    assert g["change_ok"].tolist() == [False, True, True, True]
+    # without calls only the minimum absolute effect opens the change rule
+    assert xe._leak_gate(O0, O1, P0, P1)["flag"].tolist() == [False, False, True, False]
+    assert xe._leak_gate(O0, O1, P0, P1, min_abs=0.0)["flag"].tolist() == [True, True, True, False]
+    # the signal rule is untouched by the restriction
+    g1 = xe._leak_gate(O0, O0, 0.6 * O0, 0.6 * O0)
+    assert g1["e1"].all() and g1["flag"].all() and not g1["change_ok"].any()
+
+    # through the groups: a world whose T cells carry a little of L everywhere (equal in A and B)
+    s, typ, A, B = _bleed_world(seed=4, n=2400)
+    genes = s["genes"]
+    g0 = xe._leak_gate_groups([s], [typ], [A], [B], genes)
+    none = xe._leak_gate_groups([s], [typ], [A], [B], genes, called=np.zeros(len(genes), bool))
+    every = xe._leak_gate_groups([s], [typ], [A], [B], genes, called=np.ones(len(genes), bool))
+    assert g0["n_flag"] == none["n_flag"] <= every["n_flag"] == every["n_flag_all"] == g0["n_flag_all"]
+    assert g0["n_e2"] <= g0["n_e2_all"] and g0["n_change_ok"] <= len(genes) == every["n_change_ok"]
+    t0, te = g0["table"].set_index("gene"), every["table"].set_index("gene")
+    L_genes = [f"g{i}" for i in G_L]
+    assert t0.loc[L_genes, "leak_flag"].all()                  # the planted bleed is flagged with or without calls
+    # a gene flagged only by the unrestricted rule has a small change
+    only = te.index[te["leak_flag"] & ~t0["leak_flag"]]
+    prof = xe._type_profiles([s], [typ])
+    for gname in only:
+        assert gname not in L_genes
 
 
 # ── 4. segmentation QC metrics ───────────────────────────────────────────────
@@ -840,6 +891,8 @@ def test_every_neighbour_search_of_the_app_is_in_a_function_that_takes_one_sampl
         "reseg.py": {"_patch_seam_dedup_mask"},          # duplicate cells across patch seams of one run
         "annotation.py": {"_run_seurat_annotation"},     # expression space (PCA), not tissue space
         "spage.py": {"_spage_impute", "_run_spage_imputation", "_spage_core"},   # expression space
+        "banksy.py": {"_bk_neighbours"},                 # ONE sample's coordinates (callers loop over samples)
+        "clustersets.py": {"_cs_knn"},                   # embedding space (PCs), not tissue space
     }
     names = {"cKDTree", "NearestNeighbors", "KDTree", "BallTree", "Delaunay", "kneighbors_graph",
              "radius_neighbors_graph"}

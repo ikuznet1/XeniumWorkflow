@@ -10,6 +10,7 @@ from . import (
     stats, controls, sdata_store, regions, app_layout,
 )
 from . import segfree
+from . import clustersets
 
 
 # ─── SpatialData / Sopa callbacks ─────────────────────────────────────────────
@@ -223,6 +224,10 @@ def update_tissue_info(_, seg_source, _split_done):
             res = core._proseg_state.get("result")
         n_cells_display = f"{len(res['cells_df']):,}" if res else f"{meta.get('num_cells', 0):,}"
         seg_label = "Proseg"
+    elif tool == "imgseg":
+        res = core._seg_result(seg_source)
+        n_cells_display = f"{len(res['cells_df']):,}" if res else f"{meta.get('num_cells', 0):,}"
+        seg_label = "Image segmentation"
     else:
         n_cells_display = f"{meta.get('num_cells', 0):,}"
         seg_label = "Xenium"
@@ -321,6 +326,7 @@ def _running_jobs() -> list:
             busy.append(job.name)
     for name, lock, state in (
             ("Baysor", core._baysor_lock, core._baysor_state), ("Proseg", core._proseg_lock, core._proseg_state),
+            ("Image segmentation", core._imgseg_lock, core._imgseg_state),
             ("annotation", core._annot_lock, core._annot_state), ("SpaGE", core._spage_lock, core._spage_state),
             ("SpatialData / patches", core._sdata_lock, core._sdata_state),
             ("UMAP", core._umap_reseg_lock, core._umap_reseg_state), ("SPLIT", core._split_lock, core._split_state),
@@ -466,6 +472,8 @@ def load_sample(n_clicks, picked_path, custom_path, ds_version, roi_done,
             core._baysor_state.update({"status": "idle", "message": "", "result": None})
         with core._proseg_lock:
             core._proseg_state.update({"status": "idle", "message": "", "result": None})
+        with core._imgseg_lock:
+            core._imgseg_state.update({"status": "idle", "message": "", "result": None})
         with core._annot_lock:
             core._annot_state.update({"status": "idle", "message": "", "labels": None,
                                   "labels_proseg": None, "labels_baysor": None})
@@ -607,16 +615,25 @@ def remove_extra_samples(n_clicks, extra_ver):
     Output("cluster-method", "options"),
     Output("cluster-method", "value"),
     Input("dataset-version", "data"),
+    Input("clusterset-version", "data"),
+    Input("seg-source", "value"),
+    Input("extra-datasets-version", "data"),
+    Input("baysor-done", "data"),
+    Input("proseg-done", "data"),
     State("cluster-method", "value"),
     prevent_initial_call=True,
 )
-def update_cluster_options(_, current):
-    methods = core.DATA["cluster_methods"]
-    opts = [{"label": ui.method_label(m), "value": m} for m in methods]
+def update_cluster_options(_, _cs_version=None, seg_source=None, _extra=None, _baysor=None, _proseg=None,
+                           current=None):
+    # cluster sets computed in the app (Banksy domains, joint clusters) and cached for the
+    # samples / the segmentation run now in view are installed here
+    clustersets._cs_restore(seg_source or "xenium")
+    opts = clustersets._cs_options(seg_source or "xenium")
+    methods = [o["value"] for o in opts]
     # dataset-version is also bumped by "Rerun UMAP": keep the user's selection
     # whenever it still exists in the (possibly new) dataset
     if current in methods:
-        return opts, current
+        return opts, no_update
     return opts, (methods[0] if methods else None)
 
 
@@ -677,6 +694,9 @@ def do_clean_cache(n_clicks, version, baysor_ver, proseg_ver):
     with core._proseg_lock:
         if core._proseg_state.get("status") != "running":
             core._proseg_state.update({"status": "idle", "message": "", "result": None})
+    with core._imgseg_lock:
+        if core._imgseg_state.get("status") != "running":
+            core._imgseg_state.update({"status": "idle", "message": "", "result": None})
     with core._sdata_lock:
         if core._sdata_state.get("status") != "running":
             core._sdata_state.update({"status": "idle", "message": "", "sdata": None,

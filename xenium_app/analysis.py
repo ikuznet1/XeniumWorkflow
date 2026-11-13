@@ -82,6 +82,20 @@ _DENSITY_ALL = "__all__"   # "gene" value of the all-gene-transcripts grid
 _DENSITY_MAX_CELLS = 360_000   # heat-layer cells sent per request (coarsened above this)
 _density_mem: "_OrderedDict" = _OrderedDict()       # (cache file, bin) -> dense grid
 _density_mem_lock = threading.Lock()                # (read by request threads)
+# Heat layers that are not the transcript grid of a gene (e.g. the transcript factors):
+# "gene" prefix -> {"grid": f(gene, ds) -> grid dict as _density_grid returns (plus
+# "palette" / "names" for a categorical layer whose values are 1 … n, 0 = empty) or None,
+# "label": f(gene, bin) -> str, "options": f() -> dropdown options, "hint": f(gene) -> str}
+_density_virtual_providers: dict = {}
+
+
+def _density_virtual(gene):
+    """The provider of a heat-layer "gene" that is not a gene, or None."""
+    g = str(gene or "")
+    for prefix, prov in list(_density_virtual_providers.items()):
+        if g.startswith(prefix):
+            return prov
+    return None
 
 
 def _an_dataset_tag() -> str:
@@ -89,15 +103,8 @@ def _an_dataset_tag() -> str:
 
 
 def _an_alt_res(seg_source):
-    """The loaded Baysor / Proseg result when *seg_source* names that tool, else None."""
-    tool = core._seg_tool(seg_source)
-    if tool == "proseg":
-        with core._proseg_lock:
-            return core._proseg_state.get("result")
-    if tool == "baysor":
-        with core._baysor_lock:
-            return core._baysor_state.get("result")
-    return None
+    """The loaded Baysor / Proseg / image-segmentation result when *seg_source* names that tool, else None."""
+    return core._seg_result(seg_source)
 
 
 def _ds_panel_genes(ds: dict) -> list:
@@ -251,26 +258,37 @@ def _an_polygon_mask(polygon_xy, s: dict) -> np.ndarray:
 def _an_cluster_labels(samples, method, use_corrected, alt) -> list:
     """Per sample: the active cluster set's label of each cell as str (None: no such
     column). With several samples the labels are per sample ("S0:C3"), as in the view."""
+    from . import clustersets          # (clustersets imports this module)
     multi = len(samples) > 1
     out = []
     for di, s in enumerate(samples):
         df = s["df"]
+        own = False                        # a set installed by the app: 0 = no label
+        shared = False                     # ... computed jointly: the same labels in every sample
         if alt is not None:
             cands = reseg._reseg_cluster_cols(df.columns)
             pref = [c for c in cands if ("split" in c) == bool(use_corrected)]
-            col = (pref or cands or [None])[0]
+            col = clustersets._cs_reseg_col(df.columns, method)
+            own = col is not None
+            col = col or (pref or cands or [None])[0]
         else:
             ds = s.get("ds") or core.DATA
             cm = ds.get("cluster_methods") or []
-            col = f"clust__{method if method in cm else (cm or [method])[0]}"
+            m_use = method if method in cm else (cm or [method])[0]
+            col = f"clust__{m_use}"
+            own = m_use in clustersets._cs_registry
+            shared = own and m_use == method and clustersets._cs_is_shared(m_use)
         if col is None or col not in df.columns:
             out.append(None)
             continue
         v = df[col]
         lab = v.astype(str).to_numpy(dtype=object)
         lab[v.isna().to_numpy()] = None
+        if own:
+            lab[lab == str(clustersets._CS_UNASSIGNED)] = None
         if multi:
-            lab = np.array([None if x is None else f"S{di}:C{x}" for x in lab], dtype=object)
+            pre = "C" if shared else f"S{di}:C"
+            lab = np.array([None if x is None else f"{pre}{x}" for x in lab], dtype=object)
         out.append(lab)
     return out
 
@@ -1381,10 +1399,12 @@ def _density_status(gene) -> dict:
     """Per sample of the view, whether *gene*'s grid exists: {ready, missing (has
     transcripts, no grid yet), unavailable (loaded from a .zarr)} as lists of labels."""
     out = {"ready": [], "missing": [], "unavailable": []}
+    prov = _density_virtual(gene)
     for smp in _density_samples():
         if not smp["data_dir"]:
             out["unavailable"].append(smp["label"])
-        elif gene and os.path.exists(_density_cache_file(gene, smp["ds"])):
+        elif gene and (prov["grid"](gene, smp["ds"]) is not None if prov is not None
+                       else os.path.exists(_density_cache_file(gene, smp["ds"]))):
             out["ready"].append(smp["label"])
         else:
             out["missing"].append(smp["label"])
@@ -1397,6 +1417,9 @@ def _density_grid(gene: str, bin_um, ds=None) -> "dict | None":
     total, vmax (99.5th percentile of the non-empty bins: default colour maximum)}.
     None when the gene's grid has not been computed yet. *ds*: an extra sample (its
     grid is in that sample's own µm, without the view offset)."""
+    prov = _density_virtual(gene)
+    if prov is not None:
+        return prov["grid"](gene, ds)       # its own bins; *bin_um* does not apply
     path = _density_cache_file(gene, ds)
     k = max(1, int(round(float(bin_um) / _DENSITY_BASE_UM)))
     mkey = (path, k)
@@ -1474,7 +1497,9 @@ def _density_window(gene, bin_um, x0=None, y0=None, x1=None, y1=None,
     if factor is None:
         while (sub.shape[0] // f + 1) * (sub.shape[1] // f + 1) > max_cells:
             f += 1
-    if f > 1 and sub.size:
+    if f > 1 and sub.size and g.get("palette"):
+        sub = sub[::f, ::f]                 # categories are not averaged: every f-th bin
+    elif f > 1 and sub.size:
         ph, pw = -sub.shape[0] % f, -sub.shape[1] % f
         sub = np.pad(sub, ((0, ph), (0, pw)))
         sub = sub.reshape(sub.shape[0] // f, f, sub.shape[1] // f, f).sum(axis=(1, 3)) / float(f * f)
@@ -1519,8 +1544,8 @@ def _density_windows(gene, bin_um, x0=None, y0=None, x1=None, y1=None,
                               x_offset=smp["x_offset"], factor=f)
         win["label"] = smp["label"]
         parts.append(win)
-    if len(grids) == 1:
-        vmax = grids[0][1]["vmax"]
+    if len(grids) == 1 or _density_virtual(gene) is not None:
+        vmax = max(g["vmax"] for _, g in grids)
     else:
         vkey = ("vmax", tuple(_density_cache_file(gene, smp["ds"]) for smp, _ in grids), grids[0][1]["bin"])
         with _density_mem_lock:
@@ -1534,10 +1559,14 @@ def _density_windows(gene, bin_um, x0=None, y0=None, x1=None, y1=None,
     return {"parts": parts, "bin": grids[0][1]["bin"], "vmax": vmax,
             "total": int(sum(g["total"] for _, g in grids)), "coarsened": f > 1,
             "labels": [smp["label"] for smp, _ in grids],
-            "missing": st["missing"], "unavailable": st["unavailable"]}
+            "missing": st["missing"], "unavailable": st["unavailable"],
+            "palette": grids[0][1].get("palette"), "names": grids[0][1].get("names")}
 
 
 def _density_label(gene, bin_um) -> str:
+    prov = _density_virtual(gene)
+    if prov is not None:
+        return prov["label"](gene, bin_um)
     return (f"{'All genes' if gene == _DENSITY_ALL else gene}: transcripts per "
             f"{float(bin_um):g} µm bin")
 
@@ -1567,6 +1596,12 @@ def _density_heatmap_traces(spec: dict, relayout=None) -> list:
     if wins is None:
         return []
     vmax = spec.get("max") or wins["vmax"]
+    pal = wins.get("palette")
+    scale, zmin = "Magma", 0
+    if pal:                                     # categorical layer: value i is colour i - 1
+        n = len(pal)
+        scale = [[min(1.0, (i + j) / n), pal[i]] for i in range(n) for j in (0, 1)]
+        zmin, vmax = 0.5, n + 0.5
     traces = []
     for win in wins["parts"]:
         if not win["values"].size:
@@ -1577,12 +1612,14 @@ def _density_heatmap_traces(spec: dict, relayout=None) -> list:
         c = win["cell"]
         traces.append(go.Heatmap(
             z=z, x0=win["x0"] + c / 2, dx=c, y0=-(win["y0"] + (z.shape[0] - 0.5) * c), dy=c,
-            colorscale="Magma", zmin=0, zmax=vmax,
+            colorscale=scale, zmin=zmin, zmax=vmax,
             opacity=float(spec.get("opacity") if spec.get("opacity") is not None else 0.7),
             hoverinfo="skip", name="transcript density", showlegend=False,
             showscale=not traces,               # one colour bar for all samples
             colorbar=dict(title=_density_label(spec["gene"], win["bin"]).replace(": ", ":<br>")
-                          .replace(" per ", "<br>per "), thickness=12, len=0.4, x=1.02, y=0.2),
+                          .replace(" per ", "<br>per "), thickness=12, len=0.4, x=1.02, y=0.2,
+                          **(dict(tickmode="array", tickvals=list(range(1, len(pal) + 1)),
+                                  ticktext=list(wins.get("names") or [])) if pal else {})),
         ))
     return traces
 

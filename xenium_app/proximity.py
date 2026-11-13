@@ -35,8 +35,6 @@ _PROX_SEED = 0
 _PROX_REPRO_FRAC = 5.0 / 7.0  # a placebo anchor type "reproduces" a gene at this share of same-sign units
 _PROX_MAX_PLACEBO = 3         # other anchor types of similar abundance that are run
 _PROX_L_GRID = (2.0, 5.0, 8.0, 12.0, 18.0, 25.0, 35.0, 50.0, 70.0, 100.0, 140.0, 200.0, 300.0, 400.0, 600.0)
-_PROX_ENUM_UNITS = 12         # sign-flip over genes: all 2^n sign vectors up to this many units
-_PROX_MC = 8191               # random sign vectors above that
 _PROX_SET_BYTES = 160e6       # dense weights handled at a time (anchor sets × cells)
 
 _CONTACT_R_UM = 50.0          # contact: an X cell within this distance (centroid to centroid)
@@ -204,12 +202,15 @@ def _prox_matched_random(pool_idx, pool_bin, need, n_draws: int, rng) -> tuple:
     return draws, short
 
 
-def _prox_signflip_genes(E, enum_max: int = _PROX_ENUM_UNITS, n_mc: int = _PROX_MC, seed: int = _PROX_SEED) -> "dict | None":
+def _prox_signflip_genes(E, enum_max: int = None, n_mc: int = None, seed: int = _PROX_SEED) -> "dict | None":
     """Sign-flip test of the mean over units (rows of E), for every gene (column) at once.
-    Units with a NaN are dropped; None with fewer than stats._SL_MIN_UNITS. Up to
-    *enum_max* units all 2^n sign vectors are used (exact, the same p as
-    stats._sl_signflip); above, *n_mc* random ones and p = (1 + hits) / (1 + n_mc).
-    Returns {mean, p, npos, n, min_p, exact}."""
+    Units with a NaN are dropped; None with fewer than stats._SL_MIN_UNITS. The limits are
+    those of stats._sl_signflip: up to *enum_max* units (default stats._SL_ENUM_UNITS) all
+    2^n sign vectors are used (exact, the same p); above, *n_mc* random ones (default
+    stats._SL_MC) and p = (1 + hits) / (1 + n_mc).
+    Returns {mean, p, npos, n, min_p, exact, n_vectors}."""
+    enum_max = stats._SL_ENUM_UNITS if enum_max is None else int(enum_max)
+    n_mc = stats._SL_MC if n_mc is None else int(n_mc)
     E = np.asarray(E, dtype=np.float64)
     ok = ~np.isnan(E).any(axis=1)
     n = int(ok.sum())
@@ -229,7 +230,7 @@ def _prox_signflip_genes(E, enum_max: int = _PROX_ENUM_UNITS, n_mc: int = _PROX_
         sums = signs @ Ev[:, g0:g0 + step]
         hits[g0:g0 + step] = (np.abs(sums) >= np.abs(tot[g0:g0 + step])[None, :] - tol[None, g0:g0 + step]).sum(axis=0)
     p = hits / len(signs) if exact else (hits + 1.0) / (len(signs) + 1.0)
-    return {"mean": tot / n, "p": p, "npos": (Ev > 0).sum(axis=0), "n": n, "exact": exact,
+    return {"mean": tot / n, "p": p, "npos": (Ev > 0).sum(axis=0), "n": n, "exact": exact, "n_vectors": len(signs),
             "min_p": (2.0 / 2 ** n) if exact else 1.0 / (len(signs) + 1.0), "valid": ok}
 
 
@@ -359,6 +360,23 @@ def _prox_sample(s: dict, lab, genes, target, anchor, placebos, strata, source, 
     return out
 
 
+_PROX_CALL_FDR = 0.10         # a change is "called" below this FDR: the leak gate's change rule applies to it
+_PROX_GATE_OFF = {"applicable": False, "off": True,
+                  "reason": "switched off (Gene ownership + leak gate is unticked)"}
+_PROX_GATE_OFF_MSG = ("Gene ownership and leak gate: switched off (Gene ownership + leak gate is unticked) - "
+                      "no gene is flagged, and genes owned by the anchor type are not marked.")
+
+
+def _prox_ownership(prof, genes, anchor, target, on: bool = True) -> tuple:
+    """(owner, owners, anchor_owned) per gene of *genes*; empty / False when *on* is False."""
+    if not on:
+        return np.array([""] * len(genes), dtype=object), np.array([""] * len(genes), dtype=object), \
+            np.zeros(len(genes), dtype=bool)
+    own = controls._gene_ownership(prof).set_index("gene").reindex(genes)
+    owners = own["owners"].fillna("").to_numpy()
+    return own["owner"].fillna("").to_numpy(), owners, _prox_anchor_owned(owners, anchor, target)
+
+
 def _prox_anchor_owned(owners, anchor, target) -> np.ndarray:
     """Genes the anchor type owns and the target type does not (controls._gene_ownership:
     an owner has at least 20 % of the top rate): in a target cell next to the anchor their
@@ -375,7 +393,7 @@ def _prox_params(params=None) -> dict:
          "local_r": controls._SPILL_LOCAL_R_UM, "min_anchors": _PROX_MIN_ANCHORS, "min_near": _PROX_MIN_NEAR,
          "min_far": _PROX_MIN_FAR, "min_slope_n": _PROX_MIN_SLOPE_N, "min_target": _PROX_MIN_TARGET,
          "n_random": _PROX_N_RANDOM, "seed": _PROX_SEED, "repro_frac": _PROX_REPRO_FRAC,
-         "max_placebo": _PROX_MAX_PLACEBO, "fit_length": False, "l_grid": _PROX_L_GRID}
+         "max_placebo": _PROX_MAX_PLACEBO, "fit_length": False, "l_grid": _PROX_L_GRID, "leak_gate": True}
     p.update({k: v for k, v in (params or {}).items() if v is not None and k in p})
     p["near"], p["far"] = float(p["near"]), float(p["far"])
     p["n_random"] = int(max(1, min(2000, p["n_random"])))
@@ -647,15 +665,16 @@ def _prox_compute(samples, labels, target, anchor, strata=None, source="auto", c
         table["r2"] = np.nanmedian(np.stack([per[i]["length"]["r2"] for i in used]), axis=0)
     with np.errstate(divide="ignore", invalid="ignore"):
         table["neg_log10_padj"] = -np.log10(np.maximum(table["padj"].to_numpy(dtype=float), 1e-300))
-    # ownership and leak gate: T near X (arm A) against T far from X (arm B)
-    own = controls._gene_ownership(prof).set_index("gene").reindex(genes)
-    table["owner"] = own["owner"].fillna("").to_numpy()
-    table["owners"] = own["owners"].fillna("").to_numpy()
-    table["anchor_owned"] = _prox_anchor_owned(table["owners"], anchor, target)
+    # ownership and leak gate: T near X (arm A) against T far from X (arm B); both are
+    # skipped when "Gene ownership + leak gate" is unticked (no gene is then flagged)
+    gate_on = bool(p.get("leak_gate", True))
+    table["owner"], table["owners"], table["anchor_owned"] = _prox_ownership(prof, genes, anchor, target, gate_on)
     near_masks = [per[i]["near_mask"] if i in used else np.zeros(len(samples[i]["df"]), dtype=bool) for i in range(S)]
     far_masks = [per[i]["far_mask"] if i in used else np.zeros(len(samples[i]["df"]), dtype=bool) for i in range(S)]
     jobs._job_check()
-    gate = controls._leak_gate_groups(samples, labels, near_masks, far_masks, genes, prof, per_sample=len(used) > 1)
+    gate = (controls._leak_gate_groups(samples, labels, near_masks, far_masks, genes, prof, per_sample=len(used) > 1,
+                                       called=np.nan_to_num(table["padj"].to_numpy(dtype=float), nan=1.0) < _PROX_CALL_FDR)
+            if gate_on else dict(_PROX_GATE_OFF))
     flag = table["anchor_owned"].to_numpy().copy()
     if gate["applicable"]:
         lt = gate["table"].set_index("gene").reindex(genes)
@@ -665,6 +684,7 @@ def _prox_compute(samples, labels, target, anchor, strata=None, source="auto", c
         flag |= table["gate_flag"].to_numpy()
     else:
         table["leak_fraction"] = np.nan
+        table["gate_flag"] = False
     table["leak_flag"] = flag
     cpm = controls._cpm(prof["counts"], prof["depth"])
     gix = np.array([prof["genes"].index(g) for g in genes], dtype=np.int64) if G < len(prof["genes"]) else np.arange(G)
@@ -696,7 +716,7 @@ def _prox_units_statement(res: dict) -> str:
     info, N = res["info"], res["info"]["n_random_valid"]
     if info["mode"] == "cohort":
         return (f"n = {info['n_units']} {'donors' if info['by_donor'] else 'samples'} (exact sign-flip test of "
-                f"the per-unit {'slopes' if info['estimator'] == 'slope' else 'effects'}" + ("" if info["exact"] else f", {_PROX_MC} random sign vectors")
+                f"the per-unit {'slopes' if info['estimator'] == 'slope' else 'effects'}" + ("" if info["exact"] else f", {stats._SL_MC:,} random sign vectors")
                 + f"; smallest achievable p {info['min_p']:.3g})")
     return (f"n = {res['n_target']:,} cells of type {res['target']} in {res['n_samples']} sample(s); the p-value is the "
             f"share of {N} matched random anchor sets at least as far from their mean as the observed "
@@ -801,9 +821,15 @@ def _run_proximity_de(target, anchor, label_kind, seg_source, method, use_correc
         else:
             msg += "\nSpecificity: no other type of similar abundance (within 3×) to compare with."
         g = res["gate"]
-        msg += (f"\nOwnership: {int(t['anchor_owned'].sum()):,} tested genes are owned by {anchor} and not by {target}. Leak gate "
-                + (f"({target} near vs far; {g.get('mode')}): {int(t['gate_flag'].sum()):,} genes flagged."
-                   if g.get("applicable") else f"not applied: {g.get('reason')}."))
+        if g.get("off"):
+            msg += f"\n{_PROX_GATE_OFF_MSG}"
+        else:
+            msg += (f"\nOwnership: {int(t['anchor_owned'].sum()):,} tested genes are owned by {anchor} and not by {target}. Leak gate "
+                    + (f"({target} near vs far; {g.get('mode')}): {int(t['gate_flag'].sum()):,} genes flagged "
+                       f"({g.get('n_e1', 0):,} by the signal rule, {g.get('n_e2', 0):,} by the change rule, which is applied to "
+                       f"the {g.get('n_change_ok', 0):,} genes with {res['fdr_name']} < {_PROX_CALL_FDR:g} or |log2 change| ≥ "
+                       f"{controls._LEAK_CHANGE_MIN_LFC:g})."
+                       if g.get("applicable") else f"not applied: {g.get('reason')}."))
         if res["diff_note"]:
             msg += f"\nBetween conditions: {res['diff_note']}."
         skipped = [r for r in res["samples"] if not r["used"]]
@@ -922,7 +948,8 @@ def _contact_pb_fit(prep: dict, engine: str = "auto") -> dict:
 
 def _contact_compute(samples, labels, target, anchor, strata=None, radius=_CONTACT_R_UM,
                      min_cells=_CONTACT_MIN_CELLS, min_count=None, n_shuffle=_CONTACT_N_SHUFFLE, seed=0,
-                     donors=None, fit=None, lfc_min=_CONTACT_LFC_MIN, fdr=_CONTACT_FDR, progress=None) -> dict:
+                     donors=None, fit=None, lfc_min=_CONTACT_LFC_MIN, fdr=_CONTACT_FDR, progress=None,
+                     leak_gate: bool = True) -> dict:
     """Contact-group pseudobulk differential expression (see _CONTACT_NOTE). *fit*: the
     function(prep) -> {table, …} that fits ~ sample + group (default _contact_pb_fit).
     Returns the result dict of the Differential Expression tab (kind "contact")."""
@@ -996,13 +1023,12 @@ def _contact_compute(samples, labels, target, anchor, strata=None, radius=_CONTA
     jobs._job_check()
     # ownership and leak gate (contact = arm A, comparator = arm B, per sample)
     prof = controls._type_profiles(samples, labels, genes_all)
-    own = controls._gene_ownership(prof).set_index("gene").reindex(genes)
-    table["owner"] = own["owner"].fillna("").to_numpy()
-    table["owners"] = own["owners"].fillna("").to_numpy()
-    table["anchor_owned"] = _prox_anchor_owned(table["owners"], anchor, target)
+    table["owner"], table["owners"], table["anchor_owned"] = _prox_ownership(prof, genes, anchor, target, leak_gate)
     ma = [grp[i]["a"] if i in test else np.zeros(len(samples[i]["df"]), dtype=bool) for i in range(len(samples))]
     mb = [(grp[i]["w"] > 0) if i in test else np.zeros(len(samples[i]["df"]), dtype=bool) for i in range(len(samples))]
-    gate = controls._leak_gate_groups(samples, labels, ma, mb, genes, prof, per_sample=True)
+    gate = (controls._leak_gate_groups(samples, labels, ma, mb, genes, prof, per_sample=True,
+                                       called=np.nan_to_num(table["padj"].to_numpy(dtype=float), nan=1.0) < fdr)
+            if leak_gate else dict(_PROX_GATE_OFF))
     flag = table["anchor_owned"].to_numpy().copy()
     if gate["applicable"]:
         lt = gate["table"].set_index("gene").reindex(genes)
@@ -1012,6 +1038,7 @@ def _contact_compute(samples, labels, target, anchor, strata=None, radius=_CONTA
         flag |= table["gate_flag"].to_numpy()
     else:
         table["leak_fraction"] = np.nan
+        table["gate_flag"] = False
     table["leak_flag"] = flag
     cpm = controls._cpm(prof["counts"], prof["depth"])
     gix = np.array([prof["genes"].index(g) for g in genes], dtype=np.int64)
@@ -1071,7 +1098,7 @@ def _contact_compute(samples, labels, target, anchor, strata=None, radius=_CONTA
 
 
 def _run_contact_de(target, anchor, label_kind, seg_source, method, use_corrected, radius=None,
-                    min_cells=None, n_shuffle=None, min_count=None, seed=0) -> None:
+                    min_cells=None, n_shuffle=None, min_count=None, seed=0, leak_gate: bool = True) -> None:
     """Background job: contact-group pseudobulk DE, published into the DE state."""
     _gen = jobs._dataset_gen
     try:                                   # rpy2 thread rule: before anything else
@@ -1117,7 +1144,7 @@ def _run_contact_de(target, anchor, label_kind, seg_source, method, use_correcte
 
         res = _contact_compute(samples, labels, target, anchor, strata=strata, radius=radius,
                                min_cells=min_cells, min_count=min_count, n_shuffle=n_shuffle, seed=seed,
-                               donors=stats._design_donors(samples), progress=_prog)
+                               donors=stats._design_donors(samples), progress=_prog, leak_gate=leak_gate)
         jobs._check_dataset_gen(_gen)
         fitinfo, sh, t = res["fit"], res["shuffle"], res["table"]
         k = len(res["blocks"])
@@ -1154,9 +1181,15 @@ def _run_contact_de(target, anchor, label_kind, seg_source, method, use_correcte
         else:
             msg += "\nNo label shuffle was run."
         g = res["gate"]
-        msg += (f"\nOwnership: {int(t['anchor_owned'].sum()):,} tested genes are owned by {anchor} and not by {target} (flagged). "
-                + (f"Leak gate (focal type {g.get('focal')}, {g.get('mode')}): {int(t['gate_flag'].sum()):,} genes flagged."
-                   if g.get("applicable") else f"Leak gate not applied: {g.get('reason')}."))
+        if g.get("off"):
+            msg += f"\n{_PROX_GATE_OFF_MSG} 'Pass' is then FDR and effect size alone."
+        else:
+            msg += (f"\nOwnership: {int(t['anchor_owned'].sum()):,} tested genes are owned by {anchor} and not by {target} (flagged). "
+                    + (f"Leak gate (focal type {g.get('focal')}, {g.get('mode')}): {int(t['gate_flag'].sum()):,} genes flagged "
+                       f"({g.get('n_e1', 0):,} by the signal rule, {g.get('n_e2', 0):,} by the change rule, applied to the "
+                       f"{g.get('n_change_ok', 0):,} genes with FDR < {res['fdr']:g} or |log2 change| ≥ "
+                       f"{controls._LEAK_CHANGE_MIN_LFC:g})."
+                       if g.get("applicable") else f"Leak gate not applied: {g.get('reason')}."))
         top_x = t["pass"].to_numpy(dtype=bool) & (t["owner"].to_numpy() == anchor)
         if top_x.any():
             msg += (f" {int(top_x.sum()):,} of the {res['n_pass']:,} passing genes have {anchor} as their top owner "

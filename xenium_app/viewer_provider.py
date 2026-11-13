@@ -11,6 +11,8 @@ from . import (
     core, jobs, caching, dataview, annotation, reseg, spatial, morph, figures, analysis,
     cellnest, sdata_store, regions, app_layout,
 )
+from . import clustersets
+from . import joint
 
 
 # ─── WebGL viewer data provider (binary endpoints under /viewer/*) ────────────
@@ -28,14 +30,7 @@ class _ViewerProvider:
 
     @staticmethod
     def _alt_res(source):
-        tool = core._seg_tool(source)
-        if tool == "proseg":
-            with core._proseg_lock:
-                return core._proseg_state.get("result")
-        if tool == "baysor":
-            with core._baysor_lock:
-                return core._baysor_state.get("result")
-        return None
+        return core._seg_result(source)
 
     def _frame(self, source):
         alt = self._alt_res(source)
@@ -80,8 +75,7 @@ class _ViewerProvider:
     def meta(self):
         d = core.DATA.get("data_dir")
         sources = ["xenium"]
-        for tool, lock, state in (("baysor", core._baysor_lock, core._baysor_state),
-                                  ("proseg", core._proseg_lock, core._proseg_state)):
+        for tool, lock, state in core._seg_states():
             with lock:
                 if state.get("result"):
                     sources.append(tool)
@@ -174,7 +168,7 @@ class _ViewerProvider:
             else:
                 cands = reseg._reseg_cluster_cols(df.columns)      # as make_spatial_fig picks them
                 pref = [c for c in cands if ("split" in c) == corrected]
-                col = (pref or cands or [None])[0]
+                col = clustersets._cs_reseg_col(df.columns, method) or (pref or cands or [None])[0]
             if col is not None and col in df.columns:
                 if alt is not None:
                     # same order, names and NA handling as make_spatial_fig's reseg branch
@@ -264,7 +258,9 @@ class _ViewerProvider:
             for di, (ds, edf) in enumerate(zip(dsets, dfs)):
                 cm = ds.get("cluster_methods") or []
                 col = f"clust__{method if method in cm else (cm or [method])[0]}"
-                parts.append((f"S{di}:C" + edf[col].astype(str)).values if col in edf.columns
+                # a set computed jointly keeps its labels without the per-sample prefix
+                pre = "C" if (method in cm and clustersets._cs_is_shared(method)) else f"S{di}:C"
+                parts.append((pre + edf[col].astype(str)).values if col in edf.columns
                              else np.full(len(edf), f"S{di}:C0", dtype=object))
             labels = np.concatenate(parts)
             return self._categorical(labels, "Cluster", order=list(pd.unique(labels)))
@@ -331,7 +327,7 @@ class _ViewerProvider:
                     and self._zip_matches(d, df, kind)):
                 return None
             bounds = core.DATA.get("cell_bounds" if kind == "cell" else "nucleus_bounds") or {}
-        elif kind in ("baysor", "proseg"):
+        elif kind in core._SEG_TOOL_LABELS:
             alt = self._alt_res(kind)
             if alt is None:
                 return {"n": 0, "truncated": False, "available": False}, {}
@@ -539,7 +535,10 @@ class _ViewerProvider:
                  "coarsened": bool(wins["coarsened"]),
                  # (zooming in then fetches the bins themselves, see RegionLoader.refinable)
                  "subsampled": bool(wins["coarsened"]),
-                 "label": analysis._density_label(gene, wins["bin"])},
+                 "label": analysis._density_label(gene, wins["bin"]),
+                 # a categorical layer (values 1 … n index the palette, 0 = empty)
+                 **({"palette": list(wins["palette"]), "names": list(wins.get("names") or [])}
+                    if wins.get("palette") else {})},
                 {"values": np.concatenate(vals) if len(vals) > 1 else vals[0]})
 
     def _pies(self, args):
@@ -677,8 +676,17 @@ class _UmapViewerProvider(_ViewerProvider):
 
     @staticmethod
     def _split(source):
-        base, _, flag = (source or "xenium").partition("|")
-        return base or "xenium", flag == "corr"
+        parts = (source or "xenium").split("|")
+        return parts[0] or "xenium", "corr" in parts[1:]
+
+    @classmethod
+    def _joint(cls, source):
+        """The joint embedding of all samples when the source names one ('…|emb:<cluster
+        set>', sent while a joint cluster set is selected) and it exists; else None."""
+        for part in (source or "").split("|")[1:]:
+            if part.startswith("emb:"):
+                return joint._jc_umap_view(part[4:], cls._split(source)[0])
+        return None
 
     def _umap_xy(self, source):
         base, corrected = self._split(source)
@@ -732,18 +740,25 @@ class _UmapViewerProvider(_ViewerProvider):
                 "has_transcripts": False, "images": [], "embedding": "umap"}
 
     def cells(self, source):
-        x, y = self._umap_xy(source)
+        jv = self._joint(source)
+        if jv is not None:       # all samples, in the order of the spatial view
+            x, y = np.concatenate(jv["x"]), -np.concatenate(jv["y"])
+        else:
+            x, y = self._umap_xy(source)
         xy = np.empty(2 * len(x), dtype=np.float32)
         xy[0::2] = x
         xy[1::2] = y
         return ({"n": int(len(x)), "bounds": self._xy_bounds(x, y),
-                 "n_embedded": int(np.isfinite(x).sum()),
+                 "n_embedded": int(np.isfinite(x).sum()), "samples": len(jv["tables"]) if jv is not None else 1,
                  "token": f"umap:{jobs._dataset_gen}:{core._subset_version}:{source}:{len(x)}"}, {"xy": xy})
 
     def colors(self, args):
         args = dict(args)
+        joint_view = self._joint(args.get("source")) is not None
         base, corrected = self._split(args.get("source"))
         args["source"] = base
+        if joint_view:           # the colours of every sample, as the spatial view has them
+            return _viewer_provider.colors(args)
         return super().colors(args)
 
     def boundaries(self, source, kind, x0, y0, x1, y1):
@@ -756,6 +771,15 @@ class _UmapViewerProvider(_ViewerProvider):
         return None
 
     def cell_at(self, source, index):
+        jv = self._joint(source)
+        if jv is not None:
+            pos = int(index)
+            for t in jv["tables"]:
+                if pos < len(t["df"]):
+                    return ({"index": int(index), "id": str(t["df"].index[pos]), "sample": t["label"]}
+                            if pos >= 0 else {})
+                pos -= len(t["df"])
+            return {}
         df, _ = self._frame(self._split(source)[0])
         if index < 0 or index >= len(df):
             return {}

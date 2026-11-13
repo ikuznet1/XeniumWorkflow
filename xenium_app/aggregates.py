@@ -820,7 +820,11 @@ def _agg_tab():
                                     "value": "on"}],
                           value=["on"], inputStyle={"marginRight": "3px"}, style={"display": "inline-flex"}),
         ], style=S),
-        html.Div(id="agg-design-summary", style={**L, "padding": "0 8px"}),
+        html.Div([
+            dbc.Button("Samples & conditions…", id="agg-design-open-btn", color="secondary", size="sm",
+                       n_clicks=0, style={"fontSize": "11px", "padding": "2px 8px"}),
+            html.Span(id="agg-design-summary", style=L),
+        ], style=S),
         html.Div(id="agg-status", style={**analysis._AN_STATUS_STYLE, "whiteSpace": "pre-wrap"}),
         html.Div(_AGG_NOTE, id="agg-note", style=analysis._AN_NOTE_STYLE),
         html.Div([

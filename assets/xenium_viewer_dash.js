@@ -660,7 +660,7 @@
       pointSize: size || 2,
       opacity: opacity === undefined || opacity === null ? 0.85 : opacity,
       // one polygon set per checkbox, whatever the active source (as in the Plotly view)
-      boundaries: { cell: has("cell"), nucleus: has("nucleus"), baysor: has("baysor"), proseg: has("proseg") },
+      boundaries: { cell: has("cell"), nucleus: has("nucleus"), baysor: has("baysor"), proseg: has("proseg"), imgseg: has("imgseg") },
       transcripts: { genes: tool === "xenium" ? (txGenes || []) : [], qv: 20, size: 2 },
       tool: tool_ || "pan",
       density: densityState(),
@@ -690,7 +690,9 @@
       setTimeout(function () { u.resize(); }, 60);
       var corrected = countsMode === "corrected";
       u.setState({
-        source: source + (corrected ? "|corr" : ""),
+        // a joint cluster set brings its own embedding of all samples (served when it exists)
+        source: source + (corrected ? "|corr" : "") +
+          (tool === "xenium" && /^joint_clusters/.test(method || "") ? "|emb:" + method : ""),
         dataVersion: [dataVersion, splitDone, corrected ? 1 : 0].join("|"),
         color: {
           mode: colorBy || "cluster", method: method || "", gene: gene || "",

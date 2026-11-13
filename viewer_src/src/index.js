@@ -4,7 +4,7 @@ import {Deck, OrthographicView} from '@deck.gl/core';
 import {ScatterplotLayer, PathLayer, PolygonLayer, LineLayer, BitmapLayer} from '@deck.gl/layers';
 import {parseBin, packBin} from './wire.js';
 import {
-  colormapCss, dimUnselected, fillCategorical, fillContinuous, fillDensity, fillUniform, hexToRgb,
+  colormapCss, dimUnselected, fillCategorical, fillContinuous, fillDensity, fillDensityCategorical, fillUniform, hexToRgb,
   MISSING_RGB, TX_PALETTE,
 } from './colormap.js';
 import {pointsInPolygon, PointGrid} from './spatial.js';
@@ -24,6 +24,7 @@ const BOUNDARY_STYLE = {
   nucleus: {color: [255, 159, 67, 220], label: 'nucleus boundaries'},
   proseg: {color: [46, 213, 115, 220], label: 'Proseg boundaries'},
   baysor: {color: [162, 155, 254, 220], label: 'Baysor boundaries'},
+  imgseg: {color: [255, 107, 157, 220], label: 'Image-segmentation boundaries'},
 };
 const BOUNDARY_KINDS = Object.keys(BOUNDARY_STYLE);
 
@@ -86,7 +87,7 @@ function defaultState() {
     hiddenCategories: [],
     pointSize: 3,
     opacity: 0.8,
-    boundaries: {cell: false, nucleus: false, proseg: false, baysor: false},
+    boundaries: {cell: false, nucleus: false, proseg: false, baysor: false, imgseg: false},
     transcripts: {genes: [], qv: 20, size: 2},
     // heat layer of binned transcripts under the cells: one gene ('__all__': every gene),
     // bin size in µm, colour maximum (null: the server's default), version (cache buster)
@@ -810,10 +811,17 @@ class Viewer {
     return parts.filter((p) => p.w > 0 && p.h > 0);
   }
 
+  /** Colours of a categorical density response (value i → palette[i - 1]), or null. */
+  _densityPalette(d) {
+    const p = d && d.header.palette;
+    return Array.isArray(p) && p.length ? p : null;
+  }
+
   _densityLayer() {
     const d = this._densityData();
     if (!d) return null;
-    const vmax = this._densityMax();
+    const pal = this._densityPalette(d);
+    const vmax = pal ? -1 : this._densityMax();
     const parts = this._densityParts(d);
     if (!d.images || d.imageMax !== vmax) {
       // one texel per value; rebuilt only when the data or the colour maximum changes
@@ -821,7 +829,8 @@ class Viewer {
         const n = p.w * p.h;
         const rgba = new Uint8ClampedArray(4 * n);
         const off = p.offset || 0;
-        fillDensity(rgba, d.arrays.values.subarray(off, off + n), n, vmax, 'magma');
+        if (pal) fillDensityCategorical(rgba, d.arrays.values.subarray(off, off + n), n, pal);
+        else fillDensity(rgba, d.arrays.values.subarray(off, off + n), n, vmax, 'magma');
         return new ImageData(rgba, p.w, p.h);
       });
       d.imageMax = vmax;
@@ -906,7 +915,7 @@ class Viewer {
         console.error('[XeniumViewer] extra layers', err);
       }
     }
-    const layers = [...extra, ...(L.density || []), L.cells, L.nucleus, L.cell, L.proseg, L.baysor, L.tx, ...(L.overlays || [])].filter(Boolean);
+    const layers = [...extra, ...(L.density || []), L.cells, L.nucleus, L.cell, L.proseg, L.baysor, L.imgseg, L.tx, ...(L.overlays || [])].filter(Boolean);
     this.deck.setProps({layers, viewState: this.viewState});
   }
 
@@ -1008,12 +1017,28 @@ class Viewer {
       const box = el('div', 'xv-box');
       box.dataset.kind = 'density';
       box.appendChild(el('div', 'xv-title', dens.header.label || 'Transcript density'));
-      const bar = el('div', 'xv-bar');
-      bar.style.background = colormapCss('magma');
-      box.appendChild(bar);
-      const range = el('div', 'xv-range');
-      range.append(el('span', 'xv-min', '0'), el('span', 'xv-max', fmt(this._densityMax())));
-      box.appendChild(range);
+      const pal = this._densityPalette(dens);
+      if (pal) {
+        // a categorical layer: one row per category (not clickable: it is not the cell colour)
+        const list = el('div', 'xv-list');
+        pal.forEach((color, i) => {
+          const item = el('div', 'xv-item');
+          const sw = el('span', 'xv-swatch');
+          sw.style.background = color;
+          const name = (dens.header.names || [])[i] || String(i + 1);
+          item.append(sw, el('span', 'xv-name', name));
+          item.title = name;
+          list.appendChild(item);
+        });
+        box.appendChild(list);
+      } else {
+        const bar = el('div', 'xv-bar');
+        bar.style.background = colormapCss('magma');
+        box.appendChild(bar);
+        const range = el('div', 'xv-range');
+        range.append(el('span', 'xv-min', '0'), el('span', 'xv-max', fmt(this._densityMax())));
+        box.appendChild(range);
+      }
       legend.appendChild(box);
     }
     const genes = (this.state.transcripts.genes || []).filter(Boolean);
@@ -1387,7 +1412,10 @@ class Viewer {
       boxes.push({title: col.header.label || '', rows});
     }
     const dens = this._densityData();
-    if (dens) boxes.push({title: dens.header.label || 'Transcript density', range: [0, this._densityMax()], cmap: 'magma'});
+    if (dens && this._densityPalette(dens)) {
+      boxes.push({title: dens.header.label || 'Transcript density',
+        rows: this._densityPalette(dens).map((color, i) => ({name: (dens.header.names || [])[i] || String(i + 1), color}))});
+    } else if (dens) boxes.push({title: dens.header.label || 'Transcript density', range: [0, this._densityMax()], cmap: 'magma'});
     const genes = (this.state.transcripts.genes || []).filter(Boolean);
     if (genes.length) {
       boxes.push({title: this._txTitle(), rows: genes.map((name, i) => ({name, color: TX_PALETTE[i % TX_PALETTE.length]}))});

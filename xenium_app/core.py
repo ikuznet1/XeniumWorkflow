@@ -98,6 +98,44 @@ _baysor_lock  = threading.Lock()
 _proseg_state: dict = {"status": "idle", "message": "", "result": None}
 _proseg_lock  = threading.Lock()
 
+# ─── Image-based segmentation state (imgseg: Cellpose / classical) ───────────
+_imgseg_state: dict = {"status": "idle", "message": "", "result": None}
+_imgseg_lock  = threading.Lock()
+
+# Tools whose runs replace the Xenium segmentation: seg-source values "<tool>:<tag>",
+# cache directories "<tool>_<dataset>_…", zarr "spatialdata_<tool>.zarr".
+_SEG_TOOL_LABELS = {"baysor": "Baysor", "proseg": "Proseg", "imgseg": "Image segmentation"}
+
+
+def _seg_state(tool: str) -> tuple:
+    """(state dict, lock) of a resegmentation tool, (None, None) for anything else."""
+    if tool == "baysor":
+        return _baysor_state, _baysor_lock
+    if tool == "proseg":
+        return _proseg_state, _proseg_lock
+    if tool == "imgseg":
+        return _imgseg_state, _imgseg_lock
+    return None, None
+
+
+def _seg_states() -> list:
+    """[(tool, lock, state)] of every resegmentation tool."""
+    return [(t,) + _seg_state(t)[::-1] for t in _SEG_TOOL_LABELS]
+
+
+def _seg_result(seg_source, done_only: bool = False):
+    """The loaded result of the tool *seg_source* names ("<tool>" or "<tool>:<tag>"),
+    None for Xenium or when nothing is loaded (done_only: also while the tool's state is
+    not "done")."""
+    state, lock = _seg_state(_seg_tool(seg_source))
+    if state is None:
+        return None
+    with lock:
+        if done_only and state.get("status") != "done":
+            return None
+        return state.get("result")
+
+
 # ─── SpaGE imputation state ───────────────────────────────────────────────────
 _spage_state: dict = {"status": "idle", "message": "", "result": None,
                       "result_path": None, "result_genes": None}
@@ -205,5 +243,5 @@ CELLTYPIST_MODELS = {
 # ─── Callbacks ────────────────────────────────────────────────────────────────
 
 def _seg_tool(seg_source: str) -> str:
-    """Extract tool name from seg-source value: 'xenium', 'baysor', or 'proseg'."""
+    """Extract tool name from seg-source value: 'xenium', 'baysor', 'proseg' or 'imgseg'."""
     return (seg_source or "xenium").split(":")[0]

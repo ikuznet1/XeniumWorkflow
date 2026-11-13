@@ -1,10 +1,11 @@
 """Callbacks: Baysor / Proseg, the resegmentation modal, cached runs."""
 
 import os
+import dash
 from dash import no_update
 from dash import Input, Output, State, callback_context
 
-from . import core, jobs, caching, reseg, clustering, app_layout
+from . import core, jobs, caching, reseg, clustering, imgseg, app_layout
 
 
 # ─── Baysor callbacks ─────────────────────────────────────────────────────────
@@ -173,6 +174,8 @@ def switch_reseg_tab(algo):
     run_btn_proseg_style = {**run_btn_baysor_style, "backgroundColor": "#2d6a4f"}
     if algo == "proseg":
         return hide, show, run_btn_proseg_style
+    if algo == "imgseg":
+        return hide, hide, {**run_btn_baysor_style, "backgroundColor": "#9c3d6b"}
     return show, hide, run_btn_baysor_style
 
 
@@ -216,6 +219,8 @@ def run_reseg_modal(n_clicks, algo, patches_confirmed,
                     bxmin, bxmax, bymin, bymax, bscale, bscale_std, bmin_mol, bn_clusters, buse_patches, buse_prior, bprior_conf, bprior_type,
                     pxmin, pxmax, pymin, pymax, pvoxel, pthreads, psamples,
                     precorded_samples, pschedule, pnuclear_prob, pprior_seg_prob, pprior_type):
+    if algo == "imgseg":
+        raise dash.exceptions.PreventUpdate          # run_imgseg_modal handles this tab
     if not patches_confirmed:
         return "✗ Please confirm patches in Step 1 before running segmentation.", no_update, no_update, no_update
     # "Skip - run on full tissue" overrides patches left over from earlier in the session
@@ -285,6 +290,10 @@ def update_reseg_status(baysor_done, proseg_done):
         return f"\u2713 Baysor: {b_msg}"
     if p_status == "done":
         return f"\u2713 Proseg: {p_msg}"
+    with core._imgseg_lock:
+        i_status, i_msg = core._imgseg_state["status"], core._imgseg_state["message"]
+    if i_status == "done":
+        return f"\u2713 Image segmentation: {i_msg}"
     return ""
 
 
@@ -404,6 +413,10 @@ def confirm_seg_delete(n_clicks, seg_value, baysor_ver, proseg_ver):
             with core._proseg_lock:
                 if (core._proseg_state.get("result") or {}).get("out_dir", "") == out_dir:
                     core._proseg_state.update({"status": "idle", "message": "", "result": None})
+        elif tool == "imgseg":
+            with core._imgseg_lock:
+                if (core._imgseg_state.get("result") or {}).get("out_dir", "") == out_dir:
+                    core._imgseg_state.update({"status": "idle", "message": "", "result": None})
     return False, "xenium", (baysor_ver or 0) + 1, (proseg_ver or 0) + 1
 
 
@@ -427,6 +440,9 @@ def update_boundary_options(baysor_done, proseg_done, _ds_version, boundary_opts
             updated_boundary.append({**opt, "disabled": not proseg_ready})
         elif v == "baysor":
             updated_boundary.append({**opt, "disabled": not baysor_ready})
+        elif v == "imgseg":
+            updated_boundary.append({**opt, "disabled": not (core._imgseg_state["status"] == "done"
+                                                             and core._imgseg_state["result"] is not None)})
         else:
             updated_boundary.append(opt)
 
@@ -445,6 +461,11 @@ def update_boundary_options(baysor_done, proseg_done, _ds_version, boundary_opts
         is_current = (c["out_dir"] == current_proseg_dir)
         label = ("\u2605 " if is_current else "") + c["label"]
         seg_opts.append({"label": label, "value": c["value"]})
+    current_imgseg_dir = (core._imgseg_state.get("result") or {}).get("out_dir", "")
+    for c in cached:
+        if c["value"].startswith("imgseg:"):
+            seg_opts.append({"label": ("\u2605 " if c["out_dir"] == current_imgseg_dir else "") + c["label"],
+                             "value": c["value"]})
 
     return updated_boundary, seg_opts
 
@@ -514,3 +535,222 @@ def load_seg_run_from_cache(seg_value, baysor_ver, proseg_ver):
     jobs._job_start(tool, f"Load cached {tool.capitalize()} run [{param_tag}]", loader,
                args=(out_dir,), state=state, lock=lock)
     return (no_update, no_update) + poll_on
+
+
+# ─── Image-based segmentation (third tab of the modal) ────────────────────────
+
+@app_layout.app.callback(
+    Output("modal-imgseg-panel", "style"),
+    Output("iseg-backend",       "options"),
+    Output("iseg-backend",       "value"),
+    Output("iseg-backend-note",  "children"),
+    Output("iseg-channel",       "options"),
+    Output("iseg-channel",       "value"),
+    Output("iseg-channel-cyto",  "options"),
+    Input("reseg-algo-tabs",         "value"),
+    Input("reseg-patches-confirmed", "data"),
+    State("iseg-backend",            "value"),
+    State("iseg-channel",            "value"),
+    prevent_initial_call=True,
+)
+def switch_imgseg_tab(algo, _confirmed, backend, channel):
+    """Show the panel on its tab and fill it with what this machine and this dataset have:
+    the usable backends (Cellpose only with local weights) and the image's channels."""
+    if algo != "imgseg":
+        return {"display": "none"}, no_update, no_update, no_update, no_update, no_update, no_update
+    opts = imgseg._iseg_backend_options()
+    values = [o["value"] for o in opts if not o.get("disabled")]
+    st = imgseg._iseg_cellpose_status()
+    note = "Cellpose: " + st["message"]
+    chans = imgseg._iseg_channels()
+    if not chans:
+        note += ("\nThe morphology image is read from the dataset's SpatialData store: run Step 1 "
+                 "(Prepare Patches) to list its channels.")
+    ch_opts = [{"label": c, "value": c} for c in chans]
+    return ({}, opts, backend if backend in values else "classical", note, ch_opts,
+            channel if channel in chans else imgseg._iseg_default_channel(chans), ch_opts)
+
+
+@app_layout.app.callback(
+    Output("iseg-xmin", "value"),
+    Output("iseg-xmax", "value"),
+    Output("iseg-ymin", "value"),
+    Output("iseg-ymax", "value"),
+    Input("iseg-use-viewport", "n_clicks"),
+    State("spatial-relayout", "data"),
+    prevent_initial_call=True,
+)
+def imgseg_fill_viewport(n_clicks, relayout):
+    r = relayout or {}
+    x0, x1 = r.get("xaxis.range[0]"), r.get("xaxis.range[1]")
+    y0, y1 = r.get("yaxis.range[0]"), r.get("yaxis.range[1]")
+    if not n_clicks or None in (x0, x1, y0, y1):
+        return no_update, no_update, no_update, no_update
+    # plot y = -y µm
+    return round(float(x0), 1), round(float(x1), 1), round(-float(y1), 1), round(-float(y0), 1)
+
+
+@app_layout.app.callback(
+    Output("iseg-run-request", "data"),
+    Input("reseg-modal-run-btn", "n_clicks"),
+    State("reseg-algo-tabs",     "value"),
+    prevent_initial_call=True,
+)
+def request_imgseg_run(n_clicks, algo):
+    """Run on the Image tab: hand the click to run_imgseg_modal. (Two callbacks that write
+    the same output with allow_duplicate must not have the same inputs, and the Run button
+    is the input of run_reseg_modal.)"""
+    if not n_clicks or algo != "imgseg":
+        raise dash.exceptions.PreventUpdate
+    return n_clicks
+
+
+@app_layout.app.callback(
+    Output("reseg-modal-run-status", "children", allow_duplicate=True),
+    Output("reseg-modal",            "is_open",  allow_duplicate=True),
+    Output("imgseg-poll",            "disabled", allow_duplicate=True),
+    Input("iseg-run-request", "data"),
+    State("reseg-algo-tabs",         "value"),
+    State("reseg-patches-confirmed", "data"),
+    State("iseg-backend",      "value"),
+    State("iseg-channel",      "value"),
+    State("iseg-channel-cyto", "value"),
+    State("iseg-xmin", "value"),
+    State("iseg-xmax", "value"),
+    State("iseg-ymin", "value"),
+    State("iseg-ymax", "value"),
+    State("iseg-diameter", "value"),
+    State("iseg-expand",   "value"),
+    State("iseg-min-tx",   "value"),
+    State("iseg-patch",    "value"),
+    State("iseg-thr",      "value"),
+    State("iseg-flow",     "value"),
+    State("iseg-cellprob", "value"),
+    State("iseg-gpu",      "value"),
+    prevent_initial_call=True,
+)
+def run_imgseg_modal(n_clicks, algo, patches_confirmed, backend, channel, channel_cyto,
+                     xmin, xmax, ymin, ymax, diameter, expand, min_tx, patch, thr, flow, cellprob, gpu):
+    if not n_clicks or algo != "imgseg":
+        raise dash.exceptions.PreventUpdate
+    if not patches_confirmed:
+        return "✗ Please confirm patches in Step 1 before running segmentation.", no_update, no_update
+    backend = backend or "classical"
+    if backend.startswith("cellpose"):
+        st = imgseg._iseg_cellpose_status()
+        if not st["available"] or (":" in backend and backend.split(":", 1)[1] not in st["models"]):
+            return "✗ " + st["message"], no_update, no_update
+    if not channel:
+        return ("✗ Pick the nuclear channel (the channels are listed once Step 1 has built the "
+                "SpatialData store)."), no_update, no_update
+    if diameter is None or diameter <= 0:
+        return "✗ The nucleus diameter must be positive.", no_update, no_update
+    with core._imgseg_lock:
+        if core._imgseg_state["status"] == "running":
+            return "Already running…", True, False
+        core._imgseg_state.update({"status": "running", "message": "Starting…", "result": None,
+                                   "loading_out_dir": None})
+    channels = ([channel_cyto] if channel_cyto and channel_cyto != channel and backend.startswith("cellpose")
+                else []) + [channel]
+    region = {k: v for k, v in dict(x_min=xmin, x_max=xmax, y_min=ymin, y_max=ymax).items() if v is not None}
+    jobs._job_start("imgseg", "Image segmentation" + (" (region)" if region else ""), imgseg._run_imgseg,
+                    kwargs=dict(backend=backend, channels=channels, diameter_um=float(diameter),
+                                expand_um=float(expand or 0.0),
+                                min_tx=imgseg._ISEG_MIN_TX if min_tx is None else int(min_tx),
+                                patch_um=float(patch or imgseg._ISEG_PATCH_UM), thr_scale=float(thr or 1.0),
+                                flow_threshold=0.4 if flow is None else float(flow),
+                                cellprob_threshold=0.0 if cellprob is None else float(cellprob),
+                                gpu="yes" in (gpu or []), **region),
+                    state=core._imgseg_state, lock=core._imgseg_lock)
+    return "Image segmentation starting…", False, False
+
+
+@app_layout.app.callback(
+    Output("imgseg-status", "children"),
+    Output("imgseg-poll",   "disabled", allow_duplicate=True),
+    Output("proseg-done",   "data",     allow_duplicate=True),
+    Output("seg-source",    "value",    allow_duplicate=True),
+    Output("reseg-status",  "children", allow_duplicate=True),
+    Input("imgseg-poll",    "n_intervals"),
+    State("proseg-done",    "data"),
+    State("seg-source",     "value"),
+    prevent_initial_call=True,
+)
+def poll_imgseg(_, done_version, seg_value=None):
+    """As poll_baysor / poll_proseg. "proseg-done" is the version every callback that
+    depends on the loaded resegmentation listens to, so it is bumped here as well."""
+    with core._imgseg_lock:
+        status  = core._imgseg_state["status"]
+        message = core._imgseg_state["message"]
+        out_dir = (core._imgseg_state.get("result") or {}).get("out_dir", "")
+    if status == "done":
+        param_tag = os.path.basename(out_dir).split("_")[-1] if out_dir else ""
+        return (f"✓ {message}", True, (done_version or 0) + 1,
+                f"imgseg:{param_tag}" if param_tag else "imgseg", no_update)
+    if status == "error":
+        if not out_dir and core._seg_tool(seg_value) == "imgseg":
+            return f"✗ {message}", True, (done_version or 0) + 1, "xenium", f"✗ Image segmentation: {message}"
+        return f"✗ {message}", True, no_update, no_update, f"✗ Image segmentation: {message}"
+    if status == "idle":
+        return no_update, True, no_update, no_update, no_update
+    return message, False, no_update, no_update, f"Image segmentation: {message}"
+
+
+@app_layout.app.callback(
+    Output("iseg-load-request", "data"),
+    Input("seg-source",         "value"),
+    State("iseg-load-request",  "data"),
+    prevent_initial_call=True,
+)
+def request_imgseg_load(seg_value, previous=None):
+    """An image-segmentation run was selected: hand it to load_imgseg_run_from_cache (the
+    dropdown itself is the input of load_seg_run_from_cache, see request_imgseg_run)."""
+    if not seg_value or core._seg_tool(seg_value) != "imgseg" or ":" not in seg_value:
+        raise dash.exceptions.PreventUpdate
+    return {"value": seg_value, "n": int((previous or {}).get("n", 0)) + 1}
+
+
+@app_layout.app.callback(
+    Output("seg-source",  "value",    allow_duplicate=True),
+    Output("imgseg-poll", "disabled", allow_duplicate=True),
+    Input("iseg-load-request", "data"),
+    prevent_initial_call=True,
+)
+def load_imgseg_run_from_cache(request):
+    """Selecting a cached image-segmentation run loads it (see load_seg_run_from_cache)."""
+    seg_value = request.get("value") if isinstance(request, dict) else request
+    if not seg_value or core._seg_tool(seg_value) != "imgseg" or ":" not in seg_value:
+        raise dash.exceptions.PreventUpdate
+    param_tag = seg_value.split(":", 1)[1]
+    run = next((r for r in caching._list_cached_seg_runs() if r["value"] == seg_value), None)
+    if run is None:
+        print(f"  Image segmentation: no cached run '{param_tag}' for this dataset", flush=True)
+        raise dash.exceptions.PreventUpdate
+    out_dir = run["out_dir"]
+    state, lock = core._imgseg_state, core._imgseg_lock
+    with lock:
+        if (state.get("result") or {}).get("out_dir", "") == out_dir and state["status"] == "done":
+            raise dash.exceptions.PreventUpdate
+        busy = state["status"] == "running"
+        busy_dir = state.get("loading_out_dir") if busy else None
+        if not busy:
+            state.update({"status": "running", "message": "Loading cached image segmentation…",
+                          "loading_out_dir": out_dir, "result": None})
+    if busy:
+        back = f"imgseg:{os.path.basename(busy_dir).split('_')[-1]}" if busy_dir else "xenium"
+        return (no_update if back == seg_value else back), False
+    jobs._job_start("imgseg", f"Load cached image segmentation [{param_tag}]", imgseg._load_cached_imgseg,
+                    args=(out_dir,), state=state, lock=lock)
+    return no_update, False
+
+
+@app_layout.app.callback(
+    Output("jobs-poll", "disabled", allow_duplicate=True),
+    Input("imgseg-poll", "disabled"),
+    State("jobs-poll",   "disabled"),
+    prevent_initial_call=True,
+)
+def wake_jobs_poll_imgseg(_poll, poll_disabled):
+    if jobs._jobs_panel_rows() and poll_disabled:
+        return False
+    return no_update

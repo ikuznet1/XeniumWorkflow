@@ -222,7 +222,8 @@ def run_de(n_clicks, group_a, group_b, seg_source, method, color_by, counts_mode
                             args=(prox_target, prox_anchor, prox_labels, seg_source or "xenium", method,
                                   counts_mode == "corrected",
                                   {"near": prox_near, "far": prox_far, "n_random": prox_nrand,
-                                   "fit_length": "on" in (prox_length or [])},
+                                   "fit_length": "on" in (prox_length or []),
+                                   "leak_gate": options["leak_gate"]},
                                   prox_source or "auto"),
                             state=analysis._de_state, lock=analysis._de_lock)
             return True, False, "Running…"
@@ -238,6 +239,7 @@ def run_de(n_clicks, group_a, group_b, seg_source, method, color_by, counts_mode
                         args=(prox_target, prox_anchor, prox_labels, seg_source or "xenium", method,
                               counts_mode == "corrected", contact_radius, contact_min_cells,
                               contact_nshuffle),
+                        kwargs={"leak_gate": options["leak_gate"]},
                         state=analysis._de_state, lock=analysis._de_lock, copy_context=True)
         return True, False, "Running…"
     if mode == "pseudobulk":
@@ -514,13 +516,16 @@ def delete_geneset(n_clicks, name, version, color_by):
     Output("density-gene", "options"),
     Output("density-gene", "value"),
     Input("dataset-version", "data"),
+    Input("txf-done", "data"),
     State("density-gene", "value"),
 )
-def update_density_gene_options(_ds_version, current=None):
+def update_density_gene_options(_ds_version, _txf_done=None, current=None):
     panel = sorted(dataview._panel_gene_names())
+    virtual = [o for prov in list(analysis._density_virtual_providers.values()) for o in prov["options"]()]
     opts = ([{"label": "All genes (every gene transcript)", "value": analysis._DENSITY_ALL}]
-            + [{"label": g, "value": g} for g in panel])
-    keep = current if current == analysis._DENSITY_ALL or current in set(panel) else None
+            + virtual + [{"label": g, "value": g} for g in panel])
+    keep = (current if current == analysis._DENSITY_ALL or current in set(panel)
+            or current in {o["value"] for o in virtual} else None)
     return opts, (no_update if keep == current else keep)
 
 
@@ -537,6 +542,8 @@ def run_density(n_clicks, gene):
         raise dash.exceptions.PreventUpdate
     if not gene:
         return False, True, "Pick a gene (or 'All genes')."
+    if analysis._density_virtual(gene) is not None:
+        return False, True, "This layer is not a gene's transcript grid: it is computed in its own tab."
     if not any(s["data_dir"] for s in analysis._density_samples()):
         return False, True, ("Transcript density needs the Xenium output directory "
                              "(transcripts.parquet); this dataset was loaded from a .zarr.")
@@ -579,8 +586,9 @@ def poll_density(_, done_ver):
     Input("density-done",    "data"),
     Input("dataset-version", "data"),
     Input("extra-datasets-version", "data"),
+    Input("txf-done", "data"),
 )
-def update_density_store(enable, gene, bin_um, opacity, vmax, done_ver, ds_version, extra_ver=0):
+def update_density_store(enable, gene, bin_um, opacity, vmax, done_ver, ds_version, extra_ver=0, txf_ver=0):
     """What both renderers draw as the heat layer: {on, gene, bin, opacity, max, version}.
     With several samples the layer is on as soon as one of them has a grid; the hint
     names the samples that have none yet."""
@@ -589,7 +597,9 @@ def update_density_store(enable, gene, bin_um, opacity, vmax, done_ver, ds_versi
     ready = bool(st["ready"])
     multi = len(analysis._density_samples()) > 1
     hint = ""
-    if gene and not ready:
+    if gene and analysis._density_virtual(gene) is not None:
+        hint = analysis._density_virtual(gene)["hint"](gene)
+    elif gene and not ready:
         hint = "No grid for this gene yet: press Compute."
     elif gene and ready:
         name = "all genes" if gene == analysis._DENSITY_ALL else gene
@@ -613,7 +623,8 @@ def update_density_store(enable, gene, bin_um, opacity, vmax, done_ver, ds_versi
     return ({"on": bool(want and ready), "gene": gene, "bin": bin_um or 10,
              "opacity": 0.7 if opacity is None else opacity,
              "max": vmax if vmax else None,
-             "version": f"{ds_version}|{done_ver}" + (f"|{extra_ver}" if extra_ver else "")}, hint)
+             "version": f"{ds_version}|{done_ver}" + (f"|{extra_ver}" if extra_ver else "")
+                        + (f"|f{txf_ver}" if txf_ver else "")}, hint)
 
 
 # The heat layer and the gene-set colours in the WebGL view (the Plotly view gets both

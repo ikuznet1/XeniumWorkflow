@@ -249,7 +249,7 @@ def _raw_cluster_labels(samples, method, alt) -> list:
         if lab is None:
             out.append(None)
             continue
-        out.append(np.array([None if x is None else re.sub(r"^S\d+:C", "", str(x)) for x in lab],
+        out.append(np.array([None if x is None else re.sub(r"^(S\d+:)?C", "", str(x)) for x in lab],
                             dtype=object))
     return out
 

@@ -346,11 +346,11 @@ Tests that compare **samples** (pseudobulk differential expression, composition)
 - **Per sample**: log1p(count / library size × 10,000) of every T cell is residualised (ordinary least squares) on log1p(library size) and on decile bins of the local fraction of the **density-covariate** type (cells within 50 µm; default: the type that contributes the most transcripts; "none" drops the term). d is the distance to the nearest X cell of the same sample.
 - **Effect** (table column *Near − far*, the volcano's x axis, in log2 units): mean residual of the T cells with d ≤ **Near** (default 25 µm) minus that of the T cells with d ≥ **Far** (default 100 µm). **Slope**: OLS slope of the residual on −log(d + 1). A sample needs ≥ 100 T cells, ≥ 5 X cells, ≥ 5 near and ≥ 50 far cells; genes detected (≥ 1 transcript) in fewer than 2 % of the T cells are not tested.
 - **Matched random anchors** (default 99 sets): as many non-X cells as there are X cells, drawn within the same compartment × edge-distance stratum (the columns of the Confound Controls tab; the defaults are computed when they are missing, and the status line says so), put through the same computation. They answer "what does any set of cells sitting where X sits produce?".
-- **p-values**: with ≥ 3 independent units (donors when every included sample has one, else samples; *Samples & conditions…*) the **exact sign-flip test** of the per-unit effects — the status line gives n and the smallest achievable p. With fewer units (a **single sample**) p is the share of random anchor sets at least as far from their mean as the observed effect; the status line marks this as a single-sample result that does not generalise.
+- **p-values**: with ≥ 3 independent units (donors when every included sample has one, else samples; *Samples & conditions…*) the **exact sign-flip test** of the per-unit effects, with the limits of the sample-level tests (*Samples and conditions*): all 2^n sign vectors up to 16 units, 20,000 random sign vectors with a fixed seed above — the status line gives n and the smallest achievable p. With fewer units (a **single sample**) p is the share of random anchor sets at least as far from their mean as the observed effect; the status line marks this as a single-sample result that does not generalise.
 - **Empirical FDR** (column *Emp. FDR*, the volcano's y axis): the number of genes the random sets yield at a gene's threshold divided by the number observed (never 0, made monotone). In the cohort mode the random sets' sign-flip p-values are used, in the single-sample mode |z| against the random sets with every random set scored against the others.
 - When fewer than half of the random sets leave enough near and far cells in every unit (anchors as numerous as an abundant type cover the tissue), p and FDR are taken from the **slope** instead and the status line says so; if that fails too, the cohort mode falls back to Benjamini–Hochberg and the single-sample mode refuses.
 - **Specific**: not reproduced by up to 3 other anchor types of similar abundance (within 3×): in the cohort mode same sign in ≥ 5/7 of the units, in the single-sample mode same direction and beyond the random sets at p ≤ 0.05.
-- **Leak gate**: the gate of the other tests is run for T near X against T far from X, and genes that X owns and T does not (Confound Controls → gene ownership) are flagged as well: next to X, T cells pick up X transcripts. Flagged genes are open orange diamonds in the volcano; *X ÷ T rate* shows how much more X expresses a gene. Genes with X as top owner that T also carries are counted in the status line.
+- **Leak gate**: the gate of the other tests is run for T near X against T far from X, and genes that X owns and T does not (Confound Controls → gene ownership) are flagged as well: next to X, T cells pick up X transcripts. Flagged genes are open orange diamonds in the volcano; *X ÷ T rate* shows how much more X expresses a gene. Genes with X as top owner that T also carries are counted in the status line. The gate's change rule is applied to the genes with an empirical FDR below 0.10 or a pooled |log2 change| of at least 0.5 (see *Leak gate in Differential Expression*). Unticking **Gene ownership + leak gate** switches ownership and gate off for this mode too: no gene is then flagged, and the status line says so.
 - **Between conditions**: with a design that gives ≥ 3 units per condition the per-sample effects are also tested A − B (columns *A − B*, *p (A vs B)*, BH FDR).
 - **Fit exp(−d / L)** (optional): per gene and sample the length L (grid 2–600 µm) for which residual ~ a + b·exp(−d / L) fits best; the table gives the median L and R². R² is small for most genes.
 - Honours the segmentation, the subset and Active Counts. **Timing**: 112,551-cell Prime 5K skin section, 99 random sets: 10,816 fibroblasts near 263 mast cells 4.8 s; 62,817 T cells near 3,427 macrophages 10.5 s headless, 7.8 s in the app.
@@ -366,7 +366,7 @@ Tests that compare **samples** (pseudobulk differential expression, composition)
 - **Model**: pseudobulk = Σ weight × counts per sample × group, rounded to whole counts, fitted with `~ sample + group` through the same R bridge as the pseudobulk mode (DESeq2, else edgeR, else refused with the install hint). With donors on every used sample, samples of one donor are summed into one block. The unit of the p-values is the sample (block); the status line states n.
 - **Refusal**: fewer than 2 samples with at least **Min. cells / sample / group** (default 20) in both groups → no test, with the counts per sample and a pointer to the proximity mode. A Baysor / Proseg run is one sample.
 - **Label shuffle** (default 199, 0 to skip): contact / comparator labels are permuted within sample × stratum, weights and fit are redone, and the number of genes passing (FDR < 0.05, |log2FC| > 0.5, not flagged) is compared with the observed number: P = (1 + shuffles with at least as many) / (1 + shuffles). Every shuffle is a model fit (about 4–6 s for 4,200 genes × 12 pseudobulks), so 199 take a quarter of an hour; the job shows progress and can be cancelled.
-- **Leak gate** per sample (contact = arm A); genes X owns and T does not are flagged too and never count as passing.
+- **Leak gate** per sample (contact = arm A); genes X owns and T does not are flagged too and never count as passing. With **Gene ownership + leak gate** unticked neither is computed, nothing is flagged and *pass* is FDR and effect size alone (stated in the status line).
 - Uses the active counts mode (SPLIT-corrected counts are summed and rounded as well).
 - Reimplemented from an earlier spatial study by the author (the matching weights equal that code's on fabricated data). Changed here: one generic comparison instead of fixed cell states; weighted sums are rounded because DESeq2 needs integers (the original fitted fractional sums with edgeR); the shuffle null counts passing genes as there.
 
@@ -450,6 +450,89 @@ other cells too. The null of the concentration statistics gives every tissue til
 probability, so a tissue that is unevenly dense in everything shows some excess for every
 gene; compare with a gene that should be uniform. With the area from cells, the denominator
 still depends on where the segmentation found cells (but not on what it called them).
+
+### Transcript factors (segmentation-free factorisation)
+
+**Plots panel → Transcript Factors.** Finds expression programs and where they lie **without
+using any cell**: the gene transcripts are counted on a grid, the bin × gene counts are
+factorised, and the result is laid under the segmented cells to show where a cell collects
+transcripts of more than one program.
+
+> This is a **simplified transcript-binning factorisation in the spirit of FICTURE** (Si et
+> al., *Nat Methods* 2024, doi:10.1038/s41592-024-02415-2). It is **not that tool**: there are
+> no anchors, no sliding or overlapping windows and no pixel-level decoding; a factor is
+> resolved to the bin, not to the transcript.
+
+| Control | What it does |
+|---------|--------------|
+| **Method** | *NMF (KL loss)*: non-negative matrix factorisation with the Kullback-Leibler loss (the Poisson likelihood), scikit-learn's multiplicative updates from an NNDSVDa start, until no factor's gene distribution moves by more than 0.5 % (L1) in 15 updates, at most 150 updates. *LDA (online)*: scikit-learn's online variational latent Dirichlet allocation (Hoffman et al. 2010), 5 passes in minibatches of 2,048 bins. *Reference: cell-type profiles*: nothing is fitted - the components are the mean profiles of the cell types of the chosen annotation (Σ counts of the type ÷ Σ over the genes, active counts mode; types with fewer than 20 cells are left out and named), so the factors carry the type names. |
+| **K** | Number of factors (2 - 60; default 12; ignored in the reference mode). |
+| **Bin (µm)**, **square / hexagon** | Square bins of that side, or regular hexagons whose centres are that far apart (area √3⁄2 × bin²). Default 10 µm. |
+| **≥ transcripts per bin** | Bins with fewer transcripts (default 10) are not used for the fit and get no dominant factor on the map; they are still projected. |
+| **Fit on ≤ bins** | The loadings are fitted on a random subsample of the eligible bins (default 20,000; fixed seed), pooled over the samples. |
+| **Seed** | Seed of the subsample and of the initialisation (default 0). |
+| **Cell types from** | The annotation (or the active cluster set) the factors are compared with; required for the reference mode. |
+| **Map layer** | *Dominant factor per bin* (one colour per factor, bins below the transcript minimum left empty) or the transcripts of one factor per bin, drawn **under the cells in both renderers** through the heat layer of the Transcript Density tab (its opacity and colour maximum apply; the layers are also listed in its gene picker). |
+
+**What is computed.**
+
+1. **Bins.** `transcripts.parquet` (or the tiles of `transcripts.zarr.zip`) is read one row
+   group at a time with the filter of the cell-feature matrix pushed down (**Q ≥ 20, gene
+   features only**, panel genes); a batch is reduced to its (bin, gene) counts at once and the
+   counts are merged in chunks, so the transcripts are never all in memory. The bin × gene
+   matrix is sparse and is cached per sample, bin size and shape
+   (`txfactor_<dataset>/counts__…npz`): another K, method or seed does not read the transcripts
+   again.
+2. **Fit** on the subsample → gene loadings, one distribution over the genes per factor.
+3. **Projection** of every bin onto the loadings: the factor counts W ≥ 0 that minimise the
+   Kullback-Leibler divergence of the bin's counts from W · loadings, by the multiplicative
+   (EM) update with the loadings fixed. A bin's factor counts sum to its transcripts, so a
+   factor's value is "transcripts of this bin attributed to the factor". For LDA this is the
+   maximum-likelihood mixture, **without** the Dirichlet prior of LDA's own inference.
+   Factors are ordered by their share of all transcripts (F1 = largest).
+4. **Table / CSV.** Per factor: share of the transcripts, bins and cells it dominates, the
+   annotated type whose mean profile is most similar to its loadings (cosine) and the
+   commonest type among its cells, and the top genes ranked by loading × ln(lift), where lift
+   = the gene's share of the factor ÷ its share of all transcripts. The CSV lists 50 genes
+   per factor with loading, lift and the share of the gene's transcripts the factor holds,
+   and the cross-tab.
+5. **Against the segmentation** (the cells of the active segmentation and subset): for every
+   cell the factor counts of the bins under it - under its centroid and under six points at
+   0.6 × the radius of a disc of the cell's area (the centroid alone when the table has no
+   area) - are summed into a mixture. Stored per cell and exported by Save as SpatialData as
+   `ctl_txf_dominant`, `ctl_txf_top_share`, `ctl_txf_mixed` and one `ctl_txf_share_<factor>`
+   per factor. **Mixed score** = entropy of the mixture ÷ ln K (0: one factor; 1: all equal).
+   **Color By** offers the mixed score, the share of the dominant factor and the share of
+   every factor. The plot is the cross-tab **cell type × dominant factor** (share of each
+   type's cells); the status line gives its purity, the adjusted Rand index and, in the
+   reference mode, the share of cells whose dominant factor is their own type.
+
+**Several samples.** Each sample is binned on its own grid in its own coordinates and has its
+own count cache; the loadings are fitted once on bins pooled from all samples, and the layer
+is drawn for every sample at its position. A sample loaded from a `.zarr` has no transcript
+file: it is left out and named. A registered, cancellable job with progress (checked between
+row groups, fitting rounds and projection chunks); a finished result is cached per settings
+(`txfactor_<dataset>/fit_<hash>.npz`) and loaded from there when the same run is requested
+again.
+
+**Limits.** (a) A 10 µm bin is larger than most cells, so the mixture "under a cell" describes
+the cell's position, not its own transcripts: a high mixed score marks places where the
+segmentation is likely to mix signals (cell borders, dense infiltrates), it does not prove
+that a given cell is contaminated. (b) NMF and LDA are fitted from one initialisation on one
+subsample: factors that change with the seed or with K are not stable programs. (c) A factor
+is not a cell type; two types with similar profiles share a factor and one type can split
+into several (the table shows the cosine and the commonest type so that this is visible).
+(d) In the reference mode a bin is forced into the given profiles - transcripts of anything
+not in the annotation are attributed to the nearest profile - and the profiles themselves
+carry whatever the segmentation leaked into them. (e) The transcript file is not subset or
+corrected: the cell subset and the counts mode affect the cells compared and the reference
+profiles, not the bins. (f) Hexagons are drawn on a square raster of a quarter of the bin size
+(coarser on very large sections), so their outlines are approximate on the map; the values are
+those of the hexagons.
+
+**Optional packages.** None is required beyond scikit-learn. With `numba` installed (it comes
+with `umap-learn`) the projection runs in compiled code on 4 threads; without it a numpy
+implementation is used (same optimum, slower).
 
 ### Gene-set scores
 
@@ -574,7 +657,7 @@ Per sample: **edge distance** (the cell positions are rasterised into bins, defa
 
 With **Gene ownership + leak gate** ticked (default) and a cell-type annotation present, both DE modes add `owner`, `leak_fraction` and `leak_flag` to the table and CSV (the CSV also has `owners`, `leak_share_a`, `leak_share_b`, `leak_change_frac`, `top_leak_type`); flagged genes are open orange diamonds on the volcano and the status line says how many genes, and how many of the significant ones, were flagged.
 
-- **Model**: leakage adds leak(L) × (profile of neighbouring type L) to the focal cells. Predicted leaked signal of a gene = Σ_L leak(L) × its counts per million in L. **Flag** when the predicted leak is more than half of the observed signal in either group, or when the leak alone predicts at least half of the observed log fold change. In the pseudobulk mode every sample is a section with its own leak and neighbour profiles and the groups are averaged over sections; in the cell-level mode each group is one pooled section.
+- **Model**: leakage adds leak(L) × (profile of neighbouring type L) to the focal cells. Predicted leaked signal of a gene = Σ_L leak(L) × its counts per million in L. **Flag** when the predicted leak is more than half of the observed signal in either group, or when the leak alone predicts at least half of the observed log fold change. The second (change) rule is applied only to genes **whose change is called** (FDR < 0.05 in the two DE modes, the mode's FDR threshold in the proximity and contact modes) **or whose pooled |log2 change| is at least 0.5**: the explained share is a ratio, and for a change that is noise around zero it is a ratio of two small numbers that exceeds one half by chance. Other genes are judged by the signal rule alone. The status line gives the number of genes flagged by each rule and the number the change rule was applied to; `leak_change_frac` is in the CSV for every gene. In the pseudobulk mode every sample is a section with its own leak and neighbour profiles and the groups are averaged over sections; in the cell-level mode each group is one pooled section.
 - **Measuring leak(L)** differs from the original, which chose marker genes the focal type does not express in a paired single-nucleus reference. Without a reference: a gene's focal ÷ L ratio is the leak plus the focal type's own expression, so the leak cannot exceed the lowest ratios; it is the median of the 25 lowest ratios among L's own genes (≥ 50 CPM in L, ≥ 10× every third type). A neighbour with fewer than 10 such genes, or whose own genes the focal type carries at ≥ 50 % of their level, is **not modelled and named** — its contribution is missing from the prediction.
 - It needs group A to be one cell type (≥ 80 % of its labelled cells). When B is the same type both groups are modelled; otherwise only A (e.g. "type vs all other cells").
 - **Limits**: the estimate leans low (the lowest ratios are selected in the same data), so the gate errs towards not flagging; with an annotation that does not separate the types (sub-types of one lineage, a classifier that calls most cells one label) few neighbours are modelled and the gate says little. A flag means "check the owner and the neighbours", not "wrong".
@@ -605,6 +688,7 @@ With **Gene ownership + leak gate** ticked (default) and a cell-type annotation 
 
 **Aggregates** tab: finds connected groups of cells of a chosen *class* — a set of cell types
 you pick, e.g. the immune types — that are locally denser than chance, and reports each one.
+The tab has its own **Samples & conditions…** button (the shared editor) for the comparison between conditions.
 Ported from an earlier spatial study by the author; the detection (local count, within-stratum
 null, hotspot rule, Delaunay components, tile area, permuted-label control) reproduces the
 original's numbers exactly on fabricated data, and every value of that study is a parameter here.
@@ -645,6 +729,171 @@ original's numbers exactly on fabricated data, and every value of that study is 
   the subset, the segmentation or the annotation. The cells × cells neighbour matrix is held in
   memory (about 100 neighbours per cell at 50 µm in dense tissue). Registered job with progress
   and Cancel.
+
+### Banksy spatial domains
+
+**Plots panel → Banksy.** Clusters the cells on their own expression *and* on the expression
+around them, after BANKSY (Singhal et al., *Nat Genet* 56, 431-441, 2024). With a large weight
+on the surroundings the clusters are tissue domains; with a small one they are cell types
+informed by their neighbourhood. The result is a **cluster set** ("Banksy λ=0.8"): pick it under
+**Color By → Cluster → Clustering Method**.
+
+| Control | What it does |
+|---------|--------------|
+| **Preset / λ** | *Tissue domains* λ = 0.8 (Leiden resolution 0.5), *Cell typing* λ = 0.2 (resolution 1), or your own λ in [0, 1]; λ = 0 is ordinary clustering of the same features. One cluster set per λ: a new run with the same λ replaces it. |
+| **Spatial neighbours k** | k_geom, default 15: the mean is taken over the k nearest cells, the AGF over the 2k nearest. |
+| **AGF (gradient) block** | Include the azimuthal Gabor filter block (default on). |
+| **Resolution** | Leiden resolution; the number of clusters grows with it. |
+| **Genes ≤** | Feature cap, default 2,000: with a larger panel (Xenium Prime 5K) the genes with the largest variance of log1p(normalised expression) are used. Genes seen in fewer than 10 cells are left out. |
+| **PCs / Graph neighbours / Seed** | 20 principal components, 50 neighbours in PC space (the published defaults), seed of Leiden and of the approximate neighbour search. |
+| **log1p** | Log-transform the normalised counts before scaling (default off, as in the paper). |
+
+**Method as implemented** (numpy / scipy / scikit-learn; the `Banksy` / `Banksy_py` packages are
+not used):
+
+1. Counts of the active counts mode, divided by the cell's total and multiplied by the median
+   total of all cells; gene selection as above.
+2. Per cell *u*, within its sample: the **neighbourhood mean** M = Σ Γ_uv g_v over the k nearest
+   cells, with Γ_uv ∝ exp(−r_uv² / σ_u²), σ_u the distance to the ⌊k/2⌋-th nearest cell (the 7th
+   for k = 15), normalised to sum 1; and the **AGF** G = | Σ Γ′_uv e^{iφ_uv} (g_v − m′_u) | over
+   the 2k nearest cells with their own weights Γ′ (σ: their k-th), φ_uv the direction of *v* seen
+   from *u*, m′_u the Γ′-weighted mean of the same neighbours. G is the size of the expression
+   gradient around the cell and does not change when the section is rotated or mirrored.
+3. Each of the three blocks is z-scaled per gene over all cells, and the blocks are joined as
+   [√(1−λ) · own, √(λ/μ) · mean, √(λ/(2μ)) · AGF] with μ = 1.5 (√(1−λ) and √λ without the AGF).
+4. PCA of that matrix (never held in memory: its Gram matrix is accumulated over blocks of
+   8,192 cells), then the nearest neighbours of every cell in PC space → shared-nearest-neighbour
+   graph (Jaccard weights) → **Leiden** (`leidenalg` + `igraph`). Without those two packages the
+   clusters are a KMeans partition of the same PCs (k = 10 × resolution) and the status and the
+   CSV say so. Above 40,000 cells the neighbours in PC space are approximate (`pynndescent`, when
+   installed; exact otherwise).
+
+Which details follow the paper and which are choices of this implementation: the weights Γ, the
+2k neighbours of the AGF, the z-scaling of the three blocks, the mixing with μ = 1.5, λ = 0.8 /
+0.2, k = 15, 20 PCs and 50 graph neighbours are the paper's Methods. Centring the neighbours'
+expression inside the AGF (the `− m′_u`) follows the change notes of the reference
+implementations ("normalisation with the mean neighbour expression"), not equation 1 of the
+paper, which has no centring; the reference code was not run or read here. The gene selection
+rule, the width σ of the AGF neighbourhood (the same rule applied to 2k cells), the
+shared-nearest-neighbour weighting of the graph and the default resolutions are this
+implementation's. **No comparison against the reference packages was possible** (not installed);
+the implementation is validated on fabricated cells with planted domains that differ by a weak
+programme in every cell: clustering on expression alone (λ = 0) finds the cell types and not the
+domains (ARI with the domains < 0.05), λ = 0.8 finds the domains (ARI > 0.9), λ = 0.2 still finds
+the cell types (ARI > 0.9).
+
+**Several samples.** Spatial neighbours are always cells of the same sample (the view offset
+plays no role). Normalisation, gene selection, scaling, PCA and clustering are done on all cells
+together, so cluster 3 is the same cluster in every sample and the multi-sample view shows the
+labels without a sample prefix (`C3`, not `S0:C3`). No batch correction is applied: a cluster
+that exists in one sample only can be a batch effect - see
+[Joint clustering across samples](#joint-clustering-across-samples) for Harmony.
+
+**Output.** The tab shows the cells per cluster, the mean expression of each cluster's top genes
+(in standard deviations from the mean of all cells), and per cluster the **neighbour purity**:
+the mean share of a cell's k nearest cells that are in its own cluster, next to the share
+expected if the labels were scattered at random (the cluster's share of all cells). CSV download.
+The job is listed in the jobs panel (progress, Cancel); the result is cached per dataset, cells,
+counts mode and parameters (`banksy_<dataset>/`), so the same request again is read back.
+
+**Limits.** The clusters depend on λ, k, the resolution and the seed; they are an exploratory
+partition, not a test, and neighbour purity is high by construction for large λ. Domains are only
+as good as the cell positions: across a tear or the section edge the "nearest" cells can be far
+away (no distance cap is applied). The z-scaling gives every gene the same weight, so on a sparse
+5K panel many features are noise; the gene cap matters. Cells without counts get no label.
+Recompute after changing the subset, the segmentation or the counts mode.
+
+**Time and memory** (112,551 cells, 2,000 of 5,006 genes, λ = 0.8, k = 15, on a 16-core laptop
+that was busy with other jobs): 354 s - neighbourhood features 44 s, covariance 54 s, projection
+32 s, neighbours in PC space 72 s, graph 14 s, Leiden 130 s; peak memory 2.5 GB above the loaded
+app (4.3 GB in total).
+
+Optional packages: `leidenalg` + `igraph` (Leiden), `pynndescent` (fast neighbours above 40,000
+cells).
+
+#### Cluster sets computed in the app
+
+Banksy and the joint clustering install their labels as a cluster set of the view: an integer
+column (`clust__<name>` for the Xenium segmentation and extra samples, `cluster_<name>` for a
+Baysor / Proseg run) that Color By → Cluster shows in both renderers and that the group pickers
+of Differential Expression, the composition test, co-localisation, aggregates and Save as
+SpatialData read like a Xenium cluster set. Clusters are numbered from 1 by size; **0 marks a
+cell without a label** (outside the subset the set was computed on, or without counts) and is
+shown as "Cluster 0" on the map but is in no group of the analyses. On a Baysor / Proseg run the
+set is picked in Clustering Method like any other; the run's own KMeans clusters stay the
+default. The sets are kept per dataset in `clustersets_<dataset>/` of the cache and come back on
+the next start, for extra samples when they are loaded, and for a segmentation run when it is
+selected.
+
+### Joint clustering across samples
+
+**Plots panel → Joint clustering.** With two or more samples loaded, the clusters each sample
+brought along are not comparable: cluster 3 of one sample is not cluster 3 of another. This tab
+clusters the cells of **all samples together** and installs the result as one cluster set that
+every sample shares, so pseudobulk differential expression by cluster and the composition test
+use the same labels in every sample. It needs the Xenium segmentation (a Baysor / Proseg run
+belongs to one sample) and honours the cell subset and the active counts.
+
+| Control | What it does |
+|---------|--------------|
+| **Integration** | *no integration*: clusters of the joint PCA (set **Joint clusters**). *Harmony on sample / donor / batch*: the principal components are corrected for that variable first (set **Joint clusters (Harmony)**). Donor and batch come from the [sample design](#samples-and-conditions); a sample without one counts as its own level. Without the `harmonypy` package the Harmony choices run uncorrected, the set is named **Joint clusters (uncorrected)** and the status line gives the install hint. |
+| **Genes** | Number of variable genes kept for the PCA (default 2,000; a panel with fewer uses all of them). |
+| **PCs / Neighbours / Resolution / Seed** | Principal components (30), neighbours of the graph (15), Leiden resolution (1.0), seed (0). |
+| **Joint UMAP** | Also compute one UMAP of all cells (needs `umap-learn`). |
+
+**Method.** (1) One matrix of all cells of the view over the panel genes every sample has; counts
+per 10,000 of the cell's total over these genes, log1p. (2) Genes are scored **within each
+sample** (log of variance ÷ mean of the normalised values, standardised within 20 quantile bins
+of mean expression - the "Seurat" dispersion rule) and ranked by the mean score over the samples,
+so a gene that differs only between samples is not preferred. (3) Each gene is divided by its
+standard deviation over all cells, centred, capped at 10; PCA of all cells (ARPACK on the sparse
+matrix, fixed seed). (4) Optional Harmony (Korsunsky et al., *Nat Methods* 2019) through
+`harmonypy.run_harmony` on the principal components with the chosen variable as the one
+covariate, its defaults otherwise (theta 2, automatic ridge penalty, at most 10 rounds) and the
+seed. The corrected embedding is exactly what `harmonypy` returns for those components (tested).
+(5) One neighbour graph and one clustering of the embedding with the backend of the Banksy
+domains (shared-nearest-neighbour graph → Leiden when `leidenalg` + `igraph` are installed, else
+KMeans, named as such); clusters are numbered by size. (6) One UMAP of the embedding.
+
+**Output.** The cluster set is selectable under **Cluster Set** (Color By → Cluster) in both
+renderers and wherever clusters are used (DE groups and populations, composition,
+co-localisation labels, exports); it is cached and restored with the samples. While it is
+selected, the **UMAP panel shows the joint embedding of all samples**, coloured by cluster, gene,
+cell type or gene-set score (any other Color By value: by sample); the per-cell coordinates
+(`joint_umap_1/2`, `joint_harmony_umap_1/2`) are written by Save as SpatialData for the primary
+sample as `ctl_…` columns. Cells without counts have no cluster.
+
+**Diagnostics** (status line, plot, table, CSV), each before and after the correction:
+
+- **Entropy per cluster** of the integration variable among the cluster's cells ÷ log(number of
+  levels): 0 when the cluster holds one level only; the entropy of the whole view (reference
+  line) when it is mixed as the view is. "Before" uses the clusters of the uncorrected components.
+- **Mixing index**: the inverse Simpson index of the variable among the 30 nearest neighbours of
+  5,000 random cells (median). 1: all neighbours from one level; the reference is the index of
+  the whole view. This is a simplified LISI: unweighted counts over a fixed number of
+  neighbours, not the perplexity-weighted index of the Harmony paper.
+- The table lists, per cluster, the cells of every sample, the largest sample and its share.
+
+**Caveats.**
+
+- **Integration can remove real differences between conditions.** Harmony removes what
+  separates the levels of the integration variable. When the condition is confounded with that
+  variable - always for *sample*, and for donor or batch when no donor or batch spans both
+  conditions - a cell state that exists in one condition only is, to Harmony, a level effect and
+  can be pulled into a cluster of the other condition. The status line states this for every
+  Harmony run and says whether the current design is fully confounded. Check the clusters
+  against markers and compare with the run without integration.
+- With its defaults Harmony does not merge levels whose separation is far larger than the
+  differences between cell populations; the diagnostics then stay low and the status line says
+  the clusters are still dominated by single levels.
+- Clustering describes the cells; it is not a test. Tests between conditions stay at the
+  sample / donor level (pseudobulk DE, composition).
+- UMAP with a fixed seed runs on one thread (minutes above 100,000 cells); above 300,000 cells
+  it runs unseeded on all cores, as elsewhere in the app.
+- Results are cached per set of samples, cells, counts and parameters (`joint_<dataset>/`); a
+  second run with the same input is read from the cache.
+
+Optional packages: `harmonypy` (Harmony), `leidenalg` + `igraph` (Leiden), `umap-learn` (UMAP).
 
 ### CellNEST Cell-Cell Communication
 
@@ -720,7 +969,7 @@ The ROI and the patches are saved in the SpatialData cache store together with t
 
 **Step 2 — Algorithm selection**
 
-Select the algorithm tab (Baysor or Proseg), configure parameters, and click **Run**. Progress appears in the server log.
+Select the algorithm tab (Baysor, Proseg, or Image - see [Image-based resegmentation](#image-based-resegmentation-cellpose--classical)), configure parameters, and click **Run**. Progress appears in the server log.
 
 Once complete:
 - The segmentation source dropdown automatically switches to the new segmentation
@@ -756,7 +1005,76 @@ Once complete:
 | Nuclear reassignment prob | `--nuclear-reassignment-prob` | 0.2 |
 | Prior seg reassignment prob | `--prior-seg-reassignment-prob` | 0.5 |
 
-Resegmentation output is cached per run (keyed by parameters) in `~/.xenium_explorer_cache/baysor_{dataset}_{tag}/` or `proseg_{dataset}_{tag}/`. Multiple cached runs per tool are accessible from the segmentation source dropdown.
+Resegmentation output is cached per run (keyed by parameters) in `~/.xenium_explorer_cache/baysor_{dataset}_{tag}/`, `proseg_{dataset}_{tag}/` or `imgseg_{dataset}_{tag}/`. Multiple cached runs per tool are accessible from the segmentation source dropdown.
+
+#### Image-based resegmentation (Cellpose / classical)
+
+**Resegment Cells → Step 2 → Image (Cellpose / classical).** Baysor and Proseg segment the
+transcripts; this tab segments the **morphology image** and then asks which transcripts fall
+inside each outline. The result is a run like theirs: an entry `Image: …` in the
+Segmentation Source dropdown, its own boundary checkbox (**Image-segmentation Boundaries**,
+both renderers), clusters and UMAP, annotation, SpaGE, SPLIT, Save as SpatialData, and a row
+in [Segmentation QC](#segmentation-qc) next to Xenium, Baysor and Proseg.
+
+| Control | What it does |
+|---------|--------------|
+| **Segmenter** | *Classical watershed* (built in, no model) or a Cellpose model. A Cellpose model is listed only when the `cellpose` package imports **and** that model's weights are already in Cellpose's model directory; otherwise the note under the dropdown says what is missing. |
+| **Nuclear channel** | One of the bundle's morphology focus channels (read from the SpatialData store of Step 1; default: the channel named DAPI). |
+| **Membrane / cytoplasm channel** | Optional second channel, used by the Cellpose `cyto` models only (image handed over as [cytoplasm, nucleus]). |
+| **Spatial region / Use Current Viewport** | As for Baysor / Proseg; blank = the tissue ROI of Step 1. |
+| **Nucleus diameter (µm)** | Expected diameter (default 8); converted to pixels with the image's pixel size. |
+| **Expansion (µm)** | Every label is grown by this distance after segmentation, nearest label wins, no overlap (default 5; 0 = nuclei only). |
+| **Min transcripts per cell** | Outlines with fewer assigned gene transcripts are dropped (default 5). |
+| **Image patch width (µm)** | The image is cut into overlapping patches with `sopa.make_image_patches` (default 500 µm, 30 µm overlap, clipped to the tissue ROI and the region); patches are segmented one after the other and cells cut by a patch edge are merged with `sopa.segmentation.solve_conflicts`. Cancel is honoured between patches. |
+| **Classical: threshold × Otsu** | Scales the classical backend's threshold (below 1: dimmer nuclei are included). |
+| **Cellpose: flow threshold / cell probability / GPU** | Passed to `model.eval`. |
+
+**Method.**
+
+1. *Patches*: `sopa.make_image_patches` on a private in-memory copy of the store's image
+   element (the dataset's cache store is not modified).
+2. *Segmentation* of each patch through `sopa.segmentation.StainingSegmentation` with one of
+   two backends behind the same interface (`image (C, Y, X) → label mask (Y, X)`):
+   - **Classical watershed** (numpy / scipy; scikit-image's `watershed` when installed):
+     Gaussian smoothing (σ = diameter / 10) → Otsu threshold of the patch (a patch whose two
+     Otsu classes are not clearly apart is taken as empty) → holes filled → Euclidean
+     distance transform, smoothed → its local maxima seed a watershed of the inverted
+     distance inside the foreground → objects below 20 % of a disc of the given diameter
+     removed → optional expansion. **This is a simple baseline, not a state-of-the-art
+     segmenter**: one global threshold per patch misses dim nuclei next to bright ones, and
+     the distance transform cannot split nuclei that touch along a broad contact, so dense
+     tissue is under-segmented (on a dense skin region it found about half as many objects
+     as there are Xenium cells). The expansion is a geometric guess, not a membrane.
+   - **Cellpose** (Stringer, Wang, Michaelos & Pachitariu, *Nat Methods* 18:100–106, 2021;
+     Cellpose 3: Stringer & Pachitariu, *Nat Methods* 22:592–599, 2025) through
+     `sopa.segmentation.methods.cellpose_patch`, with sopa's preprocessing (Gaussian σ = 1,
+     CLAHE). The weights file is handed to Cellpose **by its path** after checking that it
+     exists, which is the one code path in which Cellpose does not download anything. The
+     app never starts a download.
+3. *Transcripts → cells*: `transcripts.parquet` is read tile by tile with the filter of the
+   cell-feature matrix (Q ≥ 20, gene features only) and every transcript is given to the
+   polygon it lies in (2D; a transcript inside two overlapping outlines goes to the first).
+   The count matrix is then built, clustered and stored through the same functions as a
+   Baysor run (`.partial` working directory renamed when complete, `params.json`,
+   `spatialdata_imgseg.zarr`).
+
+`params.json` records the backend, model and weights file, channels, all parameters, the
+number of patches (and failed patches), polygons, cells, gene transcripts in the region and
+the share assigned to the kept cells.
+
+**Optional packages.** The classical backend needs nothing beyond the app's dependencies
+(`sopa`, `spatialdata`, `shapely`). Cellpose: `pip install 'sopa[cellpose]'` (or
+`pip install cellpose`); its weights are not part of the package - the first Cellpose run
+downloads them from the Cellpose project into `~/.cellpose/models`. Do that once yourself
+(e.g. `python -c "from cellpose import models; models.CellposeModel(model_type='nuclei')"`),
+then the model appears in the Segmenter dropdown. With Cellpose ≥ 4 the only model is `cpsam`.
+
+**Limits.** 2D: the focus image is one plane and transcripts are assigned by x, y only. A
+nuclear stain with a fixed expansion says nothing about the true cell outline; with a
+membrane channel the Cellpose `cyto` models can do better. Cellpose on the CPU takes about a
+minute per 500 µm patch at full resolution - use a region, or the GPU option. Step 1 (Prepare
+Patches) must have built the SpatialData store, because the image is read from it; a dataset
+loaded from a `.zarr` has neither image nor transcript file.
 
 ### Cell Type Annotation
 
@@ -976,6 +1294,7 @@ All caches are stored in `~/.xenium_explorer_cache/` and are keyed per dataset.
 | `genesets_{hash}.json` | Gene sets saved in the Gene Sets tab (per dataset) |
 | `de_groups_{hash}.json` | Cell groups (outlines) saved in the Differential Expression tab (per dataset) |
 | `density_{hash}/{gene}__b5um__qv20_genes_v1.npz` | Transcript-density grid of one gene (non-empty 5 µm bins); the name carries the bin size and the version of the transcript filter |
+| `txfactor_{hash}/counts__{shape}_b{bin}um__qv20_genes_v1__g{genes}.npz`, `txfactor_{hash}/fit_{settings hash}.npz` | Transcript factors: the bin × gene counts of one sample for a bin size and shape (reused for any K, method or seed), and a finished fit (loadings and the factor counts of every bin) for one set of settings |
 
 The cache root is `~/.xenium_explorer_cache/` unless `XENIUM_CACHE_DIR` is set; every cache above, including `cellnest_db/`, follows it.
 
@@ -1172,8 +1491,12 @@ See `environment.yml` (conda) or `requirements.txt` (pip) for the full pinned de
 | `zarr>=3.0` | SpatialData zarr store (v3 API required) |
 | `anndata`, `geopandas`, `shapely` | SpatialData zarr generation |
 | `spatialdata`, `sopa` | Patch-based resegmentation workflow |
+| `cellpose` | Cellpose backend of the image-based resegmentation (optional; needs its model weights on disk - the app never downloads them; without it the built-in classical watershed is the only backend) |
 | `celltypist` | CellTypist cell-type annotation |
-| `umap-learn` | UMAP recomputation on reseg cells |
+| `umap-learn` | UMAP recomputation on reseg cells; joint UMAP |
+| `leidenalg`, `igraph` | Leiden clustering of Banksy and the joint clustering (optional; without them KMeans on the same embedding, named as such) |
+| `pynndescent` | approximate nearest neighbours in PC space above 40,000 cells (optional; exact search otherwise) |
+| `harmonypy` | Harmony integration of the joint clustering across samples (optional; without it the joint clusters are uncorrected) |
 | `rpy2` + R ≥ 4.3 | Seurat label transfer, SpaGE, RCTD, SPLIT, pseudobulk differential expression |
 
 **R packages** (via rpy2):
@@ -1210,6 +1533,7 @@ or the command line, builds the Dash app and registers the callbacks.
 | `dataview` | derived data and accessors on `DATA`: gene expression, clusters, viewport cells, extra samples |
 | `annotation` | CellTypist, Seurat kNN and RCTD |
 | `reseg`, `clustering` | Baysor / Proseg runs and cached-run loading; clustering and UMAP of a run |
+| `imgseg` | image-based resegmentation: the segmenter interface (classical watershed, Cellpose via sopa with local weights only), sopa image patches, transcripts assigned to the polygons, run and cached-run loading |
 | `split`, `spage` | SPLIT ambient RNA correction; SpaGE imputation |
 | `subsetting` | the REPL helpers `subset()`, `unsubset()`, `get_genes()`, `retry_split_zarr_write()` |
 | `spatial`, `regions` | spatial analysis and niches; ROI helpers |
@@ -1222,11 +1546,15 @@ or the command line, builds the Dash app and registers the callbacks.
 | `lrdecomp` | ligand–receptor exposure decomposition into five factors, per-term sample-level tests |
 | `aggregates` | aggregates: connected groups of cells of a chosen class, outlines, composition, per-sample density |
 | `segfree` | segmentation-free abundance: marker transcripts per mm² of tissue from the transcript file, area-bin sweep, concentration against a redistribution null |
+| `clustersets` | cluster sets computed in the app: nearest-neighbour graph → Leiden (KMeans fallback) on an embedding, installing the labels as a cluster set of the view, their cache |
+| `banksy` | Banksy spatial domains: neighbourhood mean and azimuthal Gabor filter features, PCA of the neighbour-augmented matrix, the job and its tab |
+| `txfactor` | transcript factors: bin × gene counts of the transcript file on a square or hexagonal grid, NMF (KL) / online LDA / reference profiles, projection of every bin, map layer, per-cell factor mixture |
+| `joint` | joint clustering across samples: joint normalisation, gene selection and PCA, Harmony (harmonypy), mixing diagnostics, the joint UMAP of the UMAP panel |
 | `cellnest` | CellNEST loading, filters and plots |
 | `sdata_store` | SpatialData / sopa backend: cache store, Save as SpatialData, tissue ROI and patches |
 | `startup` | the import-time work: locate and load the dataset, autoload cached results |
 | `app_layout` | the Dash `app` and its layout |
-| `cb_plots`, `cb_tools`, `cb_reseg`, `cb_spage`, `cb_data`, `cb_spatial`, `cb_analysis`, `cb_stats`, `cb_controls`, `cb_proximity`, `cb_lrdecomp`, `cb_aggregates`, `cb_segfree` | the callbacks, by feature |
+| `cb_plots`, `cb_tools`, `cb_reseg`, `cb_spage`, `cb_data`, `cb_spatial`, `cb_analysis`, `cb_stats`, `cb_controls`, `cb_proximity`, `cb_lrdecomp`, `cb_aggregates`, `cb_segfree`, `cb_banksy`, `cb_txfactor`, `cb_joint` | the callbacks, by feature |
 | `viewer_provider` | data provider for `xenium_viewer_api.py` (WebGL view) and `/health` |
 | `compat` | the single namespace over all modules (below) |
 
@@ -1268,6 +1596,9 @@ XS_SAMPLES=/bundle2,/bundle3,/bundle4 node test/stats_checks.mjs http://127.0.0.
 node test/proximity_checks.mjs http://127.0.0.1:8050 out/ # Differential Expression: "Proximity to a cell type" and "Contact groups" (with XS_SAMPLES=… the contact test runs in R; without, its single-sample refusal is checked)
 node test/webgl_fallback.mjs http://127.0.0.1:8050 # automatic fallback to Plotly without WebGL2 (browsers started with WebGL disabled)
 XA_CLASS="B cells|Plasma cells" node test/aggregates_checks.mjs http://127.0.0.1:8050 out/ # Aggregates tab in both renderers: run, table, Color By, outlines, toggle, alpha hulls, CSV (needs a cell-type annotation in the cache)
+XJ_SAMPLES=/path/s1,/path/s2 node test/joint_checks.mjs http://127.0.0.1:8050 out/     # Joint clustering tab in both renderers: one-sample refusal, added samples, run (Harmony when installed), diagnostics, the shared Cluster Set on the map, the joint UMAP of all samples in the UMAP panel (WebGL and Plotly), CSV
+XB_LAMBDA=0.8 node test/banksy_checks.mjs http://127.0.0.1:8050 out/   # Banksy tab: run, table, the cluster set in Clustering Method and on the map in both renderers, second run from the cache
+TXF_K=8 node test/txfactor_checks.mjs http://127.0.0.1:8050 out/ # Transcript Factors tab: fit, table, cross-tab, map layer and mixed score in both renderers, reference mode (needs transcripts.parquet; the first run bins all transcripts)
 node test/real_results.mjs                         # WebGL against Plotly on real Baysor/Proseg/RCTD/SPLIT/SpaGE results; starts its own app (paths: see the top of the file)
 ```
 
@@ -1343,6 +1674,9 @@ A review of the code base fixed a number of defects. Most are invisible, but the
 
 Behaviour changes that came with the jobs panel (no effect on computed values):
 
+- **Leak gate**: the change rule (leak explains ≥ 50 % of the log fold change) is applied only to genes whose change is called or is at least 0.5 in log2; it used to fire on genes with a change of about zero. Fewer genes are flagged; the signal rule and the three formulas are unchanged.
+- **Proximity and contact DE** honour the **Gene ownership + leak gate** checkbox (it was ignored: both always ran).
+- **Proximity DE, cohort mode**: the sign-flip test enumerates all sign vectors up to 16 units and draws 20,000 above (it used 12 and 8,191); p-values of cohorts with 13 or more units change slightly, and those with 13 to 16 units are now exact.
 - **Baysor/Proseg run directories** are written as `<name>.partial` and renamed when the run is complete. A failed or cancelled run leaves nothing in the cache (it used to leave the tool's partial output in the run directory, which the Segmentation dropdown could list as a finished run once `segmentation.csv` / `cell-metadata.csv.gz` existed).
 - **The CellNEST database cache** (`cellnest_db/`) follows `XENIUM_CACHE_DIR`. It used to be created in `~/.xenium_explorer_cache/` regardless; with `XENIUM_CACHE_DIR` set, the database files are fetched once more into the new location (or move the directory there).
 - **Baysor and Proseg run in their own process group**, Proseg on a pseudo-terminal (so that it draws the progress bar the panel reads). Their log lines in the server log are unchanged; Proseg's progress-bar redraws are not logged.

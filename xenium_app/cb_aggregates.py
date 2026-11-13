@@ -47,8 +47,7 @@ def update_agg_class_options(kind, _ds, _annot, seg_source, method):
     Input("dataset-version",        "data"),
 )
 def update_agg_design_summary(_design, _extra, _ds):
-    return ("Samples and conditions (edited from the Differential Expression, Composition or "
-            "Co-localisation tab): " + stats._design_summary())
+    return stats._design_summary()
 
 
 @app_layout.app.callback(

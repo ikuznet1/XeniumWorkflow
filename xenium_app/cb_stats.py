@@ -21,11 +21,12 @@ from . import core, jobs, dataview, analysis, stats, proximity, app_layout, cb_a
     Input("comp-design-open-btn", "n_clicks"),
     Input("coloc-design-open-btn", "n_clicks"),
     Input("prox-design-open-btn", "n_clicks"),
+    Input("agg-design-open-btn",  "n_clicks"),
     prevent_initial_call=True,
 )
-def open_design_modal(de_clicks, comp_clicks, coloc_clicks=None, prox_clicks=None):
+def open_design_modal(de_clicks, comp_clicks, coloc_clicks=None, prox_clicks=None, agg_clicks=None):
     """Open the editor with one row per loaded sample."""
-    if not de_clicks and not comp_clicks and not coloc_clicks and not prox_clicks:
+    if not de_clicks and not comp_clicks and not coloc_clicks and not prox_clicks and not agg_clicks:
         raise dash.exceptions.PreventUpdate
     names = stats._design_names()
     return True, stats._design_rows_children(), names["A"], names["B"], ""

@@ -163,7 +163,7 @@ def _run_reseg_umap() -> None:
         elif _tool == "baysor":
             with core._baysor_lock:
                 bres = core._baysor_state["result"] if core._baysor_state["status"] == "done" else None
-        alt_res = pres or bres
+        alt_res = pres or bres or (core._seg_result(_tool, done_only=True) if _tool == "imgseg" else None)
         if _tool != "xenium" and alt_res is None:
             _set("error", "Selected segmentation is not loaded")
             return
@@ -450,7 +450,7 @@ def _run_reseg_umap() -> None:
 
         # ── Write UMAP coords back to cells_df + zarr for caching ────
         _set("running", "Caching UMAP to zarr…")
-        _lock = core._proseg_lock if pres else core._baysor_lock
+        _lock = core._proseg_lock if pres else core._baysor_lock if bres else core._seg_state(_tool)[1]
         _sdata_path = alt_res.get("sdata_path", "")
         # Build full-length arrays (NaN for cells not in this UMAP's index)
         _u1 = np.full(len(_all_cell_ids), np.nan)

@@ -7,6 +7,7 @@ import scipy.sparse as sp
 import plotly.graph_objects as go
 
 from . import core, jobs, dataview, annotation, reseg, spatial, analysis, sdata_store, regions
+from . import clustersets
 
 
 # ─── Figure builders ──────────────────────────────────────────────────────────
@@ -246,6 +247,9 @@ _spatial_base_shapes: list = []
 # functions(seg_source) -> polygon dicts of viewer_provider.overlays (µm, y down) for WebGL
 _overlay_shape_providers: list = []
 _overlay_polygon_providers: list = []
+# Embeddings other modules draw in the UMAP panel (the joint module registers): functions
+# with the arguments of make_umap_fig that return a figure, or None to leave the panel alone
+_umap_fig_providers: list = []
 
 
 _overlay_last_seg: dict = {"seg": "xenium"}   # segmentation of the last map that was built
@@ -322,20 +326,22 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                      morph_image=None, extra_title="", baysor_active=False, proseg_active=False,
                      use_corrected: bool = False, cbar_range=None,
                      sdata_roi_on: bool = False, sdata_patches_on: bool = False,
-                     density=None):
+                     density=None, alt_tool=None):
     # Choose data source: Proseg > Baysor > original Xenium (priority order)
     with core._proseg_lock:
         pres = core._proseg_state["result"] if proseg_active and core._proseg_state["result"] else None
     with core._baysor_lock:
         bres = core._baysor_state["result"] if baysor_active and not pres and core._baysor_state["result"] else None
-
-    alt_res = pres or bres
+    # a further tool (alt_tool, e.g. "imgseg"): its loaded run, drawn like a Baysor / Proseg one
+    _ores = (core._seg_result(alt_tool) if alt_tool not in (None, "xenium", "baysor", "proseg")
+             and not (pres or bres) else None)
+    alt_res = pres or bres or _ores
+    _alt_tool = "proseg" if pres else "baysor" if bres else alt_tool if _ores else "xenium"
     # Gene-set score ("geneset:<name>"): one value per cell of the view, or None when
     # the set cannot be scored - transcript counts are drawn then, as for a missing gene
     _gs = None
     if str(color_by or "").startswith("geneset:"):
-        _gs = analysis._geneset_color(color_by, "proseg" if pres else "baysor" if bres else "xenium",
-                             use_corrected)
+        _gs = analysis._geneset_color(color_by, _alt_tool, use_corrected)
         if _gs is None:
             color_by = "transcript_counts"
 
@@ -362,7 +368,7 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                 kw["cmax"] = cbar_range[1]
         return kw
     if alt_res is not None:
-        source_label = " [Proseg]" if pres else " [Baysor]"
+        source_label = f" [{core._SEG_TOOL_LABELS.get(_alt_tool, _alt_tool)}]"
         bdf      = alt_res["cells_df"]
         x        =  bdf["x_centroid"].values
         y        = -bdf["y_centroid"].values
@@ -398,6 +404,8 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                 cluster_col = next((c for c in _cluster_cols if "split" in c), None) or next(iter(_cluster_cols), None)
             else:
                 cluster_col = next((c for c in _cluster_cols if "split" not in c), None) or next(iter(_cluster_cols), None)
+            # a cluster set installed on this run and picked in Clustering Method
+            cluster_col = clustersets._cs_reseg_col(bdf.columns, method) or cluster_col
             if cluster_col is not None:
                 cluster_vals = bdf[cluster_col].astype(str)
                 unique_clusters = sorted(cluster_vals.unique(), key=lambda v: (0, int(v)) if v.isdigit() else (1, v))
@@ -546,7 +554,9 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                     if col_name in edf.columns:
                         raw_vals = edf[col_name].values
                         # Prefix dataset index so cluster IDs don't collide across samples
-                        prefixed = [f"S{di}:C{v}" for v in raw_vals]
+                        # (not for a set computed jointly: its labels are the same everywhere)
+                        _pre = "C" if (_method == method and clustersets._cs_is_shared(_method)) else f"S{di}:C"
+                        prefixed = [f"{_pre}{v}" for v in raw_vals]
                         all_clust_vals.extend(prefixed)
                         for pv in prefixed:
                             if pv not in cmap_combined:
@@ -874,6 +884,13 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
             _add_boundary(_bres_local["cell_bounds"], "#a29bfe", "Baysor Boundaries",
                           reseg_cells_df=_bres_local["cells_df"])
 
+    # Image-segmentation boundaries (zoom required, uses that run's centroids for the viewport)
+    if "imgseg" in boundary_toggles:
+        _ires_local = core._seg_result("imgseg")
+        if _ires_local:
+            _add_boundary(_ires_local["cell_bounds"], "#ff6b9d", "Image segmentation Boundaries",
+                          reseg_cells_df=_ires_local["cells_df"])
+
     if _needs_zoom_msg:
         boundary_status = " · zoom in to see Xenium boundaries"
 
@@ -903,7 +920,7 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
     all_shapes = list(_separator_shapes) + list(_pie_shapes)
     _spatial_base_shapes[:] = all_shapes
     all_shapes += _spatial_overlay_shapes(sdata_roi_on, sdata_patches_on,
-                                          "proseg" if pres else "baysor" if bres else "xenium")
+                                          _alt_tool)
     if all_shapes:
         layout_kwargs["shapes"] = all_shapes
     fig.update_layout(**layout_kwargs)
@@ -944,7 +961,7 @@ def make_cell_type_abundance_fig(width=None, height=None):
             suffix = key[len("labels_"):]
             parts = suffix.split("_", 1)
             base = parts[0].lower()
-            if base in ("baysor", "proseg"):
+            if base in core._SEG_TOOL_LABELS:
                 display = suffix.replace("_", " ").title()
             elif base in ("celltypist", "seurat", "rctd"):
                 method_map = {"celltypist": "CellTypist", "seurat": "Seurat", "rctd": "RCTD"}
@@ -1296,7 +1313,7 @@ def make_chord_fig(width=None, height=None, normalize=False, min_freq=0.0):
     return fig
 
 
-def make_niche_umap_fig(width=None, height=None, baysor_active=False, proseg_active=False):
+def make_niche_umap_fig(width=None, height=None, baysor_active=False, proseg_active=False, alt_tool=None):
     if core.DATA is None or core.DATA.get("df") is None:
         return _make_placeholder_fig()
     # Niches computed on a Baysor/Proseg run live in that run's cells_df
@@ -1304,7 +1321,11 @@ def make_niche_umap_fig(width=None, height=None, baysor_active=False, proseg_act
         pres = core._proseg_state["result"] if proseg_active and core._proseg_state["result"] else None
     with core._baysor_lock:
         bres = core._baysor_state["result"] if baysor_active and not pres and core._baysor_state["result"] else None
-    alt_res = pres or bres
+    # a further tool (alt_tool, e.g. "imgseg"): its loaded run, drawn like a Baysor / Proseg one
+    _ores = (core._seg_result(alt_tool) if alt_tool not in (None, "xenium", "baysor", "proseg")
+             and not (pres or bres) else None)
+    alt_res = pres or bres or _ores
+    _alt_tool = "proseg" if pres else "baysor" if bres else alt_tool if _ores else "xenium"
     df = alt_res["cells_df"] if alt_res is not None else core.DATA["df"]
     if "niche" not in df.columns:
         return _make_placeholder_fig("Run Spatial Niches to populate this tab.")
@@ -1430,7 +1451,18 @@ def make_roi_area_fig(width=None, height=None):
 
 def make_umap_fig(color_by, method, gene, size, opacity,
                   baysor_active=False, proseg_active=False,
-                  use_corrected: bool = False, cbar_range=None):
+                  use_corrected: bool = False, cbar_range=None, alt_tool=None):
+    for _prov in _umap_fig_providers:
+        try:
+            # alt_tool is the tool of the segmentation source ("xenium" for the Xenium cells)
+            _pfig = _prov(color_by, method, gene, size, opacity,
+                          baysor_active or alt_tool not in (None, "", "xenium", "proseg"),
+                          proseg_active, use_corrected, cbar_range)
+        except Exception as _perr:
+            print(f"  [make_umap_fig] embedding provider failed: {_perr}", flush=True)
+            _pfig = None
+        if _pfig is not None:
+            return _pfig
     mk = max(2, size * 1.2)
 
     # Check if reseg UMAP is available and the matching source is active.
@@ -1449,7 +1481,11 @@ def make_umap_fig(color_by, method, gene, size, opacity,
         pres = core._proseg_state["result"] if proseg_active and core._proseg_state["result"] else None
     with core._baysor_lock:
         bres = core._baysor_state["result"] if baysor_active and not pres and core._baysor_state["result"] else None
-    alt_res = pres or bres
+    # a further tool (alt_tool, e.g. "imgseg"): its loaded run, drawn like a Baysor / Proseg one
+    _ores = (core._seg_result(alt_tool) if alt_tool not in (None, "xenium", "baysor", "proseg")
+             and not (pres or bres) else None)
+    alt_res = pres or bres or _ores
+    _alt_tool = "proseg" if pres else "baysor" if bres else alt_tool if _ores else "xenium"
 
     # Fall back to UMAP columns embedded in cells_df (loaded from zarr) when no explicit reseg UMAP.
     # When SPLIT-corrected counts are active, prefer split_umap_1/2 if available.
@@ -1529,7 +1565,7 @@ def make_umap_fig(color_by, method, gene, size, opacity,
                 color_by = "transcript_counts"  # fall through
 
         if color_by.startswith("geneset:"):
-            _gs = analysis._geneset_color(color_by, "proseg" if pres else "baysor", use_corrected)
+            _gs = analysis._geneset_color(color_by, _alt_tool, use_corrected)
             if _gs is not None and len(_gs[0]) == len(_bdf):
                 _mkw = analysis._geneset_marker(_al(_gs[0]), _gs[1], _gs[2], cbar_range, size=mk, opacity=opacity)
                 _mkw["showscale"] = False
@@ -1584,6 +1620,7 @@ def make_umap_fig(color_by, method, gene, size, opacity,
                 _cluster_col = next((c for c in _all_cluster_cols if "split" in c), None) or next(iter(_all_cluster_cols), None)
             else:
                 _cluster_col = next((c for c in _all_cluster_cols if "split" not in c), None) or next(iter(_all_cluster_cols), None)
+            _cluster_col = clustersets._cs_reseg_col(bdf.columns, method) or _cluster_col
             if _cluster_col is not None:
                 _cvals = bdf[_cluster_col].reindex(udf.index).astype(str)
                 _unique = sorted(_cvals.unique(), key=lambda v: (0, int(v)) if v.isdigit() else (1, v))
@@ -1647,7 +1684,7 @@ def make_umap_fig(color_by, method, gene, size, opacity,
                 name=label,
             )]
 
-        title = "UMAP [Proseg]" if pres else "UMAP [Baysor]"
+        title = f"UMAP [{core._SEG_TOOL_LABELS.get(_alt_tool, _alt_tool)}]"
     else:
         # Original Xenium UMAP — switch to SPLIT UMAP coordinates when corrected counts active
         _has_split_umap = (use_corrected

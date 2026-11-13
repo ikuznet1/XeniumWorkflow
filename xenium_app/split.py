@@ -326,7 +326,7 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
         elif _tool == "proseg":
             _alt_res = pres
         else:
-            _alt_res = None
+            _alt_res = core._seg_result(seg_source, done_only=True)
 
         if _alt_res is not None:
             expr       = _alt_res["expr"]
@@ -665,7 +665,7 @@ names(._split_rctd_types) <- rownames(._split_rctd_res)
         # ── 12. Update in-memory ─────────────────────────────────────────────
         jobs._check_dataset_gen(_gen)
         if _alt_res is not None:
-            _lock = core._baysor_lock if _tool == "baysor" else core._proseg_lock
+            _lock = core._seg_state(_tool)[1] or core._proseg_lock
             with _lock:
                 _alt_res["split_corrected_expr"] = corrected_mat
                 _alt_res["split_corrected_cell_ids"] = corrected_cell_ids

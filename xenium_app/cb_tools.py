@@ -402,7 +402,8 @@ def start_annotation(n_clicks, source, model_name, rds_path, label_col,
         pres = core._proseg_state["result"] if core._seg_tool(seg_source) == "proseg" and core._proseg_state["status"] == "done" else None
     with core._baysor_lock:
         bres = core._baysor_state["result"] if core._seg_tool(seg_source) == "baysor" and core._baysor_state["status"] == "done" else None
-    alt_res = pres or bres
+    alt_res = pres or bres or (core._seg_result(seg_source, done_only=True)
+                               if core._seg_tool(seg_source) == "imgseg" else None)
 
     if alt_res is not None:
         if alt_res.get("expr") is None:

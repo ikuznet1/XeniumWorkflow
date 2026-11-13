@@ -67,13 +67,15 @@ if (await page.evaluate(() => getComputedStyle(document.querySelector('#umap-pan
   await click('#umap-toggle');
 }
 await setProp('plots-tabs', {active_tab: 'tab-de'});
+await page.waitForFunction(() => { const e = document.querySelector('#de-group-a'); return e && e.getClientRects().length > 0; }, null, {timeout: 30000}).catch(() => {});
 await page.waitForTimeout(1500);
 check('nothing runs on load (n_clicks = 0)', (await text('#de-status')) === '', await text('#de-status'));
 check('cells mode shows the group pickers, not the proximity rows', (await visible('#de-group-a')) && !(await visible('#prox-target')));
 
 // ── proximity ────────────────────────────────────────────────────────────────
 await setProp('de-mode', {value: 'proximity'});
-await page.waitForTimeout(2500);
+await page.waitForFunction(() => /Matched random anchors/.test((document.querySelector('#de-caveat') || {}).textContent || ''), null, {timeout: 30000}).catch(() => {});
+await page.waitForTimeout(1000);
 check('proximity mode shows its pickers and parameters, hides the others',
   (await visible('#prox-target')) && (await visible('#prox-near')) && !(await visible('#contact-radius')) && !(await visible('#de-group-a')));
 check('the caveat explains the mode', /Matched random anchors/.test(await text('#de-caveat')));
@@ -81,8 +83,12 @@ const labOpts = await dropdownOptions('prox-labels');
 const labels = process.env.XP_LABELS || labOpts.find((v) => String(v).startsWith('celltype:')) || labOpts[0];
 check('label sources are offered', labOpts.length > 0 && labOpts.includes(labels), JSON.stringify(labOpts));
 await setProp('prox-labels', {value: labels});
-await page.waitForTimeout(2500);
-const types = await dropdownOptions('prox-target');
+// the type lists are filled by a callback that queues behind the others: wait for it, up to 30 s
+let types = [];
+for (let i = 0; i < 60 && types.length < 2; i += 1) {
+  await page.waitForTimeout(500);
+  types = await dropdownOptions('prox-target');
+}
 const target = process.env.XP_TARGET || types[1] || types[0];
 const anchor = process.env.XP_ANCHOR || types[types.length - 1];
 check('cell types are listed for T and X', types.length >= 2 && types.includes(target) && types.includes(anchor), `${types.length} types; T = ${target}, X = ${anchor}`);

@@ -102,9 +102,8 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
         tool = core._seg_tool(seg_source)
 
         # ── Load sdata + cells_df from the active segmentation ─────────────────
-        if tool in ("baysor", "proseg"):
-            _lock = core._baysor_lock if tool == "baysor" else core._proseg_lock
-            _state = core._baysor_state if tool == "baysor" else core._proseg_state
+        if tool in core._SEG_TOOL_LABELS:
+            _state, _lock = core._seg_state(tool)
             with _lock:
                 _alt_res = _state.get("result")
             if not _alt_res:

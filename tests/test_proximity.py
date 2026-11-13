@@ -137,9 +137,15 @@ def test_signflip_over_genes_equals_the_scalar_exact_test(xe):
         ref = xe._sl_signflip(E[[0, 1, 3, 4, 5], g])
         assert r["p"][g] == ref["p"] and r["mean"][g] == pytest.approx(ref["mean"])
     assert xe._prox_signflip_genes(E[:3]) is None        # 2 valid units: no test
-    big = rng.normal(0.5, 1.0, size=(xe._PROX_ENUM_UNITS + 2, 5))
+    assert not hasattr(xe, "_PROX_MC") and not hasattr(xe, "_PROX_ENUM_UNITS")     # the shared limits are used
+    mid = rng.normal(0.5, 1.0, size=(13, 3))                  # 13 units: enumerated (2^13), as stats does
+    m = xe._prox_signflip_genes(mid)
+    assert m["exact"] and m["n_vectors"] == 2 ** 13 and m["min_p"] == pytest.approx(2 / 2 ** 13)
+    assert all(m["p"][g] == xe._sl_signflip(mid[:, g])["p"] for g in range(3))
+    big = rng.normal(0.5, 1.0, size=(xe._SL_ENUM_UNITS + 2, 5))
     a, b = xe._prox_signflip_genes(big), xe._prox_signflip_genes(big)
-    assert not a["exact"] and (a["p"] == b["p"]).all() and a["min_p"] == pytest.approx(1 / (xe._PROX_MC + 1))
+    assert not a["exact"] and (a["p"] == b["p"]).all() and a["min_p"] == pytest.approx(1 / (xe._SL_MC + 1))
+    assert a["n_vectors"] == xe._SL_MC == 20_000 and xe._SL_ENUM_UNITS == 16
     for g in range(5):
         assert abs(a["p"][g] - xe._sl_signflip(big[:, g])["p"]) < 0.03
 
@@ -194,6 +200,14 @@ def test_single_sample_gradient_is_found_and_the_bleed_gene_is_flagged(xe, one):
     assert g["log2fc"] > 0.3 and g["slope"] > 0 and g["pval"] == pytest.approx(1 / 61) and g["padj"] < 0.05
     assert not g["leak_flag"] and not g["anchor_owned"] and g["owner"] == T and g["z_random"] > 5
     assert g["L_um"] in (18.0, 25.0, 35.0, 50.0) and g["amplitude"] > 0 and g["r2"] > 0.01
+    # "Gene ownership + leak gate" unticked: the same statistics, no owner, nothing flagged
+    off = xe._prox_compute([s], [lab], T, X, params={"n_random": 60, "leak_gate": False}, source="Other")
+    to = off["table"].set_index("gene")
+    assert off["gate"]["off"] and not off["gate"]["applicable"] and "unticked" in off["gate"]["reason"]
+    assert not to["leak_flag"].any() and not to["anchor_owned"].any() and not to["gate_flag"].any()
+    assert (to["owner"] == "").all() and to["leak_fraction"].isna().all()
+    assert np.array_equal(to["padj"].to_numpy(), t["padj"].to_numpy(), equal_nan=True)
+    assert np.allclose(to["log2fc"], t["log2fc"]) and t["leak_flag"].any()
     # the Anchor's own genes bleed into adjacent Target cells: "significant", and flagged
     xm = t.loc[[f"xm{i}" for i in range(N_MARK)]]
     assert (xm["log2fc"] > 0).all() and (xm["padj"] < 0.05).sum() >= N_MARK - 2
@@ -337,6 +351,13 @@ def test_contact_effect_is_recovered_and_absent_under_shuffled_labels(xe, four):
     c = t.loc["CONTACT"]
     assert c["log2fc"] == pytest.approx(np.log2(2.5), abs=0.25) and c["padj"] < 0.05 and bool(c["pass"])
     assert not c["leak_flag"] and c["owner"] == T
+    # unticked: nothing is flagged, so "pass" is FDR and effect size alone
+    off = xe._contact_compute(samples, labels, T, X, radius=50, min_cells=20, n_shuffle=0, fit=_paired_fit,
+                              leak_gate=False)
+    to = off["table"].set_index("gene")
+    assert off["gate"]["off"] and not to["leak_flag"].any() and (to["owner"] == "").all()
+    sig = (to["padj"] < off["fdr"]) & (to["log2fc"].abs() > off["lfc_min"])
+    assert (to["pass"] == sig).all() and to["pass"].sum() > t["pass"].sum()
     # the anchor's genes differ between the groups as well, and are flagged, never passed
     xm = t.loc[[f"xm{i}" for i in range(N_MARK)]]
     assert (xm["log2fc"] > 0.4).all() and xm["leak_flag"].all() and not xm["pass"].any()
@@ -468,6 +489,14 @@ def test_proximity_job_publishes_into_the_de_tab(xe, monkeypatch, one):
     assert csv["filename"] == "proximity_Target_near_Anchor.csv" and "# unit of the p-values: n = " in csv["content"]
     assert "anchor_owned" in csv["content"].split("\n", 12)[-1].split("\n")[0] or "anchor_owned" in csv["content"]
     assert len(xe._prox_samples_view(res)) == 1
+    # the "Gene ownership + leak gate" checkbox of the tab reaches the job
+    assert _run(xe, "proximity", prox_nrand=20, leak_gate=[])[:2] == (True, False)
+    tl.wait_state(xe._de_state, xe._de_lock)
+    with xe._de_lock:
+        res2, msg2 = xe._de_state["result"], xe._de_state["message"]
+    [j for j in xe._jobs_list() if j.kind == "proximity"][-1].thread.join(30)
+    assert res2["gate"]["off"] and "switched off" in msg2 and not res2["table"]["leak_flag"].any()
+    assert "genes flagged (" in msg and "by the change rule" in msg
 
 
 def test_contact_job_publishes_and_refuses_a_single_sample(xe, monkeypatch, four):

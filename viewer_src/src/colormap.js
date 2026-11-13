@@ -123,6 +123,24 @@ export function fillDensity(rgba, values, n, max, cmap = 'magma') {
   }
 }
 
+/**
+ * RGBA image of a categorical grid: value i (1 … colors.length) takes colors[i - 1];
+ * 0 / NaN / out of range transparent.
+ */
+export function fillDensityCategorical(rgba, values, n, colors) {
+  const out = new Uint32Array(rgba.buffer, rgba.byteOffset, n);
+  const k = colors.length;
+  const pal = new Uint32Array(k + 1);
+  for (let c = 0; c < k; c++) {
+    const [r, g, b] = hexToRgb(colors[c]);
+    pal[c + 1] = pack(r, g, b, 255);
+  }
+  for (let i = 0; i < n; i++) {
+    const v = Math.round(values[i]);
+    out[i] = v >= 1 && v <= k ? pal[v] : 0;
+  }
+}
+
 export function fillUniform(rgba, n, rgb) {
   new Uint32Array(rgba.buffer, rgba.byteOffset, n).fill(pack(rgb[0], rgb[1], rgb[2], 255));
 }

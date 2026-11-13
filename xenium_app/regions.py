@@ -205,7 +205,7 @@ def _roi_apply_everywhere(rois: list) -> None:
     _orig = core.DATA.get("_df_original")
     if _orig is not None and _orig is not core.DATA["df"]:
         _roi_apply_metadata_to_df(_orig, rois)
-    for _lock, _state in ((core._baysor_lock, core._baysor_state), (core._proseg_lock, core._proseg_state)):
+    for _tool_i, _lock, _state in core._seg_states():
         with _lock:
             _res = _state.get("result")
         if _res:
@@ -259,8 +259,7 @@ def _roi_write_all_zarrs_bg() -> None:
         print(f"  ROI zarr write error (xenium): {e}", flush=True)
     # Write to Baysor/Proseg zarrs
     # (only the loaded result of each tool has its cell table in memory)
-    for tool, _lock, _state in (("baysor", core._baysor_lock, core._baysor_state),
-                                ("proseg", core._proseg_lock, core._proseg_state)):
+    for tool, _lock, _state in core._seg_states():
         try:
             with _lock:
                 result = _state.get("result")

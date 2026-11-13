@@ -133,7 +133,7 @@ def D(xe):
 class _Baseline:
     """What the freshly imported app looks like; reset() puts it back after each test."""
 
-    _STATES = ("_annot_state", "_baysor_state", "_proseg_state", "_spatial_state",
+    _STATES = ("_annot_state", "_baysor_state", "_proseg_state", "_imgseg_state", "_spatial_state",
                "_niche_state", "_save_sdata_state", "_split_state", "_spage_state",
                "_umap_reseg_state")
 

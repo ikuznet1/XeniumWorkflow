@@ -5,6 +5,7 @@ import os
 import sys
 
 from . import core, ui, loading, dataview, annotation, spage, analysis, sdata_store, regions
+from . import clustersets
 
 
 # ─── Locate & load data ───────────────────────────────────────────────────────
@@ -29,12 +30,15 @@ dataview._refresh_derived_data()
 
 
 # ─── App layout ───────────────────────────────────────────────────────────────
+# Cluster sets computed in the app for this dataset (Banksy domains, joint clusters)
+clustersets._cs_restore("xenium")
+
 meta            = core.DATA["metadata"]
 cluster_methods = core.DATA["cluster_methods"]
 gene_names      = core.DATA["gene_names"]
 
 
-cluster_options = [{"label": ui.method_label(m), "value": m} for m in cluster_methods]
+cluster_options = clustersets._cs_options("xenium")
 
 # Auto-load any previously cached SpaGE results for this dataset
 annotation._annot_autoload()

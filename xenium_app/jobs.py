@@ -89,7 +89,7 @@ _JOB_ACTIVE       = ("running", "cancelling")
 
 # kind → name used in the "Still running: …" refusal of Load Sample / Clean Cache
 _JOB_KIND_NAMES = {
-    "baysor": "Baysor", "proseg": "Proseg", "annotation": "annotation", "spage": "SpaGE",
+    "baysor": "Baysor", "proseg": "Proseg", "imgseg": "image segmentation", "annotation": "annotation", "spage": "SpaGE",
     "patches": "SpatialData / patches", "umap": "UMAP", "split": "SPLIT",
     "niches": "niches", "spatial": "spatial analysis", "save": "Save as SpatialData",
     "cellnest": "CellNEST load", "de": "differential expression",
@@ -99,7 +99,7 @@ _JOB_KIND_NAMES = {
     "segqc": "segmentation QC", "coloc": "stratified co-localisation",
     "proximity": "proximity differential expression", "contact": "contact-group differential expression",
     "lrdecomp": "ligand-receptor exposure decomposition", "aggregates": "aggregates",
-    "segfree": "segmentation-free abundance",
+    "segfree": "segmentation-free abundance", "txfactor": "transcript factors", "banksy": "Banksy clustering", "joint": "joint clustering",
 }
 
 _jobs: dict = {}                       # job id → _Job, in start order
