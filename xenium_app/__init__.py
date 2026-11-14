@@ -105,17 +105,36 @@ def _batch_preconfigure() -> bool:
     if not _os.path.exists(path):
         print(f"Batch error: data.path does not exist: {path}", flush=True)
         raise SystemExit(2)
+    read_only = any(a in ("--dry-run", "--list-steps") for a in _sys.argv[1:])
     _os.environ["DATA_DIR"] = path
     if cfg.get("cache_dir"):
         _os.environ["XENIUM_CACHE_DIR"] = _os.path.abspath(_os.path.expanduser(str(cfg["cache_dir"])))
-        _os.makedirs(_os.environ["XENIUM_CACHE_DIR"], exist_ok=True)
+        if not read_only:
+            _os.makedirs(_os.environ["XENIUM_CACHE_DIR"], exist_ok=True)
     mapping = data.get("h5ad_mapping")
     if isinstance(mapping, str):
         _os.environ["XENIUM_H5AD_MAPPING"] = _os.path.abspath(_os.path.expanduser(mapping))
     elif isinstance(mapping, dict):
-        mdir = _os.environ.get("XENIUM_CACHE_DIR") or _os.path.join(_os.path.expanduser("~"), ".xenium_explorer_cache")
-        _os.makedirs(mdir, exist_ok=True)
-        _os.environ["XENIUM_H5AD_MAPPING"] = _batch_inline_mapping_file(mapping, mdir)
+        if read_only:
+            import atexit as _atexit
+            import tempfile as _tempfile
+            with _tempfile.NamedTemporaryFile("w", suffix=".json", prefix="batch_h5ad_mapping_",
+                                              encoding="utf-8", delete=False) as _tf:
+                _tf.write(_json.dumps(mapping, sort_keys=True))
+                _tpath = _tf.name
+
+            def _rm_tmp_mapping(p=_tpath):
+                try:
+                    _os.unlink(p)
+                except OSError:
+                    pass
+
+            _atexit.register(_rm_tmp_mapping)
+            _os.environ["XENIUM_H5AD_MAPPING"] = _tpath
+        else:
+            mdir = _os.environ.get("XENIUM_CACHE_DIR") or _os.path.join(_os.path.expanduser("~"), ".xenium_explorer_cache")
+            _os.makedirs(mdir, exist_ok=True)
+            _os.environ["XENIUM_H5AD_MAPPING"] = _batch_inline_mapping_file(mapping, mdir)
     for var in ("XENIUM_ENABLE_REPL", "XENIUM_RENDERER"):      # a batch run has no browser and no REPL
         _os.environ.pop(var, None)
     return True

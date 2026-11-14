@@ -33,7 +33,7 @@ import traceback
 import numpy as np
 import pandas as pd
 
-from . import core, jobs, caching, dataview, stats, analysis, controls, provenance, compat
+from . import core, jobs, caching, dataview, annotation, stats, analysis, controls, provenance, compat
 
 
 class _BatchError(Exception):
@@ -123,7 +123,7 @@ _BATCH_NEED = {
     "lr": ["lr-labels", "lr-pairs"], "lrdecomp": ["lr-labels", "lr-pairs"],
     "aggregates": ["agg-labels", "agg-classes"], "segfree": ["sfree-labels", "sfree-type"],
     "composition": ["comp-category"], "geneset": ["geneset-name", "geneset-genes"],
-    "density": ["density-gene"],
+    "density": ["density-gene"], "spatial": ["niche-label-method"],
 }
 _BATCH_USES = {
     "de": ["de-group-a", "de-group-b", "de-leak-gate"],
@@ -151,6 +151,8 @@ _BATCH_ROLES = {
     "coloc-placebo": ("cell_type", "coloc-labels"), "prox-target": ("cell_type", "prox-labels"),
     "prox-anchor": ("cell_type", "prox-labels"), "sfree-type": ("cell_type", "sfree-labels"),
     "agg-classes": ("cell_types", "agg-labels"),
+    "niche-label-method": ("niche_label_key", None),
+    "segqc-method": ("annot_method", None), "segqc-source": ("segqc_cell_type", "segqc-method"),
     "density-gene": ("gene", None), "geneset-genes": ("genes_text", None), "spill-markers": ("genes_text", None),
     "sfree-markers": ("genes_text", None), "lr-pairs": ("pairs_text", None),
     "de-group-a": ("de_group", None), "de-group-b": ("de_group", None),
@@ -750,6 +752,17 @@ def _batch_known_clusters(seg_source, methods) -> set:
         return set(methods or ())
 
 
+def _batch_seg_scope(seg_source) -> tuple:
+    """Identity of a segmentation run for producer-before-consumer checks."""
+    tool = core._seg_tool(seg_source)
+    if tool == "xenium":
+        return ("xenium", "")
+    res = core._seg_result(seg_source, done_only=True)
+    if res is not None and res.get("out_dir"):
+        return (tool, os.path.realpath(res["out_dir"]))
+    return (tool, str(seg_source))
+
+
 def _batch_validate(cfg, log=None) -> tuple:
     """(errors, warnings) of the config against the loaded data, without computing. The
     checks of a step are made on the segmentation the step names: a cached run is loaded
@@ -768,7 +781,18 @@ def _batch_validate(cfg, log=None) -> tuple:
         except _BatchError as exc:
             return [str(exc)], warns
     known = _batch_known_clusters(ctx["seg-source"], methods)
-    first_cluster_creator = next((st["kind"] for st in cfg["steps"] if st["kind"] in _BATCH_CLUSTER_CREATORS), None)
+
+    def _step_seg_raw(st_item):
+        p = st_item.get("params") or {}
+        return p.get("seg_source") or p.get("seg-source") or ctx["seg-source"]
+
+    first_cluster_creator = next(
+        (st["kind"] for st in cfg["steps"]
+         if st["kind"] in _BATCH_CLUSTER_CREATORS
+         and core._seg_tool(_step_seg_raw(st)) == seg_tool
+         and (st["kind"] != "clustering" or seg_tool != "xenium" or bool(methods or known))),
+        None,
+    )
     if cfg.get("cluster_method") and (methods or known) and cfg["cluster_method"] not in known:
         msg = (f"cluster_method '{cfg['cluster_method']}' is not a cluster set of the data "
                f"({', '.join(map(str, sorted(known)))})")
@@ -796,10 +820,25 @@ def _batch_validate(cfg, log=None) -> tuple:
     have_tx = any(dataview._ds_has_transcripts(ds) for ds in [core.DATA] + list(dataview.EXTRA_DATASETS))
     label_kinds = _batch_label_kinds(ctx)
     _lk_seg = ctx["seg-source"]              # the segmentation label_kinds was read for
-    annotated_later = False
-    niches_later = False
-    clustered_later = None
+    annotated_so_far = set()                 # {(seg_scope, annot_method)}
+    niches_so_far = set()                    # {seg_scope}
+    clustered_so_far = {}                    # seg_scope -> creator kind
+    xenium_umap_creator = None               # "clustering" on xenium (UMAP recompute, not arbitrary cluster set)
     txfactor_later = False
+
+    def _has_annot_kind(scope, val_str):
+        parts = str(val_str).split(":", 1)
+        return (len(parts) == 2 and parts[0] == "celltype"
+                and parts[1] in core._ANNOT_METHODS and (scope, parts[1]) in annotated_so_far)
+
+    def _has_annot_group(scope, val_str):
+        parts = str(val_str).split(":")
+        if len(parts) >= 2 and parts[0] == "celltype":
+            if parts[1] in core._ANNOT_METHODS:
+                return (scope, parts[1]) in annotated_so_far
+            return any(sc == scope for sc, _m in annotated_so_far)
+        return False
+
     for st in cfg["steps"]:
         spec, where = _BATCH_STEPS[st["kind"]], f"step {st['index']} ({st['name']})"
         try:
@@ -811,6 +850,13 @@ def _batch_validate(cfg, log=None) -> tuple:
             if resolved.get(cid) in (None, "", []):
                 nm = sorted(n for n, c in allowed.items() if c == cid and n != cid)
                 errors.append(f"{where}: parameter '{nm[0] if nm else cid}' is required")
+        if st["kind"] == "txfactor":
+            txf_m = str(resolved.get("txf-method") or "nmf")
+            txf_lbl = resolved.get("txf-labels")
+            if txf_m == "reference" and _batch_unset(txf_lbl):
+                errors.append(f"{where}: parameter 'labels' is required when method is 'reference'")
+            elif txf_lbl == "niche":
+                errors.append(f"{where}: label source 'niche' is not available for txfactor")
         sctx = {**ctx, **{k: v for k, v in resolved.items() if k in _BATCH_CONTEXT}}
         if sctx["seg-source"] != ctx["seg-source"]:
             # a step on another segmentation: its labels, cell types and groups are those
@@ -831,14 +877,21 @@ def _batch_validate(cfg, log=None) -> tuple:
         else:
             label_kinds = _batch_label_kinds(ctx) if _lk_seg != ctx["seg-source"] else label_kinds
         _lk_seg = sctx["seg-source"]
+        s_seg_tool = core._seg_tool(sctx["seg-source"])
+        s_scope = _batch_seg_scope(sctx["seg-source"])
         known_s = known if sctx["seg-source"] == ctx["seg-source"] else _batch_known_clusters(sctx["seg-source"], methods)
+        s_has_clusters = bool(methods or known_s) if s_seg_tool == "xenium" else bool(known_s)
         step_cm = sctx.get("cluster-method")
         step_cm_overridden = "cluster_method" in st["params"] or "cluster-method" in st["params"]
-        if step_cm_overridden and step_cm and (methods or known_s) and step_cm not in known_s:
+        clustered_here = clustered_so_far.get(s_scope) or (
+            xenium_umap_creator if s_seg_tool == "xenium" and s_has_clusters and not step_cm_overridden else None
+        )
+        niches_here = s_scope in niches_so_far
+        if step_cm_overridden and step_cm and s_has_clusters and step_cm not in known_s:
             cm_msg = (f"{where}: cluster_method '{step_cm}' is not a cluster set of the data "
                       f"({', '.join(map(str, sorted(known_s)))})")
-            if clustered_later:
-                warns.append(f"{cm_msg} - an earlier {clustered_later} step may provide it")
+            if clustered_so_far.get(s_scope):
+                warns.append(f"{cm_msg} - an earlier {clustered_so_far[s_scope]} step may provide it")
             else:
                 errors.append(cm_msg)
         if spec.get("design") and (n_a < 1 or n_b < 1):
@@ -860,23 +913,74 @@ def _batch_validate(cfg, log=None) -> tuple:
             if role is None or _batch_unset(val):
                 continue
             if role in ("label_kind", "label_kind_or_none"):
+                if cid == "txf-labels" and val == "niche":
+                    continue                  # already reported above for txfactor
                 if val not in label_kinds:
                     msg = (f"{where}: label source '{val}' is not available "
                            f"(available: {', '.join(sorted(label_kinds)) or 'none'})")
-                    is_annot_kind = (str(val).startswith("celltype:")
-                                     and str(val).split(":", 1)[1] in core._ANNOT_METHODS)
-                    if annotated_later and is_annot_kind:
+                    if _has_annot_kind(s_scope, val):
                         warns.append(msg + " - an earlier annotation step may provide it")
-                    elif niches_later and val == "niche":
+                    elif niches_here and val == "niche":
                         warns.append(msg + " - an earlier niches step may provide it")
-                    elif clustered_later and val == "cluster":
-                        warns.append(msg + f" - an earlier {clustered_later} step may provide it")
+                    elif clustered_here and val == "cluster":
+                        warns.append(msg + f" - an earlier {clustered_here} step may provide it")
                     else:
                         errors.append(msg)
-                elif (val == "cluster" and step_cm and (methods or known_s)
-                      and step_cm not in known_s and not clustered_later and not step_cm_overridden):
+                elif (val == "cluster" and step_cm and s_has_clusters
+                      and step_cm not in known_s and not clustered_here and not step_cm_overridden):
                     errors.append(f"{where}: cluster_method '{step_cm}' is not a cluster set of the data "
                                   f"({', '.join(map(str, sorted(known_s)))})")
+            elif role == "niche_label_key":
+                alt_res = core._seg_result(sctx["seg-source"], done_only=True)
+                v_str = str(val)
+                if v_str == "labels":
+                    with core._annot_lock:
+                        ok_lbl = alt_res is None and core._annot_state.get("labels") is not None
+                    m_cand = None
+                elif v_str.startswith("labels_"):
+                    lkey = annotation._label_key_for_active_seg(v_str, alt_res)
+                    with core._annot_lock:
+                        ok_lbl = bool(lkey and core._annot_state.get(lkey) is not None)
+                    m_cand = v_str.split("_")[1] if "_" in v_str else None
+                else:
+                    ok_lbl, m_cand = False, None
+                if not ok_lbl:
+                    msg = f"{where}: annotation '{val}' is not loaded for '{sctx['seg-source']}'"
+                    if m_cand in core._ANNOT_METHODS and (s_scope, m_cand) in annotated_so_far:
+                        warns.append(msg + " - an earlier annotation step may provide it")
+                    else:
+                        errors.append(msg)
+            elif role == "annot_method":
+                v_str = str(val)
+                if v_str not in core._ANNOT_METHODS:
+                    errors.append(f"{where}: unknown annotation method '{val}' "
+                                  f"(choose from: {', '.join(core._ANNOT_METHODS)})")
+                else:
+                    with core._annot_lock:
+                        has_xen_lbl = core._annot_state.get(f"labels_{v_str}") is not None
+                    if not has_xen_lbl:
+                        msg = f"{where}: Xenium annotation 'labels_{v_str}' is not loaded"
+                        if (("xenium", ""), v_str) in annotated_so_far:
+                            warns.append(msg + " - an earlier annotation step may provide it")
+                        else:
+                            errors.append(msg)
+            elif role == "segqc_cell_type":
+                m_val = str(resolved.get(ref) or "")
+                if m_val not in core._ANNOT_METHODS:
+                    continue
+                with core._annot_lock:
+                    has_xen_lbl = core._annot_state.get(f"labels_{m_val}") is not None
+                if not has_xen_lbl:
+                    continue                  # already reported by segqc-method
+                xen_ctx = {**sctx, "seg-source": "xenium"}
+                types = _batch_cell_types(f"celltype:{m_val}", xen_ctx)
+                if types is not None and str(val) not in types:
+                    msg = (f"{where}: no cell is labelled {val!r} in 'celltype:{m_val}' "
+                           f"(labels: {', '.join(sorted(types)[:30])})")
+                    if (("xenium", ""), m_val) in annotated_so_far:
+                        warns.append(msg + " - an earlier annotation step may provide it")
+                    else:
+                        errors.append(msg)
             elif role in ("cell_type", "cell_types"):
                 kind_val = resolved.get(ref)
                 types = _batch_cell_types(kind_val, sctx) if kind_val in label_kinds else None
@@ -887,12 +991,11 @@ def _batch_validate(cfg, log=None) -> tuple:
                 if missing:
                     msg = (f"{where}: no cell is labelled {', '.join(repr(m) for m in missing)} in "
                            f"'{kind_val}' (labels: {', '.join(sorted(types)[:30])})")
-                    if kind_val == "cluster" and clustered_later:
-                        warns.append(msg + f" - an earlier {clustered_later} step may provide it")
-                    elif kind_val == "niche" and niches_later:
+                    if kind_val == "cluster" and clustered_here:
+                        warns.append(msg + f" - an earlier {clustered_here} step may provide it")
+                    elif kind_val == "niche" and niches_here:
                         warns.append(msg + " - an earlier niches step may provide it")
-                    elif (str(kind_val).startswith("celltype:")
-                          and str(kind_val).split(":", 1)[1] in core._ANNOT_METHODS and annotated_later):
+                    elif _has_annot_kind(s_scope, kind_val):
                         warns.append(msg + " - an earlier annotation step may provide it")
                     else:
                         errors.append(msg)
@@ -933,10 +1036,10 @@ def _batch_validate(cfg, log=None) -> tuple:
                     opts = None
                 if st["kind"] == "de" and opts is not None and val not in opts:
                     msg = f"{where}: group '{val}' is not available (e.g. {', '.join(sorted(opts)[:12])})"
-                    if annotated_later and str(val).startswith("celltype:"):
+                    if _has_annot_group(s_scope, val):
                         warns.append(msg + " - an earlier annotation step may provide it")
-                    elif clustered_later and str(val).startswith("cluster:"):
-                        warns.append(msg + f" - an earlier {clustered_later} step may provide it")
+                    elif clustered_here and str(val).startswith("cluster:"):
+                        warns.append(msg + f" - an earlier {clustered_here} step may provide it")
                     else:
                         errors.append(msg)
             elif role == "population":
@@ -948,10 +1051,10 @@ def _batch_validate(cfg, log=None) -> tuple:
                 if opts is not None and val not in opts:
                     msg = (f"{where}: population '{val}' is not available (e.g. "
                            f"{', '.join(sorted(map(str, opts))[:12])})")
-                    if annotated_later and str(val).startswith("celltype:"):
+                    if _has_annot_group(s_scope, val):
                         warns.append(msg + " - an earlier annotation step may provide it")
-                    elif clustered_later and str(val).startswith("cluster:"):
-                        warns.append(msg + f" - an earlier {clustered_later} step may provide it")
+                    elif clustered_here and str(val).startswith("cluster:"):
+                        warns.append(msg + f" - an earlier {clustered_here} step may provide it")
                     else:
                         errors.append(msg)
             elif role == "file" and val and not os.path.exists(os.path.expanduser(str(val))):
@@ -960,11 +1063,18 @@ def _batch_validate(cfg, log=None) -> tuple:
             elif role == "dir" and val and not os.path.isdir(os.path.expanduser(str(val))):
                 errors.append(f"{where}: directory not found: {val}")
         if st["kind"] == "annotation":
-            annotated_later = True
+            m_prod = str(resolved.get("annot-source") or "celltypist")
+            if m_prod in core._ANNOT_METHODS:
+                annotated_so_far.add((s_scope, m_prod))
         elif st["kind"] == "niches":
-            niches_later = True
-        elif st["kind"] in _BATCH_CLUSTER_CREATORS:
-            clustered_later = clustered_later or st["kind"]
+            niches_so_far.add(s_scope)
+        elif st["kind"] in ("banksy", "joint"):
+            clustered_so_far.setdefault(s_scope, st["kind"])
+        elif st["kind"] == "clustering":
+            if s_seg_tool != "xenium":
+                clustered_so_far.setdefault(s_scope, "clustering")
+            else:
+                xenium_umap_creator = xenium_umap_creator or "clustering"
         elif st["kind"] == "txfactor":
             txfactor_later = True
     return errors, warns

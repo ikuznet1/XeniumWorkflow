@@ -629,6 +629,18 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                             g for g in _adata_w.uns["split_corrected_imputed_genes"]
                             if g not in _re_genes]
                     _sdata_w.tables["table"] = _adata_new
+                    # Preserve X_corrected.attrs["corrected_cols"] across table rewrite
+                    _orig_corr_cols = None
+                    try:
+                        import zarr as _zarr_spw
+                        _zr_spw = _zarr_spw.open_group(sdata_path, mode="r", use_consolidated=False)
+                        _lay_spw = _zr_spw["tables"]["table"].get("layers", {})
+                        if "X_corrected" in _lay_spw:
+                            _rc_spw = _lay_spw["X_corrected"].attrs.get("corrected_cols")
+                            if _rc_spw is not None:
+                                _orig_corr_cols = [str(g) for g in _rc_spw]
+                    except Exception:
+                        pass
                     # The table on disk has to be deleted before it can be rewritten:
                     # keep a copy (and the root metadata) to put back if the write fails.
                     _root_w  = str(sdata_path).rstrip("/\\")
@@ -651,6 +663,13 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                         _sh_w.rmtree(_bak_dir, ignore_errors=True)
                         raise
                     _sh_w.rmtree(_bak_dir, ignore_errors=True)
+                    if _orig_corr_cols is not None:
+                        try:
+                            import zarr as _zarr_spw2
+                            _zr_spw2 = _zarr_spw2.open_group(sdata_path, mode="r+", use_consolidated=False)
+                            _zr_spw2["tables"]["table"]["layers"]["X_corrected"].attrs["corrected_cols"] = _orig_corr_cols
+                        except Exception:
+                            pass
                     return _new_genes, _adata_new
                 except Exception as _ze:
                     print(f"  SpaGE: zarr write-back failed (non-fatal): {_ze}", flush=True)
@@ -672,19 +691,43 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                         with core._spage_lock:
                             _prev_imp = list(_alt_res.get("imputed_genes") or [])
                             _prev_gni = _alt_res.get("gene_name_to_idx") or {}
+                            _full_df = _alt_res.get("_cells_df_original", _alt_res["cells_df"])
+                            _full_ids = pd.Index(_full_df.index.astype(str))
+                            _imp_ids_m = pd.Index(imp_df.index.astype(str))
+                            _fpos = (_imp_ids_m.get_indexer(_full_ids)
+                                     if _imp_ids_m.is_unique else np.full(len(_full_ids), -1))
+                            if (_fpos < 0).any() and _imp_ids_m.is_unique:
+                                _fpos = _imp_ids_m.get_indexer(
+                                    _full_ids.str.replace(r'^p\d+_', '', regex=True))
+                            _imp_aligned = (
+                                imp_df if (len(_fpos) == len(imp_df)
+                                           and np.array_equal(_fpos, np.arange(len(_fpos))))
+                                else imp_df.iloc[_fpos]
+                            )
+                            _has_orig = "_expr_original" in _alt_res
+                            _base_expr = _alt_res["_expr_original"] if _has_orig else _alt_res["expr"]
                             # Genes imputed before: replace their columns in memory too
-                            _re_genes = [g for g in imp_df.columns
+                            _re_genes = [g for g in _imp_aligned.columns
                                          if g in _prev_imp and g in _prev_gni
-                                         and _prev_gni[g] < _alt_res["expr"].shape[1]]
+                                         and _prev_gni[g] < _base_expr.shape[1]]
                             if _re_genes:
-                                _alt_res["expr"] = _spage_replace_cols(
-                                    _alt_res["expr"], [_prev_gni[g] for g in _re_genes],
-                                    imp_df[_re_genes].values)
+                                _base_expr = _spage_replace_cols(
+                                    _base_expr, [_prev_gni[g] for g in _re_genes],
+                                    _imp_aligned[_re_genes].values)
                             if new_genes:
-                                # Extend alt_res["expr"] with new imputed columns
-                                new_cols = sp.csr_matrix(imp_df[new_genes].values.astype(np.float32))
-                                _alt_res["expr"] = sp.hstack([_alt_res["expr"], new_cols]).tocsr()
-                            if _alt_res["expr"].shape[1] == adata_new.n_vars:
+                                # Extend full reseg matrix with new imputed columns
+                                new_cols = sp.csr_matrix(_imp_aligned[new_genes].values.astype(np.float32))
+                                _base_expr = sp.hstack([_base_expr, new_cols]).tocsr()
+                            if _has_orig:
+                                _alt_res["_expr_original"] = _base_expr
+                                _sub_pos = _full_ids.get_indexer(_alt_res["cells_df"].index.astype(str))
+                                if not (_sub_pos < 0).any():
+                                    _alt_res["expr"] = _base_expr[_sub_pos, :]
+                            else:
+                                _alt_res["expr"] = _base_expr
+                            _alt_res.pop("expr_csc", None)
+                            _alt_res.pop("expr_csc_src", None)
+                            if _base_expr.shape[1] == adata_new.n_vars:
                                 # Same columns as the zarr table (also for a run reloaded
                                 # from a zarr that already held imputed genes)
                                 _alt_res["gene_name_to_idx"] = {

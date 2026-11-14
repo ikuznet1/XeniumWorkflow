@@ -65,6 +65,74 @@ def _sdata_summary(sdata) -> str:
 # columns of other modules to write with Save as SpatialData (the controls module registers)
 _extra_obs_providers: list = []
 
+_ANNOT_MASK_VALUES = frozenset({"", "nan", "<NA>", "None", "Unknown"})
+
+
+def _sdata_clean_clust_str(v) -> str:
+    """Canonical categorical string for a Xenium/reseg cluster column entry ('0' = unassigned)."""
+    if v is None:
+        return "0"
+    try:
+        if pd.isna(v):
+            return "0"
+    except Exception:
+        pass
+    s = str(v).strip()
+    if not s or s in regions._OBS_PLACEHOLDERS:
+        return "0"
+    try:
+        fv = float(s)
+        if np.isfinite(fv) and fv.is_integer():
+            return str(int(fv))
+    except (TypeError, ValueError):
+        pass
+    return s
+
+
+def _sdata_full_cells_df(live_df, orig_df) -> tuple:
+    """Return (full_cells_df, active_subset_id_set_or_None) for Save as SpatialData.
+
+    When subset() is active (*orig_df* is present), starts from a copy of *orig_df* so
+    non-subset cells keep their embeddings, ROIs, niches and clusters, while merging any
+    columns added or updated on the active subset frame (*live_df*) at the subset cell IDs.
+    """
+    if orig_df is None or orig_df is live_df:
+        return live_df, None
+    full_df = orig_df.copy()
+    sub_ids = set(live_df.index.astype(str)) if live_df is not None else set()
+    if live_df is None or not len(live_df.columns):
+        return full_df, sub_ids
+    fidx = pd.Index(full_df.index.astype(str))
+    for col in live_df.columns:
+        lser = live_df[col].copy()
+        lser.index = lser.index.astype(str)
+        lser = lser[~lser.index.duplicated(keep="first")]
+        if col not in full_df.columns:
+            reindexed = lser.reindex(fidx)
+            if pd.api.types.is_string_dtype(live_df[col]) and live_df[col].dtype != object:
+                full_df[col] = pd.array(reindexed.to_numpy(), dtype="string")
+            else:
+                full_df[col] = reindexed.to_numpy()
+        else:
+            in_sub = np.asarray(fidx.isin(lser.index), dtype=bool)
+            if not in_sub.any():
+                continue
+            sub_vals = lser.reindex(fidx[in_sub])
+            pos = np.flatnonzero(in_sub)
+            cidx = full_df.columns.get_loc(col)
+            try:
+                if pd.api.types.is_integer_dtype(full_df[col]) and sub_vals.isna().any():
+                    full_df[col] = full_df[col].astype("float64")
+                elif (full_df[col].dtype != object and pd.api.types.is_object_dtype(sub_vals)
+                      and not pd.api.types.is_string_dtype(full_df[col])):
+                    full_df[col] = full_df[col].astype(object)
+                full_df.iloc[pos, cidx] = sub_vals.to_numpy()
+            except Exception:
+                merged = full_df[col].astype(object).copy()
+                merged.iloc[pos] = sub_vals.astype(object).to_numpy()
+                full_df[col] = merged
+    return full_df, sub_ids
+
 
 def _with_extra_obs(cells_df, seg_source):
     """(cells_df with the registered extra columns joined - a copy when there are any -,
@@ -138,9 +206,16 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 sdata = sd.read_zarr(sdata_path)
-            cells_df  = _alt_res["cells_df"]
-            cluster_methods = [c for c in cells_df.columns
-                               if c.startswith("cluster") or c == "niche" or c.startswith("roi_")]
+            cells_df, _sub_ids = _sdata_full_cells_df(
+                _alt_res["cells_df"], _alt_res.get("_cells_df_original"))
+            _clust_cols = [] if cells_df is None else [
+                c for c in cells_df.columns if str(c).startswith("clust__")]
+            _reseg_cset_cols = [] if cells_df is None else [
+                c for c in cells_df.columns
+                if str(c).startswith("cluster_") and c != "cluster_split_10"]
+            cluster_methods = [] if cells_df is None else [
+                c for c in cells_df.columns
+                if c.startswith("cluster") or c == "niche" or c.startswith("roi_")]
         else:
             # The app's own per-cell store (table + cell / nucleus boundaries), read
             # fresh; the sopa object of the Resegment modal has no table and no cells.
@@ -153,17 +228,24 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 sdata = sd.read_zarr(sdata_path)
-            cells_df        = core.DATA.get("df")
+            cells_df, _sub_ids = _sdata_full_cells_df(
+                core.DATA.get("df"), core.DATA.get("_df_original"))
             # The store already holds the columns DATA["df"] was loaded from; only
             # columns added in this session are attached below.
+            _clust_cols = [] if cells_df is None else [
+                c for c in cells_df.columns if str(c).startswith("clust__")]
+            _reseg_cset_cols = []
             cluster_methods = [] if cells_df is None else [
                 c for c in cells_df.columns
                 if c.startswith("cluster") or c == "niche" or c.startswith("roi_")]
 
         cells_df, _extra_cols = _with_extra_obs(cells_df, seg_source)
         # text columns go through the label path below, numeric ones through the numeric path
-        cluster_methods = list(cluster_methods) + [c for c in _extra_cols if c not in cluster_methods
-                                                   and cells_df[c].dtype == object]
+        cluster_methods = list(cluster_methods) + [
+            c for c in _extra_cols
+            if c not in cluster_methods and c not in _clust_cols
+            and (cells_df[c].dtype == object or pd.api.types.is_string_dtype(cells_df[c]))
+        ]
 
         _set("running", f"Writing to {save_path}…")
         print(f"  save_spatialdata: writing to {save_path} (seg={seg_source}, roi_only={roi_only})…", flush=True)
@@ -206,31 +288,49 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
         # ── Attach analysis results to sdata table ─────────────────────────────
         out_tbl = None
         _preserved_ccols = None
+        _cm_saved = None
         if "table" in sdata.tables:
             tbl = sdata.tables["table"]
             if "X_corrected" in tbl.layers:
                 _src_holder = _alt_res if _alt_res is not None else core.DATA
-                if isinstance(_src_holder, dict) and "split_corrected_cols" in _src_holder:
+
+                def _disk_ccols():
+                    if tbl.uns.get("split_corrected_cols") is not None:
+                        return [str(g) for g in list(tbl.uns["split_corrected_cols"])]
+                    if sdata_path and os.path.isdir(sdata_path):
+                        try:
+                            import zarr as _zarr_mod
+                            _zr = _zarr_mod.open_group(sdata_path, mode="r", use_consolidated=False)
+                            _raw_attr = _zr["tables"]["table"]["layers"]["X_corrected"].attrs.get("corrected_cols")
+                            if _raw_attr is not None:
+                                return [str(g) for g in list(_raw_attr)]
+                        except Exception:
+                            pass
+                    return None
+
+                if _sub_ids is not None:
+                    if isinstance(_src_holder, dict) and "_split_corrected_cols_original" in _src_holder:
+                        _orig_ccols = _src_holder.get("_split_corrected_cols_original")
+                        if _orig_ccols is not None:
+                            _preserved_ccols = [str(g) for g in list(_orig_ccols)]
+                        else:
+                            tbl.uns.pop("split_corrected_cols", None)
+                    else:
+                        _preserved_ccols = _disk_ccols()
+                elif isinstance(_src_holder, dict) and "split_corrected_cols" in _src_holder:
                     _raw_ccols = _src_holder.get("split_corrected_cols")
                     if _raw_ccols is not None:
                         _preserved_ccols = [str(g) for g in list(_raw_ccols)]
                     else:
                         tbl.uns.pop("split_corrected_cols", None)
-                elif tbl.uns.get("split_corrected_cols") is not None:
-                    _preserved_ccols = [str(g) for g in list(tbl.uns["split_corrected_cols"])]
-                elif sdata_path and os.path.isdir(sdata_path):
-                    try:
-                        import zarr as _zarr_mod
-                        _zr = _zarr_mod.open_group(sdata_path, mode="r", use_consolidated=False)
-                        _raw_attr = _zr["tables"]["table"]["layers"]["X_corrected"].attrs.get("corrected_cols")
-                        if _raw_attr is not None:
-                            _preserved_ccols = [str(g) for g in list(_raw_attr)]
-                    except Exception:
-                        pass
+                else:
+                    _preserved_ccols = _disk_ccols()
                 if _preserved_ccols is not None:
                     tbl.uns["split_corrected_cols"] = list(_preserved_ccols)
             has_cell_id   = "cell_id" in tbl.obs.columns
             zarr_cell_ids = tbl.obs["cell_id"].astype(str) if has_cell_id else None
+            _zkeys_arr    = zarr_cell_ids.to_numpy(dtype=str) if has_cell_id else tbl.obs.index.astype(str).to_numpy()
+            _non_sub_mask = None if _sub_ids is None else ~pd.Index(_zkeys_arr).isin(_sub_ids)
 
             def _map(series: "pd.Series") -> list:
                 """Align a Series (index=cell_id str) to zarr obs rows."""
@@ -244,29 +344,91 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
                 series = series.copy()
                 series.index = series.index.astype(str)
                 series = series[~series.index.duplicated(keep="first")]
-                _keys = zarr_cell_ids.values if has_cell_id else tbl.obs.index.astype(str)
-                return series.reindex(_keys)
+                return series.reindex(_zkeys_arr)
 
-            def _map_na(series: "pd.Series") -> list:
+            def _map_na(series: "pd.Series", prev_obs_col: "pd.Series | None" = None) -> list:
                 """As _map, but a cell without a value stays without one ("" in the
                 store, read back as missing) instead of joining a group "Unknown"."""
                 _s = series.dropna().astype(str)
                 _s = _s[~_s.isin(regions._OBS_PLACEHOLDERS)]
                 _al = _align(_s)
-                return _al.where(_al.notna(), "").tolist()
+                _out = _al.where(_al.notna(), "").to_numpy(dtype=object)
+                if _non_sub_mask is not None and prev_obs_col is not None:
+                    _prev_raw = prev_obs_col
+                    _prev_str = _prev_raw.astype(str).to_numpy(dtype=object)
+                    _prev_ok = (
+                        _prev_raw.notna().to_numpy(dtype=bool)
+                        & ~pd.Series(_prev_str).isin(regions._OBS_PLACEHOLDERS).to_numpy(dtype=bool)
+                    )
+                    _keep_prev = _non_sub_mask & _al.isna().to_numpy(dtype=bool) & _prev_ok
+                    if _keep_prev.any():
+                        _out = np.where(_keep_prev, _prev_str, _out)
+                return _out.tolist()
+
+            def _write_clust_col(col_name: str, series: "pd.Series") -> None:
+                _al = _align(series)
+                _vals = [_sdata_clean_clust_str(v) for v in _al.to_numpy()]
+                if _non_sub_mask is not None and col_name in tbl.obs.columns:
+                    _prev = tbl.obs[col_name].to_numpy()
+                    _miss = _al.isna().to_numpy(dtype=bool)
+                    for _i in np.flatnonzero(_non_sub_mask & _miss):
+                        _pv = _sdata_clean_clust_str(_prev[_i])
+                        if _pv != "0":
+                            _vals[_i] = _pv
+                tbl.obs[col_name] = pd.Categorical(_vals)
 
             if cells_df is not None:
                 # Cluster / niche / ROI columns: cells SPLIT dropped, cells outside
                 # every ROI and cells outside the subset have no value
                 for method in cluster_methods:
                     if method in cells_df.columns:
-                        tbl.obs[method] = _map_na(cells_df[method])
+                        _prev_col = (
+                            tbl.obs[method]
+                            if (method in tbl.obs.columns and not str(method).startswith("roi_"))
+                            else None
+                        )
+                        tbl.obs[method] = _map_na(cells_df[method], prev_obs_col=_prev_col)
+
+                # Categorical cluster columns (clust__* and mirrored reseg cluster_<m>)
+                if _alt_res is None:
+                    _cm_list = [
+                        str(_m) for _m in (core.DATA.get("cluster_methods") or [])
+                        if f"clust__{_m}" in cells_df.columns
+                    ]
+                    for _ccol in _clust_cols:
+                        _m = str(_ccol)[len("clust__"):]
+                        if _m and _m not in _cm_list:
+                            _cm_list.append(_m)
+                        _write_clust_col(_ccol, cells_df[_ccol])
+                    if _cm_list or "cluster_methods" in tbl.uns:
+                        _cm_saved = list(_cm_list)
+                        tbl.uns["cluster_methods"] = list(_cm_saved)
+                else:
+                    _cm_list = []
+                    for _ccol in _clust_cols:
+                        _m = str(_ccol)[len("clust__"):]
+                        if _m and _m not in _cm_list:
+                            _cm_list.append(_m)
+                        _write_clust_col(_ccol, cells_df[_ccol])
+                    for _rcol in _reseg_cset_cols:
+                        _m = str(_rcol)[len("cluster_"):]
+                        _ccol = f"clust__{_m}"
+                        if _m and _m not in _cm_list:
+                            _cm_list.append(_m)
+                        if _ccol not in _clust_cols:
+                            _write_clust_col(_ccol, cells_df[_rcol])
+                    if _cm_list or "cluster_methods" in tbl.uns:
+                        _cm_saved = list(_cm_list)
+                        tbl.uns["cluster_methods"] = list(_cm_saved)
+
                 # Embeddings computed in this session (Rerun UMAP, SPLIT UMAP) and any
                 # other numeric per-cell column the re-read table does not carry
                 # The columns of the registered providers (control / aggregate columns of
                 # this session) are always rewritten: the re-read table may carry them
                 # from an earlier export, and their text companions are rewritten above.
                 for _ncol in cells_df.columns:
+                    if str(_ncol).startswith("clust__"):
+                        continue
                     _extra = _ncol in _extra_cols
                     _always = _extra or _ncol in ("umap_1", "umap_2", "split_umap_1", "split_umap_2")
                     if not _always and (_ncol in tbl.obs.columns or _ncol in cluster_methods
@@ -279,8 +441,15 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
                         continue
                     if _always and not _extra and not cells_df[_ncol].notna().any():
                         continue
-                    tbl.obs[_ncol] = pd.to_numeric(_align(cells_df[_ncol]),
-                                                   errors="coerce").to_numpy(dtype="float64")
+                    _num_arr = pd.to_numeric(_align(cells_df[_ncol]),
+                                             errors="coerce").to_numpy(dtype="float64")
+                    if _non_sub_mask is not None and _ncol in tbl.obs.columns:
+                        _prev_num = pd.to_numeric(tbl.obs[_ncol],
+                                                  errors="coerce").to_numpy(dtype="float64")
+                        _keep_prev = _non_sub_mask & np.isnan(_num_arr) & ~np.isnan(_prev_num)
+                        if _keep_prev.any():
+                            _num_arr = np.where(_keep_prev, _prev_num, _num_arr)
+                    tbl.obs[_ncol] = _num_arr
 
             # Cell-type annotations: per-method labels of the exported segmentation
             # (Xenium: labels_<method>; reseg: labels_<method>_<tool>_<run tag>)
@@ -317,6 +486,8 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
                 tbl = tbl[keep_mask].copy()
                 if _preserved_ccols is not None:
                     tbl.uns["split_corrected_cols"] = list(_preserved_ccols)
+                if _cm_saved is not None:
+                    tbl.uns["cluster_methods"] = list(_cm_saved)
                 print(f"  save_spatialdata: table filtered to {tbl.n_obs:,} cells", flush=True)
             out_tbl = tbl
 
@@ -386,44 +557,101 @@ def _sdata_autoload() -> None:
         print(f"  SpatialData: auto-load failed: {exc}", flush=True)
 
 
-def _annot_load_from_sdata(sdata) -> None:
+def _annot_load_from_sdata(sdata=None) -> None:
     """Load cell-type annotation columns from a SpatialData table into _annot_state."""
     try:
-        if "table" not in sdata.tables:
-            return
-        tbl = sdata.tables["table"]
+        tbl = None
+        if sdata is None:
+            zpath = core.DATA.get("sdata_path")
+            if not zpath or not os.path.isdir(str(zpath)):
+                return
+            obs_dir = os.path.join(str(zpath), "tables", "table", "obs")
+            if os.path.isdir(obs_dir):
+                try:
+                    if not any(str(e).startswith("cell_type") for e in os.listdir(obs_dir)):
+                        return
+                except Exception:
+                    pass
+            try:
+                import spatialdata
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    sdata = spatialdata.read_zarr(str(zpath))
+            except ImportError:
+                import anndata as _ad
+                _tbl_dir = os.path.join(str(zpath), "tables", "table")
+                if not os.path.isdir(_tbl_dir):
+                    return
+                tbl = _ad.read_zarr(_tbl_dir)
+        if tbl is None:
+            if sdata is None or "table" not in sdata.tables:
+                return
+            tbl = sdata.tables["table"]
         obs = tbl.obs
         loaded = []
         # If obs has cell_id column, re-index labels by cell_id (integer Xenium IDs)
         # so they match DATA["df"].index when looked up in _cell_type_traces
         id_index = obs["cell_id"].astype(str) if "cell_id" in obs.columns else None
-        for m in core._ANNOT_METHODS:
+        candidates = []
+        seen_methods = set()
+        for m in list(core._ANNOT_METHODS):
             col = f"cell_type_{m}"
             if col in obs.columns:
-                labels = obs[col].astype(str).copy()
-                if id_index is not None:
-                    labels.index = id_index
-                else:
-                    labels.index = labels.index.astype(str)
-                # Only load if parquet cache didn't already populate this key
-                with core._annot_lock:
-                    if core._annot_state.get(f"labels_{m}") is None:
-                        core._annot_state[f"labels_{m}"] = labels
-                        core._annot_state["status"]  = "done"
-                        core._annot_state["message"] = f"Auto-loaded ({core._ANNOT_METHODS[m]}) from zarr"
-                        loaded.append(m)
+                candidates.append((m, col))
+                seen_methods.add(m)
+        for col in obs.columns:
+            scol = str(col)
+            if scol.startswith("cell_type_"):
+                m = scol[len("cell_type_"):]
+                if m and m not in seen_methods:
+                    candidates.append((m, scol))
+                    seen_methods.add(m)
+        if not candidates and "cell_type" in obs.columns:
+            candidates.append(("cell_type", "cell_type"))
+
+        for m, col in candidates:
+            raw = obs[col]
+            s = raw.astype(str).str.strip()
+            if id_index is not None:
+                s.index = id_index.to_numpy(dtype=str)
+            else:
+                s.index = obs.index.astype(str).to_numpy(dtype=str)
+            valid = (
+                raw.notna().to_numpy(dtype=bool)
+                & ~s.isin(_ANNOT_MASK_VALUES).to_numpy(dtype=bool)
+            )
+            labels = s[valid].copy()
+            if labels.empty:
+                continue
+            labels.index = labels.index.astype(str)
+            if m not in core._ANNOT_METHODS:
+                core._ANNOT_METHODS[m] = "Cell type" if m == "cell_type" else m
+            # Only load if parquet cache didn't already populate this key
+            with core._annot_lock:
+                if core._annot_state.get(f"labels_{m}") is None:
+                    core._annot_state[f"labels_{m}"] = labels
+                    core._annot_state["status"]  = "done"
+                    core._annot_state["message"] = f"Auto-loaded ({core._ANNOT_METHODS[m]}) from zarr"
+                    loaded.append(m)
         if loaded:
             print(f"  Annotation: loaded from zarr — {', '.join(loaded)}", flush=True)
-        # Also load RCTD weights if present
-        if "rctd_weights" in tbl.obsm and "rctd_weight_columns" in tbl.uns:
+        # Only attach zarr RCTD weights when labels_rctd itself came from this zarr
+        # (never pair stale zarr weights with a different parquet-cached RCTD run)
+        if "rctd" in loaded and "rctd_weights" in tbl.obsm and "rctd_weight_columns" in tbl.uns:
             with core._annot_lock:
                 if core._annot_state.get("rctd_weights_labels_rctd") is None:
-                    cols     = list(tbl.uns["rctd_weight_columns"])
-                    w_index  = id_index if id_index is not None else obs.index.astype(str)
-                    w        = pd.DataFrame(tbl.obsm["rctd_weights"],
-                                            index=w_index, columns=cols)
-                    core._annot_state["rctd_weights_labels_rctd"] = w
-                    print(f"  Annotation: loaded RCTD weights from zarr ({len(cols)} types)", flush=True)
+                    cols    = [str(c) for c in list(tbl.uns["rctd_weight_columns"])]
+                    w_index = (
+                        id_index.to_numpy(dtype=str)
+                        if id_index is not None
+                        else obs.index.astype(str).to_numpy(dtype=str)
+                    )
+                    raw_w   = np.asarray(tbl.obsm["rctd_weights"])
+                    if raw_w.ndim == 2 and raw_w.shape == (len(w_index), len(cols)):
+                        w = pd.DataFrame(raw_w, index=w_index, columns=cols)
+                        core._annot_state["rctd_weights_labels_rctd"] = w
+                        print(f"  Annotation: loaded RCTD weights from zarr ({len(cols)} types)", flush=True)
     except Exception as exc:
         print(f"  Annotation: zarr load failed: {exc}", flush=True)
 

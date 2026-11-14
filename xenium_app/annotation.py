@@ -105,9 +105,102 @@ def _reseg_cell_type_labels(method: str, alt_res, cell_ids_str):
     return matched.fillna("Unknown")
 
 
+def _xenium_measured_panel_genes() -> list:
+    """Measured panel gene names of core.DATA, excluding SpaGE-imputed columns
+    whether marked via gene_var['is_imputed'] or DATA['imputed_genes']."""
+    xen_imp = dataview._imputed_cols(core.DATA)
+    xen_gni = core.DATA.get("gene_name_to_idx") or {}
+    return [g for g in dataview._panel_gene_names() if xen_gni.get(g) not in xen_imp]
+
+
+def _reseg_panel_genes_and_cols(expr_mat, alt_res=None) -> tuple:
+    """Return (measured_panel_genes, col_indices) for a reseg count matrix *expr_mat*.
+    Excludes SpaGE-imputed columns on both Xenium DATA and *alt_res*."""
+    panel = _xenium_measured_panel_genes()
+    n_cols = int(expr_mat.shape[1])
+    if isinstance(alt_res, dict) and alt_res.get("gene_name_to_idx"):
+        alt_imp = dataview._imputed_cols(alt_res)
+        panel_set = set(panel)
+        pairs = sorted(
+            ((int(c), str(g)) for g, c in alt_res["gene_name_to_idx"].items()
+             if 0 <= int(c) < n_cols and int(c) not in alt_imp and str(g) in panel_set),
+            key=lambda x: x[0],
+        )
+        if pairs:
+            return [g for _, g in pairs], [c for c, _ in pairs]
+    n_meas = min(n_cols, len(panel))
+    return panel[:n_meas], list(range(n_meas))
+
+
+def _reseg_alt_for_source(seg_source=None, cell_ids=None):
+    """Resolve the in-memory reseg result dict for *seg_source* (or by matching *cell_ids*)."""
+    if seg_source and seg_source != "xenium":
+        alt_res, _ = core._seg_job_result(seg_source)
+        if isinstance(alt_res, dict):
+            return alt_res
+    if cell_ids:
+        want = {str(c) for c in list(cell_ids)[:50]}
+        for st, lk in ((core._proseg_state, core._proseg_lock),
+                       (core._baysor_state, core._baysor_lock),
+                       (core._imgseg_state, core._imgseg_lock)):
+            with lk:
+                res = st.get("result") if st.get("status") == "done" else None
+            if isinstance(res, dict):
+                bdf = res.get("_cells_df_original", res.get("cells_df"))
+                if bdf is not None and (want & set(bdf.index.astype(str))):
+                    return res
+    return None
+
+
+def _reseg_coords_df(cell_ids: list, coords_override=None, seg_source: str = None) -> pd.DataFrame:
+    """Build an (x_centroid, y_centroid) DataFrame indexed by *cell_ids* for RCTD."""
+    idx = pd.Index([str(c) for c in cell_ids])
+    if coords_override is not None:
+        if isinstance(coords_override, pd.DataFrame):
+            cdf = coords_override.copy()
+            xcol = "x_centroid" if "x_centroid" in cdf.columns else "centroid_x"
+            ycol = "y_centroid" if "y_centroid" in cdf.columns else "centroid_y"
+            out = pd.DataFrame(
+                {"x_centroid": cdf[xcol].to_numpy(dtype=np.float64),
+                 "y_centroid": cdf[ycol].to_numpy(dtype=np.float64)},
+                index=cdf.index.astype(str),
+            )
+            if list(out.index) != list(idx):
+                out = out.reindex(idx).fillna(0.0)
+            return out
+        arr = np.asarray(coords_override, dtype=np.float64)
+        if arr.ndim == 2 and arr.shape == (len(idx), 2):
+            return pd.DataFrame({"x_centroid": arr[:, 0], "y_centroid": arr[:, 1]}, index=idx)
+
+    alt_res = _reseg_alt_for_source(seg_source=seg_source, cell_ids=cell_ids)
+    if alt_res is not None:
+        bdf = alt_res.get("_cells_df_original", alt_res.get("cells_df"))
+        if bdf is not None:
+            xcol = "centroid_x" if "centroid_x" in bdf.columns else "x_centroid"
+            ycol = "centroid_y" if "centroid_y" in bdf.columns else "y_centroid"
+            if xcol in bdf.columns and ycol in bdf.columns:
+                out = pd.DataFrame(
+                    {"x_centroid": bdf[xcol].to_numpy(dtype=np.float64),
+                     "y_centroid": bdf[ycol].to_numpy(dtype=np.float64)},
+                    index=bdf.index.astype(str),
+                )
+                if not out.index.is_unique:
+                    out = out[~out.index.duplicated()]
+                if list(out.index) != list(idx):
+                    out = out.reindex(idx).fillna(0.0)
+                return out
+
+    df = core.DATA.get("_df_original", core.DATA["df"])
+    out = df[["x_centroid", "y_centroid"]].copy()
+    out.index = out.index.astype(str)
+    if not out.index.is_unique:
+        out = out[~out.index.duplicated()]
+    return out.reindex(idx).fillna(0.0)
+
+
 def _run_celltypist(model_name: str, labels_key: str = "labels",
                     expr_override=None, cell_ids_override=None, cache_sig=None,
-                    seg_source: str = None) -> None:
+                    seg_source: str = None, genes_override=None) -> None:
     """Background thread: annotate cells with CellTypist and store results."""
     core._redirect_rpy2_console()
     _gen = jobs._dataset_gen
@@ -166,12 +259,21 @@ def _run_celltypist(model_name: str, labels_key: str = "labels",
         expr     = expr_override if expr_override is not None else core.DATA["expr"]
         genes    = core.DATA["gene_names"]
         if expr_override is not None:
-            # reseg matrix holds the measured panel columns only
-            genes = list(genes)[:expr.shape[1]]
-        elif len(dataview._panel_gene_names()) != len(genes):
-            # Xenium: SpaGE-imputed columns in DATA["expr"] are not measured counts
-            genes = dataview._panel_gene_names()
-            expr  = expr[:, [core.DATA["gene_name_to_idx"][g] for g in genes]]
+            if genes_override is not None:
+                genes = list(genes_override)[:expr.shape[1]]
+                if expr.shape[1] > len(genes):
+                    expr = expr[:, :len(genes)]
+            else:
+                _alt_ct = _reseg_alt_for_source(seg_source=seg_source, cell_ids=cell_ids_override)
+                genes, _cols_ct = _reseg_panel_genes_and_cols(expr, _alt_ct)
+                if _cols_ct != list(range(expr.shape[1])):
+                    expr = expr[:, _cols_ct]
+        else:
+            _panel_ct = _xenium_measured_panel_genes()
+            if len(_panel_ct) != len(genes):
+                # Xenium: SpaGE-imputed columns in DATA["expr"] are not measured counts
+                genes = _panel_ct
+                expr  = expr[:, [core.DATA["gene_name_to_idx"][g] for g in genes]]
         barcodes = cell_ids_override if cell_ids_override is not None else core.DATA["barcodes"]
 
         # Normalize to 10,000 counts per cell then log1p (CP10K + log1p)
@@ -228,7 +330,8 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
                           expr_override=None, cell_ids_override=None,
                           umi_min: int = 20, umi_min_sigma: int = 100,
                           mode_labels_key: str = None, cache_sig=None,
-                          seg_source: str = None) -> None:
+                          seg_source: str = None, coords_override=None,
+                          genes_override=None) -> None:
     """
     Background thread: run RCTD (spacexr) for cell-type assignment.
     Requires the spacexr R package:
@@ -328,21 +431,25 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
 
         # ── Inputs of the R step: panel genes, counts, coordinates ───────────
         # Xenium: measured panel genes only (SpaGE-imputed columns are not counts)
-        xenium_genes = dataview._panel_gene_names()
-        if expr_override is not None:
-            # reseg matrix holds the measured panel columns only
-            xenium_genes = list(core.DATA["gene_names"])[:expr_override.shape[1]]
-        df = core.DATA["df"]
+        xenium_genes = _xenium_measured_panel_genes()
         if expr_override is not None:
             xen_expr  = expr_override               # cells × genes
             cell_ids  = [str(c) for c in (cell_ids_override if cell_ids_override is not None
                                           else range(expr_override.shape[0]))]
-            coords_df = df[["x_centroid", "y_centroid"]].reindex(
-                            pd.Index(cell_ids)).fillna(0.0)
+            if genes_override is not None:
+                xenium_genes = list(genes_override)[:xen_expr.shape[1]]
+                if xen_expr.shape[1] > len(xenium_genes):
+                    xen_expr = xen_expr[:, :len(xenium_genes)]
+            else:
+                _alt_rc = _reseg_alt_for_source(seg_source=seg_source, cell_ids=cell_ids)
+                xenium_genes, _cols_rc = _reseg_panel_genes_and_cols(xen_expr, _alt_rc)
+                if _cols_rc != list(range(xen_expr.shape[1])):
+                    xen_expr = xen_expr[:, _cols_rc]
+            coords_df = _reseg_coords_df(cell_ids, coords_override=coords_override, seg_source=seg_source)
         else:
             # All cells, in expression-row order (independent of an active
             # subset(), like CellTypist/Seurat): matrix rows == barcodes.
-            df = core.DATA.get("_df_original", df)
+            df = core.DATA.get("_df_original", core.DATA["df"])
             xen_expr  = core.DATA["expr"]           # cells × genes
             cell_ids  = [str(b) for b in core.DATA["barcodes"]]
             coords_df = df[["x_centroid", "y_centroid"]].copy()
@@ -414,7 +521,7 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
 
 def _run_seurat_annotation(rds_path: str, label_col: str = "Names", labels_key: str = "labels",
                             expr_override=None, cell_ids_override=None, cache_sig=None,
-                            seg_source: str = None) -> None:
+                            seg_source: str = None, genes_override=None) -> None:
     """
     Background thread: transfer cell type labels from a Seurat RDS reference
     to Xenium cells via PCA + cosine kNN majority voting.
@@ -511,10 +618,15 @@ def _run_seurat_annotation(rds_path: str, label_col: str = "Names", labels_key: 
             ref_bcs = list(ro.r['colnames'](mat_r))
 
             # Xenium: measured panel genes only (SpaGE-imputed columns are not counts)
-            xenium_genes = dataview._panel_gene_names()
+            xenium_genes = _xenium_measured_panel_genes()
+            _cols_sr = None
             if expr_override is not None:
-                # reseg matrix holds the measured panel columns only
-                xenium_genes = list(core.DATA["gene_names"])[:expr_override.shape[1]]
+                if genes_override is not None:
+                    xenium_genes = list(genes_override)[:expr_override.shape[1]]
+                    _cols_sr = list(range(len(xenium_genes)))
+                else:
+                    _alt_sr = _reseg_alt_for_source(seg_source=seg_source, cell_ids=cell_ids_override)
+                    xenium_genes, _cols_sr = _reseg_panel_genes_and_cols(expr_override, _alt_sr)
             shared = sorted(set(xenium_genes) & set(ref_genes_all))
             if len(shared) < 10:
                 _set("error", f"Only {len(shared)} shared genes — not enough for label transfer.")
@@ -547,8 +659,10 @@ rm(._annot_mat, ._annot_genes, ._annot_dir, ._annot_rds_tmp, mat_sub)
         ref_genes = pd.read_csv(os.path.join(tmpdir, "genes.txt"), header=None)[0].tolist()
         ref_bcs   = pd.read_csv(os.path.join(tmpdir, "barcodes.txt"), header=None)[0].tolist()
 
-        xen_gene_idx = ({g: i for i, g in enumerate(xenium_genes)} if expr_override is not None
-                        else core.DATA["gene_name_to_idx"])
+        xen_gene_idx = ({g: _cols_sr[i] for i, g in enumerate(xenium_genes)}
+                        if (expr_override is not None and _cols_sr is not None)
+                        else ({g: i for i, g in enumerate(xenium_genes)} if expr_override is not None
+                              else core.DATA["gene_name_to_idx"]))
         shared_xen_idx = [xen_gene_idx[g] for g in ref_genes]  # ref_genes == shared after subset
 
         # Reference matrix for shared genes (cells × shared) — already subset

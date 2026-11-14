@@ -175,14 +175,14 @@ def _get_expr_values(gene: str, alt_res=None, use_corrected: bool = False) -> "n
         idx = gni[lookup]
         if idx < expr.shape[1]:
             _col = expr.getcol(idx).toarray().ravel().astype(np.float32)
-            if expr is _corr and _corr is not None:
+            if _corr is not None and (expr is _corr or (use_corrected and is_imputed_gene)):
                 # a cell without corrected counts has no value (not a zero)
                 _cov = dataview._corrected_covered(alt_res if alt_res is not None else core.DATA)
                 if _cov is not None and len(_cov) == len(_col):
                     _col[~_cov] = np.nan
             if alt_res is None:
                 _col = _align_expr_rows_to_df(_col)
-            return np.log1p(_col)
+            return _fig_safe_log1p(_col)
     # If corrected mode is active and this is an imputed gene not in the corrected-imputed list,
     # do NOT fall through to the zarr fallback (which holds uncorrected imputed values).
     if use_corrected and is_imputed_gene:
@@ -214,6 +214,10 @@ def _get_expr_values(gene: str, alt_res=None, use_corrected: bool = False) -> "n
                 _gi_ev = _rg.index(lookup)
                 _zcol = np.array(
                     _zarr_ev.open_array(_rp, mode='r')[:, _gi_ev], dtype=np.float32)
+                if use_corrected and is_imputed_gene and _corr is not None:
+                    _cov = dataview._corrected_covered(alt_res if alt_res is not None else core.DATA)
+                    if _cov is not None and len(_cov) == len(_zcol):
+                        _zcol[~_cov] = np.nan
                 if alt_res is None:
                     _spage_streamed_cells_check(_rtag)
                     _zcol = _align_expr_rows_to_df(_zcol)
@@ -229,7 +233,7 @@ def _get_expr_values(gene: str, alt_res=None, use_corrected: bool = False) -> "n
                         raise ValueError("the result was computed for other cells of this run (another "
                                          "subset, or a re-run) — re-run SpaGE")
                     _zcol = _zcol[_rows]
-                return np.log1p(_zcol)
+                return _fig_safe_log1p(_zcol)
             if alt_res is not None and os.path.isfile(_rp):
                 # a run's result kept in the SpaGE cache file only (its write into the run's
                 # store was skipped): one row per cell id, matched to the run's cells by id;
@@ -238,10 +242,19 @@ def _get_expr_values(gene: str, alt_res=None, use_corrected: bool = False) -> "n
                 _pcol.index = _pcol.index.astype(str)
                 _pcol = _pcol[~_pcol.index.duplicated()]
                 _pvals = _pcol.reindex(alt_res["cells_df"].index.astype(str)).fillna(0).values
-                return np.log1p(np.clip(_pvals.astype(np.float32), 0, None))
+                return _fig_safe_log1p(_pvals.astype(np.float32))
         except Exception as _e:
             print(f"  SpaGE zarr read error for {lookup!r}: {_e}", flush=True)
     return None
+
+
+def _fig_safe_log1p(arr):
+    """log1p after clamping negative finite values to 0 while preserving NaNs and float32."""
+    a = np.asarray(arr)
+    if not np.issubdtype(a.dtype, np.floating):
+        a = (pd.to_numeric(pd.Series(a), errors="coerce").to_numpy(dtype=np.float64)
+             if a.dtype == object else a.astype(np.float64))
+    return np.log1p(np.maximum(a, a.dtype.type(0.0)))
 
 
 def _spage_streamed_cells_check(ids_tag) -> None:
@@ -272,7 +285,7 @@ def _get_reseg_expr_values(gene: str, alt_res: dict) -> "np.ndarray | None":
         return None
     col = expr.getcol(idx)
     vals = col.toarray().ravel().astype(np.float32)
-    return np.log1p(vals)
+    return _fig_safe_log1p(vals)
 
 
 # Figure-specific layout shapes (multi-sample separators + RCTD pies) of the last
@@ -395,7 +408,7 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
 
     # Helper: apply log1p for transcript_counts; build colorbar kwargs with optional cmin/cmax
     def _color_vals(raw_vals, color_key):
-        v = np.log1p(raw_vals) if color_key == "transcript_counts" else raw_vals.astype(float)
+        v = _fig_safe_log1p(raw_vals) if color_key == "transcript_counts" else np.asarray(raw_vals, dtype=float)
         return v
     def _cbar_kwargs():
         kw = {}
@@ -527,7 +540,7 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                     label = "Transcript Counts (log1p)"
                 cs    = core.COLORSCALES.get(color_by, "Viridis")
             else:
-                vals  = np.log1p(bdf["transcript_counts"].values)
+                vals  = _fig_safe_log1p(bdf["transcript_counts"].values)
                 label = "Transcript Counts (log1p)"
                 cs    = "Viridis"
             traces = [go.Scattergl(
@@ -745,7 +758,10 @@ def make_spatial_fig(color_by, method, gene, size, opacity,
                 show_legend = False
 
             else:
-                # QC / numeric column
+                # QC / numeric column (fall back to transcript_counts when absent from every sample,
+                # matching single-sample make_spatial_fig and viewer_provider._colors_multi)
+                if not any(color_by in edf.columns for edf in all_dfs):
+                    color_by = "transcript_counts"
                 label = core.QC_METRICS.get(color_by, color_by)
                 cs    = core.COLORSCALES.get(color_by, "Viridis")
                 all_vals = []
@@ -1700,13 +1716,13 @@ def make_umap_fig(color_by, method, gene, size, opacity,
                 raw = bdf["transcript_counts"].values if color_by == "transcript_counts" \
                       else bdf[color_by].values
                 raw   = _al(raw)
-                vals  = np.log1p(raw) if color_by == "transcript_counts" else raw.astype(float)
+                vals  = _fig_safe_log1p(raw) if color_by == "transcript_counts" else raw.astype(float)
                 label = core.QC_METRICS.get(color_by, color_by)
                 if color_by == "transcript_counts":
                     label = "Transcript Counts (log1p)"
                 cs    = core.COLORSCALES.get(color_by, "Viridis")
             else:
-                vals  = np.log1p(_al(bdf["transcript_counts"].values))
+                vals  = _fig_safe_log1p(_al(bdf["transcript_counts"].values))
                 label = "Transcript Counts (log1p)"
                 cs    = "Viridis"
             _ckw = {}
@@ -1842,7 +1858,7 @@ def make_umap_fig(color_by, method, gene, size, opacity,
             if color_by not in df.columns:
                 vals = np.zeros(len(df))
             else:
-                vals = np.log1p(df[color_by].values) if color_by == "transcript_counts" else df[color_by].values
+                vals = _fig_safe_log1p(df[color_by].values) if color_by == "transcript_counts" else df[color_by].values
             if color_by == "transcript_counts":
                 label = "Transcript Counts (log1p)"
             _ckw = {}

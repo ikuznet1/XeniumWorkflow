@@ -29,6 +29,21 @@ import numpy as np
 _DTYPES = {"float32": "<f4", "uint32": "<u4", "uint16": "<u2", "uint8": "|u1", "int32": "<i4"}
 
 
+def _json_clean(obj):
+    """Replace non-finite floats (NaN / ±Inf) with None so JSON payloads never emit
+    non-standard literals that fail browser JSON.parse()."""
+    if isinstance(obj, (float, np.floating)):
+        v = float(obj)
+        return v if math.isfinite(v) else None
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, dict):
+        return {k: _json_clean(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_clean(v) for v in obj]
+    return obj
+
+
 def pack(meta: dict, arrays: dict) -> bytes:
     """Serialise *meta* plus named numpy arrays into the wire format above."""
     listing, chunks = [], []
@@ -40,7 +55,7 @@ def pack(meta: dict, arrays: dict) -> bytes:
         raw = arr.astype(_DTYPES[dt], copy=False).tobytes()
         listing.append({"name": name, "dtype": dt, "length": int(arr.size)})
         chunks.append(raw + b"\0" * (-len(raw) % 4))
-    header = json.dumps({**meta, "arrays": listing}, separators=(",", ":")).encode()
+    header = json.dumps(_json_clean({**meta, "arrays": listing}), separators=(",", ":"), allow_nan=False).encode()
     header += b" " * (-len(header) % 4)
     return b"".join([np.uint32(len(header)).tobytes(), header, *chunks])
 
@@ -367,7 +382,7 @@ def register(server, provider, prefix: str = "") -> None:
 
     @server.route(prefix + "/viewer/meta", endpoint=f"{prefix}:viewer_meta")
     def viewer_meta():
-        return jsonify(provider.meta())
+        return jsonify(_json_clean(provider.meta()))
 
     @server.route(prefix + "/viewer/cells.bin", endpoint=f"{prefix}:viewer_cells")
     def viewer_cells():
@@ -405,7 +420,7 @@ def register(server, provider, prefix: str = "") -> None:
 
     @server.route(prefix + "/viewer/overlays", endpoint=f"{prefix}:viewer_overlays")
     def viewer_overlays():
-        return jsonify(provider.overlays(request.args.get("source", "xenium"), request.args.to_dict()))
+        return jsonify(_json_clean(provider.overlays(request.args.get("source", "xenium"), request.args.to_dict())))
 
     @server.route(prefix + "/viewer/extra/<name>.bin", endpoint=f"{prefix}:viewer_extra")
     def viewer_extra(name):
@@ -417,7 +432,7 @@ def register(server, provider, prefix: str = "") -> None:
 
     @server.route(prefix + "/viewer/cell/<int:index>", endpoint=f"{prefix}:viewer_cell")
     def viewer_cell(index):
-        return jsonify(provider.cell_at(request.args.get("source", "xenium"), index))
+        return jsonify(_json_clean(provider.cell_at(request.args.get("source", "xenium"), index)))
 
     @server.route(prefix + "/viewer/image/<int:index>", endpoint=f"{prefix}:viewer_image")
     def viewer_image(index):

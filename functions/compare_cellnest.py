@@ -309,9 +309,54 @@ def _bh_fdr(pvals):
     return np.clip(fdr, 0, 1)
 
 
+def _samples_for_condition(metrics_df, cond, sample_meta=None) -> list:
+    """Return sorted sample names belonging to *cond*, including zero-edge replicates
+    when *sample_meta* (dict or DataFrame) is provided."""
+    if sample_meta is not None:
+        if isinstance(sample_meta, dict):
+            out = []
+            for s, info in sample_meta.items():
+                c = info.get("condition") if isinstance(info, dict) else info
+                if c == cond:
+                    out.append(str(s))
+            return sorted(set(out))
+        if isinstance(sample_meta, pd.DataFrame):
+            if "sample" in sample_meta.columns and "condition" in sample_meta.columns:
+                sub = sample_meta[sample_meta["condition"] == cond]["sample"]
+                return sorted(set(sub.astype(str).tolist()))
+            if "condition" in sample_meta.columns:
+                sub = sample_meta.index[sample_meta["condition"] == cond]
+                return sorted(set(sub.astype(str).tolist()))
+    if metrics_df is None or metrics_df.empty:
+        return []
+    return sorted(metrics_df[metrics_df["condition"] == cond]["sample"].astype(str).unique())
+
+
+def _all_sample_conditions(metrics_df, sample_meta=None) -> list:
+    """Return [(sample, condition), ...] including zero-edge replicates from *sample_meta*."""
+    if sample_meta is not None:
+        if isinstance(sample_meta, dict):
+            return sorted(
+                (str(s), str(info["condition"] if isinstance(info, dict) else info))
+                for s, info in sample_meta.items()
+            )
+        if isinstance(sample_meta, pd.DataFrame):
+            if "sample" in sample_meta.columns and "condition" in sample_meta.columns:
+                return sorted(
+                    (str(r["sample"]), str(r["condition"]))
+                    for _, r in sample_meta[["sample", "condition"]].drop_duplicates().iterrows()
+                )
+            if "condition" in sample_meta.columns:
+                return sorted((str(idx), str(c)) for idx, c in sample_meta["condition"].items())
+    if metrics_df is None or metrics_df.empty:
+        return []
+    sc = metrics_df[["sample", "condition"]].drop_duplicates()
+    return sorted((str(r["sample"]), str(r["condition"])) for _, r in sc.iterrows())
+
+
 def run_pairwise_comparison(metrics_df, cond_a, cond_b, metric="normalized_freq",
                             group_cols=None, n_perm=10000, n_boot=2000,
-                            fdr_alpha=0.05, min_presence=2):
+                            fdr_alpha=0.05, min_presence=2, sample_meta=None):
     """Run full statistical comparison between two conditions.
 
     Returns DataFrame with one row per feature (LR pair or triplet).
@@ -319,12 +364,8 @@ def run_pairwise_comparison(metrics_df, cond_a, cond_b, metric="normalized_freq"
     if group_cols is None:
         group_cols = ["lr_pair"]
 
-    samples_a = sorted(
-        metrics_df[metrics_df["condition"] == cond_a]["sample"].unique()
-    )
-    samples_b = sorted(
-        metrics_df[metrics_df["condition"] == cond_b]["sample"].unique()
-    )
+    samples_a = _samples_for_condition(metrics_df, cond_a, sample_meta)
+    samples_b = _samples_for_condition(metrics_df, cond_b, sample_meta)
     all_samples = samples_a + samples_b
 
     if len(samples_a) == 0 or len(samples_b) == 0:
@@ -422,7 +463,7 @@ def run_pairwise_comparison(metrics_df, cond_a, cond_b, metric="normalized_freq"
 
 def run_all_comparisons(metrics_df, conditions, metric="normalized_freq",
                         group_cols=None, n_perm=10000, n_boot=2000,
-                        fdr_alpha=0.05, min_presence=2):
+                        fdr_alpha=0.05, min_presence=2, sample_meta=None):
     """Run all pairwise comparisons. Returns dict of (condA, condB) -> DataFrame."""
     results = {}
     pairs = list(itertools.combinations(sorted(conditions), 2))
@@ -433,6 +474,7 @@ def run_all_comparisons(metrics_df, conditions, metric="normalized_freq",
             metrics_df, cond_a, cond_b, metric=metric,
             group_cols=group_cols, n_perm=n_perm, n_boot=n_boot,
             fdr_alpha=fdr_alpha, min_presence=min_presence,
+            sample_meta=sample_meta,
         )
         results[(cond_a, cond_b)] = res
 
@@ -455,7 +497,8 @@ def run_all_comparisons(metrics_df, conditions, metric="normalized_freq",
 
 
 def run_celltype_comparisons(ct_metrics_df, cond_a, cond_b, n_perm=10000,
-                             n_boot=2000, fdr_alpha=0.05, min_presence=2):
+                             n_boot=2000, fdr_alpha=0.05, min_presence=2,
+                             sample_meta=None):
     """Run cell-type-specific comparison for one condition pair."""
     if ct_metrics_df.empty:
         return pd.DataFrame()
@@ -466,6 +509,7 @@ def run_celltype_comparisons(ct_metrics_df, cond_a, cond_b, n_perm=10000,
         group_cols=["lr_pair", "sender_type", "receiver_type"],
         n_perm=n_perm, n_boot=n_boot,
         fdr_alpha=fdr_alpha, min_presence=min_presence,
+        sample_meta=sample_meta,
     )
 
 
@@ -515,24 +559,28 @@ def plot_volcano(results_df, output_path, cond_a, cond_b, top_n_label=15):
     print(f"    Saved {output_path}")
 
 
-def plot_heatmap(metrics_df, output_path, top_n=30):
+def plot_heatmap(metrics_df, output_path, top_n=30, sample_meta=None):
     """Heatmap: LR pairs × samples, grouped by condition."""
     if metrics_df.empty:
         return
 
-    # Pick top LR pairs by variance across samples
+    # Pick top LR pairs by variance across samples (including zero-edge replicates)
     pivot = metrics_df.pivot_table(
         index="lr_pair", columns="sample", values="normalized_freq", fill_value=0
     )
     if len(pivot) == 0:
         return
+    sc_pairs = _all_sample_conditions(metrics_df, sample_meta)
+    for s, _ in sc_pairs:
+        if s not in pivot.columns:
+            pivot[s] = 0.0
     variances = pivot.var(axis=1).sort_values(ascending=False)
     top_lr = variances.head(top_n).index.tolist()
     pivot = pivot.loc[top_lr]
 
     # Order columns by condition
-    sample_cond = metrics_df[["sample", "condition"]].drop_duplicates()
-    sample_order = sample_cond.sort_values("condition")["sample"].tolist()
+    sample_cond = pd.DataFrame(sc_pairs, columns=["sample", "condition"])
+    sample_order = sample_cond.sort_values(["condition", "sample"])["sample"].tolist()
     pivot = pivot[[s for s in sample_order if s in pivot.columns]]
 
     # Condition color bar
@@ -566,7 +614,7 @@ def plot_heatmap(metrics_df, output_path, top_n=30):
     print(f"    Saved {output_path}")
 
 
-def plot_condition_dotplot(metrics_df, results_dict, output_path, top_n=30):
+def plot_condition_dotplot(metrics_df, results_dict, output_path, top_n=30, sample_meta=None):
     """Dotplot: LR pairs × conditions (size=freq, color=mean_attention)."""
     if metrics_df.empty:
         return
@@ -584,13 +632,24 @@ def plot_condition_dotplot(metrics_df, results_dict, output_path, top_n=30):
         agg = metrics_df.groupby("lr_pair")["normalized_freq"].var().nlargest(top_n)
         sig_lr = set(agg.index)
 
-    # Aggregate per condition
-    cond_agg = metrics_df[metrics_df["lr_pair"].isin(sig_lr)].groupby(
+    # Aggregate per condition (accounting for zero-edge replicates in mean_freq when sample_meta is given)
+    sub_m = metrics_df[metrics_df["lr_pair"].isin(sig_lr)]
+    cond_agg = sub_m.groupby(
         ["lr_pair", "condition"]
     ).agg(
+        sum_freq=("normalized_freq", "sum"),
         mean_freq=("normalized_freq", "mean"),
         mean_attn=("mean_attention", "mean"),
     ).reset_index()
+    if sample_meta is not None:
+        cond_n = {
+            c: len(_samples_for_condition(metrics_df, c, sample_meta))
+            for c in cond_agg["condition"].unique()
+        }
+        cond_agg["mean_freq"] = [
+            row["sum_freq"] / max(1, cond_n.get(row["condition"], 1))
+            for _, row in cond_agg.iterrows()
+        ]
 
     lr_order = (
         cond_agg.groupby("lr_pair")["mean_freq"]
@@ -631,8 +690,8 @@ def plot_condition_dotplot(metrics_df, results_dict, output_path, top_n=30):
     print(f"    Saved {output_path}")
 
 
-def plot_barplot_top_hits(metrics_df, results_dict, output_path, top_n=15):
-    """Bar plot of top significant LR pairs with replicate dots."""
+def plot_barplot_top_hits(metrics_df, results_dict, output_path, top_n=15, sample_meta=None):
+    """Bar plot of top significant LR pairs with replicate dots (including zero-edge replicates)."""
     # Collect top significant across all comparisons
     all_sig = []
     for key, df in results_dict.items():
@@ -652,39 +711,48 @@ def plot_barplot_top_hits(metrics_df, results_dict, output_path, top_n=15):
     if plot_data.empty:
         return
 
-    conditions = sorted(plot_data["condition"].unique())
-    fig, ax = plt.subplots(figsize=(max(10, top_n * 0.8), 6))
+    if sample_meta is not None:
+        sc_pairs = _all_sample_conditions(metrics_df, sample_meta)
+        conditions = sorted({c for _, c in sc_pairs})
+    else:
+        conditions = sorted(plot_data["condition"].unique())
+    if not conditions:
+        return
 
-    # Bar = mean, dots = replicates
-    bar_agg = plot_data.groupby(["lr_pair", "condition"])["normalized_freq"].mean().reset_index()
-    bar_agg = bar_agg[bar_agg["lr_pair"].isin(top_lr)]
+    fig, ax = plt.subplots(figsize=(max(10, top_n * 0.8), 6))
 
     x_pos = np.arange(len(top_lr))
     width = 0.8 / len(conditions)
     palette = sns.color_palette("Set2", len(conditions))
 
     for j, cond in enumerate(conditions):
-        cond_data = bar_agg[bar_agg["condition"] == cond]
-        # Ensure all LR pairs present
+        cond_samples = _samples_for_condition(metrics_df, cond, sample_meta)
+        rep_data = plot_data[plot_data["condition"] == cond]
         heights = []
+        rep_vectors = []
         for lr in top_lr:
-            match = cond_data[cond_data["lr_pair"] == lr]["normalized_freq"]
-            heights.append(match.values[0] if len(match) > 0 else 0)
+            lr_rows = rep_data[rep_data["lr_pair"] == lr]
+            if cond_samples:
+                by_s = lr_rows.groupby("sample")["normalized_freq"].sum()
+                reps = np.array([float(by_s.get(s, 0.0)) for s in cond_samples], dtype=np.float64)
+            else:
+                reps = lr_rows["normalized_freq"].to_numpy(dtype=np.float64)
+            heights.append(float(reps.mean()) if len(reps) > 0 else 0.0)
+            rep_vectors.append(reps)
 
         offset = (j - len(conditions) / 2 + 0.5) * width
-        bars = ax.bar(
+        ax.bar(
             x_pos + offset, heights, width,
             label=cond, color=palette[j], alpha=0.7, edgecolor="black", linewidth=0.5,
         )
 
-        # Overlay replicate dots
-        rep_data = plot_data[plot_data["condition"] == cond]
-        for i, lr in enumerate(top_lr):
-            reps = rep_data[rep_data["lr_pair"] == lr]["normalized_freq"]
-            ax.scatter(
-                [x_pos[i] + offset] * len(reps), reps,
-                color="black", s=15, zorder=5, alpha=0.7,
-            )
+        # Overlay replicate dots (all replicates in condition, including 0.0)
+        for i, reps in enumerate(rep_vectors):
+            if len(reps) > 0:
+                ax.scatter(
+                    [x_pos[i] + offset] * len(reps), reps,
+                    color="black", s=15, zorder=5, alpha=0.7,
+                )
 
     ax.set_xticks(x_pos)
     ax.set_xticklabels(top_lr, rotation=45, ha="right", fontsize=8)
@@ -695,6 +763,9 @@ def plot_barplot_top_hits(metrics_df, results_dict, output_path, top_n=15):
     fig.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"    Saved {output_path}")
+
+
+plot_top_lr_bars = plot_barplot_top_hits
 
 
 # ---------------------------------------------------------------------------
@@ -753,6 +824,7 @@ def compare_cellnest(cellnest_dir, samples_config, output_dir,
             metric="normalized_freq",
             n_perm=n_permutations, n_boot=2000,
             fdr_alpha=fdr_alpha, min_presence=min_presence,
+            sample_meta=sample_meta,
         )
         for key, df in results_dict.items():
             n_sig = (df["perm_FDR"] < 0.05).sum() if not df.empty else 0
@@ -771,6 +843,7 @@ def compare_cellnest(cellnest_dir, samples_config, output_dir,
                 ct_metrics_df, cond_a, cond_b,
                 n_perm=n_permutations, n_boot=2000,
                 fdr_alpha=fdr_alpha, min_presence=min_presence,
+                sample_meta=sample_meta,
             )
             ct_results_dict[(cond_a, cond_b)] = ct_res
             if not ct_res.empty:
@@ -832,19 +905,19 @@ def compare_cellnest(cellnest_dir, samples_config, output_dir,
 
     plot_heatmap(
         metrics_df, os.path.join(fig_dir, "heatmap_samples.pdf"),
-        top_n=top_n_plot,
+        top_n=top_n_plot, sample_meta=sample_meta,
     )
 
     if results_dict:
         plot_condition_dotplot(
             metrics_df, results_dict,
             os.path.join(fig_dir, "dotplot_conditions.pdf"),
-            top_n=top_n_plot,
+            top_n=top_n_plot, sample_meta=sample_meta,
         )
         plot_barplot_top_hits(
             metrics_df, results_dict,
             os.path.join(fig_dir, "barplot_top_hits.pdf"),
-            top_n=15,
+            top_n=15, sample_meta=sample_meta,
         )
 
     print("Done.")

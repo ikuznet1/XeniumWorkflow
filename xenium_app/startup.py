@@ -63,6 +63,8 @@ analysis._an_autoload()
 
 # Auto-load SpatialData cache if it exists for this dataset
 sdata_store._sdata_autoload()
+if core.DATA.get("sdata_path") and os.path.isdir(str(core.DATA["sdata_path"])):
+    sdata_store._annot_load_from_sdata()
 
 if _h5ad_start is not None:
     h5ad._h5ad_primary_labels()

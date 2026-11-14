@@ -225,8 +225,8 @@ def _compute_split_clusters_umap(cells_df, corrected_mat, corrected_cell_ids=Non
 # ---------------------------------------------------------------------------
 
 def _write_split_to_zarr(sdata_path, corrected_mat, cells_df, panel_genes,
-                          corrected_cell_ids=None):
-    """Write X_corrected layer + cluster/UMAP obs columns to SpatialData zarr."""
+                          corrected_cell_ids=None, covered_genes=None):
+    """Write X_corrected layer + SPLIT coverage metadata + cluster/UMAP obs columns to SpatialData zarr."""
     import zarr
     try:
         from anndata.io import write_elem as _write_elem
@@ -286,6 +286,35 @@ def _write_split_to_zarr(sdata_path, corrected_mat, cells_df, panel_genes,
         del layers_grp["X_corrected"]
     _write_elem(layers_grp, "X_corrected", mat_aligned)
 
+    # Persist partial panel-gene coverage & kept cell IDs so the app and downstream
+    # scripts (impute.py, export_to_cellnest.py, spatialdata2seurat.py) distinguish
+    # uncovered zero-padded genes/cells from biological zeros.
+    uns_grp = table_grp.require_group("uns")
+    if "encoding-type" not in uns_grp.attrs:
+        uns_grp.attrs["encoding-type"] = "dict"
+        uns_grp.attrs["encoding-version"] = "0.1.0"
+    _panel_str = [str(g) for g in panel_genes]
+    _panel_set = set(_panel_str)
+    if covered_genes is not None:
+        _cov_str = [str(g) for g in covered_genes if str(g) in _panel_set]
+    else:
+        _cov_str = None
+    if _cov_str is not None and set(_cov_str) != _panel_set:
+        layers_grp["X_corrected"].attrs["corrected_cols"] = _cov_str
+        if "split_corrected_cols" in uns_grp:
+            del uns_grp["split_corrected_cols"]
+        _write_elem(uns_grp, "split_corrected_cols", np.asarray(_cov_str, dtype=object))
+    elif "split_corrected_cols" in uns_grp:
+        del uns_grp["split_corrected_cols"]
+
+    if corrected_cell_ids is not None:
+        _cids_str = [str(c) for c in corrected_cell_ids]
+        if "split_corrected_cell_ids" in uns_grp:
+            del uns_grp["split_corrected_cell_ids"]
+        _write_elem(uns_grp, "split_corrected_cell_ids", np.asarray(_cids_str, dtype=object))
+    elif "split_corrected_cell_ids" in uns_grp:
+        del uns_grp["split_corrected_cell_ids"]
+
     # Write obs cluster/UMAP columns
     for col in ["cluster_split_10", "split_umap_1", "split_umap_2"]:
         if col in obs_grp:
@@ -293,7 +322,9 @@ def _write_split_to_zarr(sdata_path, corrected_mat, cells_df, panel_genes,
     for col in ["cluster_split_10", "split_umap_1", "split_umap_2"]:
         if col not in cells_df.columns:
             continue
-        ser = cells_df[col].reindex(zarr_ids)
+        _cdf_col = cells_df[col].copy()
+        _cdf_col.index = _cdf_col.index.astype(str)
+        ser = _cdf_col.reindex(zarr_ids)
         if cells_df[col].dtype == object or pd.api.types.is_string_dtype(cells_df[col]):
             arr = np.array(ser.fillna("").values, dtype=str)
             obs_grp.create_dataset(col, data=arr, shape=arr.shape,
@@ -558,6 +589,12 @@ rownames(._split_coords) <- colnames(._split_counts_mat)
     if corrected_cell_ids is None:
         corrected_cell_ids = cell_ids[:n_corr]
 
+    _covered_genes = (
+        [str(g) for g in corrected_gene_ids]
+        if corrected_gene_ids is not None
+        else list(shared_genes_present)
+    )
+
     # ── Optional: clusters + UMAP ────────────────────────────────────────────
     if compute_umap:
         _compute_split_clusters_umap(cells_df, corrected_mat,
@@ -566,7 +603,8 @@ rownames(._split_coords) <- colnames(._split_counts_mat)
     # ── Write to zarr ────────────────────────────────────────────────────────
     print(f"  SPLIT: writing corrected counts to zarr…", flush=True)
     _write_split_to_zarr(sdata_path, corrected_mat, cells_df, panel_genes,
-                         corrected_cell_ids=corrected_cell_ids)
+                         corrected_cell_ids=corrected_cell_ids,
+                         covered_genes=_covered_genes)
 
     print("  SPLIT: done.", flush=True)
 

@@ -326,7 +326,8 @@ def _extra_gene_values(eds: dict, gene, use_corrected: bool = False):
             raw[~cov] = np.nan
     idx_ = eds.get("df_to_expr")
     idx_ = np.arange(len(eds["df"])) if idx_ is None else np.asarray(idx_)
-    return np.log1p(np.where(idx_ >= 0, raw[np.clip(idx_, 0, len(raw) - 1)], 0.0))
+    vals = np.where(idx_ >= 0, raw[np.clip(idx_, 0, len(raw) - 1)], 0.0)
+    return np.log1p(np.maximum(vals, 0.0))
 
 
 def _extra_cell_type_labels(eds: dict, method=None):
@@ -340,7 +341,8 @@ def _extra_cell_type_labels(eds: dict, method=None):
 
     def _col(name):
         s = df[name].astype(object)
-        return s.where(s.notna() & ~s.isin(["", "nan", "<NA>"]), np.nan)
+        return s.where(s.notna() & ~s.astype(str).str.strip().isin(
+            ["", "nan", "<NA>", "None", "Unknown"]), np.nan)
 
     if method and by.get(method) is not None:
         return by[method], f"{method} (annotation cache)"

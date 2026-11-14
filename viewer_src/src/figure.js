@@ -108,15 +108,17 @@ export function planFigure(view, {maxVector = DEFAULT_MAX_VECTOR} = {}) {
     let k = 0;
     const x0 = tx - w / 2 / s, x1 = tx + w / 2 / s, y0 = ty - h / 2 / s, y1 = ty + h / 2 / s;
     for (let p = 0; p < b.n; p++) {
-      let bx0 = Infinity, by0 = Infinity, bx1 = -Infinity, by1 = -Infinity;
+      let bx0 = Infinity, by0 = Infinity, bx1 = -Infinity, by1 = -Infinity, fn = 0;
       for (let v = b.start[p]; v < b.start[p + 1]; v++) {
         const x = b.xy[2 * v], y = b.xy[2 * v + 1];
+        if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+        fn++;
         if (x < bx0) bx0 = x;
         if (x > bx1) bx1 = x;
         if (y < by0) by0 = y;
         if (y > by1) by1 = y;
       }
-      if (bx1 >= x0 && bx0 <= x1 && by1 >= y0 && by0 <= y1) idx[k++] = p;
+      if (fn >= 3 && bx1 >= x0 && bx0 <= x1 && by1 >= y0 && by0 <= y1) idx[k++] = p;
     }
     plan.counts.boundaries[b.kind] = k;
     if (k > lim) plan.raster.push(`boundary:${b.kind}`);
@@ -133,7 +135,8 @@ export function planFigure(view, {maxVector = DEFAULT_MAX_VECTOR} = {}) {
 
 // ── scene ─────────────────────────────────────────────────────────────────────────────────
 const isColor = (c) => /^\s*(#([0-9a-f]{3}|[0-9a-f]{6})|rgba?\()/i.test(String(c || ''));
-const rgbOf = (c) => (Array.isArray(c) ? [c[0], c[1], c[2]] : hexToRgb(c));
+const clampByte = (v) => Math.max(0, Math.min(255, Math.round(+v || 0)));
+const rgbOf = (c) => (Array.isArray(c) ? [clampByte(c[0]), clampByte(c[1]), clampByte(c[2])] : hexToRgb(c));
 const LAYER_NAMES = {cells: 'cells', transcripts: 'transcripts'};
 const layerName = (key, view) => {
   if (LAYER_NAMES[key]) return LAYER_NAMES[key];
@@ -205,22 +208,35 @@ export function buildScene(view, plan, rasters = {}, {title = 'Xenium spatial ma
     for (let k = 0; k < idx.length; k++) total += b.start[idx[k] + 1] - b.start[idx[k]];
     const xy = new Float32Array(2 * total);
     const start = new Uint32Array(idx.length + 1);
-    let o = 0;
+    let o = 0, rk = 0;
     for (let k = 0; k < idx.length; k++) {
       let v0 = b.start[idx[k]], v1 = b.start[idx[k] + 1];
       // rings that repeat their first vertex are closed by the path operator instead
       if (v1 - v0 > 1 && b.xy[2 * v0] === b.xy[2 * (v1 - 1)] && b.xy[2 * v0 + 1] === b.xy[2 * (v1 - 1) + 1]) v1--;
+      const r0 = o;
       for (let v = v0; v < v1; v++) {
-        xy[2 * o] = px(b.xy[2 * v]);
-        xy[2 * o + 1] = py(b.xy[2 * v + 1]);
+        const bx = b.xy[2 * v], by = b.xy[2 * v + 1];
+        if (!Number.isFinite(bx) || !Number.isFinite(by)) continue;
+        const sx = px(bx), sy = py(by);
+        if (!Number.isFinite(sx) || !Number.isFinite(sy)) continue;
+        xy[2 * o] = sx;
+        xy[2 * o + 1] = sy;
         o++;
       }
-      start[k + 1] = o;
+      if (o - r0 > 1 && xy[2 * r0] === xy[2 * (o - 1)] && xy[2 * r0 + 1] === xy[2 * (o - 1) + 1]) o--;
+      if (o - r0 < 3) {
+        o = r0;
+        continue;
+      }
+      rk++;
+      start[rk] = o;
     }
-    map.push({t: 'g', attrs: {id, 'data-count': idx.length}, items: [{
-      t: 'rings', xy: xy.subarray(0, 2 * o), start, closed: true,
-      stroke: [b.color[0], b.color[1], b.color[2]], opacity: (b.color[3] === undefined ? 255 : b.color[3]) / 255, width: 1,
-    }]});
+    if (rk > 0) {
+      map.push({t: 'g', attrs: {id, 'data-count': rk}, items: [{
+        t: 'rings', xy: xy.subarray(0, 2 * o), start: start.subarray(0, rk + 1), closed: true,
+        stroke: [b.color[0], b.color[1], b.color[2]], opacity: (b.color[3] === undefined ? 255 : b.color[3]) / 255, width: 1,
+      }]});
+    }
   }
 
   // transcripts
@@ -250,22 +266,38 @@ export function buildScene(view, plan, rasters = {}, {title = 'Xenium spatial ma
   const ov = view.overlays || {};
   const ovItems = [];
   for (const d of ov.lines || []) {
-    ovItems.push({t: 'line', x1: px(d.from[0]), y1: py(d.from[1]), x2: px(d.to[0]), y2: py(d.to[1]),
+    if (!d || !d.from || !d.to) continue;
+    const x1 = px(d.from[0]), y1 = py(d.from[1]), x2 = px(d.to[0]), y2 = py(d.to[1]);
+    if (!Number.isFinite(x1) || !Number.isFinite(y1) || !Number.isFinite(x2) || !Number.isFinite(y2)) continue;
+    ovItems.push({t: 'line', x1, y1, x2, y2,
       stroke: rgbOf(d.color || '#ffffff'), opacity: (d.alpha === undefined ? 255 : d.alpha) / 255, width: d.width || 1});
   }
   for (const d of ov.polygons || []) {
-    if (!d.points || !d.points.length) continue;
+    if (!d || !d.points || !d.points.length) continue;
+    const pts = [];
+    for (const p of d.points) {
+      if (!p) continue;
+      const sx = px(p[0]), sy = py(p[1]);
+      if (Number.isFinite(sx) && Number.isFinite(sy)) pts.push([sx, sy]);
+    }
+    if (pts.length < 3) continue;
     const width = d.width === 0 ? 0 : d.width || 2;
-    ovItems.push({t: 'poly', pts: d.points.map((p) => [px(p[0]), py(p[1])]), closed: true,
-      fill: d.fill ? hexToRgb(d.fill) : null, fillOpacity: (d.fillAlpha === undefined ? 64 : d.fillAlpha) / 255,
-      stroke: width ? hexToRgb(d.color || '#ffffff') : null, strokeOpacity: (d.alpha === undefined ? 255 : d.alpha) / 255, strokeWidth: width});
+    ovItems.push({t: 'poly', pts, closed: true,
+      fill: d.fill ? rgbOf(d.fill) : null, fillOpacity: (d.fillAlpha === undefined ? 64 : d.fillAlpha) / 255,
+      stroke: width ? rgbOf(d.color || '#ffffff') : null, strokeOpacity: (d.alpha === undefined ? 255 : d.alpha) / 255, strokeWidth: width});
   }
   for (const d of ov.points || []) {
-    ovItems.push({t: 'circles', n: 1, xy: new Float32Array([px(d.at[0]), py(d.at[1])]), rgb: new Uint8Array(hexToRgb(d.color || '#ffffff')),
+    if (!d || !d.at) continue;
+    const sx = px(d.at[0]), sy = py(d.at[1]);
+    if (!Number.isFinite(sx) || !Number.isFinite(sy)) continue;
+    ovItems.push({t: 'circles', n: 1, xy: new Float32Array([sx, sy]), rgb: new Uint8Array(rgbOf(d.color || '#ffffff')),
       a: null, r: (d.size || 8) / 2, opacity: 1});
   }
   for (const l of view.labels || []) {
-    ovItems.push({t: 'text', x: px(l.x), y: py(l.y) - 6, text: l.text, size: 12, bold: true, anchor: 'middle',
+    if (!l) continue;
+    const sx = px(l.x), sy = py(l.y) - 6;
+    if (!Number.isFinite(sx) || !Number.isFinite(sy)) continue;
+    ovItems.push({t: 'text', x: sx, y: sy, text: l.text, size: 12, bold: true, anchor: 'middle',
       fill: rgbOf(l.color || '#ffffff'), halo: [0, 0, 0]});
   }
   if (ovItems.length) map.push({t: 'g', attrs: {id: 'overlays'}, items: ovItems});

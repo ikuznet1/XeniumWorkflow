@@ -56,18 +56,62 @@ def read_zarr_sparse(zroot, path):
         return sp.csr_matrix(arr)
 
 
+def _decode_bytes_arr(arr: np.ndarray) -> np.ndarray:
+    if arr.dtype.kind == "S":
+        return arr.astype(str)
+    if arr.dtype == object:
+        return np.array([v.decode("utf-8") if isinstance(v, (bytes, bytearray)) else v for v in arr],
+                        dtype=object)
+    return arr
+
+
 def read_obs_column(obs_grp, col):
-    """Read a single obs column from zarr, returning a numpy array."""
+    """Read a single obs column from zarr, returning a numpy array.
+
+    Supports bare zarr Arrays, categorical Groups (codes + categories), and
+    anndata nullable-* Groups (nullable-string-array, nullable-integer, etc.).
+    """
     item = obs_grp[col]
-    if isinstance(item, zarr.Array):
-        return item[:]
-    # Could be a categorical group (anndata encoding)
+    if hasattr(item, "shape") or isinstance(item, zarr.Array):
+        return _decode_bytes_arr(np.asarray(item[:]))
     if isinstance(item, zarr.Group):
-        codes = item["codes"][:]
-        categories = np.asarray(item["categories"][:], dtype=object)
-        out = categories[codes]
-        out[codes < 0] = "Unknown"   # anndata encodes missing as code -1
-        return out
+        if "codes" in item and "categories" in item:
+            codes = np.asarray(item["codes"][:])
+            categories = _decode_bytes_arr(np.asarray(item["categories"][:], dtype=object))
+            out = np.empty(len(codes), dtype=object)
+            valid = (codes >= 0) & (codes < len(categories))
+            out[valid] = categories[codes[valid]]
+            out[~valid] = "Unknown"
+            return out
+        if "values" in item and "mask" in item:
+            vals = _decode_bytes_arr(np.asarray(item["values"][:]))
+            mask = np.asarray(item["mask"][:], dtype=bool)
+            enc = str(item.attrs.get("encoding-type", ""))
+            if "string" in enc or vals.dtype.kind in ("U", "O"):
+                out = vals.astype(object)
+                out[mask] = "Unknown"
+                return out
+            out = vals.astype(np.float64)
+            out[mask] = np.nan
+            return out
+        try:
+            try:
+                from anndata.io import read_elem as _read_elem
+            except ImportError:
+                from anndata.experimental import read_elem as _read_elem
+            decoded = _read_elem(item)
+            if isinstance(decoded, pd.Categorical):
+                out = np.asarray(decoded.astype(object), dtype=object)
+                out[pd.isna(out)] = "Unknown"
+                return out
+            ser = pd.Series(decoded)
+            if pd.api.types.is_numeric_dtype(ser.dtype) and not pd.api.types.is_bool_dtype(ser.dtype):
+                return pd.to_numeric(ser, errors="coerce").to_numpy(dtype=np.float64)
+            out = ser.astype(object).to_numpy(dtype=object)
+            out[pd.isna(ser).to_numpy()] = "Unknown"
+            return out
+        except Exception as exc:
+            raise ValueError(f"Could not decode obs column '{col}' ({type(item)}): {exc}") from exc
     raise ValueError(f"Unexpected zarr type for obs column '{col}': {type(item)}")
 
 
@@ -80,9 +124,21 @@ def read_uns_list(table_grp, key):
     if key not in uns_grp:
         return []
     item = uns_grp[key]
-    if isinstance(item, zarr.Array):
-        return [str(v) for v in item[:]]
-    # scalar or other — try iterating
+    if hasattr(item, "shape") or isinstance(item, zarr.Array):
+        return [v.decode("utf-8") if isinstance(v, (bytes, bytearray)) else str(v) for v in item[:]]
+    if isinstance(item, zarr.Group):
+        if "values" in item and "mask" in item:
+            vals = _decode_bytes_arr(np.asarray(item["values"][:]))
+            mask = np.asarray(item["mask"][:], dtype=bool)
+            return [str(v) for v, m in zip(vals, mask) if not m]
+        try:
+            try:
+                from anndata.io import read_elem as _read_elem
+            except ImportError:
+                from anndata.experimental import read_elem as _read_elem
+            return [str(v) for v in np.asarray(_read_elem(item)).ravel() if not pd.isna(v)]
+        except Exception:
+            return []
     try:
         return [str(v) for v in item]
     except Exception:
@@ -191,9 +247,10 @@ def export_sdata_to_cellnest(
     active_imp_csr  = raw_full_csr[:, active_imp_mask] if active_imp_genes else None
 
     # ------------------------------------------------------------------
-    # Step 3b — Read X_corrected if requested (panel genes only, no imputed cols)
+    # Step 3b — Read X_corrected if requested (covered panel genes & covered cells only)
     # ------------------------------------------------------------------
     panel_corrected_csr = None
+    _keep_rows = None
     if use_corrected:
         print("       Reading X_corrected (SPLIT) …")
         try:
@@ -213,6 +270,47 @@ def export_sdata_to_cellnest(
                 f"X_corrected has {panel_corrected_csr.shape[1]} columns; "
                 f"expected {n_var_total} or {int(panel_mask.sum())}"
             )
+
+        # Filter to SPLIT-covered panel genes when partial coverage metadata is recorded
+        _corr_cols = None
+        try:
+            _xc_grp = table_grp["layers"]["X_corrected"]
+            _raw_cc = _xc_grp.attrs.get("corrected_cols")
+            if _raw_cc is not None:
+                _corr_cols = [str(g) for g in _raw_cc]
+        except Exception:
+            pass
+        if not _corr_cols:
+            _corr_cols = read_uns_list(table_grp, "split_corrected_cols")
+        if _corr_cols:
+            _corr_col_set = set(_corr_cols)
+            _cov_col_mask = np.array([g in _corr_col_set for g in panel_genes], dtype=bool)
+            if not _cov_col_mask.all():
+                print(f"       SPLIT gene filter: keeping {int(_cov_col_mask.sum())}/{len(panel_genes)} "
+                      f"SPLIT-covered panel genes")
+                panel_corrected_csr = panel_corrected_csr[:, _cov_col_mask]
+                panel_raw_csr = panel_raw_csr[:, _cov_col_mask]
+                panel_genes = [g for g, m in zip(panel_genes, _cov_col_mask) if m]
+
+        # Filter to SPLIT-covered cells (exclude zero-padded rows of RCTD-dropped / out-of-subset cells)
+        _row_nz = np.asarray(np.abs(panel_corrected_csr).sum(axis=1)).ravel() > 0
+        _corr_cids = read_uns_list(table_grp, "split_corrected_cell_ids")
+        if _corr_cids:
+            _cid_set = set(_corr_cids)
+            _id_mask = np.array([cid in _cid_set for cid in cell_ids], dtype=bool)
+            _keep_rows = (_id_mask & _row_nz) if (_id_mask & _row_nz).any() else _row_nz
+        else:
+            _keep_rows = _row_nz
+        if not _keep_rows.any():
+            raise ValueError("No cells have non-zero SPLIT-corrected counts in X_corrected.")
+        if not _keep_rows.all():
+            print(f"       SPLIT cell filter: keeping {int(_keep_rows.sum())}/{len(cell_ids)} "
+                  f"SPLIT-covered cells")
+            cell_ids = [cid for cid, m in zip(cell_ids, _keep_rows) if m]
+            panel_corrected_csr = panel_corrected_csr[_keep_rows, :]
+            panel_raw_csr = panel_raw_csr[_keep_rows, :]
+            if active_imp_csr is not None:
+                active_imp_csr = active_imp_csr[_keep_rows, :]
 
     # ------------------------------------------------------------------
     # Step 3c — Assemble final X and X_raw based on flag combination
@@ -273,6 +371,9 @@ def export_sdata_to_cellnest(
             "Could not find centroid columns in obs. "
             "Expected 'x_centroid'/'y_centroid' or 'centroid_x'/'centroid_y'."
         )
+    if _keep_rows is not None and not _keep_rows.all():
+        x = x[_keep_rows]
+        y = y[_keep_rows]
 
     print(f"       x range: [{x.min():.1f}, {x.max():.1f}] µm")
     print(f"       y range: [{y.min():.1f}, {y.max():.1f}] µm")
@@ -311,7 +412,9 @@ def export_sdata_to_cellnest(
             print(f"       WARNING: column '{cell_type_col}' not found in obs — skipping annotation CSV")
         else:
             labels = read_obs_column(obs_grp, cell_type_col)
-            # Convert numeric cluster IDs to strings
+            if _keep_rows is not None and not _keep_rows.all():
+                labels = labels[_keep_rows]
+            # Convert numeric cluster IDs to strings, mapping missing tokens to "Unknown"
             if np.issubdtype(labels.dtype, np.floating):
                 _nan = np.isnan(labels)
                 labels = np.where(_nan, "Unknown",
@@ -319,7 +422,11 @@ def export_sdata_to_cellnest(
             elif np.issubdtype(labels.dtype, np.integer):
                 labels = labels.astype(int).astype(str)
             else:
-                labels = labels.astype(str)
+                _s_lab = pd.Series(labels, dtype=object)
+                _bad = _s_lab.isna() | _s_lab.astype(str).str.strip().isin(
+                    ["", "nan", "NaN", "None", "<NA>"]
+                )
+                labels = np.where(_bad.to_numpy(), "Unknown", _s_lab.astype(str).to_numpy())
             annotation_csv = os.path.join(output_dir, f"{data_name}_annotation.csv")
             pd.DataFrame({"cell_type": labels}, index=cell_ids).to_csv(annotation_csv)
             print(f"       Written: {annotation_csv}")

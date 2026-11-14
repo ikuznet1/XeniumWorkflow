@@ -18,6 +18,7 @@ import os
 import re
 import json
 import time
+import shutil
 import hashlib
 import threading
 import numpy as np
@@ -26,6 +27,10 @@ import scipy.sparse as sp
 import h5py
 
 from . import core, jobs, loading, dataview, stats
+
+
+class _H5adError(ValueError):
+    """Raised when an .h5ad file or mapping cannot be converted cleanly."""
 
 
 _H5AD_FORMAT = 1                    # of the converted cache (part of its directory hash)
@@ -44,7 +49,7 @@ _H5AD_LIST_KEYS = ("cell_types", "clusters")
 _H5AD_METHOD_RE = re.compile(r"^obs\d+$")     # annotation "methods" that are obs columns of a file
 
 # the file behind the loaded samples (None: the view does not come from an .h5ad)
-_h5ad_loaded: dict = {"manifest": None, "cache_dir": None}
+_h5ad_loaded: dict = {"manifest": None, "cache_dir": None, "loaded": []}
 # conversion + loading started from the Load Sample dialog
 _h5ad_state: dict = {"status": "idle", "message": "", "result": None}
 _h5ad_lock = threading.Lock()
@@ -409,6 +414,36 @@ def _h5ad_manifest(cache_dir: str) -> "dict | None":
     return man
 
 
+def _h5ad_check_finite_matrix(node, matrix_name: str, block_nnz=None) -> None:
+    """Validate up front that *node* contains no NaN/Inf (or float32-overflowing) values."""
+    block_nnz = int(block_nnz or _H5AD_BLOCK_NNZ)
+    _f32_max = float(np.finfo(np.float32).max)
+    mi = _h5ad_matrix_info(node)
+    n, m = mi["shape"]
+    if mi["encoding"] == "dense":
+        step = max(1, block_nnz // max(1, m))
+        for a in range(0, n, step):
+            jobs._job_check()
+            arr = np.asarray(node[a:min(n, a + step)])
+            if arr.size and arr.dtype.kind == "f":
+                if not np.isfinite(arr).all() or (np.abs(arr) > _f32_max).any():
+                    raise _H5adError(
+                        f"Matrix '{matrix_name}' contains non-finite (NaN / Inf) values and cannot be converted."
+                    )
+        return
+    data_ds = node["data"]
+    if data_ds.dtype.kind == "f":
+        nnz = int(mi["nnz"])
+        for s in range(0, nnz, block_nnz):
+            jobs._job_check()
+            chunk = np.asarray(data_ds[s:min(nnz, s + block_nnz)])
+            if chunk.size:
+                if not np.isfinite(chunk).all() or (np.abs(chunk) > _f32_max).any():
+                    raise _H5adError(
+                        f"Matrix '{matrix_name}' contains non-finite (NaN / Inf) values and cannot be converted."
+                    )
+
+
 def _h5ad_convert(path, mapping, progress=None, force: bool = False, block_nnz=None) -> tuple:
     """Convert *path* into per-section stores (see the module text); (manifest, cache_dir).
     A finished conversion of the same file (path, size, modification time) with the same
@@ -424,178 +459,207 @@ def _h5ad_convert(path, mapping, progress=None, force: bool = False, block_nnz=N
             return man, cache_dir
     t0 = time.time()
     say = (lambda f, m: None) if progress is None else progress
-    os.makedirs(cache_dir, exist_ok=True)
-    try:
-        os.remove(os.path.join(cache_dir, "manifest.json"))
-    except OSError:
-        pass
     est = _h5ad_estimate(info, mapping)
-    print(f"  h5ad: converting {os.path.basename(path)} ({info['n_cells']:,} cells × {info['n_genes']:,} "
-          f"genes, {est['nnz']:,} stored values in '{mapping['counts']}', {est['encoding']}) into "
-          f"per-section stores in {cache_dir} — about {est['disk_gb']:.1f} GB on disk; the loaded count "
-          f"matrices will take about {est['ram_gb']:.1f} GB of memory", flush=True)
 
-    with h5py.File(path, "r") as f:
-        obs = _h5ad_read_elem(f["obs"])
-        genes = [str(g) for g in _h5ad_read_elem(f["var"]).index]
-        if len(set(genes)) != len(genes):
+    # Validate metadata + matrix finiteness BEFORE creating cache_dir or writing section stores
+    with h5py.File(path, "r") as _f_chk:
+        _genes_chk = [str(g) for g in _h5ad_read_elem(_f_chk["var"]).index]
+        if len(set(_genes_chk)) != len(_genes_chk):
             raise ValueError("var names are not unique: make them unique (adata.var_names_make_unique()) first.")
-        n = len(obs)
-        ids = np.asarray(obs.index.astype(str), dtype=object)
-        if mapping.get("x"):
-            xy = np.column_stack([pd.to_numeric(obs[mapping["x"]], errors="coerce").to_numpy(dtype=float),
-                                  pd.to_numeric(obs[mapping["y"]], errors="coerce").to_numpy(dtype=float)])
-        else:
-            xy = np.asarray(f["obsm"][mapping["spatial"]][:, :2], dtype=float)
-        umap = (np.asarray(f["obsm"][mapping["umap"]][:, :2], dtype=float) if mapping.get("umap")
-                else np.full((n, 2), np.nan))
-        ok_xy = np.isfinite(xy).all(axis=1)
+        _node_chk = _h5ad_matrix_node(_f_chk, mapping["counts"])
+        _mi_chk = _h5ad_matrix_info(_node_chk)
+        if _mi_chk["shape"] != (info["n_cells"], len(_genes_chk)):
+            raise ValueError(
+                f"Matrix '{mapping['counts']}' has shape {_mi_chk['shape']}, "
+                f"expected {(info['n_cells'], len(_genes_chk))}."
+            )
+        _h5ad_check_finite_matrix(_node_chk, mapping["counts"], block_nnz=block_nnz)
 
-        if mapping.get("section"):
-            sec_txt = _h5ad_text_column(obs[mapping["section"]])
-            if (sec_txt == "").any():
-                raise ValueError(f"{int((sec_txt == '').sum()):,} cells have no value in the section column "
-                                 f"{mapping['section']!r}: every cell must belong to a section.")
-            # natural order of the names (section_2 before section_10)
-            sec_names = sorted(set(pd.unique(sec_txt)), key=_h5ad_natural_key)
-            code_of = {nm: i for i, nm in enumerate(sec_names)}
-            codes = np.fromiter((code_of[v] for v in sec_txt), dtype=np.int32, count=n)
-        else:
-            sec_names = [os.path.basename(path)[:-len(".h5ad")]]
-            codes = np.zeros(n, dtype=np.int32)
-        n_sec = len(sec_names)
-        safe = _h5ad_safe_names(sec_names)
-        last_row = np.full(n_sec, -1, dtype=np.int64)
-        np.maximum.at(last_row, codes, np.arange(n, dtype=np.int64))
+    committed = False
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        try:
+            os.remove(os.path.join(cache_dir, "manifest.json"))
+        except OSError:
+            pass
+        print(f"  h5ad: converting {os.path.basename(path)} ({info['n_cells']:,} cells × {info['n_genes']:,} "
+              f"genes, {est['nnz']:,} stored values in '{mapping['counts']}', {est['encoding']}) into "
+              f"per-section stores in {cache_dir} — about {est['disk_gb']:.1f} GB on disk; the loaded count "
+              f"matrices will take about {est['ram_gb']:.1f} GB of memory", flush=True)
 
-        def _level_per_section(key):
-            """The level of a condition / donor column for each section: its most frequent
-            value there; sections where it is not constant are reported."""
-            if not mapping.get(key):
-                return [""] * n_sec, []
-            txt = _h5ad_text_column(obs[mapping[key]])
-            lv, mixed = [], []
-            for c in range(n_sec):
-                vc = pd.Series(txt[codes == c]).value_counts()
-                lv.append(str(vc.index[0]) if len(vc) else "")
-                if len(vc) > 1:
-                    mixed.append(sec_names[c])
-            return lv, mixed
-
-        cond_of, cond_mixed = _level_per_section("condition")
-        donor_of, donor_mixed = _level_per_section("donor")
-        ct_cols = {f"obs{i}": c for i, c in enumerate(mapping["cell_types"])}
-        ct_txt = {m: _h5ad_text_column(obs[c]) for m, c in ct_cols.items()}
-        # cluster sets: one integer id per level, the same in every section
-        cl_cols, cl_codes, cl_levels = {}, {}, {}
-        for c in mapping["clusters"]:
-            nm = re.sub(r"[^A-Za-z0-9]+", "_", c).strip("_") or "clusters"
-            while nm in cl_cols:
-                nm += "_"
-            txt = _h5ad_text_column(obs[c])
-            lv = sorted(set(txt) - {""}, key=_h5ad_natural_key)
-            if lv and all(re.fullmatch(r"\d+", v) for v in lv) and "0" not in lv:
-                # whole-number labels keep their value (0 is the app's "no cluster")
-                cl_codes[nm] = np.array([int(v) if v else 0 for v in txt], dtype=np.int64)
-                cl_levels[nm] = {v: int(v) for v in lv}
+        with h5py.File(path, "r") as f:
+            obs = _h5ad_read_elem(f["obs"])
+            genes = [str(g) for g in _h5ad_read_elem(f["var"]).index]
+            if len(set(genes)) != len(genes):
+                raise ValueError("var names are not unique: make them unique (adata.var_names_make_unique()) first.")
+            n = len(obs)
+            ids = np.asarray(obs.index.astype(str), dtype=object)
+            if mapping.get("x"):
+                xy = np.column_stack([pd.to_numeric(obs[mapping["x"]], errors="coerce").to_numpy(dtype=float),
+                                      pd.to_numeric(obs[mapping["y"]], errors="coerce").to_numpy(dtype=float)])
             else:
-                lut = {v: i + 1 for i, v in enumerate(lv)}
-                cl_codes[nm] = np.array([lut.get(v, 0) for v in txt], dtype=np.int64)
-                cl_levels[nm] = lut
-            cl_cols[nm] = c
-        del obs
+                xy = np.asarray(f["obsm"][mapping["spatial"]][:, :2], dtype=float)
+            umap = (np.asarray(f["obsm"][mapping["umap"]][:, :2], dtype=float) if mapping.get("umap")
+                    else np.full((n, 2), np.nan))
+            ok_xy = np.isfinite(xy).all(axis=1)
 
-        node = _h5ad_matrix_node(f, mapping["counts"])
-        mi = _h5ad_matrix_info(node)
-        if mi["shape"] != (n, len(genes)):
-            raise ValueError(f"Matrix '{mapping['counts']}' has shape {mi['shape']}, expected {(n, len(genes))}.")
-        pieces: dict = {}
-        stats_c = {"nnz": 0, "n_noninteger": 0, "n_negative": 0, "max": 0.0}
-        sections = [None] * n_sec
-        empty = []                       # (section, cells dropped) of sections without a usable cell
-
-        def _finish(c):
-            rows = np.concatenate([r for r, _ in pieces[c]])
-            X = sp.vstack([p for _, p in pieces.pop(c)], format="csr") if len(rows) else \
-                sp.csr_matrix((0, len(genes)), dtype=np.float32)
-            keep = ok_xy[rows]
-            n_drop = int((~keep).sum())
-            if n_drop:
-                rows, X = rows[keep], X[np.flatnonzero(keep)]
-            if not len(rows):
-                # nothing left of this section (no cell with coordinates): no sample for it
-                empty.append((sec_names[c], n_drop))
-                return
-            cid = pd.Index(ids[rows])
-            if not cid.is_unique:
-                # the same obs name twice in one section: keep both cells, numbered
-                cid = pd.Index(_h5ad_unique_names(cid))
-            tot = np.asarray(X.sum(axis=1)).ravel()
-            df = pd.DataFrame({"x_centroid": xy[rows, 0], "y_centroid": xy[rows, 1],
-                               "transcript_counts": tot, "total_counts": tot,
-                               "umap_1": umap[rows, 0], "umap_2": umap[rows, 1],
-                               "source_row": rows.astype(np.int64)}, index=cid)
-            for m_, txt in ct_txt.items():
-                df[f"cell_type_{m_}"] = txt[rows].astype(str)
-            for nm in cl_cols:
-                df[f"clust__{nm}"] = cl_codes[nm][rows]
-            meta = {"run_name": sec_names[c], "panel_name": os.path.basename(path),
-                    "region_name": " · ".join(v for v in (cond_of[c], donor_of[c] and f"donor {donor_of[c]}") if v),
-                    "num_cells": int(len(df)), "num_transcripts": int(round(float(tot.sum()))),
-                    "source": "h5ad", "h5ad_section": sec_names[c], "h5ad_condition": cond_of[c],
-                    "h5ad_donor": donor_of[c]}
-            _h5ad_write_store(os.path.join(cache_dir, safe[c] + ".zarr"), X, df, genes,
-                              {"metadata": meta, "cluster_methods": list(cl_cols), "imputed_genes": []})
-            sections[c] = {"name": sec_names[c], "store": safe[c] + ".zarr", "n_cells": int(len(df)),
-                           "n_dropped_no_coordinates": n_drop, "condition": cond_of[c], "donor": donor_of[c],
-                           "nnz": int(X.nnz)}
-            print(f"  h5ad: section {c + 1}/{n_sec} written ({len(df):,} cells)", flush=True)
-
-        for a, b, blk in _h5ad_row_blocks(node, block_nnz):
-            jobs._job_check()
-            d = blk.data
-            stats_c["nnz"] += int(d.size)
-            if d.size:
-                if d.dtype.kind == "f":
-                    stats_c["n_noninteger"] += int(np.count_nonzero(d != np.rint(d)))
-                if d.dtype.kind in "fi":
-                    stats_c["n_negative"] += int(np.count_nonzero(d < 0))
-                stats_c["max"] = max(stats_c["max"], float(d.max()))
-            blk = blk.astype(np.float32)
-            cb = codes[a:b]
-            edges = np.flatnonzero(np.diff(cb)) + 1
-            if len(edges) < 64:
-                # runs of one section: plain row slices
-                for s, e in zip(np.r_[0, edges], np.r_[edges, b - a]):
-                    pieces.setdefault(int(cb[s]), []).append((np.arange(a + s, a + e), blk[s:e]))
+            if mapping.get("section"):
+                sec_txt = _h5ad_text_column(obs[mapping["section"]])
+                if (sec_txt == "").any():
+                    raise ValueError(f"{int((sec_txt == '').sum()):,} cells have no value in the section column "
+                                     f"{mapping['section']!r}: every cell must belong to a section.")
+                # natural order of the names (section_2 before section_10)
+                sec_names = sorted(set(pd.unique(sec_txt)), key=_h5ad_natural_key)
+                code_of = {nm: i for i, nm in enumerate(sec_names)}
+                codes = np.fromiter((code_of[v] for v in sec_txt), dtype=np.int32, count=n)
             else:
-                for c in np.unique(cb):
-                    r = np.flatnonzero(cb == c)
-                    pieces.setdefault(int(c), []).append((a + r, blk[r]))
-            for c in [c for c in pieces if last_row[c] < b]:
+                sec_names = [os.path.basename(path)[:-len(".h5ad")]]
+                codes = np.zeros(n, dtype=np.int32)
+            n_sec = len(sec_names)
+            safe = _h5ad_safe_names(sec_names)
+            last_row = np.full(n_sec, -1, dtype=np.int64)
+            np.maximum.at(last_row, codes, np.arange(n, dtype=np.int64))
+
+            def _level_per_section(key):
+                """The level of a condition / donor column for each section: its most frequent
+                value there; sections where it is not constant are reported."""
+                if not mapping.get(key):
+                    return [""] * n_sec, []
+                txt = _h5ad_text_column(obs[mapping[key]])
+                lv, mixed = [], []
+                for c in range(n_sec):
+                    vc = pd.Series(txt[codes == c]).value_counts()
+                    lv.append(str(vc.index[0]) if len(vc) else "")
+                    if len(vc) > 1:
+                        mixed.append(sec_names[c])
+                return lv, mixed
+
+            cond_of, cond_mixed = _level_per_section("condition")
+            donor_of, donor_mixed = _level_per_section("donor")
+            ct_cols = {f"obs{i}": c for i, c in enumerate(mapping["cell_types"])}
+            ct_txt = {m: _h5ad_text_column(obs[c]) for m, c in ct_cols.items()}
+            # cluster sets: one integer id per level, the same in every section
+            cl_cols, cl_codes, cl_levels = {}, {}, {}
+            for c in mapping["clusters"]:
+                nm = re.sub(r"[^A-Za-z0-9]+", "_", c).strip("_") or "clusters"
+                while nm in cl_cols:
+                    nm += "_"
+                txt = _h5ad_text_column(obs[c])
+                lv = sorted(set(txt) - {""}, key=_h5ad_natural_key)
+                if lv and all(re.fullmatch(r"\d+", v) for v in lv) and "0" not in lv:
+                    # whole-number labels keep their value (0 is the app's "no cluster")
+                    cl_codes[nm] = np.array([int(v) if v else 0 for v in txt], dtype=np.int64)
+                    cl_levels[nm] = {v: int(v) for v in lv}
+                else:
+                    lut = {v: i + 1 for i, v in enumerate(lv)}
+                    cl_codes[nm] = np.array([lut.get(v, 0) for v in txt], dtype=np.int64)
+                    cl_levels[nm] = lut
+                cl_cols[nm] = c
+            del obs
+
+            node = _h5ad_matrix_node(f, mapping["counts"])
+            mi = _h5ad_matrix_info(node)
+            if mi["shape"] != (n, len(genes)):
+                raise ValueError(f"Matrix '{mapping['counts']}' has shape {mi['shape']}, expected {(n, len(genes))}.")
+            pieces: dict = {}
+            stats_c = {"nnz": 0, "n_noninteger": 0, "n_negative": 0, "max": 0.0}
+            sections = [None] * n_sec
+            empty = []                       # (section, cells dropped) of sections without a usable cell
+
+            def _finish(c):
+                rows = np.concatenate([r for r, _ in pieces[c]])
+                X = sp.vstack([p for _, p in pieces.pop(c)], format="csr") if len(rows) else \
+                    sp.csr_matrix((0, len(genes)), dtype=np.float32)
+                keep = ok_xy[rows]
+                n_drop = int((~keep).sum())
+                if n_drop:
+                    rows, X = rows[keep], X[np.flatnonzero(keep)]
+                if not len(rows):
+                    # nothing left of this section (no cell with coordinates): no sample for it
+                    empty.append((sec_names[c], n_drop))
+                    return
+                cid = pd.Index(ids[rows])
+                if not cid.is_unique:
+                    # the same obs name twice in one section: keep both cells, numbered
+                    cid = pd.Index(_h5ad_unique_names(cid))
+                tot = np.asarray(X.sum(axis=1)).ravel()
+                df = pd.DataFrame({"x_centroid": xy[rows, 0], "y_centroid": xy[rows, 1],
+                                   "transcript_counts": tot, "total_counts": tot,
+                                   "umap_1": umap[rows, 0], "umap_2": umap[rows, 1],
+                                   "source_row": rows.astype(np.int64)}, index=cid)
+                for m_, txt in ct_txt.items():
+                    df[f"cell_type_{m_}"] = txt[rows].astype(str)
+                for nm in cl_cols:
+                    df[f"clust__{nm}"] = cl_codes[nm][rows]
+                meta = {"run_name": sec_names[c], "panel_name": os.path.basename(path),
+                        "region_name": " · ".join(v for v in (cond_of[c], donor_of[c] and f"donor {donor_of[c]}") if v),
+                        "num_cells": int(len(df)), "num_transcripts": int(round(float(tot.sum()))),
+                        "source": "h5ad", "h5ad_section": sec_names[c], "h5ad_condition": cond_of[c],
+                        "h5ad_donor": donor_of[c]}
+                _h5ad_write_store(os.path.join(cache_dir, safe[c] + ".zarr"), X, df, genes,
+                                  {"metadata": meta, "cluster_methods": list(cl_cols), "imputed_genes": []})
+                sections[c] = {"name": sec_names[c], "store": safe[c] + ".zarr", "n_cells": int(len(df)),
+                               "n_dropped_no_coordinates": n_drop, "condition": cond_of[c], "donor": donor_of[c],
+                               "nnz": int(X.nnz)}
+                print(f"  h5ad: section {c + 1}/{n_sec} written ({len(df):,} cells)", flush=True)
+
+            for a, b, blk in _h5ad_row_blocks(node, block_nnz):
+                jobs._job_check()
+                d = blk.data
+                stats_c["nnz"] += int(d.size)
+                if d.size:
+                    if not np.isfinite(d).all():
+                        raise _H5adError(
+                            f"Matrix '{mapping['counts']}' contains non-finite (NaN / Inf) values and cannot be converted."
+                        )
+                    if d.dtype.kind == "f":
+                        stats_c["n_noninteger"] += int(np.count_nonzero(d != np.rint(d)))
+                    if d.dtype.kind in "fi":
+                        stats_c["n_negative"] += int(np.count_nonzero(d < 0))
+                    stats_c["max"] = max(stats_c["max"], float(d.max()))
+                blk = blk.astype(np.float32)
+                if blk.data.size and not np.isfinite(blk.data).all():
+                    raise _H5adError(
+                        f"Matrix '{mapping['counts']}' overflows float32 and cannot be converted."
+                    )
+                cb = codes[a:b]
+                edges = np.flatnonzero(np.diff(cb)) + 1
+                if len(edges) < 64:
+                    # runs of one section: plain row slices
+                    for s, e in zip(np.r_[0, edges], np.r_[edges, b - a]):
+                        pieces.setdefault(int(cb[s]), []).append((np.arange(a + s, a + e), blk[s:e]))
+                else:
+                    for c in np.unique(cb):
+                        r = np.flatnonzero(cb == c)
+                        pieces.setdefault(int(c), []).append((a + r, blk[r]))
+                for c in [c for c in pieces if last_row[c] < b]:
+                    _finish(c)
+                say(b / max(1, n), f"Converting: {b:,} of {n:,} cells read…")
+            for c in list(pieces):
                 _finish(c)
-            say(b / max(1, n), f"Converting: {b:,} of {n:,} cells read…")
-        for c in list(pieces):
-            _finish(c)
 
-    sections = [sec for sec in sections if sec is not None]
-    if not sections:
-        raise ValueError("No cell of the file has finite coordinates in the chosen columns.")
-    integer = stats_c["n_noninteger"] == 0 and stats_c["n_negative"] == 0
-    man = {"format": _H5AD_FORMAT, "source": path, "source_size": info["size_bytes"],
-           "mapping": mapping, "n_cells": int(sum(s["n_cells"] for s in sections)), "n_genes": len(genes),
-           "counts": {"matrix": mapping["counts"], "integer": bool(integer), **stats_c},
-           "celltype_methods": ct_cols, "cluster_sets": cl_cols, "cluster_levels": cl_levels,
-           "sections": sections,
-           "n_dropped_no_coordinates": int(sum(s["n_dropped_no_coordinates"] for s in sections)
-                                           + sum(n for _nm, n in empty)),
-           "sections_without_cells": [nm for nm, _n in empty],
-           "condition_not_constant_in": cond_mixed, "donor_not_constant_in": donor_mixed,
-           "seconds": round(time.time() - t0, 1)}
-    tmp = os.path.join(cache_dir, "manifest.json.tmp")
-    with open(tmp, "w") as fh:
-        json.dump(man, fh, indent=1)
-    os.replace(tmp, os.path.join(cache_dir, "manifest.json"))
+        sections = [sec for sec in sections if sec is not None]
+        if not sections:
+            raise ValueError("No cell of the file has finite coordinates in the chosen columns.")
+        integer = stats_c["n_noninteger"] == 0 and stats_c["n_negative"] == 0
+        man = {"format": _H5AD_FORMAT, "source": path, "source_size": info["size_bytes"],
+               "mapping": mapping, "n_cells": int(sum(s["n_cells"] for s in sections)), "n_genes": len(genes),
+               "counts": {"matrix": mapping["counts"], "integer": bool(integer), **stats_c},
+               "celltype_methods": ct_cols, "cluster_sets": cl_cols, "cluster_levels": cl_levels,
+               "sections": sections,
+               "n_dropped_no_coordinates": int(sum(s["n_dropped_no_coordinates"] for s in sections)
+                                               + sum(n for _nm, n in empty)),
+               "sections_without_cells": [nm for nm, _n in empty],
+               "condition_not_constant_in": cond_mixed, "donor_not_constant_in": donor_mixed,
+               "seconds": round(time.time() - t0, 1)}
+        tmp = os.path.join(cache_dir, "manifest.json.tmp")
+        with open(tmp, "w") as fh:
+            json.dump(man, fh, indent=1)
+        os.replace(tmp, os.path.join(cache_dir, "manifest.json"))
+        committed = True
+    finally:
+        if not committed:
+            shutil.rmtree(cache_dir, ignore_errors=True)
     print(f"  h5ad: {len(sections)} section(s), {man['n_cells']:,} cells converted in {man['seconds']:.0f} s", flush=True)
     for w in _h5ad_warnings(man):
         print(f"  h5ad: WARNING — {w}", flush=True)
@@ -708,10 +772,53 @@ def _h5ad_register(man: "dict | None", cache_dir=None) -> None:
     under the column's name) and remember the file; None forgets both."""
     for m in [m for m in core._ANNOT_METHODS if _H5AD_METHOD_RE.match(m)]:
         core._ANNOT_METHODS.pop(m, None)
-    _h5ad_loaded.update({"manifest": man, "cache_dir": cache_dir if man else None})
+    loaded_dirs = (
+        [os.path.abspath(os.path.join(str(cache_dir), s["store"])) for s in (man.get("sections") or [])]
+        if (man and cache_dir) else []
+    )
+    _h5ad_loaded.update({"manifest": man, "cache_dir": cache_dir if man else None, "loaded": loaded_dirs})
     if man:
         for m, col in (man.get("celltype_methods") or {}).items():
             core._ANNOT_METHODS[m] = str(col)
+
+
+def _h5ad_sync_loaded() -> None:
+    """Prune _h5ad_loaded ('loaded' paths and manifest sections) to currently loaded samples."""
+    active = set()
+    for ds in [core.DATA] + list(dataview.EXTRA_DATASETS):
+        if not isinstance(ds, dict):
+            continue
+        for k in (ds.get("sdata_path"), ds.get("data_dir"), dataview._ds_key(ds)):
+            if k:
+                active.add(os.path.abspath(str(k)))
+    prev_loaded = _h5ad_loaded.get("loaded")
+    if isinstance(prev_loaded, set):
+        _h5ad_loaded["loaded"] = {p for p in prev_loaded if os.path.abspath(str(p)) in active}
+    elif isinstance(prev_loaded, list):
+        _h5ad_loaded["loaded"] = [p for p in prev_loaded if os.path.abspath(str(p)) in active]
+    man = _h5ad_loaded.get("manifest")
+    cache_dir = _h5ad_loaded.get("cache_dir")
+    if man and cache_dir:
+        kept = [
+            s for s in (man.get("sections") or [])
+            if os.path.abspath(os.path.join(str(cache_dir), s["store"])) in active
+        ]
+        if not kept:
+            _h5ad_register(None)
+            return
+        if len(kept) != len(man.get("sections") or []):
+            new_man = dict(man)
+            new_man["sections"] = kept
+            new_man["n_cells"] = int(sum(int(s.get("n_cells", 0)) for s in kept))
+            _h5ad_loaded["manifest"] = new_man
+        if isinstance(_h5ad_loaded.get("loaded"), set):
+            _h5ad_loaded["loaded"] = {
+                os.path.abspath(os.path.join(str(cache_dir), s["store"])) for s in kept
+            }
+        else:
+            _h5ad_loaded["loaded"] = [
+                os.path.abspath(os.path.join(str(cache_dir), s["store"])) for s in kept
+            ]
 
 
 def _h5ad_primary_labels() -> list:

@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
-from . import core, jobs, dataview, reseg
+from . import core, jobs, dataview, annotation, reseg
 from . import provenance
 
 
@@ -67,11 +67,11 @@ def _compute_reseg_clusters_umap(cells_df: pd.DataFrame, expr_mat,
         _trivial(f"failed: {_cl_err}")
 
 
-def _reseg_measured_expr(expr_mat):
+def _reseg_measured_expr(expr_mat, alt_res=None):
     """Columns of a Baysor/Proseg matrix that hold measured counts. A run's matrix is
     [panel genes | genes SpaGE imputed for this run]; the panel genes come first."""
-    _n = min(expr_mat.shape[1], len(dataview._panel_gene_names()))
-    return expr_mat if _n == expr_mat.shape[1] else expr_mat[:, :_n]
+    _, cols = annotation._reseg_panel_genes_and_cols(expr_mat, alt_res)
+    return expr_mat if cols == list(range(expr_mat.shape[1])) else expr_mat[:, cols]
 
 
 def _compute_reseg_clusters_umap_impl(cells_df: pd.DataFrame, expr_mat,
@@ -239,12 +239,30 @@ def _run_reseg_umap() -> None:
                         # Read cell IDs
                         _idx_key = _obs_fb.attrs.get("_index", "_index")
                         _all_ids = [str(v) for v in _obs_fb[_idx_key][:]]
-                        # Identify SPLIT-kept cells via non-empty cluster_split_10
+                        # Identify SPLIT-kept cells via non-empty cluster_split_10 (supports both
+                        # bare zarr Arrays and anndata categorical / nullable-string Groups)
+                        _row_nz_fb = np.asarray(np.abs(_xcorr_full).sum(axis=1)).ravel() > 0
                         if "cluster_split_10" in _obs_fb:
-                            _clust   = np.array([str(v) for v in _obs_fb["cluster_split_10"][:]])
-                            _kept_mask = np.array([bool(v.strip()) for v in _clust], dtype=bool)
+                            _col_node = _obs_fb["cluster_split_10"]
+                            if hasattr(_col_node, "shape"):
+                                _raw_cl = _col_node[:]
+                            else:
+                                try:
+                                    from anndata.io import read_elem as _read_elem_fb
+                                except ImportError:
+                                    from anndata.experimental import read_elem as _read_elem_fb
+                                _raw_cl = _read_elem_fb(_col_node)
+                            _cl_ser = pd.Series(_raw_cl, dtype=object)
+                            _kept_mask = (
+                                _cl_ser.notna().to_numpy()
+                                & ~_cl_ser.astype(str).str.strip().isin(
+                                    ["", "nan", "NaN", "None", "<NA>"]
+                                ).to_numpy()
+                            )
+                            if not _kept_mask.any() and _row_nz_fb.any():
+                                _kept_mask = _row_nz_fb
                         else:
-                            _kept_mask = np.ones(len(_all_ids), dtype=bool)
+                            _kept_mask = _row_nz_fb
                         _kept_rows = np.where(_kept_mask)[0]
                         _corr_expr = _xcorr_full[_kept_rows, :]
                         _corr_ids  = [_all_ids[i] for i in _kept_rows]
@@ -300,6 +318,11 @@ def _run_reseg_umap() -> None:
                 _set("running", f"Normalising {_n:,} Xenium cells…")
                 print(f"  Xenium UMAP: using original counts for {_n:,} cells", flush=True)
 
+            if _n < 4 or expr.shape[1] < 2:
+                _set("error", f"Too few cells ({_n}) or genes ({expr.shape[1]}) to compute UMAP — "
+                              f"need at least 4 cells and 2 genes.")
+                return
+
             _mat = expr.astype("float32").tocsr()
             _rs  = np.asarray(_mat.sum(axis=1)).flatten()
             _rs[_rs == 0] = 1.0
@@ -331,7 +354,8 @@ def _run_reseg_umap() -> None:
                 from sklearn.manifold import TSNE as _TSNE2
                 _set("running", "Running t-SNE (umap-learn unavailable)…")
                 _how2 = "t-SNE"
-                _emb2 = _TSNE2(n_components=2, perplexity=min(30, max(5, _n // 10)),
+                _perp2 = min(30, max(1, (_n - 1) // 3 if _n < 18 else min(max(5, _n // 10), _n - 1)))
+                _emb2 = _TSNE2(n_components=2, perplexity=_perp2,
                                random_state=0).fit_transform(_pca2)
 
             jobs._check_dataset_gen(_gen)
@@ -418,15 +442,19 @@ def _run_reseg_umap() -> None:
             else:
                 # No corrected cells found at all — fall back to uncorrected
                 print(f"  Reseg UMAP: no corrected cells found — using uncorrected", flush=True)
-                expr = _reseg_measured_expr(alt_res["expr"])
+                expr = _reseg_measured_expr(alt_res["expr"], alt_res)
                 _src_label = "reseg"
                 cell_ids = _all_cell_ids
         else:
             # measured panel genes only: after SpaGE the run's matrix also holds
             # dense imputed columns, which are not counts
-            expr = _reseg_measured_expr(alt_res["expr"])
+            expr = _reseg_measured_expr(alt_res["expr"], alt_res)
             cell_ids = _all_cell_ids
         n_cells = expr.shape[0]
+        if n_cells < 4 or expr.shape[1] < 2:
+            _set("error", f"Too few cells ({n_cells}) or genes ({expr.shape[1]}) to compute UMAP — "
+                          f"need at least 4 cells and 2 genes.")
+            return
         _set("running", f"Normalising {n_cells:,} {_src_label} cells…")
         print(f"  Reseg UMAP: using {_src_label} counts for {n_cells:,} cells", flush=True)
 
@@ -470,7 +498,7 @@ def _run_reseg_umap() -> None:
             from sklearn.manifold import TSNE
             _set("running", "Running t-SNE (umap-learn not installed or TF error)…")
             _how = "t-SNE"
-            perp = min(30, max(5, n_cells // 10))
+            perp = min(30, max(1, (n_cells - 1) // 3 if n_cells < 18 else min(max(5, n_cells // 10), n_cells - 1)))
             embedding = TSNE(n_components=2, perplexity=perp,
                              random_state=0).fit_transform(pca_coords)
 

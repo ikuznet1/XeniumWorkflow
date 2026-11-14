@@ -1617,16 +1617,26 @@ def _pm_variant(r) -> tuple:
     """Records with the same variant describe the same analysis; the newest one is written up."""
     P = r.get("params") or {}
     d = r.get("data") or {}
+    H = r.get("headline") or {}
+    lab = d.get("labels") or {}
+    label_tag = (lab.get("label_kind"), lab.get("cluster_method")) if lab else None
     seg_src = d.get("seg_source")
     seg_tag = d.get("seg_tag") or (seg_src.split(":", 1)[1] if isinstance(seg_src, str) and ":" in seg_src else None)
     annot_extra = P.get("method") if seg_tag else (P.get("method"), P.get("labels_key"))
     spatial_extra = None if seg_tag else P.get("labels_key")
+    txf_method = P.get("method") or "nmf"
+    txf_k = P.get("k", (P.get("resolved") or {}).get("k"))
     extra = {"annotation": annot_extra, "spatial": spatial_extra,
              "geneset": P.get("gene_set"), "patches": r.get("title"),
              "proximity": (P.get("target"), P.get("anchor")), "contact": (P.get("target"), P.get("anchor")),
              "pseudobulk": P.get("population"), "segfree": P.get("cell_type"),
              "de": (str(P.get("group_a")), str(P.get("group_b"))),
-             "composition": (P.get("proportions_of"), P.get("test"))}.get(r.get("kind"))
+             "composition": (P.get("proportions_of"), P.get("test")),
+             "banksy": (P.get("lam", (P.get("resolved") or {}).get("lam")),
+                        H.get("cluster_set") or H.get("key") or H.get("name")),
+             "spillover": (P.get("marker_source"), label_tag),
+             "txfactor": (txf_method, label_tag if txf_method == "reference" else txf_k),
+             "aggregates": (label_tag, tuple(P.get("classes") or ()))}.get(r.get("kind"))
     return (r.get("kind"), seg_src, (d.get("counts") or {}).get("used"), json.dumps(extra, default=str))
 
 

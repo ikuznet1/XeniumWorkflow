@@ -688,8 +688,11 @@ def _txf_reference(seg_source, tables, labels, genes, use_corrected, min_cells=N
     H = np.zeros((len(keep), len(genes)), dtype=np.float64)
     pos = {g: j for j, g in enumerate(genes)}
     cols = np.array([pos[g] for g in gsel], dtype=np.int64)
-    H[:, cols] = prof["counts"][keep]
-    return _txf_normalise(H), [str(prof["types"][i]) for i in keep], left
+    # Normalise strictly over the covered genes (gsel): uncovered columns stay 0.0
+    # rather than 1e-12 / R_f, which would disproportionately route uncovered
+    # transcripts to whichever cell type has the smallest total count R_f.
+    H[:, cols] = _txf_normalise(prof["counts"][keep])
+    return H, [str(prof["types"][i]) for i in keep], left
 
 
 def _txf_type_profiles(seg_source, tables, labels, genes, use_corrected):
@@ -778,11 +781,25 @@ def _run_txfactor(seg_source, cluster_method, label_kind, method="nmf", params=N
                 labels = None
         H_ref, names, left = None, None, []
         ref_hash = ""
+        n_uncovered_genes = 0
         if method == "reference":
             if labels is None:
                 _set("error", "The reference mode needs cell types: pick an annotation (or clusters) under "
                               "'Cell types from'.")
                 return
+            _ref_samples = analysis._an_samples(seg_source, use_corrected)
+            _by_key = {s["key"]: s for s in _ref_samples}
+            _ref_ss = [_by_key[t["key"]] for t, lab in zip(tables, labels)
+                       if t["key"] in _by_key and lab is not None
+                       and len(_by_key[t["key"]]["df"]) == len(t["df"])]
+            if _ref_ss:
+                _cov_set = set(analysis._an_common_genes(_ref_ss))
+                _n_before = len(genes)
+                genes = [g for g in genes if g in _cov_set]
+                n_uncovered_genes = _n_before - len(genes)
+                if len(genes) < 2:
+                    _set("error", "The count matrix shares fewer than 2 covered genes with the transcript file.")
+                    return
             H_ref, names, left = _txf_reference(seg_source, tables, labels, genes, use_corrected)
             ref_hash = hashlib.md5(H_ref.tobytes() + "|".join(names).encode()).hexdigest()[:12]
             p = {**p, "k": len(names)}
@@ -932,6 +949,7 @@ def _run_txfactor(seg_source, cluster_method, label_kind, method="nmf", params=N
             frows.append(row)
         res = {"gen": _gen, "params": p, "method": method, "genes": genes, "H": H, "names": names,
                "samples": smps, "skipped": skipped, "left_out_types": left, "info": info, "top": top,
+               "n_uncovered_genes": int(n_uncovered_genes),
                "factors": pd.DataFrame(frows), "crosstab": ct, "agreement": agree, "category": cat,
                "label_kind": label_kind, "seg_source": seg_source or "xenium",
                "seg_tag": seg_tag, "from_cache": from_cache, "share_cols": share_cols,
@@ -961,6 +979,7 @@ def _run_txfactor(seg_source, cluster_method, label_kind, method="nmf", params=N
         if method == "reference":
             msg += (f"\nReference components: the mean profiles of {K} cell types ({cat}; "
                     f"{'SPLIT-corrected' if _corr_used else 'original'} counts"
+                    f"{f'; {n_uncovered_genes} panel gene(s) not covered by SPLIT were excluded' if n_uncovered_genes else ''}"
                     f"{'; SPLIT-corrected counts do not exist for every sample of the view' if use_corrected and not _corr_used else ''}"
                     f") - not fitted."
                     + (f" Left out (fewer than {_TXF_REF_MIN_CELLS} cells): {', '.join(left[:8])}"

@@ -1304,11 +1304,14 @@ def _qc_metrics(s: dict, labels, sets: dict, source_type=None, radius: float = _
     rows = np.asarray(s["rows"])
     okr = rows >= 0
     r = np.clip(rows, 0, None)
-    setk = [k for k in sets if any(g in s["gni"] for g in sets[k])]
+    allowed = set(s["genes"])
+    setk = [k for k in sets
+            if any(g in allowed and g in s["gni"] and s["gni"][g] < csc.shape[1] for g in sets[k])]
     member = np.zeros((csc.shape[1], len(setk)))
     n_in = []
     for j, k in enumerate(setk):
-        cols = [s["gni"][g] for g in sets[k] if g in s["gni"] and s["gni"][g] < csc.shape[1]]
+        cols = [s["gni"][g] for g in sets[k]
+                if g in allowed and g in s["gni"] and s["gni"][g] < csc.shape[1]]
         member[cols, j] = 1.0
         n_in.append(len(cols))
     panel = np.zeros(csc.shape[1])
@@ -1364,13 +1367,23 @@ def _qc_metrics(s: dict, labels, sets: dict, source_type=None, radius: float = _
     row["retention"] = (float(sum(ident_sums[k] for k in _rk) / sum(ref_ident[k] for k in _rk))
                         if _rk else np.nan)
     # co-expression of mutually exclusive markers
-    if not pairs:
-        tops = [(k, sets[k][0]) for k in setk if sets[k] and sets[k][0] in s["gni"]]
+    if pairs:
+        pairs = [(a, b) for a, b in pairs
+                 if a in allowed and a in s["gni"] and s["gni"][a] < csc.shape[1]
+                 and b in allowed and b in s["gni"] and s["gni"][b] < csc.shape[1]]
+    else:
+        tops = []
+        for k in setk:
+            g0 = next((g for g in sets[k]
+                       if g in allowed and g in s["gni"] and s["gni"][g] < csc.shape[1]), None)
+            if g0 is not None:
+                tops.append((k, g0))
         pairs = [(tops[a][1], tops[b][1]) for a in range(len(tops)) for b in range(a + 1, len(tops))
                  if tops[a][1] != tops[b][1]]
     both = either = 0.0
     if pairs:
-        gs = list(dict.fromkeys(g for pr in pairs for g in pr if g in s["gni"]))
+        gs = list(dict.fromkeys(g for pr in pairs for g in pr
+                                if g in allowed and g in s["gni"] and s["gni"][g] < csc.shape[1]))
         D = csc[:, [s["gni"][g] for g in gs]].tocsc()
         D.data = (D.data >= analysis._DETECT_MIN).astype(np.float32)
         pos = {g: i for i, g in enumerate(gs)}

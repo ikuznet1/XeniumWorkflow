@@ -3,6 +3,7 @@
 import hashlib
 from dash import no_update
 import numpy as np
+import pandas as pd
 import dash
 from dash import Input, Output, State, callback_context
 import plotly.graph_objects as go
@@ -409,21 +410,35 @@ def start_annotation(n_clicks, source, model_name, rds_path, label_col,
         return True, msg, False, msg   # no job started: keep the poll off
 
     if alt_res is not None:
-        if alt_res.get("expr") is None:
+        # Always annotate the full resegmentation run (independent of an active subset(),
+        # matching Xenium's CellTypist/Seurat/RCTD behavior) so subset() never invalidates
+        # or deletes the full-run annotation & RCTD weight caches on disk.
+        _full_expr = alt_res.get("_expr_original", alt_res.get("expr"))
+        _full_df   = alt_res.get("_cells_df_original", alt_res["cells_df"])
+        if _full_expr is None:
             msg = "✗ No expression matrix for reseg cells — re-run Proseg/Baysor"
             return True, msg, False, msg   # no job started: keep the poll off
         # Measured panel columns only: SpaGE appends imputed columns at the end
         # (a run reloaded from its zarr has them without an 'imputed_genes' list)
-        _n_meas = min(alt_res["expr"].shape[1], len(dataview._panel_gene_names()))
-        expr_override     = alt_res["expr"][:, :_n_meas] if _n_meas < alt_res["expr"].shape[1] \
-                            else alt_res["expr"]
-        cell_ids_override = [str(c) for c in alt_res["cells_df"].index]
+        genes_override, _meas_cols = annotation._reseg_panel_genes_and_cols(_full_expr, alt_res)
+        expr_override = (_full_expr[:, _meas_cols]
+                         if _meas_cols != list(range(_full_expr.shape[1])) else _full_expr)
+        cell_ids_override = [str(c) for c in _full_df.index]
+        _xcol = "centroid_x" if "centroid_x" in _full_df.columns else "x_centroid"
+        _ycol = "centroid_y" if "centroid_y" in _full_df.columns else "y_centroid"
+        coords_override = pd.DataFrame(
+            {"x_centroid": _full_df[_xcol].to_numpy(dtype=np.float64),
+             "y_centroid": _full_df[_ycol].to_numpy(dtype=np.float64)},
+            index=pd.Index(cell_ids_override),
+        )
         # Identifies this segmentation's cells in the annotation disk cache
         cache_sig = (hashlib.md5("\n".join(cell_ids_override).encode()).hexdigest()[:12]
                      + f"_{expr_override.shape[0]}_{expr_override.nnz}")
     else:
         expr_override     = None
         cell_ids_override = None
+        coords_override   = None
+        genes_override    = None
         cache_sig         = None
 
     method     = source if source in core._ANNOT_METHODS else "celltypist"
@@ -459,6 +474,17 @@ def start_annotation(n_clicks, source, model_name, rds_path, label_col,
         core._annot_state.update({"status": "running", "message": "Starting…",
                               labels_key: None, mode_labels_key: None})
 
+    import inspect as _insp_ann
+
+    def _opt_kw(fn, **extra):
+        try:
+            _ps = _insp_ann.signature(fn).parameters
+            if any(p.kind == p.VAR_KEYWORD for p in _ps.values()):
+                return extra
+            return {k: v for k, v in extra.items() if k in _ps}
+        except Exception:
+            return extra
+
     _prov_seg = ("xenium" if alt_res is None
                  else provenance._prov_run_source(core._seg_tool(seg_source), alt_res))
     _job_kw = dict(state=core._annot_state, lock=core._annot_lock, uses_run=alt_res)
@@ -467,7 +493,9 @@ def start_annotation(n_clicks, source, model_name, rds_path, label_col,
                    args=(rds_path or "", label_col or "Names"),
                    kwargs=dict(labels_key=labels_key, expr_override=expr_override,
                                cell_ids_override=cell_ids_override, cache_sig=cache_sig,
-                               seg_source=_prov_seg),
+                               seg_source=_prov_seg,
+                               **_opt_kw(annotation._run_seurat_annotation,
+                                         genes_override=genes_override)),
                    copy_context=True, **_job_kw)
     elif source == "rctd":
         jobs._job_start("annotation", f"Annotation: RCTD ({rctd_mode or 'full'})", annotation._run_rctd_annotation,
@@ -478,14 +506,19 @@ def start_annotation(n_clicks, source, model_name, rds_path, label_col,
                                umi_min=int(rctd_umi_min or 20),
                                umi_min_sigma=int(rctd_umi_min_sigma or 100),
                                mode_labels_key=mode_labels_key, cache_sig=cache_sig,
-                               seg_source=_prov_seg),
+                               seg_source=_prov_seg,
+                               **_opt_kw(annotation._run_rctd_annotation,
+                                         coords_override=coords_override,
+                                         genes_override=genes_override)),
                    copy_context=True, **_job_kw)
     else:
         jobs._job_start("annotation", f"Annotation: CellTypist ({model_name})", annotation._run_celltypist,
                    args=(model_name,),
                    kwargs={"labels_key": labels_key, "expr_override": expr_override,
                            "cell_ids_override": cell_ids_override, "cache_sig": cache_sig,
-                           "seg_source": _prov_seg},
+                           "seg_source": _prov_seg,
+                           **_opt_kw(annotation._run_celltypist,
+                                     genes_override=genes_override)},
                    **_job_kw)
     return False, "Starting…", True, "Starting…"
 

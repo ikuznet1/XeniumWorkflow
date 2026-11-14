@@ -68,9 +68,10 @@ class _ViewerProvider:
 
     def _bounds(self, df, extras=()):
         x, y = self._xy(df, extras)
-        if len(x) == 0:
+        finite = np.isfinite(x) & np.isfinite(y)
+        if not finite.any():
             return [0.0, 0.0, 1.0, 1.0]
-        return [float(np.nanmin(x)), float(np.nanmin(y)), float(np.nanmax(x)), float(np.nanmax(y))]
+        return [float(x[finite].min()), float(y[finite].min()), float(x[finite].max()), float(y[finite].max())]
 
     def meta(self):
         d = core.DATA.get("data_dir")
@@ -239,7 +240,7 @@ class _ViewerProvider:
             return self._continuous(np.full(len(df), np.nan), "No data", "viridis")
         raw = pd.to_numeric(df[col], errors="coerce").values.astype(np.float64)
         if col == "transcript_counts":
-            return self._continuous(np.log1p(raw), "Transcript Counts (log1p)", "viridis")
+            return self._continuous(np.log1p(np.maximum(raw, 0.0)), "Transcript Counts (log1p)", "viridis")
         return self._continuous(raw, core.QC_METRICS.get(col, col), core.COLORSCALES.get(col, "Viridis").lower())
 
     def _colors_multi(self, mode, method, gene, df, extras, corrected=False):
@@ -294,7 +295,7 @@ class _ViewerProvider:
                 parts.append(np.asarray(vals, dtype=float) if vals is not None and len(vals) == len(edf)
                              else np.zeros(len(edf)))
             return self._continuous(np.concatenate(parts),
-                                    f"{gene} (log1p{', SPLIT-corrected' if mc else ''})")
+                                    f"{gene} (log1p{', SPLIT-corrected' if mc else ''})", "plasma")
 
         if mode.startswith("roi_") and any(mode in edf.columns for edf in dfs):
             vals = pd.concat([
@@ -309,8 +310,8 @@ class _ViewerProvider:
             pd.to_numeric(edf[col], errors="coerce").values.astype(np.float64) if col in edf.columns
             else np.zeros(len(edf)) for edf in dfs])
         if col == "transcript_counts":
-            return self._continuous(np.log1p(raw), "Transcript Counts (log1p)")
-        return self._continuous(raw, core.QC_METRICS.get(col, col))
+            return self._continuous(np.log1p(np.maximum(raw, 0.0)), "Transcript Counts (log1p)", "viridis")
+        return self._continuous(raw, core.QC_METRICS.get(col, col), core.COLORSCALES.get(col, "Viridis").lower())
 
     def boundaries(self, source, kind, x0, y0, x1, y1):
         """Polygons from the in-memory boundary dicts, or None to let the route read the
@@ -611,11 +612,18 @@ class _ViewerProvider:
             return [int(round(float(v))) for v in re.findall(r"[\d.]+", str(color))[:3]]
 
         palette = qualitative.Plotly
-        lig_cmap = rec_cmap = viridis = None
+        lig_cmap = rec_cmap = sender_cmap = viridis = None
+        annot_col = q.get("annot_col")
+        sender_col = f"from_{annot_col}" if annot_col and f"from_{annot_col}" in ccc_df.columns else None
+        receiver_col = f"to_{annot_col}" if sender_col and f"to_{annot_col}" in ccc_df.columns else None
         if color_by == "ligand":
             lig_cmap = {l: palette[i % len(palette)] for i, l in enumerate(sorted(ccc_df["ligand"].unique()))}
         elif color_by == "receptor":
             rec_cmap = {r: palette[i % len(palette)] for i, r in enumerate(sorted(ccc_df["receptor"].unique()))}
+        elif color_by == "sender_type" and sender_col:
+            stypes = sorted(set(ccc_df[sender_col].dropna())
+                            | (set(ccc_df[receiver_col].dropna()) if receiver_col else set()), key=str)
+            sender_cmap = {t: _rgb(palette[i % len(palette)]) for i, t in enumerate(stypes)}
         elif color_by == "attention":
             import plotly.colors as _pc
             viridis = np.array([_rgb(c) for c in _pc.sample_colorscale("Viridis", list(np.linspace(0, 1, 10)))])
@@ -634,6 +642,10 @@ class _ViewerProvider:
             s01 = (score - score.min()) / ((score.max() - score.min()) or 1.0)
             if viridis is not None:
                 rgb = viridis[np.minimum(9, (s01 * 10).astype(int))]
+            elif sender_cmap is not None:
+                fallback_rgb = _rgb(palette[pi % len(palette)])
+                rgb = np.array([sender_cmap.get(v, fallback_rgb) if pd.notna(v) else fallback_rgb
+                                for v in sub[sender_col]], dtype=int)
             else:
                 col = palette[pi % len(palette)]
                 if lig_cmap is not None:

@@ -138,9 +138,8 @@ def subset(cluster=None, cell_type=None,
         if _base in core.DATA["gene_name_to_idx"]:
             _raw = core.DATA["expr_csc"][:, core.DATA["gene_name_to_idx"][_base]].toarray().ravel()
             _idx = _df_to_expr_o
-            expr_vals = pd.Series(
-                np.log1p(np.where(_idx >= 0, _raw[np.clip(_idx, 0, len(_raw) - 1)], 0.0)),
-                index=df.index)
+            _vals_in = np.where(_idx >= 0, _raw[np.clip(_idx, 0, len(_raw) - 1)], 0.0)
+            expr_vals = pd.Series(np.log1p(np.maximum(_vals_in, 0.0)), index=df.index)
             if min_expr is not None: mask &= expr_vals >= min_expr
             if max_expr is not None: mask &= expr_vals <= max_expr
             _applied = True
@@ -213,7 +212,7 @@ def subset(cluster=None, cell_type=None,
             _gidx = _subset_reseg_gene_col(gene, _alt_res, _bexpr_all.shape[1])
             if _gidx is not None:
                 _braw    = _bexpr_all.getcol(_gidx).toarray().ravel()
-                _bgexpr  = pd.Series(np.log1p(_braw), index=bdf.index)
+                _bgexpr  = pd.Series(np.log1p(np.maximum(_braw, 0.0)), index=bdf.index)
                 if min_expr is not None: bmask &= _bgexpr >= min_expr
                 if max_expr is not None: bmask &= _bgexpr <= max_expr
                 _b_applied = True
@@ -249,6 +248,10 @@ def subset(cluster=None, cell_type=None,
             dataview._corrected_cols(core.DATA)
         core.DATA["_df_original"]      = df
         core.DATA["_df_to_expr_orig"]  = _df_to_expr_o
+        core.DATA["_corrected_expr_ref"] = core.DATA.get("split_corrected_expr")
+        if "split_corrected_cols" in core.DATA:
+            _x_scc = core.DATA["split_corrected_cols"]
+            core.DATA["_split_corrected_cols_original"] = None if _x_scc is None else list(_x_scc)
 
     # Update active data
     core.DATA["df"] = df_sub
@@ -299,7 +302,9 @@ def subset(cluster=None, cell_type=None,
             _alt_res["_expr_original"]      = _alt_res["expr"]
             _alt_res["_corrected_original"] = _alt_res.get("split_corrected_expr")
             if "split_corrected_cols" in _alt_res:
-                _alt_res["_corrected_cols_original"] = _alt_res["split_corrected_cols"]
+                _r_scc = _alt_res["split_corrected_cols"]
+                _alt_res["_corrected_cols_original"] = None if _r_scc is None else list(_r_scc)
+                _alt_res["_split_corrected_cols_original"] = None if _r_scc is None else list(_r_scc)
 
         _kept_pos = np.where(bmask.values)[0]
         _bdf_sub  = bdf.iloc[_kept_pos]
@@ -328,6 +333,11 @@ def unsubset():
 
     core.DATA["df"]         = core.DATA.pop("_df_original")
     core.DATA.pop("_subset_desc", None)
+    _x_corr_ref = core.DATA.pop("_corrected_expr_ref", None)
+    _has_x_scc_orig = "_split_corrected_cols_original" in core.DATA
+    _x_scc_orig = core.DATA.pop("_split_corrected_cols_original", None)
+    if _has_x_scc_orig and core.DATA.get("split_corrected_expr") is _x_corr_ref:
+        core.DATA["split_corrected_cols"] = None if _x_scc_orig is None else list(_x_scc_orig)
     core.DATA["df_to_expr"] = core.DATA.pop("_df_to_expr_orig")
 
     # Restore reseg originals if subset was applied there too
@@ -336,6 +346,7 @@ def unsubset():
             continue
         _alt_res["cells_df"] = _alt_res.pop("_cells_df_original")
         _alt_res["expr"]     = _alt_res.pop("_expr_original")
+        _alt_res.pop("_split_corrected_cols_original", None)
         _orig_corr = _alt_res.pop("_corrected_original")
         _has_orig_cols = "_corrected_cols_original" in _alt_res
         _orig_cols = _alt_res.pop("_corrected_cols_original", None)
@@ -448,7 +459,7 @@ def get_genes(file: str = None) -> list:
     -------
     list of gene name strings.
     """
-    genes = sorted(core.DATA["gene_names"])
+    genes = sorted(dataview._panel_gene_names())
     print(f"  {len(genes)} panel genes:", flush=True)
     for g in genes:
         print(f"    {g}", flush=True)

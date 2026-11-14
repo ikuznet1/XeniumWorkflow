@@ -105,11 +105,23 @@ def _run_spatial_analysis(label_key, n_neighbors, alt_res, seg_source: str = Non
                     core._spatial_state["message"] = "Label length mismatch."
                 return
 
-        # Drop NaN labels
+        # Drop NaN labels (and non-finite coordinates)
         valid_mask = ~pd.isna(labels.values if hasattr(labels, "values") else labels)
+        if len(coords) == len(valid_mask):
+            valid_mask = valid_mask & np.isfinite(coords).all(axis=1)
         labels_arr = labels.values if hasattr(labels, "values") else np.array(labels)
         labels_arr = labels_arr[valid_mask]
         coords_valid = coords[valid_mask]
+
+        if len(coords_valid) < 2:
+            with core._spatial_lock:
+                if not jobs._stale_job(_gen, "error"):
+                    core._spatial_state["status"] = "error"
+                    core._spatial_state["message"] = (
+                        f"Need at least 2 labelled cells for spatial neighborhood analysis "
+                        f"(found {len(coords_valid)})."
+                    )
+            return
 
         cell_types = sorted(set(labels_arr))
         label_to_idx = {ct: i for i, ct in enumerate(cell_types)}
@@ -120,7 +132,10 @@ def _run_spatial_analysis(label_key, n_neighbors, alt_res, seg_source: str = Non
                   f"Computing nearest neighbors (k={n_neighbors})…", 1 / 5)
 
         from sklearn.neighbors import NearestNeighbors
-        nn = NearestNeighbors(n_neighbors=min(n_neighbors + 1, len(coords_valid)), algorithm="ball_tree")
+        nn = NearestNeighbors(
+            n_neighbors=min(max(1, int(n_neighbors)) + 1, len(coords_valid)),
+            algorithm="ball_tree",
+        )
         nn.fit(coords_valid)
         _, neighbor_indices = nn.kneighbors(coords_valid)
         # Remove self (first neighbor is usually self)
@@ -231,6 +246,17 @@ def _run_spatial_niches(n_clusters: int, n_neighbors: int, label_key: str | None
         y_col = "centroid_y" if "centroid_y" in cells_df.columns else "y_centroid"
         coords = cells_df[[x_col, y_col]].values
         n_cells = len(coords)
+        n_clusters = max(1, int(n_clusters))
+        n_neighbors = max(1, int(n_neighbors))
+        if n_cells < max(2, n_clusters):
+            with core._niche_lock:
+                if not jobs._stale_job(_gen, "error"):
+                    core._niche_state["status"] = "error"
+                    core._niche_state["message"] = (
+                        f"Need at least {max(2, n_clusters)} cells to compute {n_clusters} "
+                        f"spatial niches (active view has {n_cells})."
+                    )
+            return
         k = min(n_neighbors + 1, n_cells)
 
         jobs._job_step(core._niche_state, core._niche_lock,

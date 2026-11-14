@@ -51,6 +51,12 @@ def _vectorized_spage(spatial_df: pd.DataFrame,
     rna_df     : ref_cells × (shared_genes + predict_genes)
     Returns    : DataFrame cells × genes_to_predict (raw imputed values)
     """
+    spage_repo = os.path.abspath(spage_repo)
+    if not os.path.isfile(os.path.join(spage_repo, "SpaGE", "principal_vectors.py")):
+        raise FileNotFoundError(
+            f"SpaGE not found at {spage_repo} (SpaGE/principal_vectors.py missing). "
+            f"Run `git submodule update --init SpaGE_repo` or pass spage_repo=."
+        )
     if spage_repo not in sys.path:
         sys.path.insert(0, spage_repo)
     from SpaGE.principal_vectors import PVComputation
@@ -212,6 +218,46 @@ writeLines(colnames(mat_sub), file.path(.spage_dir, "cells.txt"))
     return rna_df, all_rna_genes
 
 
+def _read_split_zarr_metadata(adata, sdata_path: str) -> tuple[list[str] | None, list[str] | None]:
+    """Read (corrected_cols, split_corrected_cell_ids) from *adata* or raw zarr *sdata_path*."""
+    corr_cols = None
+    corr_cids = None
+
+    if "X_corrected" in adata.layers:
+        raw_attr = getattr(adata.layers["X_corrected"], "attrs", {}).get("corrected_cols")
+        if raw_attr is not None:
+            corr_cols = [str(g) for g in raw_attr]
+    if corr_cols is None and adata.uns.get("split_corrected_cols") is not None:
+        corr_cols = [str(g) for g in adata.uns["split_corrected_cols"]]
+    if adata.uns.get("split_corrected_cell_ids") is not None:
+        corr_cids = [str(c) for c in adata.uns["split_corrected_cell_ids"]]
+
+    if (corr_cols is None or corr_cids is None) and os.path.isdir(sdata_path):
+        try:
+            import zarr as _zm
+            try:
+                from anndata.io import read_elem as _relem
+            except ImportError:
+                from anndata.experimental import read_elem as _relem
+            _zr = _zm.open_group(sdata_path, mode="r", use_consolidated=False)
+            if "tables" in _zr and "table" in _zr["tables"]:
+                _tg = _zr["tables"]["table"]
+                if corr_cols is None and "layers" in _tg and "X_corrected" in _tg["layers"]:
+                    _rc = _tg["layers"]["X_corrected"].attrs.get("corrected_cols")
+                    if _rc is not None:
+                        corr_cols = [str(g) for g in _rc]
+                if "uns" in _tg:
+                    _ug = _tg["uns"]
+                    if corr_cols is None and "split_corrected_cols" in _ug:
+                        corr_cols = [str(g) for g in np.asarray(_relem(_ug["split_corrected_cols"])).ravel()]
+                    if corr_cids is None and "split_corrected_cell_ids" in _ug:
+                        corr_cids = [str(c) for c in np.asarray(_relem(_ug["split_corrected_cell_ids"])).ravel()]
+        except Exception:
+            pass
+
+    return corr_cols, corr_cids
+
+
 # ── Main imputation function ───────────────────────────────────────────────────
 
 def impute(sdata_path: str,
@@ -318,6 +364,7 @@ def impute(sdata_path: str,
     print(f"  {len(adata)} cells, {len(panel_genes)} panel genes", flush=True)
 
     # ── Validate / select expression matrix ───────────────────────────────────
+    _corr_cols, _corr_cids = _read_split_zarr_metadata(adata, sdata_path)
     if use_corrected:
         if "X_corrected" not in adata.layers:
             raise ValueError(
@@ -325,6 +372,16 @@ def impute(sdata_path: str,
                 "Run SPLIT ambient RNA correction first (via the app or functions/run_split.py)."
             )
         print("  Using X_corrected layer (SPLIT-corrected counts)", flush=True)
+        if _corr_cols:
+            _corr_col_set = set(_corr_cols)
+            covered_panel_genes = [g for g in panel_genes if g in _corr_col_set]
+            if len(covered_panel_genes) < len(panel_genes):
+                print(f"  SPLIT partial gene coverage: {len(covered_panel_genes)}/{len(panel_genes)} "
+                      f"panel genes covered", flush=True)
+        else:
+            covered_panel_genes = list(panel_genes)
+    else:
+        covered_panel_genes = list(panel_genes)
 
     # ── Load reference to get full gene list ───────────────────────────────────
     print("Loading reference to discover gene universe …", flush=True)
@@ -344,7 +401,7 @@ def impute(sdata_path: str,
              'ls(all.names = TRUE, envir = globalenv())), envir = globalenv())); invisible(gc())')
 
     # ── Determine shared genes and genes_to_predict ────────────────────────────
-    shared_genes = sorted(panel_gene_set & set(all_rna_genes))
+    shared_genes = sorted(set(covered_panel_genes) & set(all_rna_genes))
     if not shared_genes:
         raise ValueError("No shared genes between the spatial panel and the reference.")
     print(f"  {len(shared_genes)} shared genes with reference", flush=True)
@@ -402,6 +459,24 @@ def impute(sdata_path: str,
     shared_idx    = [panel_gni[g] for g in shared_in_rna]
 
     X = adata.layers["X_corrected"] if use_corrected else adata.X
+    covered_mask = None
+    if use_corrected:
+        _nz_mask = np.asarray(np.abs(X).sum(axis=1)).ravel() > 0
+        if _corr_cids:
+            _obs_str = np.asarray(adata.obs_names.astype(str))
+            _id_mask = np.isin(_obs_str, [str(c) for c in _corr_cids])
+            covered_mask = (_id_mask & _nz_mask) if (_id_mask & _nz_mask).any() else _nz_mask
+        else:
+            covered_mask = _nz_mask
+        n_cov = int(covered_mask.sum())
+        if n_cov < 2:
+            raise ValueError(
+                f"Fewer than 2 SPLIT-covered cells ({n_cov}) have corrected counts; cannot run SpaGE."
+            )
+        if n_cov < len(adata):
+            print(f"  SPLIT cell coverage: fitting/predicting SpaGE on {n_cov}/{len(adata)} "
+                  f"covered cells ({len(adata) - n_cov} uncovered cells set to 0)", flush=True)
+
     if sp.issparse(X):
         xen_raw = X[:, shared_idx].toarray().astype(np.float32)
     else:
@@ -414,9 +489,19 @@ def impute(sdata_path: str,
     spatial_df = pd.DataFrame(xen_norm, index=adata.obs_names, columns=shared_in_rna)
 
     # ── Run SpaGE ─────────────────────────────────────────────────────────────
-    print(f"Running SpaGE (n_pv={n_pv}, {len(genes_to_predict)} genes, "
-          f"{len(adata)} cells) …", flush=True)
-    imp_df = _vectorized_spage(spatial_df, rna_df, n_pv, genes_to_predict, spage_repo)
+    if use_corrected and covered_mask is not None:
+        print(f"Running SpaGE (n_pv={n_pv}, {len(genes_to_predict)} genes, "
+              f"{int(covered_mask.sum())}/{len(adata)} SPLIT-covered cells) …", flush=True)
+        imp_cov = _vectorized_spage(
+            spatial_df.loc[covered_mask], rna_df, n_pv, genes_to_predict, spage_repo
+        )
+        imp_vals = np.zeros((len(adata), len(genes_to_predict)), dtype=np.float32)
+        imp_vals[covered_mask] = imp_cov.values.astype(np.float32)
+        imp_df = pd.DataFrame(imp_vals, index=adata.obs_names, columns=genes_to_predict)
+    else:
+        print(f"Running SpaGE (n_pv={n_pv}, {len(genes_to_predict)} genes, "
+              f"{len(adata)} cells) …", flush=True)
+        imp_df = _vectorized_spage(spatial_df, rna_df, n_pv, genes_to_predict, spage_repo)
     print(f"  Imputation done. Shape: {imp_df.shape}", flush=True)
 
     # ── Build output AnnData (original + imputed columns) ─────────────────────
@@ -454,6 +539,12 @@ def impute(sdata_path: str,
     # Also keep the plain imputed_genes list up to date
     if use_corrected:
         adata_out.uns["imputed_genes"] = list(adata.uns.get("imputed_genes", []))
+    if use_corrected and covered_mask is not None:
+        adata_out.uns["split_corrected_cell_ids"] = [str(c) for c in adata.obs_names[covered_mask]]
+    elif _corr_cids is not None:
+        adata_out.uns["split_corrected_cell_ids"] = list(_corr_cids)
+    if _corr_cols is not None:
+        adata_out.uns["split_corrected_cols"] = [str(g) for g in _corr_cols]
 
     # ── Write output SpatialData ───────────────────────────────────────────────
     print(f"Writing output to {output} …", flush=True)
@@ -461,6 +552,15 @@ def impute(sdata_path: str,
     sdata_out = sd.read_zarr(sdata_path)
     sdata_out.tables["table"] = adata_out
     sdata_out.write(output)
+    if _corr_cols is not None and "X_corrected" in adata_out.layers:
+        try:
+            import zarr as _zout_mod
+            _zout = _zout_mod.open_group(output, mode="r+", use_consolidated=False)
+            _zout["tables"]["table"]["layers"]["X_corrected"].attrs["corrected_cols"] = [
+                str(g) for g in _corr_cols
+            ]
+        except Exception:
+            pass
 
     print(f"Done. {len(genes_to_predict)} genes imputed → {output}", flush=True)
     return output

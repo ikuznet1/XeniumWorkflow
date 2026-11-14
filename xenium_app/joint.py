@@ -383,6 +383,10 @@ def _jc_cache_tag(samples, seg_source, params: dict, var_levels) -> str:
         h.update(b"corrected" if s["corrected"] else b"original")
         h.update(analysis._an_matrix_digest(s["csc"]).encode())
         h.update(pd.util.hash_pandas_object(pd.Index(s["df"].index.astype(str)), index=False).values.tobytes())
+        if s.get("rows") is not None:
+            h.update(np.asarray(s["rows"], dtype=np.int64).tobytes())
+    if samples and all("genes" in s and "gni" in s for s in samples):
+        h.update("|".join(analysis._an_common_genes(samples)).encode())
     return h.hexdigest()[:16]
 
 

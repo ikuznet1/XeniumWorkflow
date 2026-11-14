@@ -873,49 +873,66 @@ class Viewer {
 
   _overlayLayers() {
     const o = this.state.overlays || {};
+    const rgb = (c) => (Array.isArray(c) ? [c[0], c[1], c[2]] : hexToRgb(c));
     const out = [];
     if (o.lines && o.lines.length) {
-      out.push(new LineLayer({
-        id: 'xv-overlay-lines',
-        data: o.lines,
-        getSourcePosition: (d) => d.from,
-        getTargetPosition: (d) => d.to,
-        // color: '#rrggbb' or [r, g, b]; alpha: 0-255 (default opaque)
-        getColor: (d) => [...(Array.isArray(d.color) ? d.color : hexToRgb(d.color || '#ffffff')), d.alpha === undefined ? 255 : d.alpha],
-        getWidth: (d) => d.width || 1,
-        widthUnits: 'pixels',
-        pickable: false,
-      }));
+      const lines = o.lines.filter((d) => d && d.from && d.to
+        && Number.isFinite(d.from[0]) && Number.isFinite(d.from[1])
+        && Number.isFinite(d.to[0]) && Number.isFinite(d.to[1]));
+      if (lines.length) {
+        out.push(new LineLayer({
+          id: 'xv-overlay-lines',
+          data: lines,
+          getSourcePosition: (d) => d.from,
+          getTargetPosition: (d) => d.to,
+          // color: '#rrggbb' or [r, g, b]; alpha: 0-255 (default opaque)
+          getColor: (d) => [...rgb(d.color || '#ffffff'), d.alpha === undefined ? 255 : d.alpha],
+          getWidth: (d) => d.width || 1,
+          widthUnits: 'pixels',
+          pickable: false,
+        }));
+      }
     }
     if (o.polygons && o.polygons.length) {
-      out.push(new PolygonLayer({
-        id: 'xv-overlay-polygons',
-        data: o.polygons,
-        positionFormat: 'XY',
-        getPolygon: (d) => d.points,
-        stroked: true,
-        filled: true,
-        // fillAlpha: 0-255 (default 64); width 0 draws no outline
-        getFillColor: (d) => (d.fill ? [...hexToRgb(d.fill), d.fillAlpha === undefined ? 64 : d.fillAlpha] : [0, 0, 0, 0]),
-        // alpha: 0-255 opacity of the outline (default opaque)
-        getLineColor: (d) => [...hexToRgb(d.color || '#ffffff'), d.alpha === undefined ? 255 : d.alpha],
-        getLineWidth: (d) => (d.width === 0 ? 0 : d.width || 2),
-        lineWidthUnits: 'pixels',
-        pickable: false,
-      }));
+      const polygons = [];
+      for (const d of o.polygons) {
+        if (!d || !d.points || !d.points.length) continue;
+        const pts = d.points.filter((p) => p && Number.isFinite(p[0]) && Number.isFinite(p[1]));
+        if (pts.length >= 3) polygons.push(pts.length === d.points.length ? d : {...d, points: pts});
+      }
+      if (polygons.length) {
+        out.push(new PolygonLayer({
+          id: 'xv-overlay-polygons',
+          data: polygons,
+          positionFormat: 'XY',
+          getPolygon: (d) => d.points,
+          stroked: true,
+          filled: true,
+          // fillAlpha: 0-255 (default 64); width 0 draws no outline
+          getFillColor: (d) => (d.fill ? [...rgb(d.fill), d.fillAlpha === undefined ? 64 : d.fillAlpha] : [0, 0, 0, 0]),
+          // alpha: 0-255 opacity of the outline (default opaque)
+          getLineColor: (d) => [...rgb(d.color || '#ffffff'), d.alpha === undefined ? 255 : d.alpha],
+          getLineWidth: (d) => (d.width === 0 ? 0 : d.width || 2),
+          lineWidthUnits: 'pixels',
+          pickable: false,
+        }));
+      }
     }
     if (o.points && o.points.length) {
-      // markers of a fixed size on screen: {at: [x, y], color, size (px, default 8)}
-      out.push(new ScatterplotLayer({
-        id: 'xv-overlay-points',
-        data: o.points,
-        getPosition: (d) => d.at,
-        getFillColor: (d) => hexToRgb(d.color || '#ffffff'),
-        getRadius: (d) => (d.size || 8) / 2,
-        radiusUnits: 'pixels',
-        stroked: false,
-        pickable: false,
-      }));
+      const points = o.points.filter((d) => d && d.at && Number.isFinite(d.at[0]) && Number.isFinite(d.at[1]));
+      if (points.length) {
+        // markers of a fixed size on screen: {at: [x, y], color, size (px, default 8)}
+        out.push(new ScatterplotLayer({
+          id: 'xv-overlay-points',
+          data: points,
+          getPosition: (d) => d.at,
+          getFillColor: (d) => [...rgb(d.color || '#ffffff'), d.alpha === undefined ? 255 : d.alpha],
+          getRadius: (d) => (d.size || 8) / 2,
+          radiusUnits: 'pixels',
+          stroked: false,
+          pickable: false,
+        }));
+      }
     }
     return out;
   }
@@ -1128,15 +1145,18 @@ class Viewer {
     this._labelItems = [];
     for (const p of (this.state.overlays && this.state.overlays.polygons) || []) {
       if (!p.label || !p.points || !p.points.length) continue;
-      let sx = 0, top = Infinity;
+      let sx = 0, top = Infinity, n = 0;
       for (const pt of p.points) {
+        if (!pt || !Number.isFinite(pt[0]) || !Number.isFinite(pt[1])) continue;
         sx += pt[0];
         if (pt[1] < top) top = pt[1];
+        n++;
       }
+      if (!n) continue;
       const node = el('div', 'xv-label', p.label);
-      node.style.color = p.color || '#ffffff';
+      node.style.color = Array.isArray(p.color) ? `rgb(${p.color[0]},${p.color[1]},${p.color[2]})` : (p.color || '#ffffff');
       this.labels.appendChild(node);
-      this._labelItems.push({node, x: sx / p.points.length, y: top});
+      this._labelItems.push({node, x: sx / n, y: top});
     }
     this._updateLabels();
   }
@@ -1525,7 +1545,9 @@ class Viewer {
       view.transcripts = {n: tx.header.n, xy: tx.arrays.xy, rgba: tx.rgba, radiusPx: Math.max(0.5, +s.transcripts.size || 2) / 2};
     }
     for (const it of this._labelItems || []) {
-      view.labels.push({x: it.x, y: it.y, text: it.node.textContent, color: getComputedStyle(it.node).color});
+      if (Number.isFinite(it.x) && Number.isFinite(it.y)) {
+        view.labels.push({x: it.x, y: it.y, text: it.node.textContent, color: getComputedStyle(it.node).color});
+      }
     }
     return view;
   }

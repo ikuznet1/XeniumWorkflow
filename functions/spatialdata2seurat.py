@@ -94,6 +94,7 @@ def spatialdata2seurat(
     roi_cls: str = None,
     roi_name: str = None,
     cache_dir: str = None,
+    roi_path: str = None,
 ) -> str:
     """
     Convert a SpatialData zarr to a Seurat RDS file.
@@ -134,6 +135,9 @@ def spatialdata2seurat(
     importr("Seurat")
     importr("SeuratObject")
     importr("Matrix")
+
+    if roi_dir is None and roi_path is not None:
+        roi_dir = roi_path
 
     output_rds = os.path.abspath(output_rds)
     os.makedirs(os.path.dirname(output_rds) or ".", exist_ok=True)
@@ -178,10 +182,8 @@ def spatialdata2seurat(
             pass
 
     # ── ROI filter ─────────────────────────────────────────────────────────────
-    if roi_cls and roi_name:
-        roi_col = f"roi_{roi_cls}"
-
-        # If an external ROI source is given, load and apply it
+    if roi_cls or roi_name:
+        _invalid_tokens = {"", "nan", "NaN", "None", "<NA>"}
         if roi_dir:
             roi_dir_expanded = os.path.expanduser(roi_dir)
 
@@ -191,57 +193,147 @@ def spatialdata2seurat(
                 from shapely.geometry import Polygon as _SPoly, Point as _SPoint
                 with open(roi_dir_expanded) as _f:
                     _rois = _json.load(_f)
-                # Find the matching ROI polygon
-                _matching = [r for r in _rois
-                             if str(r.get("cls")) == str(roi_cls)
-                             and str(r.get("name")) == str(roi_name)]
+                if roi_cls and roi_name:
+                    _matching = [r for r in _rois
+                                 if str(r.get("cls")) == str(roi_cls)
+                                 and str(r.get("name")) == str(roi_name)]
+                elif roi_name:
+                    _matching = [r for r in _rois if str(r.get("name")) == str(roi_name)]
+                else:
+                    _matching = [r for r in _rois if str(r.get("cls")) == str(roi_cls)]
+                _avail_json = [(r.get("cls"), r.get("name")) for r in _rois]
                 if not _matching:
-                    _avail = [(r.get("cls"), r.get("name")) for r in _rois]
-                    raise ValueError(f"No ROI with cls='{roi_cls}' name='{roi_name}' in "
-                                     f"{roi_dir_expanded}. Available: {_avail}")
-                # Run point-in-polygon for each matching polygon (union if multiple)
-                xs = adata.obs["x_centroid"].values.astype(float)
-                ys = -adata.obs["y_centroid"].values.astype(float)  # negated as in app
+                    raise ValueError(
+                        f"No ROI matching cls={roi_cls!r} name={roi_name!r} in "
+                        f"{roi_dir_expanded}. Available: {_avail_json}"
+                    )
+                _xcol = "x_centroid" if "x_centroid" in adata.obs.columns else "centroid_x"
+                _ycol = "y_centroid" if "y_centroid" in adata.obs.columns else "centroid_y"
+                xs = adata.obs[_xcol].values.astype(float)
+                ys = -adata.obs[_ycol].values.astype(float)  # negated as in app
                 in_roi = np.zeros(len(adata), dtype=bool)
                 for _r in _matching:
                     _poly = _SPoly(_r["polygon_xy"])
                     in_roi |= np.array([_poly.contains(_SPoint(x, y))
                                         for x, y in zip(xs, ys)])
-                adata.obs[roi_col] = np.where(in_roi, roi_name, pd.NA)
-                print(f"  ROI: applied polygon from {os.path.basename(roi_dir_expanded)} "
-                      f"({in_roi.sum():,} cells inside)", flush=True)
-
+                _assign_col = f"roi_{roi_cls}" if roi_cls else f"roi_{_matching[0].get('cls', 'selected')}"
+                _assign_val = str(roi_name) if roi_name else str(_matching[0].get("name", "ROI"))
+                adata.obs[_assign_col] = np.where(in_roi, _assign_val, pd.NA)
+                print(f"  ROI: applied {len(_matching)} polygon(s) from "
+                      f"{os.path.basename(roi_dir_expanded)} ({in_roi.sum():,} cells inside)", flush=True)
+                if not in_roi.any():
+                    raise ValueError(
+                        f"No cells found inside ROI cls={roi_cls!r} name={roi_name!r}. "
+                        f"Available ROIs: {_avail_json}"
+                    )
+                n_before = len(adata)
+                adata = adata[in_roi].copy()
+                print(f"  ROI filter kept {len(adata):,} / {n_before:,} cells", flush=True)
             else:
                 # Directory with roi_<cls>.parquet
-                roi_pq = os.path.join(roi_dir_expanded, f"roi_{roi_cls}.parquet")
-                if not os.path.exists(roi_pq):
-                    candidates = [f for f in os.listdir(roi_dir_expanded)
-                                  if f.endswith(".parquet")]
+                if roi_cls:
+                    roi_col = f"roi_{roi_cls}"
+                    roi_pq = os.path.join(roi_dir_expanded, f"roi_{roi_cls}.parquet")
+                    if not os.path.exists(roi_pq):
+                        candidates = [f for f in os.listdir(roi_dir_expanded)
+                                      if f.endswith(".parquet")]
+                        if not candidates:
+                            raise FileNotFoundError(f"No parquet found in {roi_dir_expanded}")
+                        roi_pq = os.path.join(roi_dir_expanded, candidates[0])
+                        print(f"  ROI: using {roi_pq}", flush=True)
+                    roi_df = pd.read_parquet(roi_pq)
+                    if "cell_id" in roi_df.columns:
+                        roi_df = roi_df.set_index("cell_id")
+                    if roi_col not in roi_df.columns:
+                        raise KeyError(f"Column '{roi_col}' not found in {roi_pq}. "
+                                       f"Available: {list(roi_df.columns)}")
+                    adata.obs[roi_col] = roi_df[roi_col].reindex(adata.obs_names)
+                    print(f"  ROI: loaded assignments from {roi_pq}", flush=True)
+                else:
+                    candidates = sorted(f for f in os.listdir(roi_dir_expanded)
+                                        if f.endswith(".parquet"))
                     if not candidates:
                         raise FileNotFoundError(f"No parquet found in {roi_dir_expanded}")
-                    roi_pq = os.path.join(roi_dir_expanded, candidates[0])
-                    print(f"  ROI: using {roi_pq}", flush=True)
-                roi_df = pd.read_parquet(roi_pq)
-                if "cell_id" in roi_df.columns:
-                    roi_df = roi_df.set_index("cell_id")
-                if roi_col not in roi_df.columns:
-                    raise KeyError(f"Column '{roi_col}' not found in {roi_pq}. "
-                                   f"Available: {list(roi_df.columns)}")
-                adata.obs[roi_col] = roi_df[roi_col].reindex(adata.obs_names)
-                print(f"  ROI: loaded assignments from {roi_pq}", flush=True)
+                    for _fn in candidates:
+                        _pq = os.path.join(roi_dir_expanded, _fn)
+                        _rdf = pd.read_parquet(_pq)
+                        if "cell_id" in _rdf.columns:
+                            _rdf = _rdf.set_index("cell_id")
+                        for _rc in _rdf.columns:
+                            if str(_rc).startswith("roi_"):
+                                adata.obs[_rc] = _rdf[_rc].reindex(adata.obs_names)
+                    print(f"  ROI: loaded assignments from {len(candidates)} parquet(s) in {roi_dir_expanded}",
+                          flush=True)
 
-        if roi_col not in adata.obs.columns:
-            raise KeyError(f"ROI column '{roi_col}' not found in obs. "
-                           f"Run the app to assign ROIs first, or provide --roi DIR.")
+        # Unless already filtered by a .json polygon above, filter on adata.obs roi_* column(s)
+        if not (roi_dir and os.path.expanduser(roi_dir).endswith(".json")
+                and os.path.isfile(os.path.expanduser(roi_dir))):
+            # Recover any roi_* columns present in raw zarr obs but missed by consolidated read_zarr
+            try:
+                import zarr as _zroi_mod
+                _zobs = _zroi_mod.open_group(
+                    os.path.join(sdata_path, "tables", "table", "obs"), mode="r"
+                )
+                for _zk in _zobs.keys():
+                    if str(_zk).startswith("roi_") and _zk not in adata.obs.columns:
+                        _zn = _zobs[_zk]
+                        if hasattr(_zn, "shape") and _zn.shape[0] == len(adata):
+                            adata.obs[_zk] = _zn[:]
+            except Exception:
+                pass
 
-        mask = adata.obs[roi_col].astype(str) == str(roi_name)
-        n_before = len(adata)
-        adata = adata[mask].copy()
-        print(f"  ROI filter '{roi_col}' == '{roi_name}': "
-              f"{mask.sum():,} / {n_before:,} cells kept", flush=True)
-        if len(adata) == 0:
-            raise ValueError(f"No cells found with {roi_col} == '{roi_name}'. "
-                             f"Available values: {adata.obs[roi_col].dropna().unique().tolist()}")
+            if roi_cls and roi_name:
+                roi_col = f"roi_{roi_cls}"
+                if roi_col not in adata.obs.columns:
+                    raise KeyError(f"ROI column '{roi_col}' not found in obs. "
+                                   f"Run the app to assign ROIs first, or provide --roi DIR.")
+                _ser = adata.obs[roi_col]
+                _avail_vals = [str(v) for v in _ser.dropna().unique().tolist()
+                               if str(v) not in _invalid_tokens]
+                mask = (_ser.notna() & (_ser.astype(str) == str(roi_name))).to_numpy()
+                n_before = len(adata)
+                print(f"  ROI filter '{roi_col}' == '{roi_name}': "
+                      f"{int(mask.sum()):,} / {n_before:,} cells kept", flush=True)
+                if not mask.any():
+                    raise ValueError(f"No cells found with {roi_col} == '{roi_name}'. "
+                                     f"Available values: {_avail_vals}")
+                adata = adata[mask].copy()
+            elif roi_cls:
+                roi_col = f"roi_{roi_cls}"
+                if roi_col not in adata.obs.columns:
+                    raise KeyError(f"ROI column '{roi_col}' not found in obs. "
+                                   f"Run the app to assign ROIs first, or provide --roi DIR.")
+                _ser = adata.obs[roi_col]
+                mask = (_ser.notna() & (~_ser.astype(str).isin(_invalid_tokens))).to_numpy()
+                _avail_vals = [str(v) for v in _ser[mask].unique().tolist()]
+                n_before = len(adata)
+                print(f"  ROI class filter '{roi_col}' (non-empty): "
+                      f"{int(mask.sum()):,} / {n_before:,} cells kept", flush=True)
+                if not mask.any():
+                    raise ValueError(f"No cells assigned to any ROI in '{roi_col}'. "
+                                     f"Available values: {_avail_vals}")
+                adata = adata[mask].copy()
+            else:
+                roi_cols = [c for c in adata.obs.columns if str(c).startswith("roi_")]
+                if not roi_cols:
+                    raise KeyError("No 'roi_*' columns found in obs. "
+                                   "Run the app to assign ROIs first, or provide --roi DIR.")
+                _avail_by_col = {
+                    c: [str(v) for v in adata.obs[c].dropna().unique().tolist()
+                        if str(v) not in _invalid_tokens]
+                    for c in roi_cols
+                }
+                mask = np.zeros(len(adata), dtype=bool)
+                for _rc in roi_cols:
+                    _ser = adata.obs[_rc]
+                    mask |= (_ser.notna() & (_ser.astype(str) == str(roi_name))).to_numpy()
+                n_before = len(adata)
+                print(f"  ROI name filter == '{roi_name}' across {roi_cols}: "
+                      f"{int(mask.sum()):,} / {n_before:,} cells kept", flush=True)
+                if not mask.any():
+                    raise ValueError(f"No cells found with ROI name '{roi_name}' across {roi_cols}. "
+                                     f"Available values: {_avail_by_col}")
+                adata = adata[mask].copy()
 
     # ── Load SpaGE imputed genes from separate zarr (if present) ──────────────
     # SpaGE results are NOT stored in the main spatialdata zarr — they live in a
@@ -312,13 +404,48 @@ def spatialdata2seurat(
             "use_corrected=True but no 'X_corrected' layer in the SpatialData table. "
             "Run SPLIT first (app or functions/run_split.py)."
         )
+    _corr_cols_sd2s = None
+    _corr_cids_sd2s = None
     if use_corrected and "X_corrected" in adata.layers:
         print("  Using X_corrected layer (SPLIT)", flush=True)
+        _raw_attr_cc = getattr(adata.layers["X_corrected"], "attrs", {}).get("corrected_cols")
+        if _raw_attr_cc is not None:
+            _corr_cols_sd2s = [str(g) for g in _raw_attr_cc]
+        if _corr_cols_sd2s is None and adata.uns.get("split_corrected_cols") is not None:
+            _corr_cols_sd2s = [str(g) for g in adata.uns["split_corrected_cols"]]
+        if adata.uns.get("split_corrected_cell_ids") is not None:
+            _corr_cids_sd2s = [str(c) for c in adata.uns["split_corrected_cell_ids"]]
+        if (_corr_cols_sd2s is None or _corr_cids_sd2s is None) and os.path.isdir(sdata_path):
+            try:
+                import zarr as _zcc_mod
+                try:
+                    from anndata.io import read_elem as _relem_sd
+                except ImportError:
+                    from anndata.experimental import read_elem as _relem_sd
+                _zr_cc = _zcc_mod.open_group(sdata_path, mode="r", use_consolidated=False)
+                _tg_cc = _zr_cc["tables"]["table"]
+                if _corr_cols_sd2s is None and "layers" in _tg_cc and "X_corrected" in _tg_cc["layers"]:
+                    _rc_z = _tg_cc["layers"]["X_corrected"].attrs.get("corrected_cols")
+                    if _rc_z is not None:
+                        _corr_cols_sd2s = [str(g) for g in _rc_z]
+                if "uns" in _tg_cc:
+                    _ug_cc = _tg_cc["uns"]
+                    if _corr_cols_sd2s is None and "split_corrected_cols" in _ug_cc:
+                        _corr_cols_sd2s = [str(g) for g in np.asarray(_relem_sd(_ug_cc["split_corrected_cols"])).ravel()]
+                    if _corr_cids_sd2s is None and "split_corrected_cell_ids" in _ug_cc:
+                        _corr_cids_sd2s = [str(c) for c in np.asarray(_relem_sd(_ug_cc["split_corrected_cell_ids"])).ravel()]
+            except Exception:
+                pass
+
         X_full = adata.layers["X_corrected"]
         if not sp.issparse(X_full):
             X_full = sp.csr_matrix(X_full)
-        # Drop cells where all corrected counts are zero
-        nonzero_mask = np.asarray(X_full.sum(axis=1)).ravel() > 0
+        # Drop cells where all corrected counts are zero (or outside split_corrected_cell_ids)
+        nonzero_mask = np.asarray(np.abs(X_full).sum(axis=1)).ravel() > 0
+        if _corr_cids_sd2s:
+            _id_m = np.isin(np.asarray(adata.obs_names.astype(str)), _corr_cids_sd2s)
+            if (_id_m & nonzero_mask).any():
+                nonzero_mask = _id_m & nonzero_mask
         n_before = len(adata)
         adata   = adata[nonzero_mask].copy()
         X_full  = X_full[nonzero_mask]
@@ -332,6 +459,14 @@ def spatialdata2seurat(
     X_panel = X_full
     if imp_mask.any():
         X_panel = X_full.tocsr()[:, ~imp_mask]   # keep imputed columns out of the counts assay
+    if use_corrected and _corr_cols_sd2s:
+        _cc_set = set(_corr_cols_sd2s)
+        _cov_gmask = np.array([g in _cc_set for g in panel_genes], dtype=bool)
+        if not _cov_gmask.all():
+            print(f"  SPLIT gene filter: keeping {int(_cov_gmask.sum())}/{len(panel_genes)} "
+                  f"SPLIT-covered panel genes", flush=True)
+            X_panel = X_panel.tocsr()[:, _cov_gmask]
+            panel_genes = [g for g, m in zip(panel_genes, _cov_gmask) if m]
 
     # ── Build imputed matrix aligned to final cell set ─────────────────────────
     # Reads the zarr in chunks to avoid loading the full dense array into memory.
@@ -774,8 +909,8 @@ def _parse_args():
                         "instead of a separate Imputed assay")
     p.add_argument("--use_corrected",  action="store_true",
                    help="Use X_corrected layer (SPLIT output) as panel counts")
-    p.add_argument("--roi",            default=None, metavar="DIR",
-                   help="Directory with roi_<cls>.parquet for ROI assignment "
+    p.add_argument("--roi", "--roi_path", dest="roi", default=None, metavar="DIR_OR_JSON",
+                   help="Directory with roi_<cls>.parquet or ROI .json file for ROI assignment "
                         "(if omitted, reads roi_<cls> column directly from zarr obs)")
     p.add_argument("--roi_cls",        default=None, metavar="CLS",
                    help="ROI class to filter on (obs column: roi_<CLS>)")

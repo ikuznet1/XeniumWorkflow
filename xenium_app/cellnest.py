@@ -140,7 +140,7 @@ def _load_cellnest_data(folder: str, dataset_name: str, strip_suffix: str = "",
             print(f"[CellNEST] Matched segmentation table '{best_src}' "
                   f"(endpoint match fraction={best_frac:.1%})", flush=True)
             cand_cols = [c for c in seg_df.columns
-                         if c.startswith("cluster") or c.startswith("cell_type")]
+                         if c.startswith("cluster") or c.startswith("clust__") or c.startswith("cell_type")]
             if cand_cols:
                 seg_sub = seg_df[cand_cols].copy()
                 seg_sub.index = seg_sub.index.astype(str)
@@ -507,6 +507,9 @@ def _cellnest_make_spatial(lr_pair, top_n=100, color_by="_default",
         name="cells", hoverinfo="skip",
     )])
     pair_palette = qualitative.Plotly
+    _sender_col = f"from_{annot_col}" if annot_col and f"from_{annot_col}" in ccc_df.columns else None
+    _receiver_col = f"to_{annot_col}" if _sender_col and f"to_{annot_col}" in ccc_df.columns else None
+    _sender_cmap = None
     # Pre-compute color maps for non-lr_pair edge coloring
     if color_by == "ligand":
         _lig_cmap = {l: pair_palette[i % len(pair_palette)]
@@ -514,6 +517,10 @@ def _cellnest_make_spatial(lr_pair, top_n=100, color_by="_default",
     elif color_by == "receptor":
         _rec_cmap = {r: pair_palette[i % len(pair_palette)]
                      for i, r in enumerate(sorted(ccc_df["receptor"].unique()))}
+    elif color_by == "sender_type" and _sender_col:
+        _stypes = sorted(set(ccc_df[_sender_col].dropna())
+                         | (set(ccc_df[_receiver_col].dropna()) if _receiver_col else set()), key=str)
+        _sender_cmap = {t: pair_palette[i % len(pair_palette)] for i, t in enumerate(_stypes)}
 
     for pi, pair in enumerate(lr_pairs):
         ligand, receptor = _cellnest_split_pair(pair, ccc_df)
@@ -530,8 +537,10 @@ def _cellnest_make_spatial(lr_pair, top_n=100, color_by="_default",
             edge_color_hex = _lig_cmap.get(ligand, "#888888")
         elif color_by == "receptor":
             edge_color_hex = _rec_cmap.get(receptor, "#888888")
+        elif color_by == "sender_type" and _sender_cmap is None:
+            edge_color_hex = pair_palette[pi % len(pair_palette)]
         else:
-            edge_color_hex = None  # attention: handled per-edge below
+            edge_color_hex = None  # attention or sender_type: handled per-edge/group below
         # Solid per-pair color for markers (arrows, autocrine rings, sender/receiver dots)
         pair_color_hex = edge_color_hex or pair_palette[pi % len(pair_palette)]
 
@@ -551,6 +560,37 @@ def _cellnest_make_spatial(lr_pair, top_n=100, color_by="_default",
                     mode="lines", line={"color": viridis[bin_idx], "width": w},
                     opacity=0.5, showlegend=False, legendgroup=pair, hoverinfo="skip",
                 ))
+        elif _sender_cmap is not None:
+            if edge_weight:
+                scores = sub["attention_score"].values
+                w_min, w_max2 = scores.min(), scores.max()
+                w_range = w_max2 - w_min if w_max2 > w_min else 1
+                for _, row in sub.iterrows():
+                    s_val = row[_sender_col]
+                    s_hex = _sender_cmap.get(s_val, pair_color_hex) if pd.notna(s_val) else pair_color_hex
+                    w = (1 + 4 * (row["attention_score"] - w_min) / w_range) * edge_width
+                    fig.add_trace(go.Scattergl(
+                        x=[row["from_x"], row["to_x"], None],
+                        y=[-row["from_y"], -row["to_y"], None],
+                        mode="lines", line={"color": s_hex, "width": w},
+                        opacity=0.5, showlegend=False, legendgroup=pair, hoverinfo="skip",
+                    ))
+            else:
+                by_col = {}
+                for _, row in sub.iterrows():
+                    s_val = row[_sender_col]
+                    s_hex = _sender_cmap.get(s_val, pair_color_hex) if pd.notna(s_val) else pair_color_hex
+                    xs_g, ys_g = by_col.setdefault(s_hex, ([], []))
+                    xs_g += [row["from_x"], row["to_x"], None]
+                    ys_g += [-row["from_y"], -row["to_y"], None]
+                for s_hex, (xs_g, ys_g) in by_col.items():
+                    fig.add_trace(go.Scattergl(
+                        x=xs_g, y=ys_g, mode="lines",
+                        line={"color": s_hex, "width": edge_width},
+                        opacity=0.4,
+                        name=f"edges:{pair}", legendgroup=pair, showlegend=False,
+                        hoverinfo="skip",
+                    ))
         elif edge_weight:
             scores = sub["attention_score"].values
             w_min, w_max2 = scores.min(), scores.max()
@@ -593,18 +633,23 @@ def _cellnest_make_spatial(lr_pair, top_n=100, color_by="_default",
         dx = (sub["to_x"] - sub["from_x"]).values
         dy = (sub["from_y"] - sub["to_y"]).values   # note: plot y = -real_y
         angles = np.degrees(np.arctan2(dx, dy))     # clockwise from north
+        arrow_color = ([_sender_cmap.get(v, pair_color_hex) if pd.notna(v) else pair_color_hex
+                        for v in sub[_sender_col]]
+                       if _sender_cmap is not None else pair_color_hex)
         fig.add_trace(go.Scatter(
             x=sub["to_x"].tolist(), y=(-sub["to_y"]).tolist(),
             mode="markers",
-            marker={"symbol": "arrow", "size": 8, "color": pair_color_hex,
+            marker={"symbol": "arrow", "size": 8, "color": arrow_color,
                     "angle": angles.tolist(), "line": {"width": 0}},
             name=f"arrows:{pair}", legendgroup=pair, showlegend=False,
             hoverinfo="skip",
         ))
 
         # ── Sender / receiver dots ───────────────────────────────────────────
-        from_col = f"from_{color_by}" if color_by != "_default" else None
-        to_col   = f"to_{color_by}"   if color_by != "_default" else None
+        _dot_col = annot_col if (color_by == "sender_type" and annot_col) else (
+            color_by if color_by != "_default" else None)
+        from_col = f"from_{_dot_col}" if _dot_col else None
+        to_col   = f"to_{_dot_col}"   if _dot_col else None
 
         if from_col and from_col in sub.columns:
             _cats = pd.concat([sub[from_col], sub[to_col]]).dropna().unique()
@@ -848,6 +893,9 @@ def _cellnest_overlay_traces(lr_pair, top_n=100, edge_width=1, color_by="lr_pair
     # Apply global filters (ligand/receptor/sender/receiver) before per-pair processing
     ccc_df = _apply_cellnest_filters(ccc_df, f_ligand, f_receptor, f_sender, f_receiver, annot_col)
     palette = qualitative.Plotly
+    _sender_col = f"from_{annot_col}" if annot_col and f"from_{annot_col}" in ccc_df.columns else None
+    _receiver_col = f"to_{annot_col}" if _sender_col and f"to_{annot_col}" in ccc_df.columns else None
+    _sender_cmap = None
     # Pre-compute color maps
     if color_by == "ligand":
         _lig_cmap = {l: palette[i % len(palette)]
@@ -855,6 +903,10 @@ def _cellnest_overlay_traces(lr_pair, top_n=100, edge_width=1, color_by="lr_pair
     elif color_by == "receptor":
         _rec_cmap = {r: palette[i % len(palette)]
                      for i, r in enumerate(sorted(ccc_df["receptor"].unique()))}
+    elif color_by == "sender_type" and _sender_col:
+        _stypes = sorted(set(ccc_df[_sender_col].dropna())
+                         | (set(ccc_df[_receiver_col].dropna()) if _receiver_col else set()), key=str)
+        _sender_cmap = {t: palette[i % len(palette)] for i, t in enumerate(_stypes)}
     if color_by == "attention":
         import plotly.colors as _pc
         _viridis = _pc.sample_colorscale("Viridis", list(np.linspace(0, 1, 10)))
@@ -911,6 +963,52 @@ def _cellnest_overlay_traces(lr_pair, top_n=100, edge_width=1, color_by="lr_pair
                     x=head_x, y=head_y, mode="markers",
                     marker={"symbol": "arrow", "size": head_size,
                             "angle": head_angles, "color": head_colors,
+                            "line": {"width": 0}},
+                    opacity=0.7, name=f"cellnest_heads_{pair}",
+                    hoverinfo="skip"))
+        elif _sender_cmap is not None:
+            if "edge_weight" in opts:
+                scores = sub["attention_score"].values
+                w_min_s, w_max_s = scores.min(), scores.max()
+                w_range_s = w_max_s - w_min_s if w_max_s > w_min_s else 1.0
+                for i, (_, row) in enumerate(sub.iterrows()):
+                    s_val = row[_sender_col]
+                    s_col = _sender_cmap.get(s_val, node_col) if pd.notna(s_val) else node_col
+                    ew = edge_width * (0.5 + 1.5 * (row["attention_score"] - w_min_s) / w_range_s)
+                    ah = max(3, int(ew * 3))
+                    traces.append(go.Scattergl(
+                        x=[row["from_x"], row["to_x"], None],
+                        y=[-row["from_y"], -row["to_y"], None],
+                        mode="lines",
+                        line={"color": s_col, "width": ew}, opacity=0.4,
+                        name=f"cellnest_lines_{pair}", hoverinfo="skip"))
+                    traces.append(go.Scattergl(
+                        x=[row["to_x"]], y=[-row["to_y"]], mode="markers",
+                        marker={"symbol": "arrow", "size": ah,
+                                "angle": arrow_angles[i], "color": s_col,
+                                "line": {"width": 0}},
+                        opacity=0.7, name=f"cellnest_heads_{pair}", hoverinfo="skip"))
+            else:
+                by_col = {}
+                head_colors = []
+                for _, row in sub.iterrows():
+                    s_val = row[_sender_col]
+                    s_col = _sender_cmap.get(s_val, node_col) if pd.notna(s_val) else node_col
+                    head_colors.append(s_col)
+                    xs_g, ys_g = by_col.setdefault(s_col, ([], []))
+                    xs_g += [row["from_x"], row["to_x"], None]
+                    ys_g += [-row["from_y"], -row["to_y"], None]
+                for s_col, (xs_g, ys_g) in by_col.items():
+                    traces.append(go.Scattergl(
+                        x=xs_g, y=ys_g, mode="lines",
+                        line={"color": s_col, "width": edge_width}, opacity=0.4,
+                        name=f"cellnest_lines_{pair}",
+                        hoverinfo="skip"))
+                traces.append(go.Scattergl(
+                    x=sub["to_x"].tolist(), y=(-sub["to_y"]).tolist(),
+                    mode="markers",
+                    marker={"symbol": "arrow", "size": head_size,
+                            "angle": arrow_angles.tolist(), "color": head_colors,
                             "line": {"width": 0}},
                     opacity=0.7, name=f"cellnest_heads_{pair}",
                     hoverinfo="skip"))

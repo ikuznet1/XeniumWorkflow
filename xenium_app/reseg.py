@@ -1095,7 +1095,13 @@ def _fast_load_reseg_zarr(zarr_path: str):
             _node = _obs[_col]
             if hasattr(_node, "shape"):
                 _df_data[_col] = _node[:]
-            elif _col == "cluster_split_10" or _col == "niche" or str(_col).startswith("roi_"):
+            elif (
+                _col == "cluster_split_10"
+                or _col == "niche"
+                or str(_col).startswith("roi_")
+                or str(_col).startswith("cluster_")
+                or str(_col).startswith("clust__")
+            ):
                 try:
                     from anndata.io import read_elem as _read_elem
                 except ImportError:
@@ -1201,6 +1207,128 @@ def _reseg_zarr_gene_index(zarr_path: str, n_cols: int) -> dict:
         return {}
 
 
+def _reseg_zarr_split_meta(zarr_path: str, cells_df: pd.DataFrame, expr_mat,
+                           corr_mat, gene_meta: "dict | None" = None) -> dict:
+    """Read SPLIT metadata ('split_corrected_cell_ids', optional 'split_corrected_cols')
+    for a cached reseg run so RCTD-dropped rows and partial gene coverage survive reload."""
+    if corr_mat is None:
+        return {}
+    ccols = None
+    raw_cids = None
+
+    def _read_seq(node):
+        if node is None:
+            return None
+        if isinstance(node, (list, tuple, np.ndarray)):
+            return [str(v) for v in node]
+        if hasattr(node, "shape"):
+            return [str(v) for v in node[:]]
+        try:
+            from anndata.io import read_elem as _relem
+        except ImportError:
+            from anndata.experimental import read_elem as _relem
+        return [str(v) for v in np.asarray(_relem(node)).ravel()]
+
+    if zarr_path and os.path.isdir(str(zarr_path)):
+        try:
+            import zarr as _zarr_mod
+            _zroot = _zarr_mod.open_group(str(zarr_path), mode="r", use_consolidated=False)
+            if "tables" in _zroot and "table" in _zroot["tables"]:
+                _tbl = _zroot["tables"]["table"]
+                if "layers" in _tbl and "X_corrected" in _tbl["layers"]:
+                    _lg = _tbl["layers"]["X_corrected"]
+                    _ac = _lg.attrs.get("corrected_cols")
+                    if _ac is not None:
+                        ccols = [str(g) for g in list(_ac)]
+                    _ai = _lg.attrs.get("corrected_cell_ids")
+                    if _ai is not None:
+                        raw_cids = [str(c) for c in list(_ai)]
+                if "uns" in _tbl:
+                    _u = _tbl["uns"]
+                    if ccols is None and "split_corrected_cols" in _u:
+                        try:
+                            ccols = _read_seq(_u["split_corrected_cols"])
+                        except Exception:
+                            pass
+                    if raw_cids is None and "split_corrected_cell_ids" in _u:
+                        try:
+                            raw_cids = _read_seq(_u["split_corrected_cell_ids"])
+                        except Exception:
+                            pass
+        except Exception as _se:
+            print(f"  Warning: could not read SPLIT metadata from reseg zarr: {_se}", flush=True)
+
+    df_ids = cells_df.index.astype(str)
+    if raw_cids is not None:
+        raw_set = set(raw_cids)
+        direct = [cid for cid in df_ids if cid in raw_set]
+        raw_stripped = {re.sub(r"^p\d+_", "", c) for c in raw_cids}
+        stripped = [cid for cid in df_ids if re.sub(r"^p\d+_", "", cid) in raw_stripped]
+        cids = direct if len(direct) >= len(stripped) else stripped
+    elif ("cluster_split_10" in cells_df.columns
+          and cells_df["cluster_split_10"].notna().any()):
+        cids = df_ids[cells_df["cluster_split_10"].notna().to_numpy(dtype=bool)].tolist()
+    else:
+        _holder = {
+            "df": cells_df, "expr": expr_mat, "split_corrected_expr": corr_mat,
+            **(gene_meta or {}),
+        }
+        _cov = dataview._corrected_covered(_holder)
+        if _cov is not None:
+            cids = df_ids[np.asarray(_cov, dtype=bool)].tolist()
+        else:
+            cids = df_ids.tolist()
+
+    out = {"split_corrected_cell_ids": list(cids)}
+    if ccols is not None:
+        out["split_corrected_cols"] = [str(g) for g in ccols]
+    return out
+
+
+def _reseg_ensure_split_umap(zarr_path: str, cells_df: pd.DataFrame, corr_mat,
+                             split_meta: dict, set_fn, label: str) -> None:
+    """Backfill missing split_umap_1/2 (and cluster_split_10) on covered SPLIT cells only."""
+    if corr_mat is None:
+        return
+    _missing = (
+        "split_umap_1" not in cells_df.columns
+        or not cells_df["split_umap_1"].notna().any()
+    )
+    if not _missing:
+        return
+    df_ids = pd.Index(cells_df.index.astype(str))
+    _cids = (split_meta or {}).get("split_corrected_cell_ids")
+    if _cids is not None:
+        _cov_mask = np.asarray(df_ids.isin([str(c) for c in _cids]), dtype=bool)
+    else:
+        _cov_mask = np.ones(len(cells_df), dtype=bool)
+
+    if _cov_mask.all():
+        if len(cells_df) >= 2:
+            set_fn("running", f"Recomputing SPLIT UMAP for {len(cells_df):,} cells (one-time fix)…")
+            split._compute_split_clusters_umap(
+                cells_df, corr_mat, corrected_cell_ids=None,
+                progress_fn=lambda msg: set_fn("running", msg),
+            )
+    else:
+        _cov_pos = np.flatnonzero(_cov_mask)
+        _cov_ids = df_ids[_cov_pos].tolist()
+        cells_df["cluster_split_10"] = pd.array([pd.NA] * len(cells_df), dtype="string")
+        cells_df["split_umap_1"] = np.nan
+        cells_df["split_umap_2"] = np.nan
+        if len(_cov_pos) >= 2:
+            set_fn("running", f"Recomputing SPLIT UMAP for {len(_cov_pos):,} covered cells (one-time fix)…")
+            split._compute_split_clusters_umap(
+                cells_df, corr_mat[_cov_pos], corrected_cell_ids=_cov_ids,
+                progress_fn=lambda msg: set_fn("running", msg),
+            )
+    if zarr_path and os.path.isdir(str(zarr_path)):
+        _update_reseg_zarr_obs(zarr_path, cells_df)
+    if "split_umap_1" in cells_df.columns:
+        print(f"  {label}: recomputed SPLIT UMAP ({cells_df['split_umap_1'].notna().sum()} "
+              f"non-NaN values)", flush=True)
+
+
 def _reseg_patch_keep_mask(out_dir: str, zarr_path: str, ids, patch_idx, x, y,
                            n_tx=None, polys=None):
     """Slow-path cache load of a patch run: which of the cells read from the patch_XXXX
@@ -1289,21 +1417,11 @@ def _load_cached_baysor(out_dir: str) -> None:
                     clustering._compute_reseg_clusters_umap(cells_df, expr_mat,
                                                  progress_fn=lambda msg: _set("running", msg))
                     _update_reseg_zarr_obs(zarr_path_fast, cells_df)
-                # If X_corrected exists but split_umap is all NaN (zarr write bug),
-                # recompute SPLIT clusters + UMAP from the corrected matrix.
-                _split_umap_missing = (
-                    _baysor_corr is not None
-                    and ("split_umap_1" not in cells_df.columns
-                         or not cells_df["split_umap_1"].notna().any())
-                )
-                if _split_umap_missing:
-                    _set("running", f"Recomputing SPLIT UMAP for {n_cells:,} cells (one-time fix)…")
-                    split._compute_split_clusters_umap(
-                        cells_df, _baysor_corr,
-                        progress_fn=lambda msg: _set("running", msg))
-                    _update_reseg_zarr_obs(zarr_path_fast, cells_df)
-                    print(f"  Baysor: recomputed SPLIT UMAP ({cells_df['split_umap_1'].notna().sum()} "
-                          f"non-NaN values)", flush=True)
+                _bf_gidx = _reseg_zarr_gene_index(zarr_path_fast, expr_mat.shape[1])
+                _bf_split = _reseg_zarr_split_meta(
+                    zarr_path_fast, cells_df, expr_mat, _baysor_corr, gene_meta=_bf_gidx)
+                _reseg_ensure_split_umap(
+                    zarr_path_fast, cells_df, _baysor_corr, _bf_split, _set, "Baysor")
                 with core._roi_lock:
                     regions._roi_apply_metadata_to_df(cells_df, core._roi_state["rois"])
                 _set("done", f"Loaded — {n_cells:,} cells", result={
@@ -1312,9 +1430,10 @@ def _load_cached_baysor(out_dir: str) -> None:
                     "sdata_path": zarr_path_fast,
                     "split_corrected_expr": _baysor_corr,
                     "split_corrected_imputed_genes": _baysor_corr_imp,
+                    **_bf_split,
                     "spage_result_path": _spage_rpath,
                     "spage_result_genes": _spage_rgenes, **_spage_extra,
-                    **_reseg_zarr_gene_index(zarr_path_fast, expr_mat.shape[1]),
+                    **_bf_gidx,
                 })
                 print(f"Loaded cached Baysor (fast): {n_cells:,} cells, "
                       f"{len(cell_bounds):,} boundaries", flush=True)
@@ -1443,6 +1562,14 @@ def _load_cached_baysor(out_dir: str) -> None:
                 print(f"  Warning: could not read Baysor zarr: {_ze2}", flush=True)
             regions._normalize_obs_placeholders(cells_df)
 
+        _bs_gidx = (
+            _reseg_zarr_gene_index(zarr_path, expr_mat.shape[1])
+            if (expr_mat is not None and os.path.isdir(zarr_path)) else {}
+        )
+        _bs_split = _reseg_zarr_split_meta(
+            zarr_path, cells_df, expr_mat, _baysor_corr, gene_meta=_bs_gidx)
+        _reseg_ensure_split_umap(
+            zarr_path, cells_df, _baysor_corr, _bs_split, _set, "Baysor")
         with core._roi_lock:
             regions._roi_apply_metadata_to_df(cells_df, core._roi_state["rois"])
         _set("done", f"Loaded — {n_cells:,} cells", result={
@@ -1451,8 +1578,10 @@ def _load_cached_baysor(out_dir: str) -> None:
             "sdata_path": zarr_path,
             "split_corrected_expr": _baysor_corr,
             "split_corrected_imputed_genes": _baysor_corr_imp,
+            **_bs_split,
             "spage_result_path": _spage_rpath,
             "spage_result_genes": _spage_rgenes, **_spage_extra,
+            **_bs_gidx,
         })
         print(f"Loaded cached Baysor: {n_cells:,} cells, {len(cell_bounds):,} boundaries "
               f"from {os.path.basename(out_dir)}", flush=True)
@@ -1571,21 +1700,11 @@ def _load_cached_proseg(out_dir: str) -> None:
                     clustering._compute_reseg_clusters_umap(cells_df, expr_mat,
                                                  progress_fn=lambda msg: _set("running", msg))
                     _update_reseg_zarr_obs(zarr_path_fast, cells_df)
-                # If X_corrected exists but split_umap is all NaN (zarr write bug),
-                # recompute SPLIT clusters + UMAP from the corrected matrix.
-                _split_umap_missing = (
-                    _proseg_corr is not None
-                    and ("split_umap_1" not in cells_df.columns
-                         or not cells_df["split_umap_1"].notna().any())
-                )
-                if _split_umap_missing:
-                    _set("running", f"Recomputing SPLIT UMAP for {n_cells:,} cells (one-time fix)…")
-                    split._compute_split_clusters_umap(
-                        cells_df, _proseg_corr,
-                        progress_fn=lambda msg: _set("running", msg))
-                    _update_reseg_zarr_obs(zarr_path_fast, cells_df)
-                    print(f"  Proseg: recomputed SPLIT UMAP ({cells_df['split_umap_1'].notna().sum()} "
-                          f"non-NaN values)", flush=True)
+                _fp_gidx = _reseg_zarr_gene_index(zarr_path_fast, expr_mat.shape[1])
+                _fp_split = _reseg_zarr_split_meta(
+                    zarr_path_fast, cells_df, expr_mat, _proseg_corr, gene_meta=_fp_gidx)
+                _reseg_ensure_split_umap(
+                    zarr_path_fast, cells_df, _proseg_corr, _fp_split, _set, "Proseg")
                 # One-time migration: Proseg's volume from cell-metadata.csv.gz when the zarr
                 # holds neither cell_volume nor the older (mislabelled) cell_area
                 _need_cell_area = (
@@ -1647,7 +1766,6 @@ def _load_cached_proseg(out_dir: str) -> None:
                     _update_reseg_zarr_obs(zarr_path_fast, cells_df, force_cols=("cell_volume",))
                     print("  Proseg: cell_area set to the outline areas (µm²); Proseg's volume "
                           "(µm³) is kept as cell_volume", flush=True)
-                _fp_gidx = _reseg_zarr_gene_index(zarr_path_fast, expr_mat.shape[1])
                 # transcript_counts = row sums of the matrix (caches written before this
                 # rule hold Proseg's `population`: corrected here and in the zarr, once)
                 _fp_imp = [_fp_gidx["gene_name_to_idx"][g]
@@ -1664,6 +1782,7 @@ def _load_cached_proseg(out_dir: str) -> None:
                     "sdata_path": zarr_path_fast,
                     "split_corrected_expr": _proseg_corr,
                     "split_corrected_imputed_genes": _proseg_corr_imp,
+                    **_fp_split,
                     "spage_result_path": _spage_rpath,
                     "spage_result_genes": _spage_rgenes, **_spage_extra,
                     **_fp_gidx,
@@ -1852,6 +1971,14 @@ def _load_cached_proseg(out_dir: str) -> None:
                 print(f"  Warning: could not read Proseg zarr: {_ze2}", flush=True)
             regions._normalize_obs_placeholders(cells_df)
 
+        _ps_gidx = (
+            _reseg_zarr_gene_index(zarr_path, expr_mat.shape[1])
+            if (expr_mat is not None and os.path.isdir(zarr_path)) else {}
+        )
+        _ps_split = _reseg_zarr_split_meta(
+            zarr_path, cells_df, expr_mat, _proseg_corr, gene_meta=_ps_gidx)
+        _reseg_ensure_split_umap(
+            zarr_path, cells_df, _proseg_corr, _ps_split, _set, "Proseg")
         # cell_area = outline area (µm²); the zarr of an older run holds Proseg's volume
         # under that name (see _proseg_cell_area)
         if _proseg_cell_area(cells_df, cell_bounds) and os.path.isdir(zarr_path):
@@ -1864,8 +1991,10 @@ def _load_cached_proseg(out_dir: str) -> None:
             "sdata_path": zarr_path,
             "split_corrected_expr": _proseg_corr,
             "split_corrected_imputed_genes": _proseg_corr_imp,
+            **_ps_split,
             "spage_result_path": _spage_rpath,
             "spage_result_genes": _spage_rgenes, **_spage_extra,
+            **_ps_gidx,
         })
         print(f"Loaded cached Proseg: {n_cells:,} cells, {len(cell_bounds):,} boundaries "
               f"from {os.path.basename(out_dir)}", flush=True)

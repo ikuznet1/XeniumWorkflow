@@ -73,7 +73,7 @@ import datetime as _dt
 import dash_bootstrap_components as dbc
 from dash import dcc, html
 
-from . import core, jobs, caching, dataview, regions, subsetting, analysis, stats, controls
+from . import core, jobs, caching, dataview, annotation, regions, subsetting, analysis, stats, controls
 from . import clustersets, sdata_store, provenance
 
 
@@ -928,9 +928,18 @@ def _session_has_corrected(seg) -> bool:
 
 def _session_color_by_values(seg) -> set:
     """The Color By values that can be shown now (as the dropdown enables them)."""
-    with core._annot_lock:
+    if core._seg_tool(seg) == "xenium":
+        with core._annot_lock:
+            with_labels = {m for m in core._ANNOT_METHODS
+                           if core._annot_state.get(f"labels_{m}") is not None}
+        for extra in dataview.EXTRA_DATASETS:
+            with_labels |= {m for m in core._ANNOT_METHODS
+                            if dataview._extra_cell_type_labels(extra, m)[0] is not None}
+    else:
+        res = core._seg_result(seg, done_only=True)
         with_labels = {m for m in core._ANNOT_METHODS
-                       if any(k.startswith(f"labels_{m}") and v is not None for k, v in core._annot_state.items())}
+                       if res is not None
+                       and annotation._reseg_cell_type_labels(m, res, res["cells_df"].index.astype(str)) is not None}
     out = set()
     for v in _session_options("color-by"):
         v = str(v)
@@ -951,6 +960,31 @@ def _session_genes() -> set:
     return set(map(str, core.DATA.get("gene_name_to_idx") or ())) | set(map(str, dataview._panel_gene_names()))
 
 
+def _session_panel_genes() -> set:
+    return set(map(str, dataview._panel_gene_names()))
+
+
+def _session_imputed_genes(seg) -> set:
+    """Imputed genes the Gene selector lists for *seg* (as cb_spage.update_gene_options builds it)."""
+    if core._seg_tool(seg) != "xenium":
+        res = core._seg_result(seg, done_only=True)
+        if not res:
+            return set()
+        return (set(map(str, res.get("imputed_genes") or ()))
+                | set(map(str, res.get("spage_result_genes") or ())))
+    imp = (set(map(str, core.DATA.get("imputed_genes") or ()))
+           | set(map(str, core.DATA.get("split_corrected_imputed_genes") or ())))
+    gene_var = core.DATA.get("gene_var")
+    if gene_var is not None and "is_imputed" in gene_var.columns:
+        imp |= {str(g) for g in (core.DATA.get("gene_names") or ())
+                if g in gene_var.index and bool(gene_var.loc[g, "is_imputed"])}
+    with core._spage_lock:
+        res_df = core._spage_state.get("result")
+        res_genes = core._spage_state.get("result_genes") or ()
+    imp |= set(map(str, res_df.columns if res_df is not None else res_genes))
+    return imp
+
+
 def _session_dynamic_problem(cid, value, ctx, applied, current, memo) -> "str | None":
     """Why the data-dependent value of *cid* cannot be applied now (None: it can)."""
     role, ref, extra = _SESSION_DYNAMIC[cid]
@@ -965,9 +999,23 @@ def _session_dynamic_problem(cid, value, ctx, applied, current, memo) -> "str | 
         return None if str(value) in _session_color_by_values(seg) else \
             "this colouring is not available (its labels or result are not loaded)"
     if role in ("gene", "genes"):
-        genes = memo.setdefault("genes", _session_genes())
+        panel = memo.setdefault("panel_genes", _session_panel_genes())
         vals = value if isinstance(value, list) else [value]
-        bad = [v for v in vals if core._gene_base(v) not in genes]
+        if cid == "webgl-tx-genes":
+            bad = [v for v in vals if str(v) not in panel]
+        elif cid == "density-gene":
+            bad = []
+            for v in vals:
+                vprov = analysis._density_virtual(v)
+                if vprov is not None:
+                    if v not in {o["value"] for o in vprov["options"]()}:
+                        bad.append(v)
+                elif str(v) not in panel:
+                    bad.append(v)
+        else:
+            imp = memo.setdefault(("imp_genes", seg), _session_imputed_genes(seg))
+            bad = [v for v in vals if (core._gene_base(v) not in imp if core._gene_is_imp_label(v)
+                                       else str(v) not in panel)]
         return None if not bad else f"not on the gene panel: {', '.join(_session_show(b, 20) for b in bad[:5])}"
     if role == "label_kind":
         kinds = memo.setdefault(("kinds", seg), {o["value"] for o in stats._comp_category_options(seg, ctx["color-by"])})

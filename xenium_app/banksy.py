@@ -380,6 +380,8 @@ def _bk_signature(samples, seg_source, params, genes) -> str:
         h.update(b"corrected" if s["corrected"] else b"original")
         h.update(analysis._an_matrix_digest(s["csc"]).encode())     # the counts themselves, not only whose they are
         h.update(pd.util.hash_pandas_object(pd.Index(s["df"].index.astype(str)), index=False).values.tobytes())
+        if s.get("rows") is not None:
+            h.update(np.asarray(s["rows"], dtype=np.int64).tobytes())
     h.update("|".join(genes).encode())
     return h.hexdigest()[:16]
 

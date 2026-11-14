@@ -398,6 +398,76 @@ def _plain_imputed_var_names(adata) -> int:
     return len(renamed)
 
 
+def _normalize_loaded_cluster_cols(obs_df: pd.DataFrame, uns_methods) -> list:
+    """Discover and normalize cluster columns (`clust__*` and reseg `cluster_*`) in *obs_df*.
+
+    Ensures every discovered cluster set `m` has an integer-coded `obs_df['clust__' + m]`
+    column (`0` = unassigned, `1..k` = cluster IDs) and returns `cluster_methods`.
+    """
+    methods = [str(m) for m in ([] if uns_methods is None else list(uns_methods))]
+    for col in list(obs_df.columns):
+        scol = str(col)
+        if scol.startswith("clust__"):
+            m = scol[len("clust__"):]
+            if m and m not in methods:
+                methods.append(m)
+        elif scol.startswith("cluster_") and scol != "cluster_split_10":
+            m = scol[len("cluster_"):]
+            if m:
+                if f"clust__{m}" not in obs_df.columns:
+                    obs_df[f"clust__{m}"] = obs_df[col]
+                if m not in methods:
+                    methods.append(m)
+    methods = [m for m in methods if f"clust__{m}" in obs_df.columns]
+    _empty_tokens = {"", "nan", "<NA>", "None", "0", "0.0"}
+    for m in methods:
+        col = f"clust__{m}"
+        ser = obs_df[col]
+        if pd.api.types.is_integer_dtype(ser):
+            obs_df[col] = ser.fillna(0).astype(np.int64)
+            continue
+        raw_obj = ser.astype(object).to_numpy()
+        cleaned = []
+        non_empty = []
+        for v in raw_obj:
+            if v is None or (isinstance(v, float) and np.isnan(v)):
+                cleaned.append(None)
+                continue
+            try:
+                if pd.isna(v):
+                    cleaned.append(None)
+                    continue
+            except Exception:
+                pass
+            sv = str(v).strip()
+            if sv in _empty_tokens or sv in regions._OBS_PLACEHOLDERS:
+                cleaned.append(None)
+            else:
+                cleaned.append(sv)
+                non_empty.append(sv)
+        if not non_empty:
+            obs_df[col] = np.zeros(len(obs_df), dtype=np.int64)
+            continue
+        try:
+            fvals = [float(sv) for sv in non_empty]
+            intlike = all(np.isfinite(fv) and fv.is_integer() for fv in fvals)
+        except (TypeError, ValueError):
+            intlike = False
+        if intlike:
+            obs_df[col] = np.array(
+                [0 if sv is None else int(round(float(sv))) for sv in cleaned],
+                dtype=np.int64,
+            )
+        else:
+            uniq = sorted(set(non_empty))
+            lut = {sv: i + 1 for i, sv in enumerate(uniq)}
+            obs_df[col] = np.array(
+                [0 if sv is None else lut[sv] for sv in cleaned],
+                dtype=np.int64,
+            )
+    return methods
+
+
 def _load_from_xenium_sdata(zarr_path: str, data_dir: str) -> dict:
     """Load DATA dict from a spatialdata_xenium.zarr store."""
     try:
@@ -433,8 +503,16 @@ def _load_from_xenium_sdata(zarr_path: str, data_dir: str) -> dict:
     # obs columns added later through the low-level zarr API (SPLIT clusters /
     # UMAP) are not in the table's column-order, so read_zarr does not return them.
     reseg._load_zarr_obs_into_df(zarr_path, obs_df)
+    if "cell_id" in obs_df.columns and obs_df["cell_id"].notna().all():
+        _cids = _cell_ids_as_str(obs_df["cell_id"])
+        if _cids.is_unique:
+            obs_df.index = _cids
+            barcodes = list(_cids)
+    else:
+        obs_df.index = _cell_ids_as_str(obs_df.index)
+        barcodes = list(obs_df.index)
     regions._normalize_obs_placeholders(obs_df)
-    cluster_methods = list(adata.uns.get("cluster_methods", []))
+    cluster_methods = _normalize_loaded_cluster_cols(obs_df, adata.uns.get("cluster_methods", []))
     print(f"  Done: {n:,} cells | {len(gene_names)} genes | {len(cluster_methods)} cluster sets", flush=True)
 
     res = {

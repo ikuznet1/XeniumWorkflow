@@ -364,10 +364,15 @@ def _running_jobs() -> list:
             ("CellNEST load", core._cellnest_lock, core._cellnest_state),
             ("differential expression", analysis._de_lock, analysis._de_state),
             ("gene-set scoring", analysis._geneset_lock, analysis._geneset_state),
-            ("transcript density", analysis._density_lock, analysis._density_state)):
+            ("transcript density", analysis._density_lock, analysis._density_state),
+            ("Moran's I", stats._moran_lock, stats._moran_state),
+            ("ligand-receptor", stats._lr_lock, stats._lr_state),
+            ("Load .h5ad", h5ad._h5ad_lock, h5ad._h5ad_state)):
         with lock:
             if state.get("status") in ("running", "starting", "loading") and name not in busy:
                 busy.append(name)
+    if _add_sample_lock.locked() and "adding sample" not in busy:
+        busy.append("adding sample")
     return busy
 
 
@@ -498,6 +503,8 @@ def _reset_dataset_state() -> None:
     segfree._sfree_reset()
     annotation._annot_autoload()
     sdata_store._sdata_autoload()
+    if core.DATA.get("sdata_path") and os.path.isdir(str(core.DATA["sdata_path"])):
+        sdata_store._annot_load_from_sdata()
     spage._spage_autoload()
 
 
@@ -553,9 +560,10 @@ def load_sample(n_clicks, picked_path, custom_path, ds_version, roi_done,
         new_data = loading.load_from_sdata_zarr(new_dir) if is_zarr else loading.load_xenium_data(new_dir)
         # Swap DATA and rebuild everything derived from it (expr_csc, gene lists, caches)
         dataview._install_dataset(new_data)
-        _reset_dataset_state()
-        # a view that came from an .h5ad is gone: forget its cell-type columns
+        # a view that came from an .h5ad is gone: forget its cell-type columns BEFORE
+        # _reset_dataset_state() so dynamic cell_type_* loaded from a reopened .zarr stay
         h5ad._h5ad_register(None)
+        _reset_dataset_state()
         print(f"  Loaded new dataset: {new_dir}", flush=True)
         # {}: the stored viewport belongs to the previous dataset
         return ("Loaded.", False, (ds_version or 0) + 1,
@@ -586,6 +594,7 @@ def add_sample(n_clicks, picked_path, custom_path, extra_ver):
     if not _add_sample_lock.acquire(blocking=False):
         return "A sample is already being added.", no_update, no_update, no_update
     try:
+        _gen = jobs._dataset_gen
         new_dir = (custom_path or "").strip() or picked_path
         if not new_dir:
             return "Select a sample or enter a path.", no_update, no_update, no_update
@@ -600,6 +609,11 @@ def add_sample(n_clicks, picked_path, custom_path, extra_ver):
         else:
             if not os.path.exists(os.path.join(new_dir, "experiment.xenium")):
                 return f"Not a valid Xenium directory: {new_dir}", no_update, no_update, no_update
+
+        _busy = [j for j in _running_jobs() if j != "adding sample"]
+        if _busy:
+            return (f"Still running: {', '.join(_busy)}. Wait for it to finish before "
+                    f"adding a sample.", no_update, no_update, no_update)
 
         def _already_loaded(cand_dir: str, cand_key: str = "") -> bool:
             all_dirs = [core.DATA.get("sdata_path") if is_zarr else core.DATA.get("data_dir")] + [
@@ -618,6 +632,8 @@ def add_sample(n_clicks, picked_path, custom_path, extra_ver):
             return "Sample already loaded.", no_update, no_update, no_update
 
         new_data = loading.load_from_sdata_zarr(new_dir) if is_zarr else loading.load_xenium_data(new_dir)
+        if jobs._dataset_gen != _gen:
+            return "Primary dataset changed while loading sample — aborted.", no_update, no_update, no_update
         _new_key = dataview._ds_key(new_data)
         # Re-check immediately before mutating EXTRA_DATASETS in case primary/extras changed mid-load
         if _already_loaded(new_dir, _new_key):
@@ -654,9 +670,18 @@ def add_sample(n_clicks, picked_path, custom_path, extra_ver):
                 regions._roi_apply_to_sample(new_data, _rois_now)
         except Exception as _roi_exc:
             print(f"  Extra sample: ROI labels not applied: {_roi_exc}", flush=True)
+        if jobs._dataset_gen != _gen:
+            return "Primary dataset changed while loading sample — aborted.", no_update, no_update, no_update
+        _busy = [j for j in _running_jobs() if j != "adding sample"]
+        if _busy:
+            return (f"Still running: {', '.join(_busy)}. Wait for it to finish before "
+                    f"adding a sample.", no_update, no_update, no_update)
         if _already_loaded(new_dir, _new_key):
             return "Sample already loaded.", no_update, no_update, no_update
         dataview.EXTRA_DATASETS.append(new_data)
+        dataview._umap_df_cache.clear()
+        dataview._umap_fig_cache.clear()
+        stats._design_sync()
         n_total = 1 + len(dataview.EXTRA_DATASETS)
         status_msg = f"{n_total} samples loaded"
         print(f"  Added extra dataset: {new_dir} (x_offset={x_offset:.0f} µm)", flush=True)
@@ -906,12 +931,24 @@ def remove_extra_samples(n_clicks, extra_ver):
     # requests this callback although nothing was clicked.
     if not n_clicks:
         raise dash.exceptions.PreventUpdate
-    if not dataview.EXTRA_DATASETS:
-        return no_update, "No extra samples loaded."
-    n_removed = len(dataview.EXTRA_DATASETS)
-    dataview.EXTRA_DATASETS.clear()
-    print(f"  Removed {n_removed} extra dataset(s).", flush=True)
-    return (extra_ver or 0) + 1, "Extra samples removed."
+    if not _add_sample_lock.acquire(blocking=False):
+        return no_update, "Still running: adding sample. Wait for it to finish before removing samples."
+    try:
+        _busy = [j for j in _running_jobs() if j != "adding sample"]
+        if _busy:
+            return no_update, f"Still running: {', '.join(_busy)}. Wait for it to finish before removing samples."
+        if not dataview.EXTRA_DATASETS:
+            return no_update, "No extra samples loaded."
+        n_removed = len(dataview.EXTRA_DATASETS)
+        dataview.EXTRA_DATASETS.clear()
+        dataview._umap_df_cache.clear()
+        dataview._umap_fig_cache.clear()
+        h5ad._h5ad_sync_loaded()
+        stats._design_sync()
+        print(f"  Removed {n_removed} extra dataset(s).", flush=True)
+        return (extra_ver or 0) + 1, "Extra samples removed."
+    finally:
+        _add_sample_lock.release()
 
 
 @app_layout.app.callback(
@@ -953,7 +990,11 @@ def toggle_cache_clean_modal(open_clicks, cancel_clicks, confirm_clicks):
     tid = callback_context.triggered_id
     if tid == "cache-clean-open-btn" and open_clicks:
         size = caching._cache_size_str(max_age=0)
-        dataset_name = caching._dataset_name()
+        dataset_name = (
+            caching._dataset_name()
+            or os.path.basename(caching._dataset_key().rstrip("/"))
+            or "dataset"
+        )
         _busy = _running_jobs()
         if _busy:
             return True, (f"Still running: {', '.join(_busy)}. The cache cannot be cleaned "

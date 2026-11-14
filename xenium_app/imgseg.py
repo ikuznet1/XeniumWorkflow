@@ -693,14 +693,20 @@ def _load_cached_imgseg(out_dir: str) -> None:
             _set("running", f"Computing UMAP and clusters for {n_cells:,} cells (one-time)…")
             clustering._compute_reseg_clusters_umap(cells_df, expr_mat, progress_fn=lambda msg: _set("running", msg))
             reseg._update_reseg_zarr_obs(zarr_path, cells_df)
+        _ig_gidx = reseg._reseg_zarr_gene_index(zarr_path, expr_mat.shape[1]) if expr_mat is not None else {}
+        _ig_split = reseg._reseg_zarr_split_meta(
+            zarr_path, cells_df, expr_mat, corr, gene_meta=_ig_gidx)
+        reseg._reseg_ensure_split_umap(
+            zarr_path, cells_df, corr, _ig_split, _set, "Image segmentation")
         with core._roi_lock:
             regions._roi_apply_metadata_to_df(cells_df, core._roi_state["rois"])
         _set("done", f"Loaded — {n_cells:,} cells", result={
             "cells_df": cells_df, "cell_bounds": cell_bounds, "out_dir": out_dir, "expr": expr_mat,
             "source": _ISEG_TOOL, "sdata_path": zarr_path, "split_corrected_expr": corr,
-            "split_corrected_imputed_genes": corr_imp, "spage_result_path": spage_path,
+            "split_corrected_imputed_genes": corr_imp, **_ig_split,
+            "spage_result_path": spage_path,
             "spage_result_genes": spage_genes, **spage_extra,
-            **(reseg._reseg_zarr_gene_index(zarr_path, expr_mat.shape[1]) if expr_mat is not None else {})})
+            **_ig_gidx})
         print(f"Loaded cached image segmentation: {n_cells:,} cells, {len(cell_bounds):,} boundaries", flush=True)
         provenance._prov_record(
             "imgseg", "Image-based segmentation (cached run loaded)",

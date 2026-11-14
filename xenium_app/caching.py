@@ -365,7 +365,7 @@ def _clean_cache_for_dataset() -> str:
     if not os.path.isdir(cache):
         return "Cache directory not found."
     tag = hashlib.md5(_dataset_key().encode()).hexdigest()[:8]
-    dataset_name = _dataset_name()
+    dataset_name = _dataset_name() or os.path.basename(_dataset_key().rstrip("/")) or "dataset"
     removed = 0
     import shutil
     for entry in os.listdir(cache):
@@ -376,16 +376,28 @@ def _clean_cache_for_dataset() -> str:
         # (a '.partial' working directory left by a killed run counts as its run directory)
         _run_entry = (entry[:-len(_SEG_STAGE_SUFFIX)] if entry.endswith(_SEG_STAGE_SUFFIX)
                       else entry)
-        if tag in entry or (os.path.isdir(full) and (
-                _seg_run_tag(_run_entry, "baysor") or _seg_run_tag(_run_entry, "proseg")
-                 or _seg_run_tag(_run_entry, "imgseg"))):
+        _is_seg_run = os.path.isdir(full) and bool(
+            _seg_run_tag(_run_entry, "baysor") or _seg_run_tag(_run_entry, "proseg")
+            or _seg_run_tag(_run_entry, "imgseg")
+        )
+        if tag in entry or _is_seg_run:
             try:
                 if os.path.isdir(full):
                     shutil.rmtree(full)
                 else:
                     os.remove(full)
                 removed += 1
+                if _is_seg_run:
+                    _base_full = os.path.join(cache, _run_entry)
+                    _seg_forget_run(_base_full)
+                    for _t_name, _t_lock, _t_state in core._seg_states():
+                        with _t_lock:
+                            _t_res = _t_state.get("result")
+                            if (_t_state.get("status") != "running" and _t_res
+                                    and os.path.abspath(str(_t_res.get("out_dir") or "")) == os.path.abspath(_base_full)):
+                                _t_state.update({"status": "idle", "message": "", "result": None})
             except Exception as e:
                 print(f"  clean_cache: could not remove {entry}: {e}", flush=True)
+    _cache_size_memo.update({"t": 0.0, "dir": None, "val": None})
     print(f"  clean_cache: removed {removed} cache entries for dataset {dataset_name}", flush=True)
     return f"Removed {removed} cache entries for {dataset_name}."

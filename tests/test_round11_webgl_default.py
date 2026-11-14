@@ -270,9 +270,9 @@ def test_session_defaults_autosave_and_renderer_restore(xe, D, tmp_path, monkeyp
         # and updates the autosave baseline so subsequent ticks do not re-save
         out_save = xe.session_action({"action": "save", "controls": plotly_page}, 0, 0, 0, 0, 0)
         assert out_save[0].startswith("Session saved")
-        out_load = xe.session_action({"action": "load_saved", "controls": defaults}, 0, 0, 0, 0, 0)
+        out_load = xe.session_action({"action": "restore-saved", "controls": defaults}, 0, 0, 0, 0, 0)
         assert out_load[0].startswith("Session restored")
-        assert out_load[2] == {"renderer-mode": "plotly"}
+        assert out_load[2]["controls"] == {"renderer-mode": "plotly"}
         assert xe._session_autosave(plotly_page) == ""
 
         # Explicit save in WebGL mode -> restore onto a page currently on "plotly" restores "webgl"

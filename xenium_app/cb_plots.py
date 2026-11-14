@@ -616,8 +616,8 @@ def show_cell_info(cell_id, method):
 
         chips = [
             ui.info_chip("Cluster",     str(clust)),
-            ui.info_chip("X",           f"{row['x_centroid']:.1f} µm"),
-            ui.info_chip("Y",           f"{row['y_centroid']:.1f} µm"),
+            ui.info_chip("X",           _num("x_centroid", "{:.1f} µm")),
+            ui.info_chip("Y",           _num("y_centroid", "{:.1f} µm")),
             ui.info_chip("Transcripts", _num("transcript_counts", "{:.0f}")),
             ui.info_chip("Cell Area",   _num("cell_area", "{:.0f} µm²")),
             ui.info_chip("Nuc Area",    _num("nucleus_area", "{:.0f} µm²")),
@@ -635,6 +635,8 @@ def show_cell_info(cell_id, method):
         if _hit is not None:
             src_name, res, key = _hit
             row        = res["cells_df"].loc[key]
+            if isinstance(row, pd.DataFrame):
+                row    = row.iloc[0]
             alt_expr   = res.get("expr")
             source_tag = f" [{src_name}]"
 
@@ -669,10 +671,14 @@ def show_cell_info(cell_id, method):
                 for i in top_idx if raw[i] > 0 and i < len(gene_names_list)
             ]
 
+        def _rnum(col, fmt):
+            v = pd.to_numeric(row.get(col), errors="coerce")
+            return fmt.format(v) if pd.notna(v) else "—"
+
         chips = [
-            ui.info_chip("X",           f"{row['x_centroid']:.1f} µm"),
-            ui.info_chip("Y",           f"{row['y_centroid']:.1f} µm"),
-            ui.info_chip("Transcripts", str(int(row["transcript_counts"]))),
+            ui.info_chip("X",           _rnum("x_centroid", "{:.1f} µm")),
+            ui.info_chip("Y",           _rnum("y_centroid", "{:.1f} µm")),
+            ui.info_chip("Transcripts", _rnum("transcript_counts", "{:.0f}")),
         ]
         # (a Proseg run: cell_area is the area of the outline, cell_volume Proseg's own
         # volume - reseg._proseg_cell_area; a cell without an outline has no area)
