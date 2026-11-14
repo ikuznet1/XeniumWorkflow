@@ -289,13 +289,16 @@ def get_gene_expression(gene: str) -> np.ndarray:
             res       = core._spage_state.get("result")
             res_path  = core._spage_state.get("result_path")
             res_genes = core._spage_state.get("result_genes") or []
+            res_tag   = core._spage_state.get("result_ids_tag")
         if res is not None and base in res.columns:
             # Result rows follow DATA["df"] as it was when SpaGE ran; realign by
             # cell id when a subset has been applied or cleared since.
-            if len(res) != len(core.DATA["df"]) and res.index.is_unique:
-                _ridx = core.DATA["df"].index
-                if res.index.dtype == object and _ridx.dtype != object:
-                    _ridx = _ridx.astype(str)
+            # (Not only when the row counts differ: two subsets of the same size hold
+            # different cells.)
+            _ridx = core.DATA["df"].index
+            if res.index.dtype == object and _ridx.dtype != object:
+                _ridx = _ridx.astype(str)
+            if res.index.is_unique and not res.index.equals(_ridx):
                 result = res[base].reindex(_ridx).fillna(0).values.astype(np.float64)
             else:
                 result = res[base].values.astype(np.float64)
@@ -313,6 +316,7 @@ def get_gene_expression(gene: str) -> np.ndarray:
                     result = np.array(_z_ge[:, _gi], dtype=np.float64)
                 else:                          # large parquet — read single column
                     result = pd.read_parquet(res_path, columns=[base])[base].values.astype(np.float64)
+                figures._spage_streamed_cells_check(res_tag)
                 result = figures._align_expr_rows_to_df(result)
                 if len(result) != len(core.DATA["df"]):
                     # streamed under another subset(): rows cannot be matched to cells

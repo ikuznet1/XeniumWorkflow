@@ -110,7 +110,11 @@
   hideCss.textContent = "body.xv-webgl #umap-plot{display:none !important}" +
     // Plotly's "WebGL is not supported" notice must not cover the renderer bar and its status line
     "#spatial-plot .no-webgl{z-index:1 !important}" +
-    "body:not(.xv-webgl) #webgl-png-btn{display:none !important}";   // PNG export: WebGL view only
+    "body:not(.xv-webgl) #webgl-png-btn{display:none !important}" +   // PNG export: WebGL view only
+    "body:not(.xv-webgl) #webgl-export{display:none !important}" +    // figure export: likewise
+    "#webgl-export-panel select,#webgl-export-panel input,#webgl-export-panel button{font-size:11px;" +
+    "background:#161b22;color:#e6edf3;border:1px solid rgba(255,255,255,.25);border-radius:3px;padding:1px 4px}" +
+    "#webgl-export-panel button{cursor:pointer}";
   document.head.appendChild(hideCss);
 
   function setProps(id, props) {
@@ -584,6 +588,7 @@
     var plotStyle = { height: "100%", display: webgl ? "none" : "block" };
     var glStyle = { position: "absolute", inset: "0", display: webgl ? "block" : "none" };
     document.body.classList.toggle("xv-webgl", webgl);   // its style prop belongs to the plot-size controls
+    ensureExportUi();
     var umapGlStyle = { flex: "1", minHeight: "420px", position: "relative", display: webgl ? "block" : "none" };
     // Z-Level picks the file the Plotly overlay opens its channels through; the WebGL image
     // layer reads one file per ticked channel, so the control has nothing to select here.
@@ -797,7 +802,7 @@
   }
 
   // "PNG" button: the current view at twice the on-screen resolution, with legend and scale
-  // bar. Raster only; a vector figure needs the Plotly renderer (its camera button saves SVG).
+  // bar. Raster only; "Export figure" (below) writes the vector formats.
   function exportPng() {
     var canvas = viewer && lastMode === "webgl" && viewer.snapshot
       ? viewer.snapshot({ scale: 2, scaleBar: true }) : null;
@@ -814,6 +819,98 @@
       }, "image/png");
     }
     return window.dash_clientside.no_update;
+  }
+
+  // "Export figure" control beside the PNG button: the current view as SVG, PDF or PNG with
+  // a scale bar and a legend (viewer.exportFigure; vector shapes up to a limit of elements
+  // in view, an embedded image above it). Built here rather than in the Dash layout: it has
+  // no server side, and the panel is only markup around one call.
+  var EXPORT_MAX_VECTOR = 50000;   // default of the "Vector up to" field
+  var exportBusy = false;
+  var exportMsgTimer = null;
+  function ensureExportUi() {
+    var png = document.getElementById("webgl-png-btn");
+    if (!png || !png.parentNode) return null;
+    var wrap = document.getElementById("webgl-export");
+    if (wrap && wrap.previousSibling === png) return wrap;
+    if (wrap) wrap.remove();
+    wrap = document.createElement("span");
+    wrap.id = "webgl-export";
+    wrap.style.cssText = "position:relative;display:inline-flex;margin-right:8px";
+    var btn = document.createElement("button");
+    btn.id = "webgl-export-btn";
+    btn.type = "button";
+    btn.textContent = "Export figure";
+    btn.title = "Save the current WebGL view as a figure (SVG, PDF or PNG) with a scale bar and a legend";
+    btn.style.cssText = png.style.cssText;
+    btn.style.marginRight = "0";
+    var panel = document.createElement("div");
+    panel.id = "webgl-export-panel";
+    panel.style.cssText = "position:absolute;bottom:calc(100% + 8px);left:0;display:none;width:270px;padding:8px;" +
+      "background:rgba(13,17,23,.97);border:1px solid rgba(255,255,255,.2);border-radius:6px;font-size:11px;" +
+      "line-height:1.5;color:#e6edf3;z-index:20";
+    panel.innerHTML =
+      '<div style="display:flex;gap:10px;align-items:center;margin-bottom:6px">' +
+        '<label>Format <select id="webgl-export-format"><option value="svg">SVG</option>' +
+        '<option value="pdf">PDF</option><option value="png">PNG</option></select></label>' +
+        '<label title="Pixel scale of the PNG and of the images embedded in an SVG or PDF, relative to the view on screen">' +
+        'Scale <select id="webgl-export-scale"><option value="1">1x</option><option value="2" selected>2x</option>' +
+        '<option value="3">3x</option><option value="4">4x</option></select></label></div>' +
+      '<label style="display:block;margin-bottom:6px">Vector up to <input id="webgl-export-limit" type="number" min="0" ' +
+        'step="1000" value="' + EXPORT_MAX_VECTOR + '" style="width:72px"> cells (outlines, transcripts) in view; ' +
+        'a layer with more is embedded as an image, scale bar and legend stay vector.</label>' +
+      '<div style="display:flex;gap:8px;align-items:flex-start"><button id="webgl-export-go" type="button">Export</button>' +
+        '<span id="webgl-export-msg" style="color:#9da7b3"></span></div>';
+    wrap.appendChild(btn);
+    wrap.appendChild(panel);
+    png.parentNode.insertBefore(wrap, png.nextSibling);
+    btn.addEventListener("click", function () {
+      panel.style.display = panel.style.display === "none" ? "block" : "none";
+    });
+    panel.querySelector("#webgl-export-go").addEventListener("click", exportFigure);
+    return wrap;
+  }
+  document.addEventListener("click", function (ev) {       // a click elsewhere closes the panel
+    if (!ev.isTrusted) return;                             // not the scripted click that starts a download
+    var wrap = document.getElementById("webgl-export");
+    if (wrap && !wrap.contains(ev.target)) wrap.querySelector("#webgl-export-panel").style.display = "none";
+  });
+
+  function saveBlob(blob, name) {
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(function () { URL.revokeObjectURL(a.href); }, 5000);
+  }
+
+  function exportFigure() {
+    var note = function (text) {
+      var m = document.getElementById("webgl-export-msg");
+      if (m) m.textContent = text;
+    };
+    if (exportBusy) return;
+    if (!viewer || lastMode !== "webgl" || !viewer.exportFigure) { note("the WebGL view is not shown"); return; }
+    var limit = parseInt(document.getElementById("webgl-export-limit").value, 10);
+    if (!(limit >= 0)) limit = EXPORT_MAX_VECTOR;
+    var opts = { format: document.getElementById("webgl-export-format").value,
+                 scale: +document.getElementById("webgl-export-scale").value || 2, maxVector: limit };
+    exportBusy = true;
+    note("exporting…");
+    viewer.exportFigure(opts).then(function (res) {
+      saveBlob(res.blob, res.filename);
+      var size = res.info.bytes >= 1048576 ? (res.info.bytes / 1048576).toFixed(1) + " MB" : Math.ceil(res.info.bytes / 1024) + " kB";
+      var raster = res.info.notes.filter(function (n) { return n.indexOf("vector limit") >= 0; });
+      note(res.filename + " saved (" + size + "). " + raster.join(" "));
+      // the same in the status line, where it is seen with the panel closed
+      clearTimeout(exportMsgTimer);
+      setMsg("export", raster.length ? "figure export: " + raster.join(" ") : null);
+      exportMsgTimer = setTimeout(function () { setMsg("export", null); }, 20000);
+    }).catch(function (err) {
+      note("export failed: " + ((err && err.message) || err));
+    }).then(function () { exportBusy = false; });
   }
 
   window.dash_clientside = Object.assign({}, window.dash_clientside, {

@@ -15,6 +15,7 @@ This module imports nothing from the package; the other modules are found in sys
 """
 import os
 import sys
+import types
 
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # The file the app is started through; data files that ship with the app sit next to it.
@@ -54,16 +55,32 @@ def lookup(name: str):
     raise KeyError(name)
 
 
+def _is_package_module(value) -> bool:
+    """True for a module of this package (``stats``, ``jobs``, ...): the modules hold their
+    siblings under these plain names, which are imports and not globals of the app."""
+    return (isinstance(value, types.ModuleType)
+            and (value.__name__ == __package__ or value.__name__.startswith(__package__ + ".")))
+
+
+def _rebindable(name: str) -> list:
+    """Modules in which *name* may be rebound or deleted from outside: the owners, without
+    those that hold a sibling module under the name. So ``stats = ...`` typed in the REPL
+    (or ``xe.stats = ...``) makes a variable of the caller and leaves every module's
+    reference to xenium_app.stats alone."""
+    return [m for m in owners(name) if not _is_package_module(m.__dict__[name])]
+
+
 def assign(name: str, value) -> bool:
-    """Rebind *name* where it is defined. False when no module defines it."""
-    found = owners(name)
+    """Rebind *name* where it is defined. False when no module defines it (a name that is
+    only a sibling-module import counts as not defined: the caller keeps the value)."""
+    found = _rebindable(name)
     for m in found:
         setattr(m, name, value)
     return bool(found)
 
 
 def delete(name: str) -> bool:
-    found = owners(name)
+    found = _rebindable(name)
     for m in found:
         delattr(m, name)
     return bool(found)

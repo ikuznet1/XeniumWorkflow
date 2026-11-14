@@ -7,7 +7,7 @@ import pandas as pd
 import scipy.sparse as sp
 
 from . import core, jobs, caching, dataview, reseg, clustering
-from . import provenance
+from . import provenance, rworker
 
 
 def _compute_split_clusters_umap(cells_df: pd.DataFrame, corrected_mat,
@@ -220,55 +220,9 @@ def _split_write_zarr(sdata_path: str, corrected_mat, cells_df: pd.DataFrame,
         traceback.print_exc()
 
 
-def _r_dgcmatrix_to_scipy(r_mat):
-    """Convert an R dgCMatrix to a scipy CSC matrix (genes × cells).
-
-    dgCMatrix is column-sparse (CSC): p = column pointers, i = row indices.
-    Callers that need cells × genes should call .T.tocsr() on the result.
-    """
-    import scipy.sparse as sp_
-    import numpy as np
-    i = np.array(r_mat.slots["i"])
-    p = np.array(r_mat.slots["p"])
-    x = np.array(r_mat.slots["x"])
-    dims = list(r_mat.slots["Dim"])
-    return sp_.csc_matrix((x, i, p), shape=(dims[0], dims[1]))
-
-
-def _scipy_csc_parts(mat_cells_x_genes):
-    """genes × cells CSC parts (i, p, x, shape) for an R dgCMatrix.
-    i and p are 0-based int32 (dgCMatrix slots are 0-based), x is float64."""
-    m = sp.csc_matrix(mat_cells_x_genes.T, dtype=np.float64, copy=True)
-    m.sum_duplicates()
-    m.eliminate_zeros()
-    m.sort_indices()
-    if m.nnz >= 2**31 - 1:
-        raise RuntimeError(f"Matrix has {m.nnz:,} non-zeros — too many for an R dgCMatrix "
-                           f"(limit 2^31-1). Subset the cells first.")
-    return (np.ascontiguousarray(m.indices, dtype=np.int32),
-            np.ascontiguousarray(m.indptr, dtype=np.int32),
-            np.ascontiguousarray(m.data, dtype=np.float64),
-            m.shape)
-
-
-def _scipy_to_r_dgc(mat_cells_x_genes, rownames, colnames, r_name: str) -> None:
-    """Assign a cells × genes scipy matrix to the R global `r_name` as a
-    genes × cells dgCMatrix, passing only the sparse parts (never dense)."""
-    import rpy2.robjects as ro
-    i, p, x, shape = _scipy_csc_parts(mat_cells_x_genes)
-    if len(rownames) != shape[0] or len(colnames) != shape[1]:
-        raise ValueError(f"dimnames {len(rownames)}×{len(colnames)} do not match matrix {shape}")
-    ro.r.assign("._dgc_i", ro.IntVector(i))
-    ro.r.assign("._dgc_p", ro.IntVector(p))
-    ro.r.assign("._dgc_x", ro.FloatVector(x))
-    ro.r.assign("._dgc_rn", ro.StrVector(list(rownames)))
-    ro.r.assign("._dgc_cn", ro.StrVector(list(colnames)))
-    ro.r(f"""
-{r_name} <- Matrix::sparseMatrix(i=as.integer(._dgc_i), p=as.integer(._dgc_p),
-    x=as.numeric(._dgc_x), dims=c({int(shape[0])}L, {int(shape[1])}L), index1=FALSE,
-    dimnames=list(._dgc_rn, ._dgc_cn))
-rm(._dgc_i, ._dgc_p, ._dgc_x, ._dgc_rn, ._dgc_cn)
-""")
+# The sparse-matrix exchange with R (_scipy_to_r_dgc, _scipy_csc_parts,
+# _r_dgcmatrix_to_scipy) and the R part of SPLIT itself (_rw_split) are in rworker.py:
+# they run in the R worker process, which cannot import this module.
 
 
 def _split_onto_cells(mat, job_df, cur_df, cols=("cluster_split_10", "split_umap_1", "split_umap_2")) -> tuple:
@@ -342,17 +296,10 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
             provenance._prov_record("split", seg_source=seg_source, params={"reference": os.path.basename(str(rds_path or '')), "label_col": label_col, "max_cores": max_cores, "min_umi": min_umi, "min_umi_sigma": min_umi_sigma, "purify_singlets": purify_singlets}, r_packages=("spacexr", "SPLIT", "Seurat", "SeuratObject"), message=message, result=result)
 
     try:
-        import rpy2.robjects as ro
-        import rpy2.robjects.conversion as _rconv
-        from rpy2.robjects import pandas2ri
-        from rpy2.robjects.packages import importr
         import scipy.sparse as sp_
-        import scipy.io as sio
-        import tempfile
 
-        # rpy2 thread fix
-        _rconv.set_conversion(ro.default_converter)
-        pandas2ri.activate()
+        # rpy2 must be installed; its thread rule applies when R runs inside the app
+        rworker._rw_thread_setup()
 
         # Clear stale "Rerun UMAP" result so make_umap_fig uses the fresh
         # split_umap_1/2 computed below, not a cached result from a previous
@@ -409,214 +356,92 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
         n_cells, n_genes = expr_panel.shape
         print(f"  SPLIT: {n_cells:,} cells × {n_genes} panel genes", flush=True)
 
-        from rpy2.rinterface_lib import openrlib
-        with openrlib.rlock:
-            # ── 2. Check R packages ──────────────────────────────────────────────
-            _set("running", "Loading R packages (spacexr, SPLIT)…")
+        cell_ids = [str(c) for c in cells_df.index]
+
+        # ── 2. The cache of the RCTD run (doublet mode) ──────────────────────
+        # Compute a stable key for this RCTD run so we can skip it on re-runs.
+        _rctd_lkey = "labels_rctd_doublet"
+        if _alt_res is not None:
+            _rctd_tag  = hashlib.md5((_alt_res.get("out_dir", "")).encode()).hexdigest()[:8]
+            _rctd_tool = _alt_res.get("source", "baysor")
+            _rctd_lkey = f"labels_rctd_doublet_{_rctd_tool}_{_rctd_tag}"
+        # Under an active subset() the cell set is part of the key (full-dataset
+        # runs keep the old name). It goes before the labels key: _annot_autoload
+        # takes everything after the last "_labels_" in the file name as that key.
+        _cells_extra = ""
+        if (_alt_res is not None and "_cells_df_original" in _alt_res) or \
+                (_alt_res is None and "_df_original" in core.DATA):
+            _cells_extra = (f"_n{len(cell_ids)}_"
+                            + hashlib.md5("\n".join(cell_ids).encode()).hexdigest()[:8])
+        # "_cmi5pp": SPLIT's RCTD configuration (CELL_MIN_INSTANCE=5 plus
+        # run_post_process_RCTD) differs from the annotation modal's doublet run,
+        # so the two do not share a cache file even with equal UMI thresholds.
+        _rctd_cache_key  = (f"rctd_{os.path.basename(rds_path)}_{caching._ref_file_tag(rds_path)}"
+                            f"_{label_col}_doublet"
+                            f"_umi{min_umi}_sig{min_umi_sigma}_cmi5pp{_cells_extra}_{_rctd_lkey}")
+        _rctd_cache_file = caching._cache_path(_rctd_cache_key)
+        _rctd_obj_file   = _rctd_cache_file.replace(".parquet", "_rctd_obj.rds")
+
+        _split_labels_cached = None
+        if os.path.exists(_rctd_cache_file) and os.path.exists(_rctd_obj_file):
             try:
-                importr("spacexr")
-            except Exception:
-                _set("error", "spacexr not installed. In R: devtools::install_github('dmcable/spacexr')")
-                return
-            try:
-                importr("SPLIT")
-            except Exception:
-                _set("error", "SPLIT not installed. In R: remotes::install_github('bdsc-tds/SPLIT')")
-                return
-            importr("SeuratObject")
-            importr("Matrix")
-            base = importr("base")
+                _cached_rctd = pd.read_parquet(_rctd_cache_file)
+                _split_labels_cached = _cached_rctd["label"].astype(str)
+                _split_labels_cached.index = _split_labels_cached.index.astype(str)
+                # Every cached cell must belong to this run (RCTD drops low-UMI
+                # cells, so the cache may hold fewer cells, never other ones).
+                _sample = _split_labels_cached.index
+                _overlap = int(_sample.isin(set(cell_ids)).sum())
+                if not (len(_sample) > 0 and _overlap == len(_sample)):
+                    print(f"  SPLIT: RCTD cache index mismatch ({_overlap}/{len(_sample)}) — re-running", flush=True)
+                    _split_labels_cached = None
+            except Exception as _ce:
+                print(f"  SPLIT: RCTD cache load failed: {_ce}", flush=True)
+                _split_labels_cached = None
 
-            # ── 3. Load Seurat reference ─────────────────────────────────────────
-            _set("running", "Loading Seurat reference…")
-            rds = base.readRDS(rds_path)
-            meta_r  = ro.r['slot'](rds, "meta.data")
-            meta_df = pandas2ri.rpy2py(meta_r)
-            if label_col not in meta_df.columns:
-                _set("error", f"Column '{label_col}' not found. Available: {list(meta_df.columns)[:10]}")
-                return
+        def _publish_rctd_labels(_split_labels):
+            # Store RCTD labels in _annot_state so cell-type coloring works
+            _rctd_generic_key = "_".join(_rctd_lkey.split("_")[:2] + _rctd_lkey.split("_")[3:])
+            with core._annot_lock:
+                jobs._check_dataset_gen(_gen)
+                _split_publish_labels(core._annot_state, _split_labels, _rctd_lkey,
+                                      _rctd_generic_key, partial=bool(_cells_extra))
 
-            # ── 4. Shared genes ──────────────────────────────────────────────────
-            _set("running", "Finding shared genes…")
-            ro.r.assign("._split_rds", rds)
-            mat_r     = ro.r("SeuratObject::LayerData(._split_rds[['RNA']], layer='counts')")
-            ref_genes = list(ro.r['rownames'](mat_r))
-            shared_genes = sorted(set(panel_genes) & set(ref_genes))
-            if len(shared_genes) < 10:
-                _set("error", f"Only {len(shared_genes)} shared genes between reference and panel.")
-                return
-            print(f"  SPLIT: {len(shared_genes)} shared genes", flush=True)
-
-            # ── 5. Build Reference ───────────────────────────────────────────────
-            _set("running", f"Building RCTD Reference ({len(meta_df):,} ref cells)…")
-            ro.r.assign("._split_genes", ro.StrVector(shared_genes))
-            ro.r("""
-._split_ref_mat <- SeuratObject::LayerData(._split_rds[['RNA']], layer='counts')[._split_genes, , drop=FALSE]
-._split_ref_mat <- as(._split_ref_mat, 'dgCMatrix')
-._split_ref_mat@x <- as.numeric(round(._split_ref_mat@x))
-""")
-            ref_labels_r       = ro.StrVector(meta_df[label_col].astype(str).tolist())
-            ref_labels_r.names = ro.StrVector(list(meta_df.index.astype(str)))
-            ro.r.assign("._split_ref_labels", ref_labels_r)
-            ro.r("""
-._split_ref_factor <- as.factor(._split_ref_labels)
-._split_numi_ref   <- colSums(._split_ref_mat)
-._split_reference  <- spacexr::Reference(
-    counts      = ._split_ref_mat,
-    cell_types  = ._split_ref_factor,
-    nUMI        = ._split_numi_ref
-)
-""")
-
-            # ── 6. Build SpatialRNA (panel genes only) ───────────────────────────
-            _set("running", f"Building SpatialRNA object ({n_cells:,} cells)…")
-            # Subset expr_panel to shared genes
-            _panel_pos = {g: i for i, g in enumerate(panel_genes)}
-            shared_idx = [_panel_pos[g] for g in shared_genes if g in _panel_pos]
-            shared_genes_present = [g for g in shared_genes if g in _panel_pos]
-            expr_shared = expr_panel[:, shared_idx]  # cells × shared_genes
-            # gene × cells dgCMatrix for R, built from the sparse parts
-            cell_ids = [str(c) for c in cells_df.index]
-            _scipy_to_r_dgc(expr_shared, shared_genes_present, cell_ids, "._split_counts_mat")
-
-            ro.r.assign("._split_x", ro.FloatVector(cells_df["x_centroid"].astype(float).tolist()))
-            ro.r.assign("._split_y", ro.FloatVector(cells_df["y_centroid"].astype(float).tolist()))
-            ro.r("""
-._split_coords <- data.frame(x=._split_x, y=._split_y)
-rownames(._split_coords) <- colnames(._split_counts_mat)
-._split_numi <- colSums(._split_counts_mat)
-._split_spatialrna <- spacexr::SpatialRNA(
-    coords  = ._split_coords,
-    counts  = ._split_counts_mat,
-    nUMI    = ._split_numi
-)
-""")
-
-            # ── 7. Run RCTD (doublet mode) — with caching ────────────────────────
-            # Compute a stable key for this RCTD run so we can skip it on re-runs.
-            _rctd_lkey = "labels_rctd_doublet"
-            if _alt_res is not None:
-                _rctd_tag  = hashlib.md5((_alt_res.get("out_dir", "")).encode()).hexdigest()[:8]
-                _rctd_tool = _alt_res.get("source", "baysor")
-                _rctd_lkey = f"labels_rctd_doublet_{_rctd_tool}_{_rctd_tag}"
-            # Under an active subset() the cell set is part of the key (full-dataset
-            # runs keep the old name). It goes before the labels key: _annot_autoload
-            # takes everything after the last "_labels_" in the file name as that key.
-            _cells_extra = ""
-            if (_alt_res is not None and "_cells_df_original" in _alt_res) or \
-                    (_alt_res is None and "_df_original" in core.DATA):
-                _cells_extra = (f"_n{len(cell_ids)}_"
-                                + hashlib.md5("\n".join(cell_ids).encode()).hexdigest()[:8])
-            # "_cmi5pp": SPLIT's RCTD configuration (CELL_MIN_INSTANCE=5 plus
-            # run_post_process_RCTD) differs from the annotation modal's doublet run,
-            # so the two do not share a cache file even with equal UMI thresholds.
-            _rctd_cache_key  = (f"rctd_{os.path.basename(rds_path)}_{caching._ref_file_tag(rds_path)}"
-                                f"_{label_col}_doublet"
-                                f"_umi{min_umi}_sig{min_umi_sigma}_cmi5pp{_cells_extra}_{_rctd_lkey}")
-            _rctd_cache_file = caching._cache_path(_rctd_cache_key)
-            _rctd_obj_file   = _rctd_cache_file.replace(".parquet", "_rctd_obj.rds")
-
-            _rctd_from_cache = False
-            if os.path.exists(_rctd_cache_file) and os.path.exists(_rctd_obj_file):
-                try:
-                    _cached_rctd = pd.read_parquet(_rctd_cache_file)
-                    _split_labels_cached = _cached_rctd["label"].astype(str)
-                    _split_labels_cached.index = _split_labels_cached.index.astype(str)
-                    # Every cached cell must belong to this run (RCTD drops low-UMI
-                    # cells, so the cache may hold fewer cells, never other ones).
-                    _sample = _split_labels_cached.index
-                    _overlap = int(_sample.isin(set(cell_ids)).sum())
-                    if len(_sample) > 0 and _overlap == len(_sample):
-                        # path passed as a value (it contains the reference's file name)
-                        ro.globalenv["._split_rctd_path"] = _rctd_obj_file
-                        ro.r('._split_rctd <- readRDS(._split_rctd_path); rm(._split_rctd_path)')
-                        _split_labels = _split_labels_cached
-                        _rctd_from_cache = True
-                        _set("running", "RCTD loaded from cache, running SPLIT::purify()…")
-                        print("  SPLIT: RCTD loaded from cache", flush=True)
-                    else:
-                        print(f"  SPLIT: RCTD cache index mismatch ({_overlap}/{len(_sample)}) — re-running", flush=True)
-                except Exception as _ce:
-                    print(f"  SPLIT: RCTD cache load failed: {_ce}", flush=True)
-
-            if not _rctd_from_cache:
-                _set("running", f"Running RCTD doublet mode (max_cores={max_cores})… [~20-40 min]")
-                print("  SPLIT: starting RCTD doublet mode…", flush=True)
-                ro.r.assign("._split_max_cores",    ro.IntVector([max_cores]))
-                ro.r.assign("._split_min_umi",      ro.IntVector([min_umi]))
-                ro.r.assign("._split_min_umi_sigma", ro.IntVector([min_umi_sigma]))
-                ro.r("""
-options(mc.cores = ._split_max_cores[1])
-cat("  SPLIT R: detected cores =", parallel::detectCores(),
-    "| requesting =", ._split_max_cores[1], "\n")
-._split_rctd <- spacexr::create.RCTD(._split_spatialrna, ._split_reference,
-    max_cores=._split_max_cores[1], CELL_MIN_INSTANCE=5,
-    UMI_min=._split_min_umi[1], UMI_min_sigma=._split_min_umi_sigma[1])
-._split_rctd <- spacexr::run.RCTD(._split_rctd, doublet_mode='doublet')
-._split_rctd <- SPLIT::run_post_process_RCTD(._split_rctd)
-""")
-                # Save RCTD object + labels to cache for future re-runs.
-                # Use as.character() in R to avoid rpy2 converting factor levels to
-                # integer codes (which would show numbers instead of cell type names).
+        def _on_r_event(name, data):
+            """Intermediate results of the R step (rworker._rw_split), as they arrive."""
+            if name == "rctd_from_cache":
+                _publish_rctd_labels(_split_labels_cached)
+            elif name == "rctd_labels":
+                # RCTD is done and its object is saved: cache its labels for re-runs
                 jobs._check_dataset_gen(_gen)
                 try:
-                    ro.globalenv["._split_rctd_path"] = _rctd_obj_file
-                    ro.r('saveRDS(._split_rctd, ._split_rctd_path); rm(._split_rctd_path)')
-                    ro.r("""
-._split_rctd_res   <- ._split_rctd@results$results_df
-._split_rctd_types <- as.character(._split_rctd_res$first_type)
-names(._split_rctd_types) <- rownames(._split_rctd_res)
-""")
-                    _types_r = ro.r("._split_rctd_types")
-                    _names_r = ro.r("names(._split_rctd_types)")
                     _split_labels = pd.Series(
-                        list(_types_r), index=list(_names_r), name="label"
+                        list(data["types"]), index=list(data["cell_ids"]), name="label"
                     ).astype(str)
                     pd.DataFrame({"label": _split_labels}).to_parquet(_rctd_cache_file)
                     print(f"  SPLIT: RCTD cached ({len(_split_labels.unique())} types)", flush=True)
                 except Exception as _se:
                     print(f"  SPLIT: RCTD cache save failed: {_se}", flush=True)
-                    _split_labels = None
+                    return
+                _publish_rctd_labels(_split_labels)
 
-            # Store RCTD labels in _annot_state so cell-type coloring works
-            if _split_labels is not None:
-                _rctd_generic_key = "_".join(_rctd_lkey.split("_")[:2] + _rctd_lkey.split("_")[3:])
-                with core._annot_lock:
-                    jobs._check_dataset_gen(_gen)
-                    _split_publish_labels(core._annot_state, _split_labels, _rctd_lkey,
-                                          _rctd_generic_key, partial=bool(_cells_extra))
-
-            print("  SPLIT: RCTD done, running purify()…", flush=True)
-
-            # ── 8. Run SPLIT::purify ─────────────────────────────────────────────
-            _set("running", "Running SPLIT::purify()…")
-            # Full counts matrix (all panel genes) gene × cells
-            _scipy_to_r_dgc(expr_panel, list(panel_genes), cell_ids, "._split_full_counts")
-            ro.r.assign("._split_do_purify_singlets", ro.BoolVector([purify_singlets]))
-            ro.r("""
-._split_res <- SPLIT::purify(
-    counts          = ._split_full_counts,
-    rctd            = ._split_rctd,
-    DO_purify_singlets = ._split_do_purify_singlets[1]
-)
-._split_purified <- ._split_res$purified_counts
-""")
-
-            # ── 9. Convert back to Python ────────────────────────────────────────
-            _set("running", "Converting corrected counts to Python…")
-            purified_r = ro.r["._split_purified"]
-            # Extract cell IDs from R colnames — RCTD may drop low-UMI cells
-            try:
-                corrected_cell_ids = list(ro.r['colnames'](purified_r))
-            except Exception:
-                corrected_cell_ids = None
-            # purify() returns only the genes RCTD used (panel ∩ reference), not the panel
-            try:
-                corrected_gene_ids = list(ro.r['rownames'](purified_r))
-            except Exception:
-                corrected_gene_ids = None
-            # Convert dgCMatrix → scipy CSR (cells × genes)
-            purified_csr_t = _r_dgcmatrix_to_scipy(purified_r)  # gene × cells
+        # ── 3.-9. R: reference, RCTD (doublet mode), SPLIT::purify ───────────
+        # In the R worker process of this job (rworker._rw_split), so that Cancel stops
+        # R at once; inside the app with XENIUM_R_INPROCESS=1.
+        _r_out = rworker._rw_call(
+            rworker._rw_split,
+            {"rds_path": rds_path, "label_col": label_col, "panel_genes": list(panel_genes),
+             "expr": sp_.csr_matrix(expr_panel), "cell_ids": cell_ids,
+             "x": cells_df["x_centroid"].to_numpy(dtype=np.float64),
+             "y": cells_df["y_centroid"].to_numpy(dtype=np.float64),
+             "max_cores": max_cores, "min_umi": min_umi, "min_umi_sigma": min_umi_sigma,
+             "purify_singlets": bool(purify_singlets), "rctd_obj_file": _rctd_obj_file,
+             "rctd_cached": _split_labels_cached is not None},
+            on_progress=lambda _m, _f=None: _set("running", _m), on_event=_on_r_event,
+            r_packages=("spacexr", "SPLIT", "Seurat", "SeuratObject"),
+            on_note=lambda _n: print(f"  SPLIT: {_n}", flush=True))
+        corrected_cell_ids, corrected_gene_ids = _r_out["cell_ids"], _r_out["gene_ids"]
+        purified_csr_t = _r_out["purified"]                   # gene × cells
         corrected_mat  = purified_csr_t.T.tocsr()             # cells × genes
         corrected_mat.data = np.clip(corrected_mat.data, 0, None)
         if corrected_gene_ids is not None and corrected_gene_ids != list(panel_genes):
@@ -797,11 +622,15 @@ names(._split_rctd_types) <- rownames(._split_rctd_res)
 
     except jobs._JobCancelled:
         raise                      # reported by _job_finish, not an error
-    except Exception:
+    except rworker._RwRefused as _exc:
+        _set("error", str(_exc))   # a missing R package, label column, …: the message as it is
+    except Exception as _exc:
         import traceback
         msg = traceback.format_exc()
         print(f"  SPLIT ERROR:\n{msg}", flush=True)
+        # an error raised in the R worker is reported by its own last traceback line
+        _last = (getattr(_exc, "formatted", "") or msg).strip().splitlines()[-1]
         with core._split_lock:
             if not jobs._stale_job(_gen, "error"):
                 core._split_state["status"]  = "error"
-                core._split_state["message"] = msg.strip().splitlines()[-1]
+                core._split_state["message"] = _last

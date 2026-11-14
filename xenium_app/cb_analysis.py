@@ -6,7 +6,7 @@ import dash
 from dash import Input, Output, State, ClientsideFunction
 import time as _time
 
-from . import provenance
+from . import provenance, rworker
 from . import core, jobs, dataview, analysis, stats, regions, proximity, app_layout, cb_spatial
 
 
@@ -242,9 +242,7 @@ def run_de(n_clicks, group_a, group_b, seg_source, method, color_by, counts_mode
                             state=analysis._de_state, lock=analysis._de_lock)
             return True, False, "Running…"
         try:
-            import rpy2.robjects.conversion as _rconv
-            import rpy2.robjects as _ro_mod
-            _rconv.set_conversion(_ro_mod.default_converter)
+            rworker._rw_thread_setup()     # R itself runs in the job's R worker process
         except Exception as exc:
             return False, True, f"rpy2 / R is not available ({exc}). " + stats._PB_INSTALL_HINT
         if not _an_job_claim(analysis._de_state, analysis._de_lock):
@@ -261,9 +259,7 @@ def run_de(n_clicks, group_a, group_b, seg_source, method, color_by, counts_mode
             return False, True, "Pick the cell population to sum the counts over."
         # rpy2 conversion rules for this thread, so the job's context copy carries them
         try:
-            import rpy2.robjects.conversion as _rconv
-            import rpy2.robjects as _ro_mod
-            _rconv.set_conversion(_ro_mod.default_converter)
+            rworker._rw_thread_setup()     # R itself runs in the job's R worker process
         except Exception as exc:
             return False, True, f"rpy2 / R is not available ({exc}). " + stats._PB_INSTALL_HINT
         if not _an_job_claim(analysis._de_state, analysis._de_lock):
@@ -390,7 +386,9 @@ def download_de_table(n_clicks):
               f"segmentation: {res['seg_source']}; Wilcoxon rank-sum on log1p(CP10K), cells as "
               f"observations; BH FDR\n"
               f"# unit of the p-values: {res.get('units_note', '')}\n"
-              f"# median counts per cell: A {res.get('median_counts_a', float('nan')):.0f}, "
+              + (f"# library size of a cell: its total over the {res['lib_shared_genes']} genes shared by the "
+                 f"pooled samples (their panels differ)\n" if res.get("lib_shared_genes") else "")
+              + f"# median counts per cell: A {res.get('median_counts_a', float('nan')):.0f}, "
               f"B {res.get('median_counts_b', float('nan')):.0f}; pct_a / pct_b: cells with count >= 1 "
               f"transcript; rate_a / rate_b: sum of counts / sum of total counts of the group x 10,000; "
               f"low_count: fewer than {analysis._DE_RATE_MIN_COUNT} transcripts of the gene over both groups\n"

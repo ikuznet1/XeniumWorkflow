@@ -558,7 +558,7 @@ def test_methods_text_does_not_overclaim(xe):
     ["baysor", "proseg", "imgseg", "patches", "annotation", "split", "spage", "umap", "spatial", "niches", "de",
      "pseudobulk", "proximity", "contact", "geneset", "density", "composition", "moran", "lr", "lrdecomp",
      "compartments", "spillover", "segqc", "coloc", "aggregates", "segfree", "banksy", "joint", "txfactor",
-     "h5ad", "save", "cellnest"]))
+     "h5ad", "save", "cellnest", "session"]))
 def test_every_kind_gives_a_record_and_a_methods_paragraph(xe, prov_dir, kind):
     """Fabricated call of the one helper for each analysis kind: required fields, and a
     template that renders from what the record holds."""

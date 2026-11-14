@@ -15,6 +15,7 @@ from . import txfactor
 from . import lrdecomp
 from . import provenance
 from . import figures
+from . import session
 
 
 with core._spage_lock:
@@ -33,6 +34,7 @@ else:
 sidebar = html.Div([
     # Header + collapsible tissue info (rebuilt dynamically on dataset change)
     html.Div(id="tissue-info-content"),
+    session._session_sidebar_entry(),      # Session: save / restore… (session.py, cb_session.py)
 
     html.Hr(style={"borderColor": core.BORDER, "margin": "0 0 14px 0"}),
 
@@ -1588,6 +1590,8 @@ dbc.Modal([
        style={"color": core.TEXT},
        content_style={"backgroundColor": core.DARK_BG, "color": core.TEXT},
        backdrop=True),
+
+    session._session_modal(),
 
     html.Div([
         # ── Hover-reveal sidebar ──────────────────────────────────────────────

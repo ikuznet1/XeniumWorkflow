@@ -9,6 +9,7 @@ import {
 } from './colormap.js';
 import {pointsInPolygon, PointGrid} from './spatial.js';
 import {RegionLoader} from './region.js';
+import {buildScene, DEFAULT_MAX_VECTOR, planFigure, scaleBarLength, sceneToPdf, sceneToSvg} from './figure.js';
 
 const VERSION = '0.1.0';
 const SETTLE_MS = 150;
@@ -1362,7 +1363,7 @@ class Viewer {
   /**
    * The current view as a 2D canvas at `scale` x the on-screen (CSS) resolution: the WebGL
    * frame, then overlay labels, the legend and (scaleBar) a scale bar drawn on top.
-   * Raster only: the cells are drawn by the GPU, there is no vector form of the frame.
+   * Raster only (the frame the GPU drew); exportFigure() writes the vector formats.
    */
   snapshot({scale = 2, scaleBar = true, unit = 'µm'} = {}) {
     const [w, h] = this._size();
@@ -1419,29 +1420,35 @@ class Viewer {
     return out;
   }
 
-  /** The legend boxes as on screen (top right), drawn on a 2D context in CSS pixels. */
-  _drawLegend(g, w, h, font) {
+  /** What the legend shows: [{kind, title, rows: [{name, color}]} | {kind, title, range, cmap}] (hidden categories left out). */
+  _legendBoxes() {
     const boxes = [];
     const col = this._shownColors();
     if (col && col.header.kind === 'continuous') {
-      boxes.push({title: col.header.label || '', range: this._colorRange()});
+      boxes.push({kind: 'continuous', title: col.header.label || '', range: this._colorRange(), cmap: this._colormap()});
     } else if (col && col.header.kind === 'categorical') {
       const hidden = new Set(this.state.hiddenCategories);
       const rows = [];
       (col.header.categories || []).forEach((name, i) => {
         if (!hidden.has(name)) rows.push({name, color: (col.header.colors || [])[i] || '#808080'});
       });
-      boxes.push({title: col.header.label || '', rows});
+      boxes.push({kind: 'categorical', title: col.header.label || '', rows});
     }
     const dens = this._densityData();
     if (dens && this._densityPalette(dens)) {
-      boxes.push({title: dens.header.label || 'Transcript density',
+      boxes.push({kind: 'density', title: dens.header.label || 'Transcript density',
         rows: this._densityPalette(dens).map((color, i) => ({name: (dens.header.names || [])[i] || String(i + 1), color}))});
-    } else if (dens) boxes.push({title: dens.header.label || 'Transcript density', range: [0, this._densityMax()], cmap: 'magma'});
+    } else if (dens) boxes.push({kind: 'density', title: dens.header.label || 'Transcript density', range: [0, this._densityMax()], cmap: 'magma'});
     const genes = (this.state.transcripts.genes || []).filter(Boolean);
     if (genes.length) {
-      boxes.push({title: this._txTitle(), rows: genes.map((name, i) => ({name, color: TX_PALETTE[i % TX_PALETTE.length]}))});
+      boxes.push({kind: 'transcripts', title: this._txTitle(), rows: genes.map((name, i) => ({name, color: TX_PALETTE[i % TX_PALETTE.length]}))});
     }
+    return boxes;
+  }
+
+  /** The legend boxes as on screen (top right), drawn on a 2D context in CSS pixels. */
+  _drawLegend(g, w, h, font) {
+    const boxes = this._legendBoxes();
     const W = 200, ROW = 16, PAD = 8;
     let y = 8;
     for (const box of boxes) {
@@ -1487,6 +1494,107 @@ class Viewer {
       if (more) g.fillText(`… ${more} more`, x + PAD + 16, ry + ROW / 2);
       y += bh + 6;
     }
+  }
+
+  // ── figure export (SVG / PDF / PNG) ─────────────────────────────────────────
+  /** Plain data of what is drawn right now, for figure.js (see planFigure). */
+  _figureView() {
+    const [w, h] = this._size();
+    const s = this.state;
+    const L = this._layers;
+    const view = {
+      width: w, height: h, scale: this._scale(), target: [this.viewState.target[0], this.viewState.target[1]],
+      background: s.background, cells: null, boundaries: [], transcripts: null,
+      overlays: s.overlays || {}, labels: [],
+      // the on-screen title counts the transcripts loaded around the view, not those in it
+      legend: this._legendBoxes().map((b) => (b.kind === 'transcripts' ? {...b, title: 'Transcripts'} : b)),
+    };
+    if (L.cells && this._cells && this._rgba) {
+      const size = Math.max(0.5, +s.pointSize || 3);
+      view.cells = {n: this._cells.n, xy: this._cells.xy, rgba: this._rgba, radiusUm: CELL_RADIUS_UM, minPx: size / 2, maxPx: size * 2.5,
+        opacity: Math.max(0, Math.min(1, +s.opacity))};
+    }
+    for (const kind of ['nucleus', 'cell', 'proseg', 'baysor', 'imgseg']) { // the order of _render
+      const d = this._loaders[kind].data;
+      if (!L[kind] || !d || !d.header.n || !d.arrays.xy) continue;
+      view.boundaries.push({kind, label: BOUNDARY_STYLE[kind].label, color: BOUNDARY_STYLE[kind].color, n: d.header.n,
+        start: d.arrays.start, xy: d.arrays.xy});
+    }
+    const tx = this._loaders.tx.data;
+    if (L.tx && tx && tx.header.n && tx.arrays.xy && tx.rgba) {
+      view.transcripts = {n: tx.header.n, xy: tx.arrays.xy, rgba: tx.rgba, radiusPx: Math.max(0.5, +s.transcripts.size || 2) / 2};
+    }
+    for (const it of this._labelItems || []) {
+      view.labels.push({x: it.x, y: it.y, text: it.node.textContent, color: getComputedStyle(it.node).color});
+    }
+    return view;
+  }
+
+  /**
+   * The layers `keep(rootLayerId)` accepts, drawn alone on a transparent 2D canvas at
+   * `scale` x the CSS resolution (same technique as snapshot()).
+   */
+  _renderRaster(keep, scale) {
+    const [w, h] = this._size();
+    const out = document.createElement('canvas');
+    out.width = Math.round(w * scale);
+    out.height = Math.round(h * scale);
+    const g = out.getContext('2d');
+    const rootId = (layer) => {
+      while (layer.parent) layer = layer.parent;
+      return layer.id;
+    };
+    this.deck.setProps({useDevicePixels: scale, layerFilter: ({layer}) => keep(rootId(layer))});
+    try {
+      this.deck.redraw('export');
+      g.drawImage(this.canvas, 0, 0, out.width, out.height);
+    } finally {
+      this.deck.setProps({useDevicePixels: true, layerFilter: null});
+      this.deck.redraw('export');
+    }
+    return {href: out.toDataURL('image/png'), pw: out.width, ph: out.height, getRgba: () => g.getImageData(0, 0, out.width, out.height).data};
+  }
+
+  /**
+   * The current view as a figure file: cells, boundaries, transcripts and overlays as vector
+   * shapes, scale bar and legend as vector shapes and text, the image and density layers as
+   * an embedded image. A layer with more than `maxVector` elements in view is embedded as an
+   * image as well (info.rasterized names it), so the file stays bounded.
+   * @param {object} o format: 'svg' | 'pdf' | 'png'; scale: pixel scale (1 … 4) of embedded
+   *   images and of the PNG; maxVector; background (CSS colour, default: the view's); title
+   * @returns {Promise<{blob: Blob, filename: string, format: string, info: object}>}
+   */
+  async exportFigure({format = 'svg', scale = 2, maxVector = DEFAULT_MAX_VECTOR, background, title} = {}) {
+    format = String(format).toLowerCase();
+    if (!['svg', 'pdf', 'png'].includes(format)) throw new Error(`exportFigure: unknown format ${format}`);
+    await Promise.race([this.whenIdle(), new Promise((r) => setTimeout(r, 5000))]); // a hidden tab has no animation frames
+    const [w, h] = this._size();
+    if (this._destroyed || !w || !h) throw new Error('exportFigure: the view has no size');
+    scale = Math.max(1, Math.min(4, +scale || 2));
+    const view = this._figureView();
+    const plan = planFigure(view, {maxVector});
+    const rasters = {};
+    const isUnder = (id) => !id.startsWith('xv-') || id.startsWith('xv-density');
+    if ((this.deck.props.layers || []).some((l) => l && isUnder(l.id))) rasters.underlay = this._renderRaster(isUnder, scale);
+    for (const key of plan.raster) {
+      const id = key === 'cells' ? 'xv-cells' : key === 'transcripts' ? 'xv-transcripts' : `xv-boundary-${key.slice(9)}`;
+      rasters[key] = this._renderRaster((x) => x === id, scale);
+    }
+    const opts = {};
+    if (title) opts.title = title;
+    if (background !== undefined) opts.background = background;
+    const scene = buildScene(view, plan, rasters, opts);
+    const info = {...scene.info, format, width: scene.width, height: scene.height, title: scene.title};
+    let blob;
+    if (format === 'pdf') {
+      blob = new Blob([await sceneToPdf(scene)], {type: 'application/pdf'});
+    } else {
+      const svg = new Blob([sceneToSvg(scene)], {type: 'image/svg+xml'});
+      blob = format === 'svg' ? svg : await svgToPng(svg, scene.width, scene.height, scale);
+      if (format === 'png') info.pixels = [Math.round(scene.width * scale), Math.round(scene.height * scale)];
+    }
+    info.bytes = blob.size;
+    return {blob, filename: `xenium_figure.${format}`, format, info};
   }
 
   // ── teardown ────────────────────────────────────────────────────────────────
@@ -1542,6 +1650,32 @@ function clip(g, text, width) {
   return text + '…';
 }
 
+/** An SVG file drawn on a canvas at `scale` x its size and encoded as PNG. */
+function svgToPng(svgBlob, width, height, scale) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(svgBlob);
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const c = document.createElement('canvas');
+        c.width = Math.round(width * scale);
+        c.height = Math.round(height * scale);
+        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+        c.toBlob((b) => (b ? resolve(b) : reject(new Error('exportFigure: PNG encoding failed'))), 'image/png');
+      } catch (err) {
+        reject(err);
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error('exportFigure: the figure could not be rasterized'));
+    };
+    img.src = url;
+  });
+}
+
 function boundsOf(xy, n) {
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
   for (let i = 0; i < n; i++) {
@@ -1568,6 +1702,7 @@ function mount(element, opts) {
     destroy: () => v.destroy(),
     setExtraLayers: (fn) => v.setExtraLayers(fn),
     snapshot: (opts) => v.snapshot(opts),
+    exportFigure: (opts) => v.exportFigure(opts),
     // extras
     whenIdle: () => v.whenIdle(),
     getStatus: () => v.getStatus(),
@@ -1585,6 +1720,8 @@ if (typeof window !== 'undefined') {
     mount,
     version: VERSION,
     util: {parseBin, packBin, pointsInPolygon},
+    // the figure writers behind exportFigure() (pure functions; see src/figure.js)
+    figure: {buildScene, planFigure, scaleBarLength, sceneToPdf, sceneToSvg, DEFAULT_MAX_VECTOR},
     // The layer classes of THIS bundle's deck.gl copy, for building setExtraLayers() layers.
     // Layers created from another copy of deck.gl must not be mixed in.
     layers: {ScatterplotLayer, PathLayer, PolygonLayer, LineLayer, BitmapLayer},

@@ -250,6 +250,16 @@ def run_reseg_modal(n_clicks, algo, patches_confirmed,
                    state=core._baysor_state, lock=core._baysor_lock)
         return "Baysor starting…", False, False, no_update
     else:  # proseg
+        # the request's values are converted before anything starts: numbers as numbers,
+        # the free-text schedule as a short list of positive integers (nothing else may
+        # reach the Proseg command line)
+        try:
+            pschedule = reseg._proseg_schedule(pschedule)
+            pvoxel = float(pvoxel) if pvoxel not in (None, "") else None
+            pthreads = int(pthreads) if pthreads not in (None, "") else None
+        except (TypeError, ValueError) as exc:
+            _why = str(exc) if str(exc).startswith("Sampler schedule") else "voxel size and threads must be numbers."
+            return f"✗ Proseg not started: {_why}", no_update, no_update, no_update
         with core._proseg_lock:
             if core._proseg_state["status"] == "running":
                 return "Already running…", True, no_update, False
@@ -263,7 +273,7 @@ def run_reseg_modal(n_clicks, algo, patches_confirmed,
                    kwargs=dict(voxel_size=pvoxel, n_threads=pthreads,
                                n_samples=int(psamples) if psamples else 10,
                                recorded_samples=int(precorded_samples) if precorded_samples else None,
-                               schedule=pschedule.strip() if pschedule else None,
+                               schedule=pschedule,
                                nuclear_reassign_prob=float(pnuclear_prob) if pnuclear_prob is not None else None,
                                prior_seg_prob=float(pprior_seg_prob) if pprior_seg_prob is not None else None,
                                prior_type=pprior_type or "nucleus",

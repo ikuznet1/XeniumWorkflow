@@ -216,6 +216,8 @@ def _batch_components() -> dict:
 
 
 def _batch_default(cid, prop):
+    if prop == "value" and cid in (_batch_memo.get("session") or {}):
+        return _batch_memo["session"][cid]          # a restored session (config key `session`)
     comp = _batch_components().get(cid)
     return getattr(comp, prop, None) if comp is not None else None
 
@@ -232,12 +234,13 @@ def _batch_coerce(cid, prop, value):
 
 
 def _batch_context(cfg) -> dict:
-    counts = str(cfg.get("counts") or "original").lower()
+    _ses = _batch_memo.get("session") or {}          # the config's own keys come first
+    counts = str(cfg.get("counts") or _ses.get("counts-mode") or "original").lower()
     if counts not in ("original", "corrected"):
         raise _BatchError(f"counts: '{counts}' is not 'original' or 'corrected'")
     core._active_counts_mode = counts
     methods = list(core.DATA.get("cluster_methods") or [])
-    return {"seg-source": cfg.get("seg_source") or "xenium", "counts-mode-store": counts,
+    return {"seg-source": cfg.get("seg_source") or _ses.get("seg-source") or "xenium", "counts-mode-store": counts,
             "cluster-method": cfg.get("cluster_method") or _batch_default("cluster-method", "value")
             or (methods[0] if methods else None),
             "color-by": cfg.get("color_by") or _batch_default("color-by", "value")}
@@ -320,7 +323,7 @@ def _batch_norm_config(cfg) -> dict:
     if not isinstance(cfg, dict):
         raise _BatchError("the config must be a mapping (data, output_dir, steps, …)")
     known = {"data", "cache_dir", "output_dir", "steps", "continue_on_error", "seg_source", "counts",
-             "cluster_method", "color_by", "figures", "tables"}
+             "cluster_method", "color_by", "figures", "tables", "session"}
     extra = set(cfg) - known
     if extra:
         raise _BatchError(f"unknown top-level key(s): {', '.join(sorted(map(str, extra)))} "
@@ -386,8 +389,29 @@ def _batch_check_data(cfg) -> None:
             f"package is imported: run 'python -m xenium_app.batch <config>' (a new process per config).")
 
 
-def _batch_setup_samples(cfg, log) -> None:
-    """Extra samples and the design, through the functions the app's dialogs use."""
+def _batch_resolve_sample(ref, rows):
+    """The loaded sample a design entry names, by precedence: the label (S0, S1, …), then
+    the path / dataset key, then the name or the folder name. A name that fits several
+    samples is an error (it used to pick the first, and one sample's name could shadow
+    another sample's label). None when nothing fits."""
+    ref = str(ref).strip()
+    hit = [r for r in rows if str(r["label"]) == ref]
+    if not hit:
+        hit = [r for r in rows if str(r["key"]) == ref or _batch_same_path(ref, r["key"])]
+    if not hit:
+        hit = [r for r in rows
+               if ref in (str(r["name"]), os.path.basename(str(r["key"]).rstrip("/")))]
+    if len(hit) > 1:
+        raise _BatchError(f"data.design: '{ref}' fits several loaded samples "
+                          f"({', '.join(x['label'] + '=' + str(x['name']) for x in hit)}): "
+                          f"name the sample by its label (S0, S1, …) or its path")
+    return hit[0] if hit else None
+
+
+def _batch_setup_samples(cfg, log, save: bool = True) -> None:
+    """Extra samples and the design, through the functions the app's dialogs use.
+    save=False (a dry run): the design is applied in memory for the validation, and the
+    design file saved for these samples is not replaced."""
     data = cfg["data"]
     cb_data = _batch_module("cb_data")
     for p in data.get("extra_samples") or []:
@@ -401,21 +425,21 @@ def _batch_setup_samples(cfg, log) -> None:
     design = data.get("design")
     if design:
         rows = stats._design_samples()
-        by = {}
-        for r in rows:
-            for k in (r["label"], r["name"], r["key"], os.path.basename(str(r["key"]).rstrip("/"))):
-                by.setdefault(str(k), r)
-        new = []
+        new, seen = [], {}
         names = design.get("names") or {}
         # names as text: YAML reads `A: 1` / `B: no` as a number / a boolean
         names = {c: str(names[c]).strip() for c in ("A", "B") if names.get(c) is not None and str(names[c]).strip()}
         for d in design.get("samples") or []:
             if not isinstance(d, dict) or "sample" not in d:
                 raise _BatchError("data.design.samples: each entry needs 'sample' (S0, S1, …, a name or a path)")
-            r = by.get(str(d["sample"])) or next((x for x in rows if _batch_same_path(d["sample"], x["key"])), None)
+            r = _batch_resolve_sample(d["sample"], rows)
             if r is None:
                 raise _BatchError(f"data.design: no loaded sample '{d['sample']}' "
                                   f"(loaded: {', '.join(x['label'] + '=' + x['name'] for x in rows)})")
+            if r["key"] in seen:
+                raise _BatchError(f"data.design: '{seen[r['key']]}' and '{d['sample']}' both name the sample "
+                                  f"{r['label']}={r['name']}: list every sample once")
+            seen[r["key"]] = d["sample"]
             # presence, not truthiness: a condition written as 0 or false is a condition
             raw = d.get("condition")
             asked = "" if raw is None else str(raw).strip()
@@ -433,8 +457,39 @@ def _batch_setup_samples(cfg, log) -> None:
         new += [{"key": r["key"], "cond": "", "batch": "", "donor": ""} for r in rows if r["key"] not in listed]
         with stats._design_lock:
             stats._design_state["names"].update({"A": "A", "B": "B"})
-        stats._design_set(new, names)
-        log("  design: " + stats._design_summary())
+        stats._design_set(new, names, save=save)
+        log("  design: " + stats._design_summary()
+            + ("" if save else " (dry run: the saved design of these samples is not replaced)"))
+
+
+def _batch_apply_session(cfg, log, save: bool = True) -> None:
+    """Config key ``session``: a session file (session.py) applied before the steps,
+    through the same restore the Session dialog runs. Its control values become the
+    defaults of the steps (a step's own params and the config's top-level keys still come
+    first); a design given under data.design replaces the session's. save=False (a dry
+    run): the session's state is applied in memory for the validation; no cache file,
+    store or provenance record is written."""
+    _batch_memo.pop("session", None)
+    path = cfg.get("session")
+    if not path:
+        return
+    ses = _batch_module("session")
+    try:
+        with open(os.path.expanduser(str(path)), "rb") as fh:
+            doc = ses._session_parse(fh.read(ses._SESSION_MAX_BYTES + 1))
+    except OSError as exc:
+        raise _BatchError(f"session: cannot read {path}: {exc}") from None
+    except ses._SessionError as exc:
+        raise _BatchError(f"session: {path}: {exc}") from None
+    if cfg["data"].get("design") and isinstance(doc.get("state"), dict):
+        doc["state"].pop("design", None)
+        log("  session: its sample design is not used (the config gives data.design)")
+    report = ses._session_restore(doc, None, "batch config", echo=False, persist=save)
+    if not report["ok"]:
+        raise _BatchError(f"session: {report['refused']}")
+    for line in report["text"].splitlines():
+        log("  session: " + line)
+    _batch_memo["session"] = dict(report["controls"])
 
 
 def _batch_wait(job, kind, log) -> None:
@@ -512,11 +567,19 @@ def _batch_cell_table(kind, resolved, ctx) -> "pd.DataFrame | None":
         elif kind == "niches":
             cols = [c for c in df.columns if str(c) == "niche"]
         elif kind == "clustering":
-            cols = [c for c in df.columns if str(c) in ("umap_1", "umap_2") or str(c).startswith("cluster")]
+            # the embedding the step computed: with corrected counts the job writes
+            # split_umap_1/2 and leaves umap_1/2 (an earlier original-counts embedding) alone
+            # (which of the two the job says in its record; the requested mode otherwise)
+            _rec = next((r for r in reversed(provenance._prov_recent) if r.get("kind") == "umap"), None)
+            _said = str(((_rec or {}).get("headline") or {}).get("embedding_columns") or "")
+            _corr = (_said.startswith("split_umap") if _said else
+                     (resolved.get("counts-mode-store") or ctx.get("counts-mode-store")) == "corrected")
+            _emb = ("split_umap_1", "split_umap_2") if _corr else ("umap_1", "umap_2")
+            cols = [c for c in df.columns if str(c) in _emb or str(c).startswith("cluster")]
         else:
             cols = []
         if not cols:
-            return None
+            continue        # a sample without the columns (the job wrote another sample's) is left out
         for c in cols:
             out[str(c)] = df[c].to_numpy()
         parts.append(out)
@@ -898,7 +961,8 @@ def _batch_run(cfg: dict, dry_run: bool = False, log=None) -> dict:
     log = log or (lambda s: print(s, flush=True))
     cfg = _batch_norm_config(cfg)
     _batch_check_data(cfg)
-    _batch_setup_samples(cfg, log)
+    _batch_setup_samples(cfg, log, save=not dry_run)
+    _batch_apply_session(cfg, log, save=not dry_run)
     ctx = _batch_context(cfg)
     summary = {"ok": True, "dry_run": bool(dry_run), "data": cfg["data"]["path"], "steps": [],
                "errors": [], "warnings": [], "kaleido": _batch_kaleido()}

@@ -58,6 +58,7 @@ Works with standard Xenium panels (a few hundred genes) and with **Xenium Prime 
   - [Save as SpatialData](#save-as-spatialdata)
   - [Cell Subsetting](#cell-subsetting)
   - [Jobs panel: progress and Cancel](#jobs-panel-progress-and-cancel)
+  - [Sessions: save and restore](#sessions-save-and-restore)
   - [Server Log & Python REPL](#server-log--python-repl)
 - [Caching](#caching)
 - [Standalone Functions (`functions/`)](#standalone-functions-functions)
@@ -130,6 +131,7 @@ Useful start-up variants:
 XENIUM_RENDERER=webgl python xenium_explorer.py <bundle>     # start in the WebGL view
 XENIUM_PLOTLY_MAX_CELLS=1500000 python xenium_explorer.py …   # cells the Plotly map may draw (default 900,000)
 XENIUM_ENABLE_REPL=1  python xenium_explorer.py <bundle>     # enable the in-app Python REPL
+XENIUM_R_INPROCESS=1  python xenium_explorer.py <bundle>     # run R inside the app instead of in a worker process (see Jobs panel)
 python xenium_explorer.py path/to/exported.zarr              # open a store written by "Save as SpatialData"
 python xenium_explorer.py path/to/study.h5ad                 # an AnnData file, one sample per section (see below)
 ```
@@ -289,6 +291,7 @@ data:
       - {sample: S0, condition: treated, donor: d1}    # sample: S0 / S1 …, a name or a path
       - {sample: S1, condition: control, donor: d1}
 cache_dir: /scratch/cache           # the app's cache; also holds the provenance records
+session: my_session.json            # optional: a saved session applied before the steps (see Sessions)
 output_dir: /scratch/out
 seg_source: xenium                  # or a cached run: baysor:<tag>, proseg:<tag>, imgseg:<tag>
 counts: original                    # or corrected (SPLIT)
@@ -317,7 +320,9 @@ through the Run callbacks and once through the command and compares the tables e
 
 **Output.** One folder per step (`01_<name>/` …) with: the CSV of the tab's Download button
 (with its comment header), every table of the result as Parquet, per-cell results as
-`cells.parquet` (compartments, gene-set scores, annotation labels, niches), the tab's figures,
+`cells.parquet` (compartments, gene-set scores, annotation labels, niches, and for a `clustering`
+step the cluster columns with the embedding the step computed: `umap_1/2`, or `split_umap_1/2` with
+corrected counts), the tab's figures,
 `status.txt` (the analysis' status line) and `provenance.json`; at the top `provenance.json` and
 `methods.md` for the run (see [Methods and provenance record](#methods-and-provenance-record))
 and `batch_summary.json`. Figures are written as PNG when `kaleido` is installed; otherwise as
@@ -328,7 +333,11 @@ or its own `seg_source` parameter): a cached run is loaded before the step when 
 that tool, or none, is in memory, and a run that does not exist is an error — a step never falls
 back to the Xenium cells or to another run. `data.design` is the design of the run: it replaces
 the design saved for these samples (a sample it does not list is unassigned; a listed sample
-without `donor` or `batch` has none).
+without `donor` or `batch` has none). A `sample:` entry is matched to a loaded sample by its label
+first (`S0`, `S1`, …), then by its path, then by its name or folder name; a name that fits several
+samples, and two entries that name the same sample, are errors (name the sample by label or path).
+With `--dry-run` the design is applied in memory for the checks only: the design saved for these
+samples is not replaced.
 
 **Failures.** A failed step stops the run with the step's own message and exit code 1; with
 `continue_on_error: true` the remaining steps run and the exit code is still 1. Exit code 2: the
@@ -490,6 +499,8 @@ These rules hold for every analysis of the feature reference below; the feature 
 
 **Depth differences.** The DE status line and CSV give the median counts per cell of both groups and warn when they differ by more than 1.5×. The DE table also gives **Rate A / Rate B** (Σ counts ÷ Σ total counts of the group, per 10,000), which does not move with depth.
 
+**Library size when panels differ.** An analysis that pools the cells of several samples and tests the genes they share (cell-level differential expression, the pooled ligand–receptor score, gene-set scores) takes as the library size of a cell its total count over **those shared genes**, the same gene set for every cell. With one panel this is the whole panel and nothing changes. With different panels (a ~500-gene sample beside a 5K sample) a library over each sample's own panel would divide the cells of the larger panel by counts of genes the other sample never measured, lowering every shared gene in that sample for a reason that is not biology. Rate A / Rate B and the median counts per cell of the cell-level test, and the median counts per cell reported with a pseudobulk test, are over the same shared genes. Analyses that work within one sample (Moran's I, the per-sample part of proximity DE) use that sample's own panel. Pseudobulk tests are not affected: their size factors come from DESeq2 / edgeR on the sums over the shared genes.
+
 ## Features
 
 ### Sidebar
@@ -569,6 +580,12 @@ What it draws:
 - **Overlays**: SpatialData ROI and patch outlines, CellNEST edges with their colour and gray-out options, and RCTD weight pies.
 - **Multiple samples** side by side, with a dotted separator midway in each gap; boundaries, transcripts, image and UMAP remain primary-sample only, as in the Plotly view. Clicking a cell of any sample fills the cell-info panel; cells of an added sample are marked `[sample N: <folder>]`.
 - **PNG export**: the **PNG** button next to Pan / Lasso / Box downloads the current view at 2× with legend and scale bar.
+- **Figure export** (SVG, PDF, PNG): **Export figure** next to the PNG button opens a small panel with the format, a pixel scale (1× to 4×) and a vector limit, and saves `xenium_figure.svg`, `.pdf` or `.png`. The figure shows what is in view: cells as circles in their current colours and opacity (hidden categories left out), the boundary sets that are switched on as outlines, transcripts as dots, ROI outlines, ruler and other overlays, and the morphology image and the density layer as one embedded image beneath them. A scale bar of a round length (1, 2 or 5 × 10^k µm, at most a fifth of the width) is drawn at the lower left, and the legend is placed in a margin to the right of the map: the visible categories with their colours, or a colour bar with the name, minimum and maximum. Scale bar, legend and labels are always vector shapes and text.
+  - **Vector limit** (default 50,000, shown in the panel): a layer (cells, one boundary set, transcripts) with more elements in view than the limit is embedded as an image at the chosen scale instead of being written as shapes, so the file stays bounded (2.5 to 3 MB of SVG per 50,000 cells). The file says so in its title and description (`<title>` / `<desc>` in SVG, Title / Subject in PDF), and the panel and the status line report it. Zoom in, or raise the limit, to get every cell as a shape.
+  - **Units**: one figure unit is one CSS pixel of the view (one point in the PDF); the SVG root carries `data-um-per-px` and `data-viewport` (µm), and the scale bar carries `data-length-um`.
+  - **PDF**: written by the viewer itself (PDF 1.4, compressed, transparency for opacities, the colour bar as a shading). Text is set in Helvetica, which is referenced and not embedded; characters outside Windows-1252 (for example Greek or CJK category names) print as `?` in the PDF, while the SVG keeps them. A journal that requires embedded fonts needs the PDF re-saved from a vector editor, or the SVG.
+  - **PNG**: the same figure (map plus legend margin) rasterized at the chosen scale; the **PNG** button remains the quick snapshot with the on-screen legend.
+  - The image layer is exported as drawn at that moment (tiles still loading are missing). Exports are not recorded in the provenance log.
 
 Differences from the Plotly view: the Z-Level selector is disabled (the WebGL view reads the focus image); CellNEST arrowheads scale with edge length and edges have no hover text; gray-out dims every non-participating cell. CellNEST edges have so far been tested in this view with synthetic inputs only.
 
@@ -654,7 +671,7 @@ A **download button** (camera icon) appears on hover over each plot; exports as 
 
 **Statistics**
 
-- Expression is `log1p(count / library size × 10,000)`, where the library size is the cell's total count over the measured panel genes in the active counts mode.
+- Expression is `log1p(count / library size × 10,000)`, where the library size is the cell's total count over the measured panel genes in the active counts mode. When cells of samples with different panels are pooled, it is the total over the genes the samples share (see [Statistical conventions](#statistical-conventions)); the status line, the CSV header and the methods text then say so.
 - Test: two-sided Wilcoxon rank-sum (Mann–Whitney U) per gene, normal approximation with tie correction and continuity correction. The implementation ranks only the non-zero values of the sparse matrix (all zeros of a gene share one average rank) and is numerically identical to `scipy.stats.mannwhitneyu(method="asymptotic")`; `scanpy.tl.rank_genes_groups(method="wilcoxon", tie_correct=True)` gives the same statistic without the continuity correction.
 - `log2FC = log2((mean_A + 1) / (mean_B + 1))` of the group means of the normalised (not log-transformed) values, i.e. counts per 10,000 with a pseudocount of 1 (the Seurat definition). `% A` / `% B`: percentage of cells with at least one count.
 - FDR: Benjamini–Hochberg over all tested genes.
@@ -693,6 +710,7 @@ Tests that compare **samples** (pseudobulk differential expression, composition)
 - **Genes**: the genes shared by the samples assigned to A or B are tested; a sample marked *excluded* does not change the gene list. When the used samples share fewer genes than the largest panel among them, the status line says so.
 - **Volcano**: points are coloured by **FDR < 0.05 alone**, and the x axis is the unshrunken (MLE) log2FC by default; **Volcano x axis** switches to the shrunken estimate. (Before, the shrunken estimate was plotted and a significant gene shrunk to ~0 was drawn as not significant.)
 - **Model**: **DESeq2** through rpy2 — design `~ condition`, or `~ batch + condition` with batch labels; Wald test; independent filtering at alpha 0.05; log2 fold change **A / B**. The table gives the unshrunken (MLE) log2FC and, with **Shrink log2FC** ticked, the **apeglm**-shrunken one (DESeq2's `normal` prior when apeglm is not installed; the column and the volcano axis name the estimator, or say "unshrunken"). If DESeq2's dispersion trend cannot be fitted the gene-wise estimates are used and the status line says so.
+- **Where R runs**: the fit runs in an R worker process of the job, so **Cancel** stops it at once (see [Jobs panel](#jobs-panel-progress-and-cancel)); each run pays about 3 s for R and DESeq2 to load. `XENIUM_R_INPROCESS=1` fits inside the app instead; the results are identical.
 - **Without DESeq2**: **edgeR**'s quasi-likelihood F-test is used when edgeR is installed, and the result is labelled as such. With neither package the run is refused with the install hint (`BiocManager::install(c("DESeq2", "apeglm"))`). There is no fallback to a t-test.
 - **Refusals and warnings**: a condition with **fewer than 2 samples is refused**; with fewer than 3 the status line warns that the variance estimates are unreliable. A sample contributing fewer than **Min. cells / sample** (default 10) is dropped and named. Genes with a total count below **Min. total count / gene** (default 10) are not tested and counted in the status line, as are genes DESeq2 leaves without an adjusted p-value (they are not drawn in the volcano).
 - A Baysor / Proseg run is a single sample: pseudobulk needs the Xenium segmentation with several samples loaded.
@@ -1396,7 +1414,7 @@ Once complete:
 | Threads | `--nthreads` | all cores |
 | Components | `--ncomponents` | 10 |
 | Recorded samples | `--recorded-samples` | 100 |
-| Sampler schedule | `--schedule` | `150 150 300` |
+| Sampler schedule | `--schedule` | `150 150 300` (whole numbers of iterations only, separated by spaces or commas, at most 12 stages; anything else is refused before Proseg starts) |
 | Nuclear reassignment prob | `--nuclear-reassignment-prob` | 0.2 |
 | Prior seg reassignment prob | `--prior-seg-reassignment-prob` | 0.5 |
 
@@ -1619,8 +1637,10 @@ Every long-running job (Baysor, Proseg, Prepare Patches, cell type annotation, S
 | Baysor | patch *i* of *n*; inside a patch the stage Baysor logs and the percentage of its segmentation iterations (the stages before and after the iterations print no percentage and are shown at fixed marks) | the Baysor (Julia) process and its children are terminated at once |
 | Proseg | patch *i* of *n*; inside a patch the fraction of sampler iterations, read from Proseg's own progress bar (Proseg draws it on a terminal only, so the app runs it on a pseudo-terminal; without one the bar is missing and only the patch count advances) | the Proseg process is terminated at once |
 | Prepare Patches | step 1/3 SpatialData, 2/3 tissue ROI, 3/3 patches | stops after the current step (the sopa call in progress finishes first) |
-| CellTypist / Seurat / RCTD annotation | step text | stops after the current step |
-| SPLIT | step text | stops after the current step (an RCTD run in R cannot be interrupted) |
+| CellTypist / Seurat annotation | step text | stops after the current step |
+| RCTD annotation | step text | the R worker process is terminated at once |
+| SPLIT | step text | during the R step (RCTD, `purify()`) the R worker process is terminated at once; afterwards it stops after the current step |
+| Pseudobulk and contact-group differential expression | step text; label shuffle *i* of *n* | during a model fit the R worker process is terminated at once; otherwise at the next step |
 | SpaGE | step text; fraction of gene chunks during the imputation itself | stops after the current step / gene chunk |
 | Rerun UMAP, spatial analysis, niches, CellNEST load | step text (steps *k* of *n* for spatial analysis and niches) | stops after the current step |
 | Save as SpatialData | step text | only before the store is written |
@@ -1628,7 +1648,8 @@ Every long-running job (Baysor, Proseg, Prepare Patches, cell type annotation, S
 How cancelling works, and its limits:
 
 - **External tools** run in their own process group. Cancel sends `SIGTERM` to the group and `SIGKILL` five seconds later to whatever is left, so Julia and any child processes go with it. The tools are also stopped, and their working directories removed, when the app exits or is stopped with Ctrl-C, `SIGTERM` or `SIGHUP`; after `kill -9` of the app a running tool has to be stopped by hand.
-- **Python and R steps cannot be interrupted.** The job checks for a cancel request between steps, so the panel shows *cancelling after the current step…* until the step in progress returns. For RCTD (annotation or SPLIT) on a whole slide that step can take tens of minutes; reading a large Seurat reference, `sopa` reading the Xenium bundle or building patches, and a UMAP fit are other long single steps. `baysor --version`, which the app runs to find Baysor before the segmentation starts (Julia start-up), is also not interrupted.
+- **Long R steps run in a worker process, which Cancel terminates at once.** The pseudobulk and contact-group model fits (DESeq2 / edgeR), RCTD annotation and the R part of SPLIT (RCTD in doublet mode and `SPLIT::purify()`) run in a second Python process that loads R itself (`xenium_app/rworker.py`). It is a registered child process of the job like Baysor and Proseg: Cancel sends `SIGTERM` to its process group, R stops within a fraction of a second together with anything it started, the memory R held is returned to the system, the job ends as cancelled and publishes nothing. Input and result travel as JSON and `.npz` files in a private temporary directory that is removed when the step ends, is cancelled or fails, and when the app exits. Both paths run the same Python and R statements on the same values; a pseudobulk fit is bit-identical either way. The price is the start of the worker for each R step: about 0.3 s for R, plus the load time of the packages (about 3 s for DESeq2), which R inside the app pays only once per session; the contact-group test uses one worker for all its fits. If the worker cannot start, the step runs inside the app and the status line (pseudobulk, contact) or the server log (RCTD, SPLIT) says so. `XENIUM_R_INPROCESS=1` runs every R step inside the app as before; Cancel then waits for the R call in progress. The R package versions in the provenance record are read from the R that did the work, in either case.
+- **Python steps, and the R that still runs inside the app, cannot be interrupted.** The job checks for a cancel request between steps, so the panel shows *cancelling after the current step…* until the step in progress returns. Still inside the app: reading the Seurat reference for Seurat kNN annotation and for SpaGE (`readRDS` and the export of the shared-gene matrix, seconds to a few minutes for a large reference). `sopa` reading the Xenium bundle or building patches and a UMAP fit are other long single steps. `baysor --version`, which the app runs to find Baysor before the segmentation starts (Julia start-up), is also not interrupted.
 - **Nothing half-written is kept.** A Baysor/Proseg run works in `<run directory>.partial` and gets its real name only when it is complete; a cancelled or failed run removes that directory, so it never appears in the Segmentation dropdown and an earlier run with the same parameters stays as it was. Once a job starts writing its result (run directory and zarr store, SPLIT / SpaGE write-back to the SpatialData store, annotation caches) it can no longer be cancelled; the row then reads *writing results — cannot be cancelled now*. A streamed SpaGE result that was cancelled is deleted.
 - A cancelled job reports `✗ Cancelled` in its status line, the same job can be started again straight away, and the loaded dataset is not changed. As before, starting Baysor/Proseg replaces the run that was loaded for that tool, and an annotation run clears that method's previous labels, at the moment the job is started, not when it is cancelled. Intermediate results that are complete and reusable are kept: the SpatialData store, tissue ROI and patches of Prepare Patches, and the RCTD result SPLIT caches before `purify()` (with its labels).
 - Loading another sample is still refused while any job is running, including one that is being cancelled.
@@ -1636,6 +1657,47 @@ How cancelling works, and its limits:
 - A failed Baysor/Proseg run no longer leaves its partial output in the cache (the tool's messages are in the server log).
 
 From the REPL: `_jobs_list()` returns the registered jobs (`.kind`, `.label`, `.state`, `.step`, `.fraction`, `.elapsed()`, `.thread`, `.procs`), `_job_cancel(job.id)` cancels one.
+
+### Sessions: save and restore
+
+The settings of a session live in the browser page and in the server process, so they are lost when the server restarts. **Session: save / restore…** (sidebar, under the dataset block) opens a small dialog:
+
+| Action | What it does |
+|--------|--------------|
+| **Save session** | writes the session of the loaded dataset to `<cache>/sessions/` (one saved slot per dataset) |
+| **Download…** | the same session as a JSON file |
+| **Restore saved session** | applies the saved slot |
+| **Restore last session** | applies the automatic save of the *previous run* of the app on this dataset |
+| **Restore from file…** | applies an uploaded session file |
+
+The app also saves the "last session" of the dataset by itself about once a minute while a page is open and something changed. Nothing is ever restored without one of the three Restore actions: a freshly started app shows its defaults. The first automatic save of a server run keeps the file of the run before, so "Restore last session" still means the previous run after the new run has started saving. Session files are not removed by "Clean cache".
+
+**What a session file holds** (settings and choices, as one JSON document with a format version, the app commit, a timestamp and the identity of the data: the dataset key of the provenance log, and the name and number of cells of every sample):
+
+- the value of every control on the allow-list in `xenium_app/session.py`: segmentation source, counts mode, active cluster set, Color By, gene, view settings, the annotation choice, and the parameters of every analysis tab and dialog;
+- the sample design (conditions, donors, batches, condition names);
+- ROIs, gene sets and saved DE groups (their outlines and gene lists);
+- the filters of an active `subset()`.
+
+**What it does not hold**: results of any kind (matrices, labels, cluster sets, tables, figures). After a restore, run an analysis again and its result comes back from the cache the app already keeps. Also not saved: path fields (reference `.rds`, CellNEST folder, sample path, SpatialData output), CellNEST results and their filters, the `.h5ad` mapping dialog, scratch fields of dialogs, the open tab, selections and the viewport, and a subset that was made from an explicit list of cell ids or from 50 or more values (the app records only how many; saving says so). The table at the top of `session.py` lists every item with the reason.
+
+The design, ROIs, gene sets and DE groups already have their own cache files, which the app loads at start-up. A restore goes through the same functions as their dialogs (so those files are rewritten) and only adds or replaces: an ROI, gene set or group that exists now and is not in the session is kept, and the report says so.
+
+**Security rules of restore.** A session file is input from outside, also when the app wrote it.
+
+- JSON only (at most 8 MB, no `NaN` / `Infinity`, no repeated key). Nothing in the file is unpickled, evaluated, executed or imported.
+- Every value is checked against an allow-list before it is applied: a known key, the right type, the range of its input or the options of its control, a pattern for text. A value that fails is refused and named in the report; an unknown key is ignored and named.
+- Values that name something of the data (a segmentation run, a cluster set, a label source, a cell type, a gene, a group) are applied only when that thing exists now.
+- No path in the file is opened, read or written. A path field is never restored. A sample the session had beside the primary one is added only when the Load Sample picker itself lists exactly that path (the same directories the dialog offers); otherwise it is reported as "needs loading" and you add it with '+ Add sample'. The free-text path field of that dialog has no counterpart in a session file.
+- The REPL gate (`XENIUM_ENABLE_REPL`), the host bind (`XENIUM_HOST`), the port and the cache and data directories are settings of the server process; no key of a session file reaches them, and the REPL input is not a session control.
+
+**When the data is not the same.** A session saved for another dataset key, another number of cells or another set of samples is restored *in part*: only the plain parameters (numbers, switches, fixed choices, text lists) are applied. The segmentation source, cluster set, colouring, label sources, cell types, genes, region boxes, the image-overlay controls and the renderer choice (their options belong to the loaded images and data size), the design, ROIs, gene sets, DE groups and the subset are skipped, and the report lists them. Cluster, label and ROI state is never applied to other cells. A session that names a segmentation run or a cluster set that no longer exists restores the rest and names what is missing; a session written by a newer version of the format is refused.
+
+**Jobs.** Restore is refused while a job is running (the same rule as Load Sample). Loading the cached segmentation run a session names goes through the Segmentation dropdown's own callback.
+
+Explicit saves and every restore are written to the provenance log (kind `session`); the automatic save is not. In batch mode, `session: file.json` applies a session before the steps: its control values become the defaults of the steps, while a step's own `params`, the config's top-level keys (`seg_source`, `counts`, `cluster_method`, `color_by`) and a `data.design` still take precedence. With `--dry-run` the session is applied in memory for the checks only: no design, ROI, gene-set or group file, no store and no provenance record is written.
+
+Limits: a restore is applied step by step, not as one transaction (a refusal is decided before anything is changed; a value that turns out to be missing is skipped and the rest continues). A second browser tab on the same server shares the automatic save. A dataset that was moved to another directory has another key and is restored in part.
 
 ### Server Log & Python REPL
 
@@ -1689,6 +1751,7 @@ All caches are stored in `~/.xenium_explorer_cache/` and are keyed per dataset.
 | `cellnest_db/` | Ligand-receptor / signalling database files used by the CellNEST tab |
 | `genesets_{hash}.json` | Gene sets saved in the Gene Sets tab (per dataset) |
 | `de_groups_{hash}.json` | Cell groups (outlines) saved in the Differential Expression tab (per dataset) |
+| `sessions/{id}.saved.json`, `.last.json`, `.prev.json` | Session files of a dataset: the slot of **Save session**, the automatic save of the current server run and that of the run before (settings only; `{id}` is the stem of the dataset's provenance file; kept by "Clean cache") |
 | `density_{hash}/{gene}__b5um__qv20_genes_v1.npz` | Transcript-density grid of one gene (non-empty 5 µm bins); the name carries the bin size and the version of the transcript filter |
 | `txfactor_{hash}/counts__{shape}_b{bin}um__qv20_genes_v1__g{genes}.npz`, `txfactor_{hash}/fit_{settings hash}.npz` | Transcript factors: the bin × gene counts of one sample for a bin size and shape (reused for any K, method or seed), and a finished fit (loadings and the factor counts of every bin) for one set of settings |
 
@@ -2007,6 +2070,7 @@ or the command line, builds the Dash app and registers the callbacks.
 | `app_layout` | the Dash `app` and its layout |
 | `provenance` | methods and provenance record: the one call every analysis makes (`_prov_record`), the per-dataset record file, the Provenance tab, the JSON export and the methods text with its per-analysis templates and references |
 | `batch` | headless batch mode (`python -m xenium_app.batch`): config, validation, steps run through the Run callbacks and the job registry, output files |
+| `session`, `cb_session` | session save / restore: the state inventory and the allow-list of controls, validation of a session file, snapshot, restore through the functions of the UI, the automatic "last session", the dialog and its callbacks |
 | `cb_plots`, `cb_tools`, `cb_reseg`, `cb_spage`, `cb_data`, `cb_spatial`, `cb_analysis`, `cb_stats`, `cb_controls`, `cb_proximity`, `cb_lrdecomp`, `cb_aggregates`, `cb_segfree`, `cb_banksy`, `cb_txfactor`, `cb_joint`, `cb_nav`, `cb_provenance` | the callbacks, by feature |
 | `viewer_provider` | data provider for `xenium_viewer_api.py` (WebGL view) and `/health` |
 | `compat` | the single namespace over all modules (below) |
@@ -2087,6 +2151,13 @@ A review of the code base fixed a number of defects. Most are invisible, but the
 - **Batch mode**: a step runs on the segmentation run it names (the run is loaded when another is in memory; a missing run is an error), the dry run checks against that run's cells, the annotation and gene-set steps write `cells.parquet`, and a step that produced no result of its own fails.
 - **"% of cells expressing" on SPLIT-corrected counts** (DE `% A` / `% B`, the ligand–receptor detection threshold, Moran's `% cells`, genes per cell in Segmentation QC): a cell detects a gene when its count is **≥ 1 transcript**. For integer counts this is the former count > 0; for corrected (fractional) counts a residue below one transcript no longer counts, so these percentages are lower than before. The DE table also gives **Rate A / Rate B** (Σ counts ÷ Σ total counts of the group, per 10,000), which is defined for fractional counts and does not move with depth; `low_count` marks genes with fewer than 100 transcripts over both groups.
 - **Every CSV the app writes** has one more comment line at the end of its header, `# provenance record: prov-…` (see [Methods and provenance record](#methods-and-provenance-record)). Readers that skip `#` lines are not affected; a script that counts header lines is.
+- **Pooled cell-level DE and ligand–receptor scores of samples with different panels**: the library size of a cell is its total over the genes the pooled samples share (it was the total over each sample's own panel, which lowered every shared gene in the sample with the larger panel). log2 fold changes, p-values, Rate A / Rate B and the median counts per cell of such a comparison change; with one panel nothing changes. The median counts per cell of a pseudobulk result follow the same rule.
+- **Composition, moderated test, with donor labels on some samples only**: the sections of a labelled donor within a condition are one unit, as in the exact test (every section used to be a replicate). The units note counts the donors that were given ("4 donors, 1 sample without a donor").
+- **Rerun UMAP on corrected counts** embeds every cell that has corrected counts, also after a SPLIT run under `subset()` (only that run's cells were embedded). Above 300,000 cells the record no longer states a UMAP seed: UMAP runs unseeded there.
+- **SpaGE**: a result computed under `subset()` is cached per set of cells and read back by cell id (two subsets of the same size shared one cache entry and could be shown on each other's cells); the cache of a Baysor / Proseg run belongs to that run (a re-run with the same parameters recomputes; imputations of runs cached by earlier versions are recomputed once). A gene entered twice is imputed once.
+- **Old bundles with numbered cells** (integer `cell_id`): the expression matrix is matched to the cells (it was all zero, without a message). A `spatialdata_xenium.zarr` written from such a bundle by an earlier version must be deleted so that it is rebuilt. Cells and matrix that do not correspond at all are an error.
+- **Methods text**: the paired-design sentence follows the rule of the tests; proximity names the density-covariate type that was used (not "auto"); spillover and segmentation-free abundance state the marker rule and reference that were used; compartments without labels describe no core; a Cellpose run is described as one. Contact-group DE names `~ donor + group` in its status line, title and CSV header when donors were pooled.
+- **Batch mode**: `data.design` entries resolve by label, then path, then name (a name could shadow another sample's label); `--dry-run` no longer replaces the saved design; a `clustering` step with corrected counts exports `split_umap_1/2`; a `niches` step with extra samples writes its `cells.parquet`.
 - **Plots panel**: the tabs are grouped in two levels; Composition and Segmentation-free abundance are tabs of their own (they were sections of Cell Type Abundance). No number changes.
 - **DE status line and CSV** give the median counts per cell of both groups and warn when they differ by more than 1.5×; they state the unit of the p-values.
 - **Pseudobulk volcano**: coloured by FDR alone; x axis = unshrunken log2FC unless the shrunken one is chosen (see above). The cell-level volcano keeps its |log2FC| ≥ 0.5 rule.

@@ -77,6 +77,10 @@ def load_cellnest(n_clicks, folder, dataset, strip_suffix):
     if not n_clicks or not folder or not dataset:
         raise dash.exceptions.PreventUpdate
     with core._cellnest_lock:
+        # one load at a time: two jobs would share _cellnest_state, and the slower one (or
+        # a cancelled one) would decide what is shown
+        if core._cellnest_state.get("status") == "loading":
+            return "Already loading. Wait for it to finish, or cancel it in the jobs panel.", False
         core._cellnest_state["status"] = "loading"
         core._cellnest_state["message"] = "Loading…"
         core._cellnest_state["data"]   = None

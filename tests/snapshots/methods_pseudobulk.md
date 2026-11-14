@@ -9,7 +9,7 @@
 
 Pseudobulk differential expression of the population 'T cell' between the two conditions of the sample design: the counts of the population's cells were summed per donor and condition (A: 3 donors; B: 3 donors); a sample with fewer than 10 cells of the population was dropped and a gene with a total count below 10 was not tested. Model: DESeq2 (Wald test), design ~ donor + condition; log2 fold changes are A / B (unshrunken maximum-likelihood estimates; shrunken estimates: apeglm); adjusted p-values are those of the fitting package (Benjamini-Hochberg). 280 genes were tested, 20 were not (low count), and 0 have no adjusted p-value. Original (uncorrected) counts were summed; SPLIT-corrected counts are not used for count models. [1] [2]
 
-Cell labels: celltype:celltypist (cell type). Original counts were used. Sample design as set in the app: condition A ('treated'): S0 (donor d0), S1 (donor d1), S2 (donor d2); condition B ('control'): S3 (donor d0), S4 (donor d1), S5 (donor d2). Donor labels were given and at least one donor occurs in both conditions (paired).
+Cell labels: celltype:celltypist (cell type). Original counts were used. Sample design as set in the app: condition A ('treated'): S0 (donor d0), S1 (donor d1), S2 (donor d2); condition B ('control'): S3 (donor d0), S4 (donor d1), S5 (donor d2). Donor labels were given for every included sample and at least 2 donors occur in both conditions: the design is paired by donor.
 
 Parameters: population = T cell; min_cells = 10; min_count = 10; shrink = yes; engine = auto.
 

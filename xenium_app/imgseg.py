@@ -656,7 +656,7 @@ def _run_imgseg(backend: str = "classical", channels=None, diameter_um: float = 
             result={"n_cells": int(n_cells), "n_transcripts": int(n_tx),
                     "n_transcripts_assigned": int(n_kept_tx), "n_patches_failed": int(n_failed)},
             message=msg, cache=False, t0=_t0,
-            packages=("sopa", "spatialdata", "scikit-image") + (("cellpose", "torch") if backend == "cellpose" else ()))
+            packages=("sopa", "spatialdata", "scikit-image") + (("cellpose", "torch") if info["backend"] == "cellpose" else ()))
     except jobs._JobCancelled:
         raise
     except jobs._DatasetChanged:
@@ -688,7 +688,7 @@ def _load_cached_imgseg(out_dir: str) -> None:
             try:
                 with open(ref) as f:
                     sref = json.load(f)
-                if os.path.isdir(sref.get("path", "")):
+                if os.path.exists(sref.get("path", "")):      # zarr (streamed) or parquet
                     spage_path, spage_genes = sref["path"], sref.get("genes", [])
             except Exception:
                 pass

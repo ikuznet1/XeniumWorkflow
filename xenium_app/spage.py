@@ -32,6 +32,25 @@ def _spage_cache_path(rds_path: str, genes_key: str) -> str:
     return os.path.join(_spage_cache_dir(), f"spage_{tag}.parquet")
 
 
+def _spage_ids_tag(index) -> str:
+    """Short hash of the cell ids (in order) a result has one row for: part of the cache key
+    of a result computed under subset(), and what a reader of a positional (streamed)
+    result compares with the cells now on display."""
+    h = hashlib.md5()
+    for _cid in index:
+        h.update(str(_cid).encode())
+        h.update(b"\x00")
+    return h.hexdigest()[:10]
+
+
+def _spage_requested_genes(genes_input) -> list:
+    """The gene names of the free-text field (one per line or comma-separated), each once,
+    in the order entered: a name entered twice would become duplicate rows of the reference
+    sub-matrix and duplicate columns of the result."""
+    return list(dict.fromkeys(g for line in str(genes_input or "").replace(",", "\n").split("\n")
+                              for g in [line.strip()] if g))
+
+
 def _spage_index_update(cache_file: str, dataset_key: str = None) -> None:
     """Record the latest spage cache file for this dataset (*dataset_key*: the
     key captured when the job started; default: the dataset loaded now)."""
@@ -71,6 +90,7 @@ def _spage_autoload() -> None:
                         core._spage_state["message"]      = f"Auto-loaded (streaming) — {len(_genes_al):,} genes"
                         core._spage_state["result_path"]  = zarr_path
                         core._spage_state["result_genes"] = _genes_al
+                        core._spage_state["result_ids_tag"] = None
                     print(f"  SpaGE: streaming {len(_genes_al):,} genes from {zarr_path}", flush=True)
                     return
             # Normal parquet — check size before loading entire file
@@ -86,6 +106,7 @@ def _spage_autoload() -> None:
                         core._spage_state["message"]      = f"Auto-loaded (streaming) — {_nc_al:,} genes"
                         core._spage_state["result_path"]  = cache_file
                         core._spage_state["result_genes"] = list(_genes_al)
+                        core._spage_state["result_ids_tag"] = None
                     print(f"  SpaGE: large cache {_nr_al:,}×{_nc_al:,} → streaming read", flush=True)
                     return
             except Exception:
@@ -352,8 +373,7 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                 genes_needed = shared_genes + predict_candidates[:2000]
                 genes_key = "auto200"
         else:
-            requested = [g.strip() for line in genes_input.replace(",", "\n").split("\n")
-                         for g in [line.strip()] if g]
+            requested = _spage_requested_genes(genes_input)
             genes_to_predict = [g for g in requested if g in rna_genes_all and g not in xenium_genes]
             if not genes_to_predict:
                 _set("error", "None of the requested genes found in reference (or all in Xenium panel).")
@@ -366,13 +386,24 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
         _cache_corr_suffix = "_corr" if use_corrected else ""
         _cache_seg_suffix = (f"__{seg_source.replace(':', '_')}{_cache_corr_suffix}"
                              if (seg_source and seg_source != "xenium") else _cache_corr_suffix)
+        # ... and the run itself: a re-run with the same parameters is committed into the
+        # same directory under the same tag with other cells (a new run id), and must not
+        # be served the imputation of the run it replaced
+        _run_id = core._seg_run_id(_alt_res) if _alt_res is not None else ""
+        if _run_id:
+            _cache_seg_suffix += f"_r{_run_id}"
         # n_pv and an active subset() change the result; they are added to the key only
         # when they differ from the default / full dataset so existing caches stay valid.
+        # Under a subset the key names the cells (count and a hash of their ids): two
+        # subsets of the same size are different results.
         _cache_extra = f"_pv{n_pv}" if int(n_pv) != 50 else ""
+        _subset_ids_tag = None
         if _alt_res is not None and "_cells_df_original" in _alt_res:
-            _cache_extra += f"_n{len(_alt_res['cells_df'])}"
+            _subset_ids_tag = _spage_ids_tag(_alt_res["cells_df"].index)
+            _cache_extra += f"_n{len(_alt_res['cells_df'])}_{_subset_ids_tag}"
         elif _alt_res is None and "_df_original" in core.DATA:
-            _cache_extra += f"_n{len(core.DATA['df'])}"
+            _subset_ids_tag = _spage_ids_tag(core.DATA["df"].index)
+            _cache_extra += f"_n{len(core.DATA['df'])}_{_subset_ids_tag}"
         cache_file = _spage_cache_path(rds_path, genes_key + _cache_seg_suffix + _cache_extra)
         zarr_cache = cache_file.replace(".parquet", ".zarr")
         # A streamed result has one row per current DATA["df"] row and no cell ids:
@@ -592,7 +623,12 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                                     adata_new.uns.get("split_corrected_imputed_genes", [])]
                             dataview._gene_expr_cache.clear()
 
-            _set("done", f"Done{' (cached)' if cached else ''} — {len(imp_df.columns):,} genes imputed",
+            # a run's result that could not be written into its store (subset active, no
+            # store, failed write) is read from the cache file, by cell id: say so
+            _not_stored = (_alt_res is not None
+                           and not all(g in (_alt_res.get("gene_name_to_idx") or {}) for g in imp_df.columns))
+            _set("done", f"Done{' (cached)' if cached else ''} — {len(imp_df.columns):,} genes imputed"
+                 + (" (not written into the run's store: read from the SpaGE cache file)" if _not_stored else ""),
                  result=imp_df if _alt_res is None else None)
 
         jobs._check_dataset_gen(_gen)
@@ -607,6 +643,7 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                         with core._spage_lock:
                             core._spage_state["result_path"]  = zarr_cache
                             core._spage_state["result_genes"] = _genes_c
+                            core._spage_state["result_ids_tag"] = _subset_ids_tag
                     if _alt_res is not None:
                         try:
                             import json as _json_sc
@@ -641,6 +678,7 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                         with core._spage_lock:
                             core._spage_state["result_path"]  = cache_file
                             core._spage_state["result_genes"] = list(_genes_c)
+                            core._spage_state["result_ids_tag"] = _subset_ids_tag
                         if not _xen_subset:
                             _spage_index_update(cache_file, _ds_key)
                     else:
@@ -789,6 +827,7 @@ writeLines(colnames(mat_sub), "{cells_file}")
                 with core._spage_lock:
                     core._spage_state["result_path"]  = zarr_cache
                     core._spage_state["result_genes"] = genes_to_predict
+                    core._spage_state["result_ids_tag"] = _subset_ids_tag
                 if not _xen_subset:
                     _spage_index_update(zarr_cache, _ds_key)
             else:

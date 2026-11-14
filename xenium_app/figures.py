@@ -201,6 +201,7 @@ def _get_expr_values(gene: str, alt_res=None, use_corrected: bool = False) -> "n
             with core._spage_lock:
                 _rp = core._spage_state.get("result_path")
                 _rg = core._spage_state.get("result_genes") or []
+                _rtag = core._spage_state.get("result_ids_tag")
         else:
             return None
     if _rp and lookup in _rg:
@@ -211,15 +212,36 @@ def _get_expr_values(gene: str, alt_res=None, use_corrected: bool = False) -> "n
                 _zcol = np.array(
                     _zarr_ev.open_array(_rp, mode='r')[:, _gi_ev], dtype=np.float32)
                 if alt_res is None:
+                    _spage_streamed_cells_check(_rtag)
                     _zcol = _align_expr_rows_to_df(_zcol)
                     if len(_zcol) != len(core.DATA["df"]):
                         # streamed under another subset(): rows cannot be matched to cells
                         raise ValueError(f"result has {len(_zcol):,} rows for "
                                          f"{len(core.DATA['df']):,} cells — re-run SpaGE")
                 return np.log1p(_zcol)
+            if alt_res is not None and os.path.isfile(_rp):
+                # a run's result kept in the SpaGE cache file only (its write into the run's
+                # store was skipped): one row per cell id, matched to the run's cells by id;
+                # a cell without a row (the result was computed under a subset) reads 0
+                _pcol = pd.read_parquet(_rp, columns=[lookup])[lookup]
+                _pcol.index = _pcol.index.astype(str)
+                _pcol = _pcol[~_pcol.index.duplicated()]
+                _pvals = _pcol.reindex(alt_res["cells_df"].index.astype(str)).fillna(0).values
+                return np.log1p(np.clip(_pvals.astype(np.float32), 0, None))
         except Exception as _e:
             print(f"  SpaGE zarr read error for {lookup!r}: {_e}", flush=True)
     return None
+
+
+def _spage_streamed_cells_check(ids_tag) -> None:
+    """Raise when a streamed (positional, no cell ids) SpaGE result of the Xenium cells was
+    computed under a subset() of other cells than the ones now on display: its rows cannot
+    be matched to them, also when the two subsets have the same number of cells."""
+    if not ids_tag:
+        return
+    from . import spage
+    if spage._spage_ids_tag(core.DATA["df"].index) != ids_tag:
+        raise ValueError("the result was computed for another subset of the cells — re-run SpaGE")
 
 
 def _get_reseg_expr_values(gene: str, alt_res: dict) -> "np.ndarray | None":

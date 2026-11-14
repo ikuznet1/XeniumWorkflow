@@ -8,7 +8,7 @@ import pandas as pd
 import scipy.sparse as sp
 
 from . import core, jobs, caching, dataview, split
-from . import provenance
+from . import provenance, rworker
 
 
 def _labels_key_for_method(method: str, alt_res=None) -> str:
@@ -232,13 +232,10 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
         if status == "done":
             provenance._prov_record("annotation", "Cell type annotation: RCTD", seg_source=provenance._prov_labels_source(labels_key), params={"method": "rctd", "reference": os.path.basename(str(rds_path or '')), "label_col": label_col, "mode": mode, "n_cores": n_cores, "umi_min": umi_min, "umi_min_sigma": umi_min_sigma, "labels_key": labels_key}, r_packages=("spacexr", "Seurat", "SeuratObject"), message=message, result=provenance._prov_labels_summary(labels))
 
-    ro = None       # set once R is used; the finally below cleans up after it
-    tmpdir = None
     try:
         # inside the try so a missing rpy2 reports an error instead of a stuck "running"
-        import rpy2.robjects.conversion as _rconv
-        import rpy2.robjects as _ro_mod
-        _rconv.set_conversion(_ro_mod.default_converter)
+        # (R itself runs in the R worker process, see rworker)
+        rworker._rw_thread_setup()
         cache_key  = (f"rctd_{os.path.basename(rds_path)}_{caching._ref_file_tag(rds_path)}_{label_col}_{mode}"
                       f"_umi{umi_min}_sig{umi_min_sigma}_{_key_for_cache}")
         cache_file = caching._cache_path(cache_key)
@@ -306,215 +303,90 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
                 _set("done", f"Done (cached) — {len(unique_types)} cell types", labels=labels)
                 return
 
-        import rpy2.robjects as ro
-        import rpy2.robjects.conversion as _rconv
-        from rpy2.robjects import pandas2ri
-        from rpy2.robjects.packages import importr
+        # ── Inputs of the R step: panel genes, counts, coordinates ───────────
+        # Xenium: measured panel genes only (SpaGE-imputed columns are not counts)
+        xenium_genes = dataview._panel_gene_names()
+        if expr_override is not None:
+            # reseg matrix holds the measured panel columns only
+            xenium_genes = list(core.DATA["gene_names"])[:expr_override.shape[1]]
+        df = core.DATA["df"]
+        if expr_override is not None:
+            xen_expr  = expr_override               # cells × genes
+            cell_ids  = [str(c) for c in (cell_ids_override if cell_ids_override is not None
+                                          else range(expr_override.shape[0]))]
+            coords_df = df[["x_centroid", "y_centroid"]].reindex(
+                            pd.Index(cell_ids)).fillna(0.0)
+        else:
+            # All cells, in expression-row order (independent of an active
+            # subset(), like CellTypist/Seurat): matrix rows == barcodes.
+            df = core.DATA.get("_df_original", df)
+            xen_expr  = core.DATA["expr"]           # cells × genes
+            cell_ids  = [str(b) for b in core.DATA["barcodes"]]
+            coords_df = df[["x_centroid", "y_centroid"]].copy()
+            coords_df.index = coords_df.index.astype(str)
+            if list(coords_df.index) != cell_ids:
+                coords_df = coords_df.reindex(pd.Index(cell_ids)).fillna(0.0)
+        gene_idx   = ({g: i for i, g in enumerate(xenium_genes)} if expr_override is not None
+                      else core.DATA["gene_name_to_idx"])
+        _panel_idx = [gene_idx[g] for g in xenium_genes]
+        if _panel_idx != list(range(xen_expr.shape[1])):
+            xen_expr = xen_expr[:, _panel_idx]      # one column per panel gene, in that order
 
-        # Ensure rpy2 conversion rules are active in this thread
-        _rconv.set_conversion(ro.default_converter)
-        pandas2ri.activate()
+        # ── R: reference, SpatialRNA, run.RCTD, labels and weights ───────────
+        # In the R worker process of this job (rworker._rw_rctd), so that Cancel stops R
+        # at once; inside the app with XENIUM_R_INPROCESS=1.
+        _r_out = rworker._rw_call(
+            rworker._rw_rctd,
+            {"rds_path": rds_path, "label_col": label_col, "mode": mode, "n_cores": n_cores,
+             "umi_min": umi_min, "umi_min_sigma": umi_min_sigma, "genes": list(xenium_genes),
+             "expr": sp.csr_matrix(xen_expr), "cell_ids": cell_ids,
+             "cx": np.ascontiguousarray(coords_df["x_centroid"].to_numpy(dtype=np.float64)),
+             "cy": np.ascontiguousarray(coords_df["y_centroid"].to_numpy(dtype=np.float64))},
+            on_progress=lambda _m, _f=None: _set("running", _m),
+            r_packages=("spacexr", "Seurat", "SeuratObject"),
+            on_note=lambda _n: print(f"  RCTD: {_n}", flush=True))
+        del xen_expr
 
-        from rpy2.rinterface_lib import openrlib
-        with openrlib.rlock:
-            # ── 1. Check spacexr ─────────────────────────────────────────────
-            _set("running", "Loading spacexr…")
+        labels    = pd.Series(dict(zip(_r_out["cell_ids"], _r_out["types"])), name="label").astype(str)
+        labels.index  = labels.index.astype(str)
+        unique_types = labels.unique().tolist()
+        print(f"  RCTD: {len(labels):,} cells → {len(unique_types)} types", flush=True)
+
+        jobs._check_dataset_gen(_gen)
+        # last cancellation point: label cache, weight cache and labels go together
+        jobs._job_shield()
+        caching._annot_cache_frame(labels, cache_sig).to_parquet(cache_file)
+
+        # ── Cache the weight matrix (full mode only) ──────────────────────────
+        weights_df = None
+        if mode == "full":
             try:
-                importr("spacexr")
-            except Exception as _spacexr_err:
-                print(f"  RCTD: importr('spacexr') failed: {_spacexr_err}", flush=True)
-                _set("error", f"spacexr not found by rpy2: {str(_spacexr_err)[:200]}")
-                return
-
-            importr("SeuratObject")
-            importr("Matrix")
-            base = importr("base")
-
-            # ── 2. Load Seurat reference ─────────────────────────────────────
-            _set("running", "Loading Seurat reference…")
-            rds = base.readRDS(rds_path)
-            meta_r  = ro.r['slot'](rds, "meta.data")
-            meta_df = pandas2ri.rpy2py(meta_r)
-            if label_col not in meta_df.columns:
-                _set("error", f"Column '{label_col}' not found. Available: {list(meta_df.columns)[:10]}")
-                return
-
-            # ── 3. Determine shared genes ────────────────────────────────────
-            _set("running", "Finding shared genes…")
-            ro.r.assign("._rctd_rds", rds)
-            mat_r     = ro.r("SeuratObject::LayerData(._rctd_rds[['RNA']], layer='counts')")
-            ref_genes = list(ro.r['rownames'](mat_r))
-            # Xenium: measured panel genes only (SpaGE-imputed columns are not counts)
-            xenium_genes = dataview._panel_gene_names()
-            if expr_override is not None:
-                # reseg matrix holds the measured panel columns only
-                xenium_genes = list(core.DATA["gene_names"])[:expr_override.shape[1]]
-            shared_genes = sorted(set(xenium_genes) & set(ref_genes))
-            if len(shared_genes) < 10:
-                _set("error", f"Only {len(shared_genes)} shared genes between reference and panel.")
-                return
-            print(f"  RCTD: {len(shared_genes)} shared genes", flush=True)
-
-            # ── 4. Build Reference object ────────────────────────────────────
-            _set("running", f"Building RCTD Reference ({len(meta_df):,} ref cells)…")
-            ro.r.assign("._rctd_genes", ro.StrVector(shared_genes))
-            ro.r("""
-._rctd_ref_mat <- SeuratObject::LayerData(._rctd_rds[['RNA']], layer='counts')[._rctd_genes, , drop=FALSE]
-._rctd_ref_mat <- as(._rctd_ref_mat, 'dgCMatrix')
-._rctd_ref_mat@x <- as.numeric(round(._rctd_ref_mat@x))
-""")
-            ref_labels_r       = ro.StrVector(meta_df[label_col].astype(str).tolist())
-            ref_labels_r.names = ro.StrVector(list(meta_df.index.astype(str)))
-            ro.r.assign("._rctd_ref_labels", ref_labels_r)
-            ro.r("""
-._rctd_ref_factor <- as.factor(._rctd_ref_labels)
-._rctd_numi_ref   <- colSums(._rctd_ref_mat)
-._rctd_reference  <- spacexr::Reference(
-    counts     = ._rctd_ref_mat,
-    cell_types = ._rctd_ref_factor,
-    nUMI       = ._rctd_numi_ref
-)
-""")
-
-            # ── 5. Build SpatialRNA from Xenium ──────────────────────────────
-            _set("running", "Building SpatialRNA object…")
-            df = core.DATA["df"]
-            if expr_override is not None:
-                xen_mat_full = expr_override.T        # genes × cells
-                cell_ids     = [str(c) for c in (cell_ids_override if cell_ids_override is not None
-                                                 else range(expr_override.shape[0]))]
-                coords_df    = df[["x_centroid", "y_centroid"]].reindex(
-                                   pd.Index(cell_ids)).fillna(0.0)
-            else:
-                # All cells, in expression-row order (independent of an active
-                # subset(), like CellTypist/Seurat): matrix columns == barcodes.
-                df = core.DATA.get("_df_original", df)
-                xen_mat_full = core.DATA["expr"].T  # genes × cells
-                cell_ids     = [str(b) for b in core.DATA["barcodes"]]
-                coords_df    = df[["x_centroid", "y_centroid"]].copy()
-                coords_df.index = coords_df.index.astype(str)
-                if list(coords_df.index) != cell_ids:
-                    coords_df = coords_df.reindex(pd.Index(cell_ids)).fillna(0.0)
-
-            gene_idx   = ({g: i for i, g in enumerate(xenium_genes)} if expr_override is not None
-                          else core.DATA["gene_name_to_idx"])
-            shared_idx = [gene_idx[g] for g in shared_genes]
-            # shared_genes × cells dgCMatrix built from the sparse parts
-            # (no MatrixMarket text round trip)
-            split._scipy_to_r_dgc(xen_mat_full.T[:, shared_idx], shared_genes, cell_ids, "._rctd_xen_mat")
-            del xen_mat_full
-            ro.r.assign("._rctd_cx", ro.FloatVector(
-                np.ascontiguousarray(coords_df["x_centroid"].to_numpy(dtype=np.float64))))
-            ro.r.assign("._rctd_cy", ro.FloatVector(
-                np.ascontiguousarray(coords_df["y_centroid"].to_numpy(dtype=np.float64))))
-            ro.r("""
-._rctd_coords   <- data.frame(x=._rctd_cx, y=._rctd_cy, row.names=colnames(._rctd_xen_mat))
-._rctd_numi_xen <- colSums(._rctd_xen_mat)
-._rctd_puck     <- spacexr::SpatialRNA(
-    coords = ._rctd_coords,
-    counts = ._rctd_xen_mat,
-    nUMI   = ._rctd_numi_xen
-)
-""")
-
-            # ── 6. Create and run RCTD ───────────────────────────────────────
-            _set("running", f"Running RCTD ({mode} mode, {n_cores} cores)…")
-            ro.r.assign("._rctd_mode",    mode)
-            ro.r.assign("._rctd_cores",   n_cores)
-            ro.r.assign("._rctd_umi_min",       ro.IntVector([umi_min]))
-            ro.r.assign("._rctd_umi_min_sigma", ro.IntVector([umi_min_sigma]))
-            ro.r("""
-._rctd_obj <- spacexr::create.RCTD(._rctd_puck, ._rctd_reference, max_cores=._rctd_cores,
-    UMI_min=._rctd_umi_min[1], UMI_min_sigma=._rctd_umi_min_sigma[1])
-._rctd_obj <- spacexr::run.RCTD(._rctd_obj, doublet_mode=._rctd_mode)
-""")
-            print("  RCTD: run complete — extracting results…", flush=True)
-
-            # ── 7. Extract per-cell labels ────────────────────────────────────
-            _set("running", "Extracting RCTD results…")
-            if mode == "full":
-                ro.r("""
-._rctd_weights <- ._rctd_obj@results$weights
-._rctd_types   <- colnames(._rctd_weights)[apply(._rctd_weights, 1, which.max)]
-names(._rctd_types) <- rownames(._rctd_weights)
-""")
-            elif mode == "multi":
-                # multi mode: @results is a per-pixel list (no results_df), in the
-                # column order of the filtered SpatialRNA counts
-                ro.r("""
-._rctd_res   <- ._rctd_obj@results
-._rctd_types <- vapply(._rctd_res, function(r)
-    if (length(r$cell_type_list)) as.character(r$cell_type_list[1]) else NA_character_,
-    character(1))
-names(._rctd_types) <- colnames(._rctd_obj@spatialRNA@counts)[seq_along(._rctd_types)]
-._rctd_types <- ._rctd_types[!is.na(._rctd_types)]
-""")
-            else:  # doublet
-                ro.r("""
-._rctd_res   <- ._rctd_obj@results$results_df
-._rctd_types <- as.character(._rctd_res$first_type)
-names(._rctd_types) <- rownames(._rctd_res)
-""")
-
-            types_r   = ro.r("._rctd_types")
-            names_r   = ro.r("names(._rctd_types)")
-            cell_ids  = list(names_r)
-            cell_vals = [str(v) for v in types_r]
-            labels    = pd.Series(dict(zip(cell_ids, cell_vals)), name="label").astype(str)
-            labels.index  = labels.index.astype(str)
-            if len(labels) == 0:
-                raise RuntimeError(f"RCTD ({mode}) returned no cell labels")
-
-            unique_types = labels.unique().tolist()
-            print(f"  RCTD: {len(labels):,} cells → {len(unique_types)} types", flush=True)
-
+                if "weights" not in _r_out:
+                    raise RuntimeError(_r_out.get("weights_error") or "no weights returned")
+                weights_df = pd.DataFrame(_r_out["weights"], index=_r_out["weight_cells"],
+                                          columns=_r_out["weight_types"])
+                weights_df.index = weights_df.index.astype(str)
+                weights_cache = cache_file.replace(".parquet", "_weights.parquet")
+                weights_df.to_parquet(weights_cache)
+                print(f"  RCTD: weights saved ({weights_df.shape[1]} types)", flush=True)
+            except Exception as _we:
+                print(f"  RCTD: weight extraction failed: {_we}", flush=True)
+        weights_key = f"rctd_weights_{labels_key}"
+        with core._annot_lock:
             jobs._check_dataset_gen(_gen)
-            # last cancellation point: label cache, weight cache and labels go together
-            jobs._job_shield()
-            caching._annot_cache_frame(labels, cache_sig).to_parquet(cache_file)
+            core._annot_state[weights_key] = weights_df
 
-            # ── 8. Extract and cache weight matrix (full mode only) ───────────
-            weights_df = None
-            if mode == "full":
-                _set("running", "Extracting RCTD weight matrix…")
-                try:
-                    ro.r("._rctd_weights_dense <- as.matrix(._rctd_weights)")
-                    ct_names   = list(ro.r("colnames(._rctd_weights)"))
-                    cell_ids_w = list(ro.r("rownames(._rctd_weights)"))
-                    w_arr      = np.array(ro.r("._rctd_weights_dense"))
-                    weights_df = pd.DataFrame(w_arr, index=cell_ids_w, columns=ct_names)
-                    weights_df.index = weights_df.index.astype(str)
-                    weights_cache = cache_file.replace(".parquet", "_weights.parquet")
-                    weights_df.to_parquet(weights_cache)
-                    print(f"  RCTD: weights saved ({weights_df.shape[1]} types)", flush=True)
-                except Exception as _we:
-                    print(f"  RCTD: weight extraction failed: {_we}", flush=True)
-            weights_key = f"rctd_weights_{labels_key}"
-            with core._annot_lock:
-                jobs._check_dataset_gen(_gen)
-                core._annot_state[weights_key] = weights_df
-
-            _set("done", f"Done — {len(unique_types)} cell types in {len(labels):,} cells",
-                 labels=labels)
+        _set("done", f"Done — {len(unique_types)} cell types in {len(labels):,} cells",
+             labels=labels)
 
     except jobs._JobCancelled:
         raise                      # reported by _job_finish, not an error
+    except rworker._RwRefused as exc:
+        _set("error", str(exc))    # spacexr missing, unknown label column, too few shared genes
     except Exception as exc:
         import traceback; traceback.print_exc()
         _set("error", str(exc)[:300])
-    finally:
-        # Cleanup R temporaries and the temp dir on every exit path (best-effort).
-        # The names start with a dot, so ls() needs all.names=TRUE.
-        if ro is not None:
-            try:
-                from rpy2.rinterface_lib import openrlib as _orl
-                with _orl.rlock:
-                    ro.r("rm(list=ls(pattern='^[.]_rctd_', all.names=TRUE, envir=globalenv()), "
-                         "envir=globalenv()); invisible(gc())")
-            except Exception:
-                pass
-        if tmpdir:
-            import shutil; shutil.rmtree(tmpdir, ignore_errors=True)
+    # (the R temporaries are removed by rworker._rw_rctd itself, on every exit path)
 
 
 def _run_seurat_annotation(rds_path: str, label_col: str = "Names", labels_key: str = "labels",

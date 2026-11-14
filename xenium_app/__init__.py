@@ -16,15 +16,15 @@ modules.
 """
 MODULES = (
     # 1. libraries
-    "core", "jobs", "caching", "ui", "loading", "dataview", "annotation", "reseg",
+    "core", "jobs", "rworker", "caching", "ui", "loading", "dataview", "annotation", "reseg",
     "clustering", "split", "spage", "subsetting", "spatial", "morph", "figures",
     "analysis", "cellnest", "sdata_store", "regions", "imgseg", "stats", "h5ad", "controls",
     "proximity", "lrdecomp", "aggregates", "segfree", "txfactor", "clustersets", "banksy",
-    "joint", "provenance", "batch",
+    "joint", "provenance", "session", "batch",
     # 2. import-time work
     "startup", "app_layout", "cb_plots", "cb_tools", "cb_reseg", "cb_spage", "cb_data",
     "cb_spatial", "cb_analysis", "cb_stats", "cb_controls", "cb_proximity", "cb_lrdecomp",
-    "cb_aggregates", "cb_segfree", "cb_txfactor", "cb_banksy", "cb_joint", "cb_provenance", "cb_nav",
+    "cb_aggregates", "cb_segfree", "cb_txfactor", "cb_banksy", "cb_joint", "cb_provenance", "cb_session", "cb_nav",
     "viewer_provider",
 )
 
@@ -136,6 +136,7 @@ from . import (  # noqa: E402,F401
 )
 from . import joint, cb_joint  # noqa: E402,F401
 from . import provenance, cb_provenance  # noqa: E402,F401
+from . import session, cb_session  # noqa: E402,F401
 if not _BATCH_MAIN:      # run as a script, batch.py is "__main__" and registers itself under its own name
     from . import batch  # noqa: E402,F401
 from . import cb_nav  # noqa: E402,F401

@@ -270,10 +270,21 @@ def _an_common_genes(samples) -> list:
     return genes
 
 
+def _an_panels_differ(samples, genes) -> bool:
+    """True when some sample measures genes beyond the shared list *genes*: the library size
+    of a pooled analysis is then the total over the shared genes, not over each panel."""
+    return any(len(s["genes"]) != len(genes) for s in samples)
+
+
 def _an_size_factors(s: dict, genes=None):
     """(sf, in_view) per matrix row of sample *s*: sf = _AN_SCALE / library size, where
     the library size is the cell's total count over the measured panel genes of the
-    active matrix; 0 for rows that are not in the view (subset) or have no counts."""
+    active matrix; 0 for rows that are not in the view (subset) or have no counts.
+    genes: the genes the library is summed over instead of the sample's whole panel. An
+    analysis that pools the cells of several samples passes the genes they share
+    (_an_common_genes): a cell of a larger panel is otherwise divided by counts of genes
+    the other samples never measured, and its values for the shared genes come out lower
+    for that reason alone."""
     csc = s["csc"]
     cols = np.array([s["gni"][g] for g in (s["genes"] if genes is None else genes)], dtype=np.int64)
     if len(cols) == csc.shape[1]:
@@ -700,7 +711,10 @@ def _de_compute(samples, masks_a, masks_b, progress=None) -> dict:
     masks_a / masks_b: per-sample boolean masks over the cells (None: every cell that is
     not in the other group). A cell in both groups is counted in A only. Expression is
     log1p(count / library size × 10,000); the log2 fold change is of the group means of
-    the normalised (not log) values with pseudocount 1; cells are the observations."""
+    the normalised (not log) values with pseudocount 1; cells are the observations. The
+    library size of a cell is its total over the tested genes, i.e. the genes all pooled
+    samples share: the whole panel when the samples have one panel, and the same gene set
+    for every cell when their panels differ."""
     if not samples:
         raise ValueError("The active view has no expression matrix.")
     if masks_a is None and masks_b is None:
@@ -725,7 +739,7 @@ def _de_compute(samples, masks_a, masks_b, progress=None) -> dict:
         rows = s["rows"]
         ok = rows >= 0
         n_nomat += int(((a | b) & ~ok).sum())
-        sf, _in_view = _an_size_factors(s)
+        sf, _in_view = _an_size_factors(s, genes)
         grp = np.zeros(s["csc"].shape[0], dtype=np.int8)
         grp[rows[ok & b]] = 2
         grp[rows[ok & a]] = 1
@@ -768,6 +782,8 @@ def _de_compute(samples, masks_a, masks_b, progress=None) -> dict:
     return {"table": table, "n_a": n_a, "n_b": n_b, "n_overlap": n_overlap,
             "n_no_matrix": n_nomat, "n_genes": len(genes), "n_samples": len(samples),
             "corrected": bool(samples[0]["corrected"]),
+            # number of shared genes the libraries were summed over, when panels differ
+            "lib_shared_genes": len(genes) if _an_panels_differ(samples, genes) else None,
             "median_counts_a": med_a, "median_counts_b": med_b,
             "depth_ratio": _depth_ratio(med_a, med_b)}
 
@@ -874,6 +890,10 @@ def _run_de(spec_a, spec_b, seg_source, method, color_by, use_corrected, options
             _msg += (f" {res['n_overlap']:,} cells were in both groups and were removed from B.")
         if res["n_samples"] > 1:
             _msg += f" Cells of {res['n_samples']} samples were pooled."
+        if res.get("lib_shared_genes"):
+            _msg += (f" The samples have different panels: the library size of every cell (normalisation, "
+                     f"Rate columns, median counts per cell) is its total over the "
+                     f"{res['lib_shared_genes']:,} shared genes that are tested.")
         if res.get("n_uncorrected"):
             _msg += " " + _an_uncorrected_note(res["n_uncorrected"]) + "."
         _msg += (f"\nUnit of the p-values: {res['units_note']} (they are not, when the groups come "
@@ -1831,7 +1851,9 @@ _AN_LABEL_STYLE = {"fontSize": "11px", "color": core.MUTED}
 _AN_STATUS_STYLE = {"fontSize": "11px", "color": core.TEXT, "padding": "2px 8px", "minHeight": "16px",
                     "flexShrink": "0"}
 
-_DE_CAVEAT = ("Wilcoxon rank-sum test per gene on log1p(count / library size × 10,000); "
+_DE_CAVEAT = ("Wilcoxon rank-sum test per gene on log1p(count / library size × 10,000), the library "
+              "size being the cell's total over the tested genes (the panel; the shared genes when "
+              "samples with different panels are pooled); "
               "log2 fold change of the group means of the normalised counts (pseudocount 1); "
               "Benjamini–Hochberg FDR over all tested genes. Every cell is treated as an "
               "independent observation, so p-values are anticonservative when the groups come "

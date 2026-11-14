@@ -205,7 +205,7 @@ def _seg_result(seg_source, done_only: bool = False):
 
 # ─── SpaGE imputation state ───────────────────────────────────────────────────
 _spage_state: dict = {"status": "idle", "message": "", "result": None,
-                      "result_path": None, "result_genes": None}
+                      "result_path": None, "result_genes": None, "result_ids_tag": None}
 _spage_lock   = threading.Lock()
 SPAGE_STREAM_THRESHOLD = 500_000_000  # ~2 GB at float32; above this stream to zarr on disk
 _spage_repl_pending = False   # set by run_spage(); cleared once poll_spage_repl fires

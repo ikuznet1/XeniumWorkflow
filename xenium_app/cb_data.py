@@ -214,24 +214,30 @@ def update_tissue_info(_, seg_source, _split_done):
         _ntx_str = str(_ntx)
     cache_size = caching._cache_size_str()
 
+    # the cells of the loaded table (not the count experiment.xenium states: a ROI-only
+    # export keeps the full run's metadata, a store written from a run has none)
+    _n_df = core.DATA.get("_df_original")
+    if _n_df is None:
+        _n_df = core.DATA.get("df")
+    _n_loaded = f"{len(_n_df):,}" if _n_df is not None else f"{meta.get('num_cells', 0):,}"
     # Determine active cell count from reseg result if active
     tool = core._seg_tool(seg_source)
     if tool == "baysor":
         with core._baysor_lock:
             res = core._baysor_state.get("result")
-        n_cells_display = f"{len(res['cells_df']):,}" if res else f"{meta.get('num_cells', 0):,}"
+        n_cells_display = f"{len(res['cells_df']):,}" if res else _n_loaded
         seg_label = "Baysor"
     elif tool == "proseg":
         with core._proseg_lock:
             res = core._proseg_state.get("result")
-        n_cells_display = f"{len(res['cells_df']):,}" if res else f"{meta.get('num_cells', 0):,}"
+        n_cells_display = f"{len(res['cells_df']):,}" if res else _n_loaded
         seg_label = "Proseg"
     elif tool == "imgseg":
         res = core._seg_result(seg_source)
-        n_cells_display = f"{len(res['cells_df']):,}" if res else f"{meta.get('num_cells', 0):,}"
+        n_cells_display = f"{len(res['cells_df']):,}" if res else _n_loaded
         seg_label = "Image segmentation"
     else:
-        n_cells_display = f"{meta.get('num_cells', 0):,}"
+        n_cells_display = _n_loaded
         seg_label = "Xenium"
 
     return html.Div([
@@ -454,7 +460,7 @@ def _reset_dataset_state() -> None:
                 core._annot_state[_k] = None
     with core._spage_lock:
         core._spage_state.update({"status": "idle", "message": "", "result": None,
-                              "result_path": None, "result_genes": None})
+                              "result_path": None, "result_genes": None, "result_ids_tag": None})
     with core._sdata_lock:
         core._sdata_state.update({"status": "idle", "message": "", "sdata": None,
                               "roi": None, "patches": None})
@@ -596,7 +602,9 @@ def add_sample(n_clicks, picked_path, custom_path, extra_ver):
             last_ds = dataview.EXTRA_DATASETS[-1]
             last_max_x = last_ds["df"]["x_centroid"].max() + last_ds["x_offset"]
         else:
-            last_max_x = core.DATA["df"]["x_centroid"].max()
+            # the whole primary sample, also while subset() shows a slice of it
+            _prim = core.DATA.get("_df_original")
+            last_max_x = (_prim if _prim is not None else core.DATA["df"])["x_centroid"].max()
         new_min_x  = new_data["df"]["x_centroid"].min()
         x_offset   = last_max_x - new_min_x + 500.0
         new_data["x_offset"] = x_offset
@@ -805,6 +813,15 @@ def _h5ad_install(datasets, man, cache_dir) -> str:
 )
 def h5ad_poll(_, ds_version, roi_done, extra_ver, cellnest_ver):
     _nu = (no_update,) * 9
+    # a job started on the loaded dataset while the file was converting: the converted
+    # sections are installed only once it has finished (installing resets every job state,
+    # as Load Sample refuses to do while a job runs); the result is kept for a later tick
+    with h5ad._h5ad_lock:
+        _converted = h5ad._h5ad_state["status"] == "done"
+    _busy = [j for j in _running_jobs() if j != "Load .h5ad"] if _converted else []
+    if _busy:
+        return (f"Converted. Waiting for {', '.join(_busy)} to finish before the file is installed…",
+                False) + _nu
     with h5ad._h5ad_lock:
         status, msg = h5ad._h5ad_state["status"], h5ad._h5ad_state["message"]
         res = h5ad._h5ad_state.get("result") if status == "done" else None
@@ -860,7 +877,8 @@ def remove_extra_samples(n_clicks, extra_ver):
     Input("baysor-done", "data"),
     Input("proseg-done", "data"),
     State("cluster-method", "value"),
-    prevent_initial_call=True,
+    # also runs on page load: the layout's dropdown is built once from the start-up
+    # dataset, and a tab opened after Load Sample / an .h5ad must list the loaded one's sets
 )
 def update_cluster_options(_, _cs_version=None, seg_source=None, _extra=None, _baysor=None, _proseg=None,
                            current=None):

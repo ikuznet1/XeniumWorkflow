@@ -356,7 +356,8 @@ def test_in_memory_spage_result_under_a_subset_is_not_registered(xe, D, spage_wo
     from xenium_app import spage as spage_mod
     keep = list(D["df"].index[: max(3, len(D["df"]) // 2)])
     xe.subset(cell_ids=keep)
-    _spage_cache(xe, D, spage_world, 3.0, suffix=f"_n{len(D['df'])}")
+    # the key of a subset names its cells: their number and a hash of their ids (round 8)
+    _spage_cache(xe, D, spage_world, 3.0, suffix=f"_n{len(D['df'])}_{spage_mod._spage_ids_tag(D['df'].index)}")
     xe._run_spage_imputation(spage_world, 50, "GNEW")
     assert xe._spage_state["status"] == "done", xe._spage_state["message"]
     idx = {}

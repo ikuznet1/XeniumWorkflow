@@ -97,6 +97,37 @@ def _tx_write_gene_only(src: str, dst: str, qv_min=20) -> int:
     return n
 
 
+_PROSEG_SCHEDULE_MAX_STAGES = 12
+_PROSEG_SCHEDULE_MAX_ITER = 100000
+
+
+def _proseg_schedule(schedule):
+    """The sampler schedule of a Proseg run as it goes on the command line: positive
+    integers separated by one space ("150 150 300"), or None when the field is empty.
+    The field is free text: anything that is not a short list of positive integers
+    (separated by spaces or commas) raises ValueError, so no other token - e.g. a further
+    Proseg option - can reach the command line."""
+    if schedule is None:
+        return None
+    if isinstance(schedule, (list, tuple)):
+        schedule = " ".join(str(v) for v in schedule)
+    if not isinstance(schedule, str):
+        raise ValueError("Sampler schedule: expected integers separated by spaces, e.g. 150 150 300.")
+    toks = [t for t in re.split(r"[\s,]+", schedule.strip()) if t]
+    if not toks:
+        return None
+    out = []
+    for t in toks:
+        if not (t.isascii() and t.isdigit()) or not (1 <= int(t) <= _PROSEG_SCHEDULE_MAX_ITER):
+            raise ValueError(f"Sampler schedule: {t[:40]!r} is not a whole number of iterations between 1 and "
+                             f"{_PROSEG_SCHEDULE_MAX_ITER:,} (expected e.g. 150 150 300).")
+        out.append(str(int(t)))
+    if len(out) > _PROSEG_SCHEDULE_MAX_STAGES:
+        raise ValueError(f"Sampler schedule: {len(out)} stages given, at most "
+                         f"{_PROSEG_SCHEDULE_MAX_STAGES} are accepted.")
+    return " ".join(out)
+
+
 def _proseg_prior_type(prior_type) -> str:
     """Proseg prior the app supports: "nucleus" (default) or "cell". Anything else -
     e.g. the removed "none" option still held in a browser's saved state - is the
@@ -442,20 +473,23 @@ def _proseg_run_single(tx_df, patch_dir, proseg_bin, voxel_size, n_threads, n_sa
     # The --xenium preset of proseg 1.x does not drop low-quality transcripts
     # (--min-qv defaults to 0): keep Q-score ≥ 20 like the Xenium matrix / Baysor path
     cmd += ["--min-qv", "20"]
+    # every value is converted to a number here (a string that is not one raises): no
+    # request value reaches the command line as free text
     if voxel_size:
-        cmd += ["--initial-voxel-size", str(voxel_size)]
+        cmd += ["--initial-voxel-size", str(float(voxel_size))]
     if n_threads:
-        cmd += ["--nthreads", str(n_threads)]
+        cmd += ["--nthreads", str(int(n_threads))]
     if n_samples:
-        cmd += ["--ncomponents", str(n_samples)]
+        cmd += ["--ncomponents", str(int(n_samples))]
     if recorded_samples:
-        cmd += ["--recorded-samples", str(recorded_samples)]
+        cmd += ["--recorded-samples", str(int(recorded_samples))]
+    schedule = _proseg_schedule(schedule)
     if schedule:
-        cmd += ["--schedule"] + schedule.split()
+        cmd += ["--schedule"] + schedule.split(" ")
     if nuclear_reassign_prob is not None:
-        cmd += ["--nuclear-reassignment-prob", str(nuclear_reassign_prob)]
+        cmd += ["--nuclear-reassignment-prob", str(float(nuclear_reassign_prob))]
     if prior_seg_prob is not None:
-        cmd += ["--prior-seg-reassignment-prob", str(prior_seg_prob)]
+        cmd += ["--prior-seg-reassignment-prob", str(float(prior_seg_prob))]
 
     returncode = jobs._job_run_process(cmd, cwd=patch_dir, log_tag="proseg", use_pty=True,
                                   on_line=_proseg_progress_parser(progress_fn))
@@ -1133,7 +1167,7 @@ def _load_cached_baysor(out_dir: str) -> None:
                 import json as _jref
                 with open(_spage_ref_file) as _jf:
                     _sref = _jref.load(_jf)
-                if os.path.isdir(_sref.get("path", "")):
+                if os.path.exists(_sref.get("path", "")):     # zarr (streamed) or parquet
                     _spage_rpath  = _sref["path"]
                     _spage_rgenes = _sref.get("genes", [])
                     print(f"  Baysor: restored SpaGE result ({len(_spage_rgenes)} genes)", flush=True)
@@ -1318,16 +1352,51 @@ def _load_cached_baysor(out_dir: str) -> None:
         _set("error", str(exc)[:300])
 
 
+def _proseg_patch_offsets(out_dir: str) -> list:
+    """[(patch directory name, global-id offset)] of a cached Proseg patch run, as the live
+    run numbered its cells: the k-th patch that RETURNED cells has the offset
+    1 + k * 10,000,000. Which patches those are is the run's record (params.json
+    "patch_ok"), not the directory listing: a patch that failed after Proseg wrote its
+    cell-metadata.csv.gz keeps its directory but took no offset, and counting it would
+    shift the ids of every later patch by one stride. Runs recorded before "patch_ok"
+    existed fall back to the position among the patch directories with metadata."""
+    _STRIDE = 10_000_000
+    names = sorted(d for d in os.listdir(out_dir)
+                   if os.path.isdir(os.path.join(out_dir, d)) and d.startswith("patch_")
+                   and os.path.exists(os.path.join(out_dir, d, "cell-metadata.csv.gz")))
+    ok = None
+    try:
+        with open(os.path.join(out_dir, "params.json")) as _pf:
+            _ok = json.load(_pf).get("patch_ok")
+        if _ok is not None:
+            ok = [int(p) for p in _ok]
+    except Exception:
+        ok = None
+    if ok is None:
+        return [(n, 1 + i * _STRIDE) for i, n in enumerate(names)]
+    out = []
+    for n in names:
+        m = re.fullmatch(r"patch_(\d+)", n)
+        if m and int(m.group(1)) in ok:
+            out.append((n, 1 + ok.index(int(m.group(1))) * _STRIDE))
+        else:
+            print(f"  Proseg: {n} is not among the patches the run kept (params.json patch_ok) - "
+                  f"its files are not read", flush=True)
+    return out
+
+
 def _load_proseg_patch_boundaries(out_dir: str, patch_names: list) -> dict:
     """Load Proseg cell boundaries from per-patch polygon files with global ID remapping.
 
     Applies the same ID offset used for cell-metadata: global_id = local_id + 1 + i * STRIDE.
     Returns a cell_bounds dict {str(global_id): ([x…], [y…])}.
     """
-    _STRIDE = 10_000_000
     cell_bounds: dict = {}
-    for _i, _pname in enumerate(patch_names):
-        _offset = 1 + _i * _STRIDE
+    _offsets = dict(_proseg_patch_offsets(out_dir))
+    for _pname in patch_names:
+        if _pname not in _offsets:
+            continue
+        _offset = _offsets[_pname]
         _pdir = os.path.join(out_dir, _pname)
         for _poly_name in ("cell-polygons.geojson.gz", "polygons.geojson",
                            "polygons.json", "cell_polygons.json"):
@@ -1382,7 +1451,7 @@ def _load_cached_proseg(out_dir: str) -> None:
                 import json as _jref
                 with open(_spage_ref_file) as _jf:
                     _sref = _jref.load(_jf)
-                if os.path.isdir(_sref.get("path", "")):
+                if os.path.exists(_sref.get("path", "")):     # zarr (streamed) or parquet
                     _spage_rpath  = _sref["path"]
                     _spage_rgenes = _sref.get("genes", [])
                     print(f"  Proseg: restored SpaGE result ({len(_spage_rgenes)} genes)", flush=True)
@@ -1433,18 +1502,14 @@ def _load_cached_proseg(out_dir: str) -> None:
                             cells_df["cell_area"] = _cm["cell_area"].reindex(cells_df.index)
                         else:
                             # Patch-based: read volumes from each patch, remap IDs
-                            _patch_dirs = sorted([
-                                _pd for _pd in os.listdir(out_dir)
-                                if os.path.isdir(os.path.join(out_dir, _pd)) and _pd.startswith("patch_")
-                                and os.path.exists(os.path.join(out_dir, _pd, "cell-metadata.csv.gz"))
-                            ])
+                            _patch_dirs = _proseg_patch_offsets(out_dir)
                             if _patch_dirs:
                                 _area_map = {}
-                                for _pi, _pd in enumerate(_patch_dirs):
+                                for _pd, _poff in _patch_dirs:
                                     _cm = pd.read_csv(os.path.join(out_dir, _pd, "cell-metadata.csv.gz"),
                                                       usecols=["cell", "volume"])
                                     for _lid, _vol in zip(_cm["cell"].values, _cm["volume"].values):
-                                        _gid = str(int(_lid) + 1 + _pi * _STRIDE)
+                                        _gid = str(int(_lid) + _poff)
                                         _area_map[_gid] = _vol
                                 cells_df["cell_area"] = cells_df.index.map(
                                     lambda x: _area_map.get(str(x), np.nan)
@@ -1463,11 +1528,7 @@ def _load_cached_proseg(out_dir: str) -> None:
 
                 # Patch runs build the zarr without cell_boundaries shapes — load from polygon files
                 if not cell_bounds:
-                    _fp_patch_names = sorted([
-                        _d for _d in os.listdir(out_dir)
-                        if os.path.isdir(os.path.join(out_dir, _d)) and _d.startswith("patch_")
-                        and os.path.exists(os.path.join(out_dir, _d, "cell-metadata.csv.gz"))
-                    ])
+                    _fp_patch_names = [_n for _n, _o in _proseg_patch_offsets(out_dir)]
                     if _fp_patch_names:
                         cell_bounds = _load_proseg_patch_boundaries(out_dir, _fp_patch_names)
                         # the files also hold the cells the patch merge did not keep
@@ -1511,17 +1572,13 @@ def _load_cached_proseg(out_dir: str) -> None:
         # matching the scheme used during the live run: global_id = local_id + 1 + i*STRIDE
         _CELL_ID_STRIDE   = 10_000_000
         _PROSEG_UNASSIGNED = 4294967295  # 0xFFFFFFFF sentinel for unassigned transcripts
-        _patch_names = sorted([
-            d for d in os.listdir(out_dir)
-            if os.path.isdir(os.path.join(out_dir, d)) and d.startswith("patch_")
-            and os.path.exists(os.path.join(out_dir, d, "cell-metadata.csv.gz"))
-        ])
+        _patch_offsets = _proseg_patch_offsets(out_dir)
+        _patch_names = [_n for _n, _o in _patch_offsets]
         meta_parts: list = []
         tx_parts:   list = []
         if _patch_names:
             # Patch run: apply global-ID stride (replicates live-run numbering)
-            for _i, _pname in enumerate(_patch_names):
-                _offset = 1 + _i * _CELL_ID_STRIDE
+            for _pname, _offset in _patch_offsets:
                 _pdir   = os.path.join(out_dir, _pname)
                 _df     = pd.read_csv(os.path.join(_pdir, "cell-metadata.csv.gz"))
                 _remap  = {int(lid): int(lid) + _offset for lid in _df["cell"].values}
@@ -2088,6 +2145,9 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
         # a stale "none" (option removed from the UI) runs as the default prior and
         # therefore shares the default prior's cache tag
         prior_type = _proseg_prior_type(prior_type)
+        # integers only (ValueError otherwise); normalised, so the cache tag and the
+        # provenance record state what goes on the command line
+        schedule = _proseg_schedule(schedule)
         if not core.DATA.get("data_dir"):
             _set("error", "Resegmentation needs the original Xenium output directory "
                           "(transcripts.parquet); this dataset was " + dataview._origin_phrase() + ".")

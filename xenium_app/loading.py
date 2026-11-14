@@ -113,6 +113,47 @@ def _gdf_to_bounds_dict(gdf) -> dict:
     return dict(zip(keys, zip(xs, ys)))
 
 
+def _cell_ids_as_str(values) -> pd.Index:
+    """Cell ids / barcodes as text: bytes decoded, numbers written without a decimal part
+    (a float column 1.0, 2.0 names the cells 1, 2)."""
+    out = []
+    for v in values:
+        if isinstance(v, (bytes, bytearray)):
+            v = bytes(v).decode("utf-8", "replace")
+        elif isinstance(v, (float, np.floating)) and np.isfinite(v) and float(v).is_integer():
+            v = int(v)
+        out.append(str(v))
+    return pd.Index(out, dtype=object, name=getattr(values, "name", None))
+
+
+def _align_matrix_to_cells(expr, barcodes, cell_ids):
+    """Rows of the cell x gene matrix *expr* (one per entry of *barcodes*) in the order of
+    *cell_ids*, as CSR. Both id lists are compared as text. A cell without a matrix row
+    gets an empty row, with a printed warning that says how many there are; when NO cell
+    is found among the barcodes the ids of the two files do not correspond and a
+    ValueError is raised - an all-zero matrix is never returned silently."""
+    barcodes = _cell_ids_as_str(barcodes)
+    cell_ids = _cell_ids_as_str(cell_ids)
+    barcode_idx = {b: i for i, b in enumerate(barcodes)}
+    row_order   = np.array([barcode_idx.get(cid, -1) for cid in cell_ids], dtype=np.int64)
+    valid_mask  = row_order >= 0
+    n_cells, n_found = len(cell_ids), int(valid_mask.sum())
+    if n_cells and expr.shape[0] and n_found == 0:
+        raise ValueError(
+            f"None of the {n_cells:,} cell ids of cells.parquet (e.g. {list(cell_ids[:3])}) is among the "
+            f"{len(barcodes):,} barcodes of cell_feature_matrix.h5 (e.g. {list(barcodes[:3])}): the two "
+            f"files do not describe the same cells, and no expression matrix was built.")
+    if valid_mask.all():
+        return expr[row_order].tocsr()
+    print(f"  WARNING: {n_cells - n_found:,} of {n_cells:,} cells of cells.parquet have no row in "
+          f"cell_feature_matrix.h5 (e.g. {list(cell_ids[~valid_mask][:3])}): their counts are zero for "
+          f"every gene. Check that the two files come from the same run.", flush=True)
+    rows_v = np.where(valid_mask)[0]
+    expr_aligned = sp.lil_matrix((n_cells, expr.shape[1]), dtype=np.float32)
+    expr_aligned[rows_v] = expr[row_order[valid_mask]]
+    return expr_aligned.tocsr()
+
+
 def _build_xenium_sdata(data_dir: str) -> None:
     """Read all raw Xenium files and write spatialdata_xenium.zarr next to them (one-time generation)."""
     try:
@@ -134,6 +175,10 @@ def _build_xenium_sdata(data_dir: str) -> None:
 
     cells = pd.read_parquet(os.path.join(data_dir, "cells.parquet"))
     cells = cells.set_index("cell_id")
+    # Cell ids are text everywhere in the app. Bundles of older Xenium Onboard Analysis
+    # versions number the cells (integer cell_id) while the matrix barcodes are text:
+    # matched without this cast, no cell would find its matrix row.
+    cells.index = _cell_ids_as_str(cells.index)
 
     # Secondary analysis is optional: use analysis/ when extracted, else read the
     # same CSVs straight from analysis.tar.gz, else go without UMAP / clustering.
@@ -144,11 +189,11 @@ def _build_xenium_sdata(data_dir: str) -> None:
     _analysis_tar = os.path.join(data_dir, "analysis.tar.gz")
     if os.path.isdir(os.path.join(data_dir, "analysis")):
         if os.path.exists(os.path.join(data_dir, _umap_rel)):
-            umap_df = pd.read_csv(os.path.join(data_dir, _umap_rel), index_col="Barcode")
+            umap_df = pd.read_csv(os.path.join(data_dir, _umap_rel), index_col="Barcode", dtype={"Barcode": str})
         for method in (sorted(os.listdir(cluster_dir)) if os.path.isdir(cluster_dir) else []):
             path = os.path.join(cluster_dir, method, "clusters.csv")
             if os.path.exists(path):
-                df_c = pd.read_csv(path, index_col="Barcode")
+                df_c = pd.read_csv(path, index_col="Barcode", dtype={"Barcode": str})
                 cluster_methods[method] = df_c["Cluster"]
     elif os.path.exists(_analysis_tar):
         try:
@@ -160,10 +205,10 @@ def _build_xenium_sdata(data_dir: str) -> None:
                     if not _m.isfile():
                         continue
                     if _name == _umap_rel:
-                        umap_df = pd.read_csv(_tf.extractfile(_m), index_col="Barcode")
+                        umap_df = pd.read_csv(_tf.extractfile(_m), index_col="Barcode", dtype={"Barcode": str})
                     elif (len(_parts) == 4 and _parts[:2] == ["analysis", "clustering"]
                           and _parts[3] == "clusters.csv"):
-                        df_c = pd.read_csv(_tf.extractfile(_m), index_col="Barcode")
+                        df_c = pd.read_csv(_tf.extractfile(_m), index_col="Barcode", dtype={"Barcode": str})
                         cluster_methods[_parts[2]] = df_c["Cluster"]
         except Exception as exc:
             print(f"  Warning: could not read analysis.tar.gz: {exc}", flush=True)
@@ -210,18 +255,8 @@ def _build_xenium_sdata(data_dir: str) -> None:
         df[f"clust__{method}"] = series.reindex(df.index).fillna(0).astype(int)
 
     # Align expression matrix rows to match df.index order
-    barcode_idx = {b: i for i, b in enumerate(barcodes)}
-    row_order   = np.array([barcode_idx.get(cid, -1) for cid in df.index], dtype=np.int64)
-    valid_mask  = row_order >= 0
     n_cells, n_genes = len(df), len(gene_names)
-
-    if valid_mask.all():
-        expr_aligned = expr[row_order].tocsr()
-    else:
-        rows_v = np.where(valid_mask)[0]
-        expr_aligned = sp.lil_matrix((n_cells, n_genes), dtype=np.float32)
-        expr_aligned[rows_v] = expr[row_order[valid_mask]]
-        expr_aligned = expr_aligned.tocsr()
+    expr_aligned = _align_matrix_to_cells(expr, barcodes, df.index)
 
     # Build AnnData
     var_df  = pd.DataFrame({"is_imputed": False}, index=pd.Index(gene_names, name="gene"))

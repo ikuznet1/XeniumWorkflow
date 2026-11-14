@@ -30,6 +30,7 @@ import dash_bootstrap_components as dbc
 from dash import dcc, html, dash_table
 
 from . import core, jobs, caching, compat, dataview, stats, analysis
+from . import rworker
 
 
 _PROV_SCHEMA      = 1
@@ -68,6 +69,7 @@ _PROV_KINDS = {
     "banksy": "Banksy-style spatial domains", "joint": "Joint clustering across samples",
     "txfactor": "Transcript factors", "h5ad": "AnnData (.h5ad) conversion",
     "save": "Save as SpatialData", "cellnest": "CellNEST results loaded",
+    "session": "Session saved or restored",
 }
 # job kinds that are not analyses (nothing a methods section would report)
 _PROV_NOT_ANALYSES: dict = {}
@@ -412,13 +414,20 @@ def _prov_design():
         return None
     names = stats._design_names()
     donors = [r["donor"] for r in rows if r["cond"] and r["donor"]]
-    paired = bool(donors) and any(
-        {x["cond"] for x in rows if x["donor"] == d and x["cond"]} == {"A", "B"} for d in set(donors))
+    # paired by the rule the tests use (stats._sl_units): every included sample has a donor
+    # and at least 2 donors occur in both conditions - not "some donor occurs in both"
+    _u = stats._sl_units([r["cond"] for r in rows], [r["donor"] for r in rows])
+    paired = bool(_u["paired"])
+    _both = sorted({d for d in set(donors)
+                    if {x["cond"] for x in rows if x["donor"] == d and x["cond"]} == {"A", "B"}})
     return {"condition_names": {"A": names.get("A", "A"), "B": names.get("B", "B")},
             "samples": [{"label": r["label"], "name": r["name"], "condition": r["cond"] or "excluded",
                          "donor": r["donor"], "batch": r["batch"], "n_cells": r["n_cells"]} for r in rows],
             "n_a": sum(r["cond"] == "A" for r in rows), "n_b": sum(r["cond"] == "B" for r in rows),
             "donors_given": bool(donors), "paired_donors": paired,
+            "donors_in_both": _both,
+            "donors_on_all": bool(donors) and all(r["donor"] for r in rows if r["cond"] in ("A", "B")),
+            "units_note": _u["note"],
             "summary": stats._design_summary()}
 
 
@@ -472,24 +481,10 @@ def _prov_pkg_version(name: str) -> str:
 
 
 def _prov_r_versions(packages) -> dict:
-    """R and R package versions, asked of the R that the job has just used (rpy2 already
-    imported in this process); {} when R was not started."""
-    if "rpy2.robjects" not in sys.modules:
-        return {}
-    out = {}
-    try:
-        ro = sys.modules["rpy2.robjects"]
-        import rpy2.robjects.conversion as _rconv
-        _rconv.set_conversion(ro.default_converter)
-        out["R"] = str(ro.r("R.version.string")[0]).replace("R version ", "")
-        for p in packages or ():
-            try:
-                out[p] = str(ro.r(f'as.character(utils::packageVersion("{p}"))')[0])
-            except Exception:
-                out[p] = "not found"
-    except Exception as exc:
-        out.setdefault("R", f"version not read ({type(exc).__name__})")
-    return out
+    """R and R package versions, asked of the R that the job has just used: the R worker
+    process of the job (it reported them with its result, see rworker), else the R of
+    this process (rpy2 already imported here); {} when R was not started."""
+    return rworker._rw_versions_seen(packages) or rworker._rw_r_versions(packages)
 
 
 def _prov_software(packages=(), r_packages=(), tools=None) -> dict:
@@ -902,9 +897,25 @@ def _pm_design(r) -> str:
     txt = "Sample design as set in the app: " + "; ".join(parts)
     if ex:
         txt += "; excluded: " + ", ".join(ex)
-    txt += ". " + ("Donor labels were given" + (" and at least one donor occurs in both conditions (paired)."
-                                               if de.get("paired_donors") else "; no donor occurs in both conditions.")
-                   if de.get("donors_given") else "No donor labels were given: each sample counted as one unit.")
+    if not de.get("donors_given"):
+        return txt + ". No donor labels were given: each sample counted as one unit."
+    both = de.get("donors_in_both")
+    if de.get("paired_donors"):
+        txt += (". Donor labels were given for every included sample and at least 2 donors occur in both "
+                "conditions: the design is paired by donor.")
+    elif both:
+        txt += (f". Donor labels were given; {', '.join(map(str, both))} occur{'s' if len(both) == 1 else ''} "
+                f"in both conditions, but the design is not paired (pairing needs a donor on every included "
+                f"sample and at least 2 donors in both conditions): the samples of a donor within a condition "
+                f"were combined into one unit and the units compared as independent.")
+    elif both is None:
+        # a record written before the rule was recorded with the design
+        txt += ". Donor labels were given; the design is not paired by donor."
+    else:
+        txt += (". Donor labels were given; no donor occurs in both conditions (not paired): the samples of a "
+                "donor within a condition were combined into one unit.")
+    if de.get("donors_on_all") is False:
+        txt += " Some included samples have no donor label; each of them is its own unit."
     return txt
 
 
@@ -917,7 +928,11 @@ def _pm_de(r):
              f"(A: {_pm_v(H, 'label_a')}, n = {_pm_num(_pm_v(H, 'n_a'))} cells; "
              f"B: {_pm_v(H, 'label_b')}, n = {_pm_num(_pm_v(H, 'n_b'))} cells) was tested for every measured gene "
              f"({_pm_num(_pm_v(H, 'n_genes'))} genes) with the two-sided Wilcoxon rank-sum test on "
-             f"log1p(counts per 10,000) and p-values were adjusted with the Benjamini-Hochberg procedure "
+             f"log1p(counts per 10,000)"
+             + (f" (the pooled samples have different panels: the library size of a cell is its total over "
+                f"the {_pm_num(H['lib_shared_genes'])} shared genes that were tested)"
+                if H.get("lib_shared_genes") else "")
+             + " and p-values were adjusted with the Benjamini-Hochberg procedure "
              f"over the tested genes.",
              "Cells were treated as independent observations; this test does not use the sample design, "
              "so with cells from few samples its p-values are too small (pseudo-replication) and rank genes "
@@ -973,8 +988,14 @@ def _pm_proximity(r):
     est = str(H.get("estimator") or info.get("estimator") or "")
     fdr = str(H.get("fdr") or info.get("fdr") or "")
     mode = str(H.get("mode") or info.get("mode") or "")
-    src = P.get("source") if P.get("source") not in ("", "none") else None
-    src = src or (H.get("source") if H.get("source") not in ("", "none") else None)
+    # the density-covariate type the run USED (the result's "source": the type "auto" was
+    # resolved to, None when no covariate was used), not the request, which may be "auto"
+    src_unrecorded = False
+    if "source" in H:
+        src = H.get("source") if H.get("source") not in ("", "none", "auto") else None
+    else:
+        src = P.get("source") if P.get("source") not in ("", "none", "auto") else None
+        src_unrecorded = P.get("source") == "auto"
     rp = P.get("resolved") if isinstance(P.get("resolved"), dict) else {}
     near, far = rp.get("near", P.get("near")), rp.get("far", P.get("far"))
     lr = rp.get("local_r", 50)
@@ -985,6 +1006,9 @@ def _pm_proximity(r):
     if src:
         resid += (f" and on quantile bins of the local fraction of '{src}' cells within {_pm_num(lr)} µm "
                   f"(the density covariate)")
+    elif src_unrecorded:
+        resid += ("; a density-covariate cell type was to be chosen automatically, and which one (or none) "
+                  "was used was not recorded for this run")
     else:
         resid += "; no density-covariate cell type was used"
     s.append(resid + ".")
@@ -1135,23 +1159,68 @@ def _pm_lrdecomp(r):
 def _pm_compartments(r):
     P = r["params"]
     q = P.get("resolved") or P
+    H = r.get("headline") or {}
+    if "dominant" not in H:
+        # a record without the result's field: say what a core is, not that one was defined
+        core_txt = (f"Where cell-type labels were used, the dense core of the dominant cell type is: at least "
+                    f"{_pm_num(_pm_v(q, 'min_nb'))} other cells within that radius, at least "
+                    f"{_pm_num(_pm_v(q, 'min_frac'))} of them of the type, and further than "
+                    f"{_pm_num(_pm_v(q, 'min_edge'))} µm from the edge (see the status line for whether a core "
+                    f"was defined).")
+    elif H.get("dominant"):
+        core_txt = (f"Dense core of the cell type '{H['dominant']}'"
+                    + (" (the most frequent type of the view)" if P.get("dominant") in (None, "", "auto") else "")
+                    + f": at least {_pm_num(_pm_v(q, 'min_nb'))} other cells within "
+                    f"that radius, at least {_pm_num(_pm_v(q, 'min_frac'))} of them of the type, and further than "
+                    f"{_pm_num(_pm_v(q, 'min_edge'))} µm from the edge.")
+    else:
+        core_txt = (f"No cell-type labels were used, so no core was defined: cells within "
+                    f"{_pm_num(_pm_v(q, 'min_edge'))} µm of the tissue edge are 'edge', all others 'other'.")
     return ([f"Tissue compartments, per sample, on the cells of {_pm_seg(r)}: cell positions were rasterised "
              f"into {_pm_num(_pm_v(q, 'bin_um'))} µm bins, occupied bins taken as tissue (morphological closing "
              f"x {_pm_num(_pm_v(q, 'close_bins'))}; interior holes of at most {_pm_num(_pm_v(q, 'hole_max_bins'))} "
              f"bins filled) and a Euclidean distance transform gave each cell its distance to the tissue edge. "
              f"Local density is the number of other cells within {_pm_num(_pm_v(q, 'radius'))} µm.",
-             f"Dense core of the dominant cell type: at least {_pm_num(_pm_v(q, 'min_nb'))} other cells within "
-             f"that radius, at least {_pm_num(_pm_v(q, 'min_frac'))} of them of the type, and further than "
-             f"{_pm_num(_pm_v(q, 'min_edge'))} µm from the edge. No test is attached; the columns describe where "
-             f"a cell sits, not what it is."], [])
+             core_txt + " No test is attached; the columns describe where a cell sits, not what it is."], [])
+
+
+def _pm_marker_rule(H) -> "str | None":
+    """The marker rule a run recorded ("user", "specific", "fallback"), None when it did not."""
+    mi = H.get("marker_info")
+    rule = H.get("marker_rule") or (mi.get("rule") if isinstance(mi, dict) else None)
+    return str(rule) if rule in ("user", "specific", "fallback") else None
+
+
+def _pm_markers_sentence(H, of: str) -> str:
+    """How the markers of a run were chosen, from the recorded rule: listed by the user,
+    the specificity rule, or its fallback (never the specificity claim for a fallback set)."""
+    spec = ("at least 50 counts per million in the type and at least 10x the level of every other type")
+    rule = _pm_marker_rule(H)
+    if rule == "user":
+        return "Markers were the genes listed by the user."
+    if rule == "specific":
+        return f"Markers were derived from the annotation: the most specific genes of {of} ({spec})."
+    if rule == "fallback":
+        return (f"Markers were derived from the annotation, but fewer than 3 genes of {of} met the specificity "
+                f"rule ({spec}), so the genes with the highest specificity ratio among those at 50 counts per "
+                f"million or more were used whatever their ratio: these markers are not exclusive to the type "
+                f"and what is built on them is an upper bound.")
+    return (f"Markers were the most specific genes of {of} in the annotation ({spec}; when fewer than 3 genes "
+            f"meet this, the genes with the highest ratio) or the genes listed by the user; which applied "
+            f"was not recorded for this run (see its status line).")
 
 
 def _pm_spillover(r):
+    H = r.get("headline") or {}
+    kind = H.get("reference_kind")
+    ref = ("the median of that share inside source cells" if kind == "median" else
+           "the mean of that share inside source cells (its median was 0 - the markers are sparse - so the "
+           "mean was the reference and the per-cell score is coarse)" if kind == "mean" else
+           "a reference share inside source cells (its median, or its mean when the median is 0; which one "
+           "was not recorded for this run)")
     return ([f"Spillover score and gene ownership on {_pm_seg(r)}: the spillover score of a cell for a source "
-             "cell type is the share of the cell's counts in the source type's marker genes divided by the "
-             "median of that share inside source cells. Markers were the source type's most specific genes in "
-             "the annotation (at least 50 counts per million in the source and at least 10x every other "
-             "type) or the genes listed by the user.",
+             "cell type is the share of the cell's counts in the source type's marker genes divided by "
+             + ref + ". " + _pm_markers_sentence(H, "the source type"),
              "Built-in validity checks: the marker share of non-source cells must fall with the distance to "
              "the nearest source cell and rise with the fraction of source cells nearby; when a check fails "
              "the score is reported as not usable as a contamination mask.",
@@ -1206,9 +1275,8 @@ def _pm_segfree(r):
     P = r["params"]
     return ([f"Segmentation-free abundance of '{_pm_v(P, 'cell_type')}': marker transcripts per mm² of "
              "tissue, counted from the transcript file (quality Q >= 20, gene features only), not from the "
-             "cells. Markers were the most specific genes of the cell type in the annotation (at least 50 "
-             "counts per million in the type and at least 10x every other type) or the genes listed by the "
-             "user. The tissue area was taken from a square grid at every tile size of the sweep.",
+             "cells. " + _pm_markers_sentence(r.get("headline") or {}, "the cell type")
+             + " The tissue area was taken from a square grid at every tile size of the sweep.",
              "Concentration: Gini coefficient of the marker count over the tissue tiles and the share of "
              "the count in the top 10 % of tiles, each minus its mean under a null that redistributes the "
              f"same number of transcripts over the same tiles ({_pm_num(_pm_v(P, 'n_null'))} redistributions, "
@@ -1307,10 +1375,12 @@ def _pm_imgseg(r):
     if r.get("cache") == "cache" and "run" in P:
         return ([f"An image-based segmentation computed in an earlier session (run {_pm_v(P, 'run')}) was "
                  f"loaded from the cache ({_pm_num(_pm_v(H, 'n_cells'))} cells)."], ["sopa"])
-    cp = str(P.get("backend")) == "cellpose"
+    # the recorded backend of a Cellpose run is "cellpose:<model>"
+    _kind, _, _model = str(P.get("backend")).partition(":")
+    cp = _kind == "cellpose"
     return (["Cells were segmented on the morphology image, patch by patch through sopa (cells cut by a "
              "patch edge merged), with "
-             + ("Cellpose (local weights)" if cp else
+             + ((f"Cellpose (model '{_model}', local weights)" if _model else "Cellpose (local weights)") if cp else
                 "the built-in classical backend (Gaussian smoothing, Otsu threshold per patch, "
                 "distance-transform watershed, optional fixed-distance expansion of every nucleus - a simple "
                 "baseline, not a state-of-the-art segmenter)")
@@ -1427,6 +1497,21 @@ def _pm_cellnest(r):
              "CellNEST."], ["cellnest"])
 
 
+def _pm_session(r):
+    P = r["params"]
+    what = ("control values, the sample design, regions of interest, gene sets, saved groups and subset "
+            "filters; no results")
+    if P.get("action") == "restore":
+        part = ("" if P.get("mode") != "independent" else
+                " The session had been saved for other data, so only the settings that do not depend on the "
+                "data were applied.")
+        return ([f"The settings of a saved session ({what}) were restored from the {_pm_v(P, 'from')} "
+                 f"(saved {_pm_v(P, 'saved_at')}); {_pm_v(P, 'n_controls_set')} control values were set and "
+                 f"{_pm_v(P, 'n_missing')} values that named data no longer present were left out.{part} "
+                 f"Analyses run afterwards are recorded on their own."], [])
+    return ([f"The settings of the session ({what}) were saved as a JSON file ({_pm_v(P, 'to')})."], [])
+
+
 _PROV_TEMPLATES = {
     "de": _pm_de, "pseudobulk": _pm_pseudobulk, "proximity": _pm_proximity, "contact": _pm_contact,
     "geneset": _pm_geneset, "density": _pm_density, "composition": _pm_composition, "moran": _pm_moran,
@@ -1436,13 +1521,14 @@ _PROV_TEMPLATES = {
     "baysor": _pm_reseg("baysor"), "proseg": _pm_reseg("proseg"), "imgseg": _pm_imgseg,
     "patches": _pm_patches, "split": _pm_split, "spage": _pm_spage, "umap": _pm_umap,
     "spatial": _pm_spatial, "niches": _pm_niches, "h5ad": _pm_h5ad, "save": _pm_save,
-    "cellnest": _pm_cellnest,
+    "cellnest": _pm_cellnest, "session": _pm_session,
 }
 # order of the sections of the methods text
 _PROV_ORDER = ["h5ad", "patches", "baysor", "proseg", "imgseg", "umap", "annotation", "split", "spage",
                "segqc", "compartments", "spillover", "de", "pseudobulk", "proximity", "contact",
                "geneset", "density", "moran", "composition", "spatial", "niches", "coloc", "aggregates",
-               "segfree", "txfactor", "banksy", "joint", "lr", "lrdecomp", "cellnest", "save"]
+               "segfree", "txfactor", "banksy", "joint", "lr", "lrdecomp", "cellnest", "save",
+               "session"]
 
 
 def _pm_software(sw: dict) -> str:

@@ -66,12 +66,16 @@ def _stale_job(gen: int, status: str, message=None) -> bool:
 # processes, a step text, an optional fraction done and a cancel flag. The jobs panel
 # (update_jobs_panel) and _running_jobs() read from it.
 #
-# Cancellation is cooperative for Python / R code: the flag is checked at step
-# boundaries (_set("running", …) via _stale_job, _check_dataset_gen, _job_check), so a
-# library or R call that is in progress finishes first. External tools are started
-# with _job_run_process() in their own process group, which Cancel terminates
-# (SIGTERM, then SIGKILL after _JOB_KILL_GRACE_S). Once a job starts to write its
-# result it calls _job_shield(): from there it runs to completion.
+# Cancellation is cooperative for Python code: the flag is checked at step boundaries
+# (_set("running", …) via _stale_job, _check_dataset_gen, _job_check), so a library
+# call that is in progress finishes first. Child processes are started with
+# _job_popen() in their own process group, which Cancel terminates (SIGTERM, then
+# SIGKILL after _JOB_KILL_GRACE_S): the external tools through _job_run_process(), and
+# the long R steps (pseudobulk / contact fits, RCTD, SPLIT) through the R worker
+# process of rworker.py, so Cancel ends those at once. R that still runs inside the
+# app (reading a Seurat reference for Seurat kNN annotation and SpaGE, and every R
+# step with XENIUM_R_INPROCESS=1) finishes its current call first. Once a job starts
+# to write its result it calls _job_shield(): from there it runs to completion.
 import itertools as _itertools
 import time as _time
 import signal as _signal
@@ -385,6 +389,41 @@ def _kill_proc_tree(proc, grace: float = None) -> None:
         pass
 
 
+def _job_popen(cmd, **popen_kw):
+    """Start a child process of the current job (or of no job) and register it: it leads
+    its own session / process group, is listed in the job's procs (so Cancel terminates
+    it with its children) and in _job_procs_all (so the shutdown hooks do).
+    Raises _JobCancelled, without starting anything, when Cancel was already requested.
+    Used by _job_run_process() (Baysor, Proseg) and by the R worker (rworker.py); every
+    process started here is handed to _job_proc_done() when it is no longer needed."""
+    job = _job_current()
+    new_group = hasattr(os, "setsid")
+    if new_group:
+        popen_kw["start_new_session"] = True
+    with _jobs_lock:
+        # under the lock: a Cancel either sees the process or is seen here
+        _job_check()
+        proc = subprocess.Popen(cmd, **popen_kw)
+        proc._xe_new_group = new_group
+        proc._xe_job = job
+        _job_procs_all.add(proc)
+        if job is not None:
+            job.procs.append(proc)
+    return proc
+
+
+def _job_proc_done(proc, grace: float = None) -> None:
+    """End of a process started by _job_popen(): stop whatever is left of it and of its
+    process group, reap it and take it off the registry."""
+    if proc.poll() is None or (getattr(proc, "_xe_new_group", False) and _proc_group_alive(proc.pid)):
+        _kill_proc_tree(proc, grace)
+    job = getattr(proc, "_xe_job", None)
+    with _jobs_lock:
+        _job_procs_all.discard(proc)
+        if job is not None and proc in job.procs:
+            job.procs.remove(proc)
+
+
 def _job_run_process(cmd, cwd=None, log_tag: str = "", on_line=None, use_pty: bool = False,
                      env=None) -> int:
     """Run an external tool for the current job and return its exit code.
@@ -398,36 +437,25 @@ def _job_run_process(cmd, cwd=None, log_tag: str = "", on_line=None, use_pty: bo
     bar on a terminal (Proseg); falls back to a pipe where there is none.
     Raises _JobCancelled when the job was cancelled while the tool ran."""
     import codecs, select
-    job = _job_current()
     master = None
     popen_kw = dict(cwd=cwd, stdin=subprocess.DEVNULL, env=env)
-    new_group = hasattr(os, "setsid")
-    if new_group:
-        popen_kw["start_new_session"] = True
     if use_pty:
         try:
             import pty
             master, slave = pty.openpty()
         except Exception:
             master = None
-    with _jobs_lock:
-        # under the lock: a Cancel either sees the process or is seen here
-        try:
-            _job_check()
-            if master is not None:
-                proc = subprocess.Popen(cmd, stdout=slave, stderr=slave, **popen_kw)
-            else:
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                        **popen_kw)
-        except BaseException:
-            if master is not None:
-                os.close(master)
-                os.close(slave)
-            raise
-        proc._xe_new_group = new_group
-        _job_procs_all.add(proc)
-        if job is not None:
-            job.procs.append(proc)
+    try:
+        if master is not None:
+            proc = _job_popen(cmd, stdout=slave, stderr=slave, **popen_kw)
+        else:
+            proc = _job_popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **popen_kw)
+    except BaseException:
+        if master is not None:
+            os.close(master)
+            os.close(slave)
+        raise
+    new_group = proc._xe_new_group
     if master is not None:
         os.close(slave)
     fd = master if master is not None else proc.stdout.fileno()
@@ -470,12 +498,7 @@ def _job_run_process(cmd, cwd=None, log_tag: str = "", on_line=None, use_pty: bo
             _emit(pending)
         proc.wait()
     finally:
-        if proc.poll() is None or (new_group and _proc_group_alive(proc.pid)):
-            _kill_proc_tree(proc)
-        with _jobs_lock:
-            _job_procs_all.discard(proc)
-            if job is not None and proc in job.procs:
-                job.procs.remove(proc)
+        _job_proc_done(proc)
         try:
             if master is not None:
                 os.close(master)
@@ -497,6 +520,14 @@ def _jobs_kill_all_processes() -> None:
         _kill_proc_tree(proc, grace=2.0)
     for stage in list(caching._seg_stage_active):     # the runs these tools were working on
         caching._seg_stage_discard(stage)
+    for hook in list(_job_exit_hooks):                # e.g. the R worker's exchange directories
+        try:
+            hook()
+        except Exception:
+            pass
+
+
+_job_exit_hooks: list = []      # callables() run after the tool processes were stopped at exit
 
 
 _atexit.register(_jobs_kill_all_processes)

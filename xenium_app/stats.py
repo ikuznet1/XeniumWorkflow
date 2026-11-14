@@ -17,7 +17,7 @@ import plotly.graph_objects as go
 import time as _time
 
 from . import core, jobs, dataview, ui, figures, analysis, spatial
-from . import provenance
+from . import provenance, rworker
 
 
 # ─── Samples and their conditions ─────────────────────────────────────────────
@@ -158,9 +158,10 @@ def _design_samples() -> list:
     return out
 
 
-def _design_set(rows, names=None) -> None:
+def _design_set(rows, names=None, save: bool = True) -> None:
     """Store the assignment: rows = [{key, cond, batch, donor}], names = {"A": …, "B": …}.
-    A row without "donor" keeps the donor the sample had."""
+    A row without "donor" keeps the donor the sample had. save=False: in memory only, the
+    design file of these samples is left as it is (a validation-only batch run)."""
     _design_sync()
     _clean = lambda v: re.sub(r"\s+", " ", str(v or "").strip())
     with _design_lock:
@@ -175,7 +176,8 @@ def _design_set(rows, names=None) -> None:
                 nm = _clean(names.get(c))
                 _design_state["names"][c] = nm or c
         _design_state["version"] += 1
-        _design_save()
+        if save:
+            _design_save()
 
 
 def _design_names() -> dict:
@@ -446,8 +448,12 @@ def _sl_units(conds, donors=None) -> dict:
         out["units"] = [(d if not d.startswith("\x00") else "", c, ix) for (d, c), ix in groups.items()]
         out["n_samples"] = len(inc)
         out["n_units"] = len(groups)
-        n_d = len({d for (d, _c) in groups})
-        out["note"] = (f"n = {len(inc)} samples" + (f" ({n_d} donors)" if named else "")
+        # the donors given in the design (a sample without a donor label is not a donor)
+        n_d, n_unl = len(named), sum(1 for i in inc if not donors[i])
+        out["note"] = (f"n = {len(inc)} samples"
+                       + (f" ({n_d} donor{'s' if n_d != 1 else ''}"
+                          + (f", {n_unl} sample{'s' if n_unl != 1 else ''} without a donor" if n_unl else "")
+                          + ")" if named else "")
                        + (f", {len(groups)} independent units after combining the samples of one donor"
                           if len(groups) != len(inc) else ""))
         if both:
@@ -745,7 +751,8 @@ def _pb_prepare(samples, masks, conds, batches, min_cells=_PB_MIN_CELLS,
     # used is decided first, the gene list second.
     tots, ns, note = [], [], {}
     for i, s in enumerate(samples):
-        if not _counts_are_integer(s):
+        # (only for a sample of the design: an excluded one contributes no column)
+        if conds[i] in ("A", "B") and not _counts_are_integer(s):
             _pb_sum_counts(s, np.zeros(len(s["df"]), dtype=bool))    # raises unless rounding is allowed
         tot, n = _pb_sum_values(s, masks[i])
         tots.append(np.asarray(tot, dtype=np.float64))
@@ -894,55 +901,9 @@ def _pb_prepare(samples, masks, conds, batches, min_cells=_PB_MIN_CELLS,
             "min_cells": min_cells, "min_count": min_count}
 
 
-_PB_R_FUNCS = r"""
-.xe_pb_deseq2 <- function(counts, genes, samples, cond, batch, shrink) {
-  suppressPackageStartupMessages(library(DESeq2))
-  storage.mode(counts) <- "integer"
-  dimnames(counts) <- list(genes, samples)
-  cd <- data.frame(condition = factor(cond, levels = c("B", "A")), row.names = samples)
-  if (!is.null(batch)) { cd$batch <- factor(batch); dsg <- ~ batch + condition } else dsg <- ~ condition
-  dds <- suppressMessages(DESeqDataSetFromMatrix(countData = counts, colData = cd, design = dsg))
-  note <- ""
-  dds <- tryCatch(suppressMessages(DESeq(dds, quiet = TRUE)), error = function(e) {
-    note <<- paste0("DESeq() stopped (", conditionMessage(e), "): gene-wise dispersion estimates ",
-                    "were used without the trend fit")
-    d <- tryCatch(estimateSizeFactors(dds), error = function(e2) estimateSizeFactors(dds, type = "poscounts"))
-    d <- suppressMessages(estimateDispersionsGeneEst(d))
-    dispersions(d) <- mcols(d)$dispGeneEst
-    suppressMessages(nbinomWaldTest(d))
-  })
-  res <- results(dds, name = "condition_A_vs_B", alpha = 0.05)
-  shr <- rep(NA_real_, nrow(res)); shr_type <- "none"
-  if (isTRUE(shrink)) {
-    for (ty in c(if (requireNamespace("apeglm", quietly = TRUE)) "apeglm", "normal")) {
-      s <- tryCatch(suppressMessages(lfcShrink(dds, coef = "condition_A_vs_B", type = ty, quiet = TRUE)),
-                    error = function(e) NULL)
-      if (!is.null(s)) { shr <- s$log2FoldChange; shr_type <- ty; break }
-    }
-  }
-  list(baseMean = as.numeric(res$baseMean), log2FoldChange = as.numeric(res$log2FoldChange),
-       lfcSE = as.numeric(res$lfcSE), stat = as.numeric(res$stat), pvalue = as.numeric(res$pvalue),
-       padj = as.numeric(res$padj), shrunk = as.numeric(shr), shrink_type = shr_type,
-       size_factors = as.numeric(sizeFactors(dds)), note = note,
-       version = as.character(packageVersion("DESeq2")))
-}
-.xe_pb_edger <- function(counts, genes, samples, cond, batch) {
-  suppressPackageStartupMessages(library(edgeR))
-  dimnames(counts) <- list(genes, samples)
-  condition <- factor(cond, levels = c("B", "A"))
-  design <- if (!is.null(batch)) model.matrix(~ factor(batch) + condition) else model.matrix(~ condition)
-  y <- DGEList(counts = counts)
-  y <- calcNormFactors(y)
-  y <- estimateDisp(y, design)
-  fit <- glmQLFit(y, design)
-  qlf <- glmQLFTest(fit, coef = ncol(design))
-  tt <- qlf$table
-  list(log2FoldChange = as.numeric(tt$logFC), logCPM = as.numeric(tt$logCPM), stat = as.numeric(tt$F),
-       pvalue = as.numeric(tt$PValue), padj = as.numeric(p.adjust(tt$PValue, method = "BH")),
-       size_factors = as.numeric(y$samples$lib.size * y$samples$norm.factors / 1e6), note = "",
-       version = as.character(packageVersion("edgeR")))
-}
-"""
+# The R code of the two fits (_PB_R_FUNCS) and the function that runs it (_rw_pb_fit) are
+# in rworker.py: they run in the R worker process, which cannot import this module.
+_PB_R_PACKAGES = ("DESeq2", "edgeR", "apeglm", "ashr")     # versions kept in the provenance record
 
 _PB_INSTALL_HINT = ('Pseudobulk differential expression needs the R package DESeq2 (or edgeR): in R, '
                     'run  install.packages("BiocManager"); BiocManager::install(c("DESeq2", "apeglm")).')
@@ -957,48 +918,20 @@ def _pb_fit(prep: dict, shrink: bool = True, engine: str = "auto") -> dict:
     shrinkage estimator ran], lfc_se, base_mean, mean_a, mean_b, stat, pval, padj),
     engine, method_label, shrink, stat_name, size_factors, notes.
 
-    Call from a thread whose rpy2 conversion context was set (see _run_pseudobulk_de)."""
-    try:
-        import rpy2.robjects as ro
-        import rpy2.robjects.conversion as _rconv
-        from rpy2.robjects.packages import isinstalled
-    except Exception as exc:
-        raise ValueError(f"rpy2 / R is not available ({exc}). " + _PB_INSTALL_HINT) from None
-    _rconv.set_conversion(ro.default_converter)          # rpy2 thread rule: unconditional
+    The R part (rworker._rw_pb_fit) runs in the R worker process of the current job, which
+    Cancel terminates; inside the app with XENIUM_R_INPROCESS=1, or when the worker cannot
+    start (said in the notes). Both run the same statements on the same values."""
     counts = np.asarray(prep["counts"], dtype=np.int64)
-    n_g, n_s = counts.shape
     cond = list(prep["cond"])
-    with _rconv.localconverter(ro.default_converter):
-        have = {p: bool(isinstalled(p)) for p in ("DESeq2", "edgeR")}
-        if engine == "auto":
-            engine = "deseq2" if have["DESeq2"] else ("edger" if have["edgeR"] else None)
-        if engine is None or not have["DESeq2" if engine == "deseq2" else "edgeR"]:
-            raise ValueError(_PB_INSTALL_HINT)
-        ro.r(_PB_R_FUNCS)
-        r_counts = ro.r["matrix"](ro.IntVector(counts.ravel(order="F").tolist()), nrow=n_g, ncol=n_s)
-        r_batch = ro.NULL if prep.get("batch") is None else ro.StrVector([str(b) for b in prep["batch"]])
-        args = (r_counts, ro.StrVector(list(prep["genes"])), ro.StrVector(list(prep["labels"])),
-                ro.StrVector(cond), r_batch)
-        if engine == "deseq2":
-            res = ro.globalenv[".xe_pb_deseq2"](*args, bool(shrink))
-        else:
-            res = ro.globalenv[".xe_pb_edger"](*args)
-        # a copy: np.asarray() of an R numeric vector is a view of R's memory, which R
-        # reuses once the vector is collected (size factors read after a later R call
-        # came back as garbage)
-        get = lambda k: np.array(res.rx2(k), dtype=np.float64, copy=True)
-        txt = lambda k: str(res.rx2(k)[0])
-        sf = get("size_factors")
-        out = {"log2fc": get("log2FoldChange"), "stat": get("stat"), "pval": get("pvalue"),
-               "padj": get("padj")}
-        note, version = txt("note"), txt("version")
-        if engine == "deseq2":
-            out["lfc_se"], out["base_mean"] = get("lfcSE"), get("baseMean")
-            shrink_type = txt("shrink_type")
-            if shrink_type != "none":
-                out["log2fc_shrunk"] = get("shrunk")
-        else:
-            shrink_type = "none"
+    worker_notes = []
+    out = rworker._rw_call(
+        rworker._rw_pb_fit,
+        {"counts": counts, "genes": list(prep["genes"]), "labels": list(prep["labels"]), "cond": cond,
+         "batch": None if prep.get("batch") is None else [str(b) for b in prep["batch"]],
+         "shrink": bool(shrink), "engine": engine, "install_hint": _PB_INSTALL_HINT},
+        r_packages=_PB_R_PACKAGES, on_note=worker_notes.append)
+    engine, sf = out["engine"], out["size_factors"]
+    note, version, shrink_type = out["note"], out["version"], out["shrink_type"]
     norm = counts / np.where(sf > 0, sf, np.nan)[None, :]
     a = np.array([c == "A" for c in cond])
     table = pd.DataFrame({"gene": list(prep["genes"]), "log2fc": out["log2fc"]})
@@ -1019,7 +952,7 @@ def _pb_fit(prep: dict, shrink: bool = True, engine: str = "auto") -> dict:
         stat_name, mean_unit = "F", "counts per million (TMM)"
     return {"table": table, "engine": engine, "method_label": label, "shrink": shrink_type,
             "stat_name": stat_name, "mean_unit": mean_unit, "size_factors": sf,
-            "notes": [note] if note else []}
+            "notes": ([note] if note else []) + worker_notes}
 
 
 def _run_pseudobulk_de(population, seg_source, method, color_by, counts_corrected=False,
@@ -1030,9 +963,7 @@ def _run_pseudobulk_de(population, seg_source, method, color_by, counts_correcte
     volcano, the table and the CSV of the Differential Expression tab show it."""
     _gen = jobs._dataset_gen
     try:                                   # rpy2 thread rule: before anything else
-        import rpy2.robjects as _ro_mod
-        import rpy2.robjects.conversion as _rconv
-        _rconv.set_conversion(_ro_mod.default_converter)
+        rworker._rw_thread_setup()
     except Exception:
         pass                               # reported by _pb_fit with the install hint
 
@@ -1045,7 +976,7 @@ def _run_pseudobulk_de(population, seg_source, method, color_by, counts_correcte
             if result is not None:
                 analysis._de_state["result"] = result
         if status == "done":
-            provenance._prov_record("pseudobulk", seg_source=seg_source, corrected=counts_corrected, params={"population": population, "cluster_method": method, "color_by": color_by, "min_cells": min_cells, "min_count": min_count, "shrink": shrink, "engine": engine, "options": options}, labels=(color_by, method), uses_design=True, r_packages=("DESeq2", "edgeR", "apeglm", "ashr"), message=message, result=result)
+            provenance._prov_record("pseudobulk", seg_source=seg_source, corrected=counts_corrected, params={"population": population, "cluster_method": method, "color_by": color_by, "min_cells": min_cells, "min_count": min_count, "shrink": shrink, "engine": engine, "options": options}, labels=(color_by, method), uses_design=True, r_packages=_PB_R_PACKAGES, message=message, result=result)
 
     try:
         _t0 = _time.time()
@@ -1085,11 +1016,14 @@ def _run_pseudobulk_de(population, seg_source, method, color_by, counts_correcte
         lfc_note = ("unshrunken (MLE)" + (f"; {fit['shrink']}-shrunken estimate in column "
                                            f"log2fc_shrunk" if shrunk else ""))
         # depth of the cells behind each condition (median counts per cell of the population)
+        # over the genes the used samples share (the genes the pseudobulk sums are of): with
+        # different panels a cell's total over its own panel is not comparable between them
         _libs = {"A": [], "B": []}
+        _lib_genes = analysis._an_common_genes([s for s, r in zip(samples, prep["sample_rows"]) if r["used"]])
         for i, (smp, r) in enumerate(zip(samples, prep["sample_rows"])):
             if not r["used"]:
                 continue
-            _sf, _iv = analysis._an_size_factors(smp)
+            _sf, _iv = analysis._an_size_factors(smp, _lib_genes)
             _rows = np.asarray(smp["rows"])
             _sel = _rows[np.asarray(masks[i], dtype=bool) & (_rows >= 0)]
             _sfs = _sf[_sel]
@@ -1628,7 +1562,10 @@ def _comp_compute(kind, seg_source="xenium", method=None, transform="logit", tes
     sub = sub.loc[sub.sum(axis=1) > 0]
     t_donor = [donors[i] for i in t_idx]
     t_batch_in = [batches[i] for i in t_idx]
-    by_donor = bool(t_idx) and all(t_donor)
+    # Donor labels on some samples only: the labelled donors' sections are still combined
+    # (_sl_units makes an unlabelled sample its own unit and never pairs such a design), as
+    # in the exact test - sections of one donor are not replicates in either test.
+    by_donor = bool(t_idx) and any(t_donor)
     unit_note, dropped, paired = f"n = {n_a + n_b} samples", [], False
     y_u = p_u = None
     u_cond, u_block = t_cond, t_batch_in
@@ -1652,7 +1589,8 @@ def _comp_compute(kind, seg_source="xenium", method=None, transform="logit", tes
             u_block = [b[0] for b in ub] if all(len(b) == 1 for b in ub) else [""] * len(units)
         n_a, n_b = u_cond.count("A"), u_cond.count("B")
         res["n_a"], res["n_b"] = n_a, n_b
-    what = "independent units (donors)" if by_donor else "samples"
+    what = ("independent units (donors)" if by_donor and all(t_donor)
+            else "independent units" if by_donor else "samples")
     if n_a < _COMP_MIN_SAMPLES or n_b < _COMP_MIN_SAMPLES:
         res["test_note"] = (f"No test was run: condition A has {n_a} and condition B has {n_b} "
                             f"{what} with {cat_name} labels; at least {_COMP_MIN_SAMPLES} per "
@@ -2295,6 +2233,7 @@ def _lr_compute(samples, labels, pairs, k: int = _MORAN_K, n_perm: int = 200, se
         if a is not None and b is not None and (a, b) not in kept:
             kept.append((a, b))
     info["n_pairs_on_panel"] = len(kept)
+    info["lib_shared_genes"] = len(genes_all) if analysis._an_panels_differ(samples, genes_all) else None
     info["n_pairs_missing"] = len(pairs) - len(kept)
     if not kept:
         raise ValueError(f"None of the {len(pairs)} ligand–receptor pairs has both genes among "
@@ -2315,7 +2254,9 @@ def _lr_compute(samples, labels, pairs, k: int = _MORAN_K, n_perm: int = 200, se
         n = int(ok.sum())
         if n < 3:
             continue
-        sf, _in_view = analysis._an_size_factors(s)
+        # the cells of all samples are pooled: library over the genes they share (see
+        # analysis._an_size_factors), the whole panel when the samples have one panel
+        sf, _in_view = analysis._an_size_factors(s, genes_all)
         sub = s["csc"][:, np.array([s["gni"][g] for g in G], dtype=np.int64)].tocsr()[rows[ok]]
         sub = sub.astype(np.float64)
         det = sub.copy()                    # detection is decided on the counts: ≥ 1 transcript
@@ -2461,6 +2402,9 @@ def _run_lr(pairs_text, label_kind, seg_source, method, use_corrected, k, n_perm
             msg += " " + analysis._an_uncorrected_note(res["n_uncorrected"]) + "."
         if len(samples) > 1:
             msg += f" Cells of {len(samples)} samples were pooled (graph and permutations within each sample)."
+        if info.get("lib_shared_genes"):
+            msg += (f" The samples have different panels: the library size of every cell is its total over "
+                    f"the {info['lib_shared_genes']:,} genes they share.")
         msg += (f"\nUnit of the p-values: n = {info['n_cells']:,} cells, treated as exchangeable within "
                 f"their sample (label permutation); not a test across samples. Detected = count ≥ 1 "
                 f"transcript.")

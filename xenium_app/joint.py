@@ -239,8 +239,10 @@ def _jc_harmony(pcs, batch, seed: int = _JC_SEED, theta: float = _JC_THETA) -> n
     if hm is None:
         raise ImportError("harmonypy is not installed")
     pcs = np.asarray(pcs, dtype=np.float32)
-    ho = hm.run_harmony(pcs, {"level": np.asarray(batch).astype(str)}, ["level"], theta=float(theta),
-                        random_state=int(seed), verbose=False)
+    # the covariate as a DataFrame: every harmonypy release takes one (the 0.0.x releases
+    # read meta_data.shape and index it by column, which a plain dict does not support)
+    meta = pd.DataFrame({"level": np.asarray(batch).astype(str)})
+    ho = hm.run_harmony(pcs, meta, ["level"], theta=float(theta), random_state=int(seed), verbose=False)
     Z = np.asarray(ho.Z_corr)
     if Z.shape != pcs.shape:
         Z = Z.T
@@ -704,6 +706,11 @@ def _run_joint(seg_source, use_corrected: bool = False, params=None) -> None:
         elif r["umap"] is not None:
             msg += ("\nSelect the set under Cluster Set (Color By → Cluster): the UMAP panel then shows the joint "
                     "embedding of all samples.")
+            if len(r["umap"]) > clustering._UMAP_PARALLEL_MIN_CELLS:
+                # what clustering._umap_seed_kwargs did: the recorded seed is not UMAP's
+                msg += (f"\nThe UMAP of more than {clustering._UMAP_PARALLEL_MIN_CELLS:,} cells ran multi-threaded "
+                        f"without a seed: its layout is not reproducible between runs (the seed applies to the "
+                        f"PCA, Harmony, the clustering and the mixing index).")
         if harmony:
             msg += "\n" + _JC_CONFOUND_WARNING
             if conf == "full":
@@ -898,10 +905,15 @@ def _jc_umap_fig(color_by, method, gene, size, opacity, baysor_active=False, pro
         elif color_by.startswith("geneset:"):
             gs = analysis._geneset_color(color_by, seg, use_corrected)
             if gs is not None and len(gs[0]) == len(x):
-                lim = gs[1]
-                rng = (lim[0], lim[1]) if isinstance(lim, (tuple, list)) else (-float(lim), float(lim))
-                traces, what = _continuous(gs[0], str(gs[2]), "RdBu_r" if not isinstance(lim, (tuple, list)) else "Viridis",
-                                           rng), str(gs[2])
+                # as the map and the WebGL views: a provider's sequential values (a (lo, hi)
+                # range registered under the label) on Viridis, signed scores on RdBu_r
+                # around zero. _geneset_color itself always returns one limit.
+                seq = analysis._view_color_seq.get(gs[2])
+                if seq is not None:
+                    rng, scale = (float(seq[0]), float(seq[1])), "Viridis"
+                else:
+                    rng, scale = (-float(gs[1]), float(gs[1])), "RdBu_r"
+                traces, what = _continuous(gs[0], str(gs[2]), scale, rng), str(gs[2])
     except Exception as exc:
         print(f"  Joint UMAP: colouring by {color_by} failed ({exc}); colouring by sample", flush=True)
         traces = None

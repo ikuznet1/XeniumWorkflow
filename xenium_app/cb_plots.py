@@ -356,7 +356,32 @@ def capture_click(spatial_click, umap_click, measure_state):
                     if len(_hit) and np.any(np.abs(_e["x_centroid"].values[_hit]
                                                    + float(eds["x_offset"]) - px) < 1e-3):
                         return {"id": cell_id, "sample": si}
+    if triggered == "umap-plot":
+        return _sample_prefixed_cell(cell_id)
     return cell_id
+
+
+def _sample_prefixed_cell(point_id):
+    """A point of the joint UMAP carries "<sample label>:<cell id>" (labels S0, S1, … of the
+    samples side by side). Returned as what selected-cell holds: the plain id for the
+    primary sample, {"id", "sample": k} for the k-th extra sample. Anything else - the cell
+    id of the ordinary UMAP, which may itself contain a colon - is returned unchanged."""
+    if not isinstance(point_id, str) or ":" not in point_id or not dataview.EXTRA_DATASETS:
+        return point_id
+    lab, cid = point_id.split(":", 1)
+    dsets = [core.DATA] + list(dataview.EXTRA_DATASETS)
+    if not (lab[:1] == "S" and lab[1:].isdigit() and int(lab[1:]) < len(dsets)):
+        return point_id
+    k = int(lab[1:])
+    try:
+        if point_id in dsets[0]["df"].index:            # a real id of this form
+            return point_id
+        ids = dsets[k]["df"].index
+        if cid not in ids and not (ids.astype(str) == cid).any():
+            return point_id
+    except Exception:
+        return point_id
+    return cid if k == 0 else {"id": cid, "sample": k}
 
 
 # ─── Distance measurement ────────────────────────────────────────────────────

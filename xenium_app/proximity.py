@@ -19,7 +19,7 @@ from dash import dcc, html
 import dash_bootstrap_components as dbc
 
 from . import core, jobs, ui, analysis, stats, controls
-from . import provenance
+from . import provenance, rworker
 
 # ─── Parameters ───────────────────────────────────────────────────────────────
 _PROX_NEAR_UM = 25.0          # near: nearest anchor at most this far
@@ -70,7 +70,8 @@ _CONTACT_NOTE = (
     "stratum without comparator are left out), so location alone cannot make the difference. "
     "Pseudobulk = Σ weight × counts per sample × group (rounded to whole counts), fitted with "
     "~ sample + group in R (DESeq2, or edgeR when it is not installed); the unit of the p-values "
-    "is the sample. Needs at least 2 samples with both groups above the minimum cell count. Label "
+    "is the sample (with a donor on every used sample: the sections of a donor are pooled, "
+    "~ donor + group, and the unit is the donor). Needs at least 2 samples with both groups above the minimum cell count. Label "
     "shuffle: the contact / comparator labels are permuted within sample × stratum, the weights "
     "and the fit are redone, and the number of genes passing (FDR, |log2FC|, not flagged) is "
     "compared with the observed number (every shuffle is a model fit of a few seconds; Cancel "
@@ -1071,10 +1072,11 @@ def _contact_compute(samples, labels, target, anchor, strata=None, radius=_CONTA
     def _prep(M):
         return {"counts": np.rint(M[keep]).astype(np.int64), "genes": genes, "labels": col_labels,
                 "cond": ["B", "A"] * len(blocks), "batch": [b for b in blocks for _ in (0, 1)],
-                "design": "~ sample + group"}
+                "design": "~ donor + group" if by_donor else "~ sample + group"}
 
     if progress is not None:
-        progress(0.05, f"Fitting ~ sample + group on {len(blocks)} samples × {len(genes):,} genes in R…")
+        progress(0.05, f"Fitting {'~ donor + group' if by_donor else '~ sample + group'} on {len(blocks)} "
+                       f"{'donors' if by_donor else 'samples'} × {len(genes):,} genes in R…")
     jobs._job_check()
     f0 = fit(_prep(M0))
     table = f0["table"].copy()
@@ -1161,9 +1163,7 @@ def _run_contact_de(target, anchor, label_kind, seg_source, method, use_correcte
     """Background job: contact-group pseudobulk DE, published into the DE state."""
     _gen = jobs._dataset_gen
     try:                                   # rpy2 thread rule: before anything else
-        import rpy2.robjects as _ro_mod
-        import rpy2.robjects.conversion as _rconv
-        _rconv.set_conversion(_ro_mod.default_converter)
+        rworker._rw_thread_setup()
     except Exception:
         pass                               # reported by the fit with the install hint
 
@@ -1214,9 +1214,11 @@ def _run_contact_de(target, anchor, label_kind, seg_source, method, use_correcte
                 _set("running", text)
             jobs._job_progress(text, f)
 
-        res = _contact_compute(samples, labels, target, anchor, strata=strata, radius=radius,
-                               min_cells=min_cells, min_count=min_count, n_shuffle=n_shuffle, seed=seed,
-                               donors=stats._design_donors(samples), progress=_prog, leak_gate=leak_gate)
+        # one R worker for the observed fit and every label shuffle (R and DESeq2 load once)
+        with rworker._rw_session():
+            res = _contact_compute(samples, labels, target, anchor, strata=strata, radius=radius,
+                                   min_cells=min_cells, min_count=min_count, n_shuffle=n_shuffle, seed=seed,
+                                   donors=stats._design_donors(samples), progress=_prog, leak_gate=leak_gate)
         jobs._check_dataset_gen(_gen)
         fitinfo, sh, t = res["fit"], res["shuffle"], res["table"]
         k = len(res["blocks"])
@@ -1232,11 +1234,11 @@ def _run_contact_de(target, anchor, label_kind, seg_source, method, use_correcte
                     "lfc_title": "log2 fold change (contact / comparator), unshrunken (MLE)",
                     "up_name": "higher in contact", "down_name": "lower in contact"})
         res["title"] = (f"{target} within {radius:g} µm of {anchor} ({res['n_a']:,} cells) vs matched {target} "
-                        f"without ({res['n_b']:,}) — {fitinfo['method_label']}, ~ sample + group; n = {k} {unit}")
+                        f"without ({res['n_b']:,}) — {fitinfo['method_label']}, {res['design']}; n = {k} {unit}")
         msg = (f"Contact groups ({cat}): {target} with a {anchor} cell within {radius:g} µm ({res['n_a']:,} cells) "
                f"vs {target} without ({res['n_b']:,} cells, reweighted to the contact cells' compartment × edge "
                f"bin × density quintile) in {k} {unit} [{', '.join(res['blocks'])}]; {fitinfo['method_label']}, "
-               f"design ~ sample + group. {res['n_genes']:,} genes tested ({res['n_filtered']:,} with a total "
+               f"design {res['design']}. {res['n_genes']:,} genes tested ({res['n_filtered']:,} with a total "
                f"count below {res['min_count']} not tested); {int((t['padj'] < 0.05).sum()):,} with FDR < 0.05; "
                f"{res['n_pass']:,} pass (FDR < {res['fdr']:g}, |log2FC| > {res['lfc_min']:g}, not flagged) "
                f"({'SPLIT-corrected' if res['corrected'] else 'original'} counts, weighted sums rounded; "
@@ -1310,7 +1312,7 @@ def _contact_csv_header(res: dict) -> str:
              f"{'SPLIT-corrected' if res['corrected'] else 'original'} (weighted sums, rounded)",
              f"# contact = a {res['anchor']} cell within {res['radius']:g} um in the same sample; comparator "
              f"weights reproduce the contact cells' compartment x edge bin x density quintile mix per sample",
-             f"# method: {res.get('method_label', '')}; design: ~ sample + group; log2fc = contact / comparator",
+             f"# method: {res.get('method_label', '')}; design: {res.get('design') or '~ sample + group'}; log2fc = contact / comparator",
              f"# unit of the p-values: {res.get('units_note', '')}",
              f"# pass = padj < {res['fdr']:g} and |log2fc| > {res['lfc_min']:g} and not leak_flag; leak_flag = "
              f"anchor_owned ({res['anchor']} owns the gene, {res['target']} does not) or gate_flag (leak gate)"]

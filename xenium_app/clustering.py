@@ -24,6 +24,18 @@ def _umap_seed_kwargs(n_cells: int, seed: int) -> dict:
     return {"n_jobs": -1}
 
 
+def _umap_seeds(n_cells: int, how: str = "UMAP") -> dict:
+    """The seeds of an embedding as the provenance record states them: what
+    _umap_seed_kwargs() did for this number of cells (t-SNE, the fallback, is always
+    seeded)."""
+    if how == "UMAP" and n_cells > _UMAP_PARALLEL_MIN_CELLS:
+        return {"svd_random_state": 0,
+                "umap_random_state": f"none (more than {_UMAP_PARALLEL_MIN_CELLS:,} cells: UMAP ran "
+                                     f"multi-threaded without a seed; the layout is not reproducible "
+                                     f"between runs)"}
+    return {"random_state": 0}
+
+
 def _compute_reseg_clusters_umap(cells_df: pd.DataFrame, expr_mat,
                                   progress_fn=None) -> None:
     """Compute KMeans clustering and UMAP for reseg cells in-place on cells_df.
@@ -160,7 +172,8 @@ def _run_reseg_umap() -> None:
             provenance._prov_record(
                 "umap", seg_source=core._umap_reseg_state.get("seg_source", "xenium"),
                 corrected=(core._umap_reseg_state.get("counts_mode", "original") == "corrected"),
-                params=dict(record.get("params") or {}), seeds={"random_state": 0},
+                params=dict(record.get("params") or {}),
+                seeds=dict(record.get("seeds") or {"random_state": 0}),
                 packages=("umap-learn", "scikit-learn"), message=message,
                 result={"corrected": _corr, "n_cells": int(record.get("n_cells") or 0),
                         "n_uncorrected": int(record.get("n_uncorrected") or 0) if _corr else 0,
@@ -258,9 +271,12 @@ def _run_reseg_umap() -> None:
                 if _corr_expr.shape[0] == core.DATA["expr"].shape[0] and len(_d2e) == len(_df_ids):
                     # Full-size matrix, one row per DATA["expr"] row (zero rows for
                     # cells SPLIT dropped): select the kept cells through df_to_expr.
-                    _corr_set = {str(cid) for cid in _corr_ids}
-                    _sub_mask = [(c in _corr_set) and (r >= 0)
-                                 for c, r in zip(_df_ids, _d2e)]  # bool mask over DATA["df"]
+                    # The cells with corrected counts are the non-empty rows (as everywhere
+                    # else, dataview._corrected_covered), not the recorded id list: a SPLIT
+                    # run under subset() is merged into the rows of an earlier full run, and
+                    # its ids alone would leave those cells out.
+                    _row_nz = np.asarray(abs(_corr_expr).sum(axis=1)).ravel() > 0
+                    _sub_mask = list((_d2e >= 0) & _row_nz[np.clip(_d2e, 0, None)])  # over DATA["df"]
                     expr = _corr_expr[_d2e[np.where(_sub_mask)[0]], :]
                 else:
                     # Rows in corrected_cell_ids order
@@ -351,7 +367,7 @@ def _run_reseg_umap() -> None:
                          + (f" ({_how2} of the SPLIT-corrected counts; {len(_xen_df) - _n:,} cells without them "
                             f"have no coordinates)" if _sub_mask is not None else f" ({_how2} of the original counts)"),
                  record={"corrected": _sub_mask is not None, "n_cells": _n,
-                         "n_uncorrected": len(_xen_df) - _n,
+                         "n_uncorrected": len(_xen_df) - _n, "seeds": _umap_seeds(_n, _how2),
                          "params": {"method": _how2, "n_components": int(_nc),
                                     "n_neighbors": int(min(15, _n - 1)), "min_dist": 0.1}})
             print(f"  {_label} UMAP recomputed for {_n:,} cells", flush=True)
@@ -382,9 +398,12 @@ def _run_reseg_umap() -> None:
         # cells with zeros which would distort the UMAP embedding).
         if _corr is not None:
             _corr_ids = [str(c) for c in alt_res.get("split_corrected_cell_ids", [])]
-            if not _corr_ids and _corr.shape[0] == len(_all_cell_ids):
-                # Loaded from zarr (no corrected_cell_ids in memory) — derive from non-zero rows
-                _nonzero_mask = np.diff(_corr.indptr) > 0
+            if _corr.shape[0] == len(_all_cell_ids):
+                # One row per cell (empty for a cell without corrected counts): the corrected
+                # cells are the non-empty rows. The recorded id list is not used here - it is
+                # absent for a run loaded from zarr, and after a SPLIT run under subset() it
+                # names that run's cells only although the matrix also holds earlier rows.
+                _nonzero_mask = np.asarray(abs(sp.csr_matrix(_corr)).sum(axis=1)).ravel() > 0
                 _corr_ids = [_all_cell_ids[i] for i in np.where(_nonzero_mask)[0]]
                 print(f"  Reseg UMAP: derived {len(_corr_ids):,} corrected cell IDs "
                       f"from non-zero X_corrected rows", flush=True)
@@ -506,7 +525,7 @@ def _run_reseg_umap() -> None:
         # reported again after the zarr write; the record is written here, once per run
         _set("done", _done_msg, result=umap_df,
              record={"corrected": _is_corr, "n_cells": n_cells,
-                     "n_uncorrected": len(_all_cell_ids) - n_cells,
+                     "n_uncorrected": len(_all_cell_ids) - n_cells, "seeds": _umap_seeds(n_cells, _how),
                      "params": {"method": _how, "n_components": int(n_comp),
                                 "n_neighbors": int(min(15, n_cells - 1)), "min_dist": 0.1}})
 
