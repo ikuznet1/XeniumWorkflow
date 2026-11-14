@@ -682,16 +682,7 @@ def _load_cached_imgseg(out_dir: str) -> None:
         if not os.path.isdir(zarr_path):
             _set("error", f"No SpatialData store in {os.path.basename(out_dir)}: run the segmentation again.")
             return
-        spage_path, spage_genes = None, None
-        ref = os.path.join(out_dir, "spage_result.json")
-        if os.path.exists(ref):
-            try:
-                with open(ref) as f:
-                    sref = json.load(f)
-                if os.path.exists(sref.get("path", "")):      # zarr (streamed) or parquet
-                    spage_path, spage_genes = sref["path"], sref.get("genes", [])
-            except Exception:
-                pass
+        spage_path, spage_genes, spage_extra = reseg._spage_ref_restore(out_dir)
         cells_df, expr_mat, corr, corr_imp, cell_bounds = reseg._fast_load_reseg_zarr(zarr_path)
         n_cells = len(cells_df)
         if (("umap_1" not in cells_df.columns or not reseg._reseg_cluster_cols(cells_df.columns))
@@ -705,7 +696,7 @@ def _load_cached_imgseg(out_dir: str) -> None:
             "cells_df": cells_df, "cell_bounds": cell_bounds, "out_dir": out_dir, "expr": expr_mat,
             "source": _ISEG_TOOL, "sdata_path": zarr_path, "split_corrected_expr": corr,
             "split_corrected_imputed_genes": corr_imp, "spage_result_path": spage_path,
-            "spage_result_genes": spage_genes,
+            "spage_result_genes": spage_genes, **spage_extra,
             **(reseg._reseg_zarr_gene_index(zarr_path, expr_mat.shape[1]) if expr_mat is not None else {})})
         print(f"Loaded cached image segmentation: {n_cells:,} cells, {len(cell_bounds):,} boundaries", flush=True)
         provenance._prov_record(

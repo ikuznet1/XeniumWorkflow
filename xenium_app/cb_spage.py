@@ -10,6 +10,13 @@ from . import compat, core, jobs, dataview, spage, subsetting, morph, app_layout
 
 # ─── SpaGE callbacks ──────────────────────────────────────────────────────────
 
+def _run_imputed_genes(res: dict) -> list:
+    """Imputed genes a segmentation run can show: those in its matrix and those of its
+    current SpaGE result reference (streamed, or kept in the cache file only)."""
+    return sorted(set(map(str, res.get("imputed_genes") or []))
+                  | set(map(str, res.get("spage_result_genes") or [])))
+
+
 @app_layout.app.callback(
     Output("spage-poll",    "disabled"),
     Output("spage-status",       "children"),
@@ -27,6 +34,9 @@ def start_spage(n_clicks, rds_path, n_pv, genes_input, seg_source):
     _problem = core._ref_rds_problem(rds_path)
     if _problem:                              # nothing is started: the poll stays off, Run stays enabled
         return True, f"✗ {_problem}", f"✗ {_problem}", False
+    _alt, _seg_err = core._seg_job_result(seg_source, "nothing was imputed")
+    if _seg_err:                              # a run that is named but not loaded: nothing is started
+        return True, f"✗ {_seg_err}", f"✗ {_seg_err}", False
     with core._spage_lock:
         if core._spage_state["status"] == "running":
             return False, "Already running…", "Already running…", True
@@ -42,7 +52,7 @@ def start_spage(n_clicks, rds_path, n_pv, genes_input, seg_source):
     # Copy the current contextvars context so rpy2 conversion rules are available in the thread
     jobs._job_start("spage", "SpaGE imputation", spage._run_spage_imputation,
                args=(rds_path, n_pv, genes_str, seg_src),
-               state=core._spage_state, lock=core._spage_lock, copy_context=True)
+               state=core._spage_state, lock=core._spage_lock, copy_context=True, uses_run=_alt)
     _start_msg = "Starting SpaGE…"
     if core._active_counts_mode == "corrected":
         # SpaGE always imputes from the original counts (see _run_spage_imputation)
@@ -144,14 +154,11 @@ def update_gene_options(_spage_version, _ds_version, seg_source):
         else:
             res = core._seg_result(seg_source, done_only=True)
         if res:
-            imp_genes = res.get("imputed_genes", [])
+            # the union, as for the Xenium cells below: genes written into the run's matrix
+            # and genes of a streamed / cache-only result (not in the matrix) are both served
+            imp_genes = _run_imputed_genes(res)
             if imp_genes:
-                imp = [{"label": f"{g} [imp]", "value": f"{g} [imp]"} for g in sorted(imp_genes)]
-                return base + imp
-            # Streaming SpaGE: genes not written to alt_res["expr"] — use reseg-specific gene list
-            streaming_genes = res.get("spage_result_genes") or []
-            if streaming_genes:
-                imp = [{"label": f"{g} [imp]", "value": f"{g} [imp]"} for g in sorted(streaming_genes)]
+                imp = [{"label": f"{g} [imp]", "value": f"{g} [imp]"} for g in imp_genes]
                 return base + imp
         return base
 

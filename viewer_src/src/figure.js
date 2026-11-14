@@ -351,9 +351,19 @@ export function buildScene(view, plan, rasters = {}, {title = 'Xenium spatial ma
 const n2 = (v) => String(Math.round(v * 100) / 100);
 const n3 = (v) => String(Math.round(v * 1000) / 1000);
 const hex = (c) => '#' + ((1 << 24) | (c[0] << 16) | (c[1] << 8) | c[2]).toString(16).slice(1);
-// eslint-disable-next-line no-control-regex
-const xml = (s) => String(s).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
-  .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+/**
+ * Text for an XML attribute or element. Every code point XML 1.0 does not allow is dropped -
+ * the C0 controls other than tab, LF and CR, U+FFFE, U+FFFF and unpaired surrogates (one
+ * such character makes the whole SVG ill-formed: no viewer opens it, and the PNG export,
+ * which loads the SVG as an image, fails) - then the markup characters are escaped.
+ */
+export function xmlText(s) {
+  // eslint-disable-next-line no-control-regex
+  return String(s).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\ufffe\uffff]/g, '')
+    .replace(/[\ud800-\udbff][\udc00-\udfff]|[\ud800-\udfff]/g, (m) => (m.length === 2 ? m : ''))
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+const xml = xmlText;
 const attrs = (a) => (a ? Object.keys(a).map((k) => ` ${k}="${xml(a[k])}"`).join('') : '');
 const FONT = 'Helvetica, Arial, sans-serif';
 
@@ -448,10 +458,16 @@ export function sceneToSvg(scene) {
 // A minimal PDF 1.4 writer: one page in figure units (1 unit = 1 pt), filled and stroked
 // paths, Flate-compressed RGB images with a soft mask, axial shadings, and text in the
 // standard Helvetica fonts (not embedded; WinAnsi characters only, others print as '?').
-const WINANSI = {0x20ac: 0x80, 0x2026: 0x85, 0x2018: 0x91, 0x2019: 0x92, 0x201c: 0x93, 0x201d: 0x94, 0x2022: 0x95, 0x2013: 0x96,
-  0x2014: 0x97, 0x03bc: 0xb5, 0x2212: 0x2d};
+// Windows-1252 bytes 0x80-0x9F: all 27 characters that sit above U+00FF in Unicode (the rest
+// of the code page equals Latin-1), plus two look-alikes that have no code of their own
+// there (Greek mu → micro sign, minus sign → hyphen-minus).
+const WINANSI = {0x20ac: 0x80, 0x201a: 0x82, 0x0192: 0x83, 0x201e: 0x84, 0x2026: 0x85, 0x2020: 0x86, 0x2021: 0x87,
+  0x02c6: 0x88, 0x2030: 0x89, 0x0160: 0x8a, 0x2039: 0x8b, 0x0152: 0x8c, 0x017d: 0x8e, 0x2018: 0x91, 0x2019: 0x92,
+  0x201c: 0x93, 0x201d: 0x94, 0x2022: 0x95, 0x2013: 0x96, 0x2014: 0x97, 0x02dc: 0x98, 0x2122: 0x99, 0x0161: 0x9a,
+  0x203a: 0x9b, 0x0153: 0x9c, 0x017e: 0x9e, 0x0178: 0x9f, 0x03bc: 0xb5, 0x2212: 0x2d};
 
-function pdfText(text) {
+/** A PDF literal string in WinAnsiEncoding; a character outside Windows-1252 becomes '?'. */
+export function pdfText(text) {
   let out = '(';
   for (const ch of String(text)) {
     let c = ch.codePointAt(0);

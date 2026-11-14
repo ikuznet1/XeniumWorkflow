@@ -785,10 +785,15 @@ def _jc_restore_umap(method, tables, seg_source="xenium") -> None:
             known = own if full is None else pd.Index(full.index.astype(str))
             if not len(ids) or not ids.isin(known).all():
                 return                              # not the cells of this sample
-            um = pd.DataFrame(arr["umap"][sel, :2], index=ids).reindex(own)
-            cols.append({f"{prefix}_1": um[0].to_numpy(dtype=np.float32), f"{prefix}_2": um[1].to_numpy(dtype=np.float32)})
-        for t, c in zip(tables, cols):
-            controls._ctl_put(t, seg_source, c)
+            # stored against the WHOLE sample, not the slice a subset shows now: the
+            # columns are read per cell id (_ctl_get), so the cells outside the subset have
+            # their coordinates again once it is cleared (no second restore is attempted)
+            frame = t["df"] if full is None else full
+            um = pd.DataFrame(arr["umap"][sel, :2], index=ids).reindex(known)
+            cols.append(({**t, "df": frame},
+                         {f"{prefix}_1": um[0].to_numpy(dtype=np.float32), f"{prefix}_2": um[1].to_numpy(dtype=np.float32)}))
+        for t_full, c in cols:
+            controls._ctl_put(t_full, seg_source, c)
     except Exception as exc:
         print(f"  Joint clustering: the cached UMAP was not restored ({exc})", flush=True)
 
@@ -1011,7 +1016,7 @@ def _jc_csv(res) -> str:
              "# " + _jc_diag_text(d, res["var"] if res["var"] != "none" else "sample")]
     if res["harmony"]:
         lines.append("# " + _JC_CONFOUND_WARNING.replace("⚠ ", ""))
-    return provenance._prov_csv_stamp(res, ("\n".join(lines) + "\n" + res["table"].to_csv(index=False)))
+    return provenance._prov_csv_stamp(res, (provenance._csv_comments(lines) + res["table"].to_csv(index=False)))
 
 
 # ─── Layout ───────────────────────────────────────────────────────────────────

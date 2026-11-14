@@ -407,17 +407,15 @@ def _prox_params(params=None) -> dict:
 def _prox_unit_groups(n_samples: int, conds=None, donors=None) -> tuple:
     """Independent units of a one-sample-per-row effect matrix: ({unit name: [sample
     indices]}, by_donor, included sample indices). Samples with a condition are included
-    (all samples when none has one); a unit is a donor when every included sample has a
-    donor, else a sample."""
+    (all samples when none has one); the units are those of stats._sl_unit_groups (the
+    samples of one donor are one unit, a sample without a donor label is its own);
+    by_donor: every included sample has a donor."""
     conds = list(conds) if conds is not None else [""] * n_samples
     donors = [str(d or "").strip() for d in (donors if donors is not None else [""] * n_samples)]
     inc = ([i for i in range(n_samples) if conds[i] in ("A", "B")]
            if any(c in ("A", "B") for c in conds) else list(range(n_samples)))
-    by_donor = bool(inc) and all(donors[i] for i in inc)
-    groups: dict = {}
-    for i in inc:
-        groups.setdefault(donors[i] if by_donor else f"sample{i}", []).append(i)
-    return groups, by_donor, inc
+    ug = stats._sl_unit_groups(inc, donors)
+    return ug["groups"], ug["by_donor"], inc
 
 
 def _prox_unit_means(E, groups: dict) -> np.ndarray:
@@ -626,7 +624,10 @@ def _prox_compute(samples, labels, target, anchor, strata=None, source="auto", c
     table["pval"], table["padj"] = tt["p"], tt["padj"]
     other = tests["slope" if est == "nearfar" else "nearfar"]
     table["p_slope" if est == "nearfar" else "p_nearfar"] = other["p"]
+    _dn = [str(d or "").strip() for d in (donors if donors is not None else [""] * S)]
+    _used_ix = [i for ix in groups.values() for i in ix]
     info = {"mode": mode, "n_units": tt["n_units"], "by_donor": by_donor, "min_p": tt["min_p"], "exact": tt["exact"],
+            "unit_word": stats._sl_unit_groups(_used_ix, _dn)["word"],
             "fdr": tt["fdr"], "n_random_valid": tt["n_valid"], "estimator": est,
             "n_random_valid_nearfar": tests["nearfar"]["n_valid"]}
     mu = tt["mu"]
@@ -758,7 +759,7 @@ def _prox_units_statement(res: dict) -> str:
     """Unit and n of the p-values of a proximity result."""
     info, N = res["info"], res["info"]["n_random_valid"]
     if info["mode"] == "cohort":
-        return (f"n = {info['n_units']} {'donors' if info['by_donor'] else 'samples'} (exact sign-flip test of "
+        return (f"n = {info['n_units']} {info.get('unit_word') or ('donors' if info['by_donor'] else 'samples')} (exact sign-flip test of "
                 f"the per-unit {'slopes' if info['estimator'] == 'slope' else 'effects'}" + ("" if info["exact"] else f", {stats._SL_MC:,} random sign vectors")
                 + f"; smallest achievable p {info['min_p']:.3g})")
     return (f"n = {res['n_target']:,} cells of type {res['target']} in {res['n_samples']} sample(s); the p-value is the "
@@ -781,7 +782,7 @@ def _run_proximity_de(target, anchor, label_kind, seg_source, method, use_correc
             if result is not None:
                 analysis._de_state["result"] = result
         if status == "done":
-            provenance._prov_record("proximity", seg_source=seg_source, corrected=use_corrected, params={"target": target, "anchor": anchor, "source": source, **(params or {})}, labels=(label_kind, method), message=message, result=result)
+            provenance._prov_record("proximity", seg_source=seg_source, corrected=use_corrected, params={"target": target, "anchor": anchor, "source": source, **(params or {})}, labels=(label_kind, method), message=message, result=result, uses_design=True)
 
     try:
         _t0 = _time.time()
@@ -940,7 +941,7 @@ def _prox_csv_header(res: dict) -> str:
         lines.append(f"# sample {r['label']} ({r['name']}): {r['n_target']} target cells, {r['n_anchor']} anchors, "
                      f"{r['n_near']} near, {r['n_far']} far; condition {r['cond'] or '-'}; donor {r['donor'] or '-'}"
                      + (f"; not used: {r['note']}" if not r["used"] else ""))
-    return provenance._prov_csv_stamp(res, ("\n".join(lines) + "\n"))
+    return provenance._prov_csv_stamp(res, (provenance._csv_comments(lines)))
 
 
 # ─── Contact-group pseudobulk DE ──────────────────────────────────────────────
@@ -1035,12 +1036,18 @@ def _contact_compute(samples, labels, target, anchor, strata=None, radius=_CONTA
             f"so one sample gives no test. For a single sample use the mode 'Proximity to a cell type' "
             f"(cell-level, with a matched-anchor null).")
     dn = [str((donors[i] if donors is not None else "") or "").strip() for i in range(len(samples))]
-    by_donor = all(dn[i] for i in test) and len({dn[i] for i in test}) < len(test)
-    if by_donor and len({dn[i] for i in test}) < 2:
+    # the blocks are the independent units (stats._sl_unit_groups): the sections of one donor
+    # are one block - also when another tested sample has no donor label
+    ug = stats._sl_unit_groups(test, dn, names={i: samples[i]["label"] for i in test})
+    by_donor = ug["combined"]                  # some block is a donor with several sections
+    if len(ug["groups"]) < 2:
         raise ValueError("The testable samples all come from one donor: they are one independent unit, and "
                          "the contact test needs at least 2.")
-    block_of = {i: (dn[i] if by_donor else samples[i]["label"]) for i in test}
+    block_of = {i: name.lstrip("\x00") for name, ix in ug["groups"].items() for i in ix}
     blocks = list(dict.fromkeys(block_of[i] for i in test))
+    unit_word = ug["word"] if by_donor else "samples"
+    design = ("~ sample + group" if not by_donor else
+              "~ donor + group" if ug["by_donor"] else "~ unit + group")
     # cells × genes matrices of the cells that are in a group
     mats, cells = {}, {}
     for i in test:
@@ -1072,11 +1079,11 @@ def _contact_compute(samples, labels, target, anchor, strata=None, radius=_CONTA
     def _prep(M):
         return {"counts": np.rint(M[keep]).astype(np.int64), "genes": genes, "labels": col_labels,
                 "cond": ["B", "A"] * len(blocks), "batch": [b for b in blocks for _ in (0, 1)],
-                "design": "~ donor + group" if by_donor else "~ sample + group"}
+                "design": design}
 
     if progress is not None:
-        progress(0.05, f"Fitting {'~ donor + group' if by_donor else '~ sample + group'} on {len(blocks)} "
-                       f"{'donors' if by_donor else 'samples'} × {len(genes):,} genes in R…")
+        progress(0.05, f"Fitting {design} on {len(blocks)} "
+                       f"{unit_word.split(' (')[0]} × {len(genes):,} genes in R…")
     jobs._job_check()
     f0 = fit(_prep(M0))
     table = f0["table"].copy()
@@ -1149,7 +1156,7 @@ def _contact_compute(samples, labels, target, anchor, strata=None, radius=_CONTA
                                "n_a_dropped", "n_strata", "testable")} | {"block": block_of.get(i, "")}
             for i, g in enumerate(grp)]
     return {"kind": "contact", "table": table, "fit": {k: v for k, v in f0.items() if k != "table"},
-            "samples": rows, "blocks": blocks, "by_donor": by_donor, "shuffle": shuffle, "gate": {k: v for k, v in gate.items() if k != "table"},
+            "samples": rows, "blocks": blocks, "by_donor": by_donor, "unit_word": unit_word, "block_design": design, "shuffle": shuffle, "gate": {k: v for k, v in gate.items() if k != "table"},
             "target": target, "anchor": anchor, "radius": float(radius), "min_cells": min_cells,
             "min_count": min_count, "lfc_min": lfc_min, "fdr": fdr, "n_genes": len(genes),
             "n_filtered": int((~keep).sum()), "n_sig": int(sig0.sum()), "n_pass": obs,
@@ -1222,13 +1229,13 @@ def _run_contact_de(target, anchor, label_kind, seg_source, method, use_correcte
         jobs._check_dataset_gen(_gen)
         fitinfo, sh, t = res["fit"], res["shuffle"], res["table"]
         k = len(res["blocks"])
-        unit = "donors" if res["by_donor"] else "samples"
+        unit = res.get("unit_word") or ("donors" if res["by_donor"] else "samples")
         res.update({"category": cat, "seg_source": seg_source or "xenium", "seconds": _time.time() - _t0,
                     "label_a": f"{target} in contact with {anchor}", "label_b": f"{target} without contact (matched)",
                     "population": f"{target} near {anchor}", "method_label": fitinfo["method_label"],
                     "stat_name": fitinfo["stat_name"], "shrink": fitinfo["shrink"], "engine": fitinfo["engine"],
                     "mean_unit": fitinfo["mean_unit"],
-                    "design": "~ donor + group" if res["by_donor"] else "~ sample + group",
+                    "design": res.get("block_design") or ("~ donor + group" if res["by_donor"] else "~ sample + group"),
                     "units_note": f"n = {k} {unit}, each with a contact and a matched comparator pseudobulk",
                     "notes": list(fitinfo.get("notes") or []), "computed_defaults": defaults,
                     "lfc_title": "log2 fold change (contact / comparator), unshrunken (MLE)",
@@ -1252,7 +1259,7 @@ def _run_contact_de(target, anchor, label_kind, seg_source, method, use_correcte
             res["counts_rounded"] = True
             msg += "\n⚠ " + stats._PB_NONINTEGER_NOTE[0].upper() + stats._PB_NONINTEGER_NOTE[1:] + "."
         msg += (f"\nUnit of the p-values: {res['units_note']} "
-                f"({'the donors: not their sections, not the cells' if res['by_donor'] else 'the samples, not the cells'}).")
+                f"({'the samples, not the cells' if not res['by_donor'] else 'the donors: not their sections, not the cells' if unit == 'donors' else 'the sections of one donor are one unit; not the cells'}).")
         if k < 3:
             msg += f"\n⚠ Only {k} {unit}: variance estimates from fewer than 3 are unreliable."
         if sh["n"]:
@@ -1325,7 +1332,7 @@ def _contact_csv_header(res: dict) -> str:
                      + (f"block {r['block']}" if r["testable"] else "not used"))
     if res.get("n_uncorrected"):
         lines.append(f"# {analysis._an_uncorrected_note(res['n_uncorrected'])}")
-    return provenance._prov_csv_stamp(res, ("\n".join(lines) + "\n"))
+    return provenance._prov_csv_stamp(res, (provenance._csv_comments(lines)))
 
 
 def _prox_samples_view(res):

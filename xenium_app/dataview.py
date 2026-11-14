@@ -139,6 +139,19 @@ def _ds_key(ds: dict) -> str:
     return str(ds.get("data_dir") or ds.get("sdata_path") or f"mem:{id(ds)}")
 
 
+_TRANSCRIPT_FILES = ("transcripts.parquet", "transcripts.zarr.zip")
+
+
+def _ds_has_transcripts(ds: dict) -> bool:
+    """The sample has a transcript file the transcript-level jobs (density, segmentation-
+    free abundance, transcript factors) can read: transcripts.parquet or
+    transcripts.zarr.zip in its Xenium output directory. THE check of every place that
+    says whether such a job can run (the tabs' notes, the batch validation): the jobs
+    themselves run on every loaded sample that has one."""
+    d = ds.get("data_dir")
+    return bool(d) and any(os.path.exists(os.path.join(str(d), f)) for f in _TRANSCRIPT_FILES)
+
+
 def _ds_name(ds: dict) -> str:
     """Short display name of a dataset dict: the last path component of its key (the
     section's name for a sample that comes from an .h5ad)."""
@@ -167,6 +180,21 @@ def _ds_corrected(ds: dict):
     return m
 
 
+def _imputed_cols(holder: dict) -> set:
+    """Matrix columns of *holder* (DATA, an extra sample or a segmentation run) that hold
+    SpaGE-imputed genes, not counts: var["is_imputed"] of a dataset, the imputed_genes list
+    of a run. Empty when the holder names none."""
+    gni = holder.get("gene_name_to_idx") or {}
+    names = set(map(str, holder.get("imputed_genes") or []))
+    gv = holder.get("gene_var")
+    if gv is not None and "is_imputed" in getattr(gv, "columns", ()):
+        try:
+            names |= set(map(str, gv.index[gv["is_imputed"].fillna(False).astype(bool)]))
+        except Exception:
+            pass
+    return {int(gni[g]) for g in names if g in gni}
+
+
 def _corrected_covered(holder: dict):
     """Per row of holder["split_corrected_expr"]: True when the cell has corrected counts.
 
@@ -185,9 +213,15 @@ def _corrected_covered(holder: dict):
     if holder.get("_split_cov_src") is not m or holder.get("_split_cov_expr") is not e:
         cov = np.asarray(abs(m).sum(axis=1)).ravel() > 0
         if e is not None and sp.issparse(e) and e.shape[0] == m.shape[0]:
-            # measured genes only: the imputed gene columns appended to "expr" are not counts
-            ee = e if e.shape[1] <= m.shape[1] else sp.csr_matrix(e)[:, :m.shape[1]]
-            cov |= ~(np.asarray(abs(ee).sum(axis=1)).ravel() > 0)
+            # measured genes only: the imputed gene columns of "expr" are not counts. They
+            # are named by the holder (_imputed_cols); a corrected matrix that was reloaded
+            # from the store is padded to the full width, so the width alone does not tell.
+            w = np.ones(e.shape[1])
+            w[m.shape[1]:] = 0.0
+            imp = [c for c in _imputed_cols(holder) if c < e.shape[1]]
+            if imp:
+                w[imp] = 0.0
+            cov |= ~(np.asarray(abs(e) @ w).ravel() > 0)
         holder["_split_cov"] = cov
         holder["_split_cov_src"], holder["_split_cov_expr"] = m, e
     return holder["_split_cov"]
@@ -215,10 +249,15 @@ def _multi_use_corrected(use_corrected: bool) -> bool:
 def _extra_gene_values(eds: dict, gene, use_corrected: bool = False):
     """log1p counts of *gene* for the cells of an extra sample (original or, when asked
     for and present, its SPLIT-corrected matrix); None when the sample lacks the gene."""
-    g_idx = (eds.get("gene_name_to_idx") or {}).get(gene)
+    # the dropdown value of an imputed gene is "G [imp]"; the sample stores it as "G"
+    base = core._gene_base(gene)
+    g_idx = (eds.get("gene_name_to_idx") or {}).get(base)
     if g_idx is None or eds.get("expr") is None:
         return None
-    key = "split_corrected_expr" if (use_corrected and _ds_corrected(eds) is not None) else "expr"
+    # an imputed gene has values in X only: the corrected layer holds a zero padding column
+    imputed = core._gene_is_imp_label(gene) or int(g_idx) in _imputed_cols(eds)
+    key = ("split_corrected_expr" if (use_corrected and not imputed and _ds_corrected(eds) is not None)
+           else "expr")
     m = figures._csc_view(eds, key)
     if g_idx >= m.shape[1]:
         return None
@@ -272,10 +311,13 @@ def get_gene_expression(gene: str) -> np.ndarray:
             pass
         return _hit
 
-    if gene.endswith(" [imp]"):
-        base = gene[:-6]
+    if core._gene_is_imp_label(gene):
+        base = core._gene_base(gene)
         # Check if imputed gene was written back into DATA["expr"]
-        if base in core.DATA.get("gene_name_to_idx", {}):
+        # (unless the current SpaGE result is another one than the stored column holds:
+        # streamed, or not written back - spage._spage_supersedes)
+        from . import spage
+        if base in core.DATA.get("gene_name_to_idx", {}) and not spage._spage_supersedes(base):
             gene_idx = core.DATA["gene_name_to_idx"][base]
             expr_csc = core.DATA.get("expr_csc")# or DATA["expr"]
             raw  = expr_csc[:, gene_idx].toarray().ravel()

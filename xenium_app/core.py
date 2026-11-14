@@ -200,12 +200,38 @@ def _seg_result(seg_source, done_only: bool = False):
             return None
         res = state.get("result")
     _seg_run_id(res)         # fixed at first use (see _seg_run_id)
+    if res:
+        # a job that asks for the run works on it: registered, so that the run is not
+        # re-run or deleted under it (jobs._job_use_run, added to the hooks by jobs.py)
+        for hook in _seg_result_hooks:
+            hook(res)
     return res
+
+
+_seg_result_hooks: list = []     # callables(result) run by _seg_result for a loaded run
+
+
+def _seg_job_result(seg_source, nothing: str = "nothing was computed") -> tuple:
+    """(result, error) for a job or callback that works on the segmentation the UI names.
+    THE guard of every such entry point: (None, "") for Xenium; (the run's result, "")
+    when the named Baysor / Proseg / image-segmentation run is loaded (state "done"); and
+    (None, message) when a run is named but not loaded - it is still loading from the
+    cache, or its load failed. The caller stops with the message: the Xenium cells are
+    never used under the name of another segmentation (results, stores and provenance
+    would carry the run's name)."""
+    if _seg_tool(seg_source) == "xenium":
+        return None, ""
+    res = _seg_result(seg_source, done_only=True)
+    if res is None:
+        return None, (f"The selected segmentation ({seg_source}) is not loaded (it is still loading, or its "
+                      f"load failed): {nothing}.")
+    return res, ""
 
 
 # ─── SpaGE imputation state ───────────────────────────────────────────────────
 _spage_state: dict = {"status": "idle", "message": "", "result": None,
-                      "result_path": None, "result_genes": None, "result_ids_tag": None}
+                      "result_path": None, "result_genes": None, "result_ids_tag": None,
+                      "result_stored": None}
 _spage_lock   = threading.Lock()
 SPAGE_STREAM_THRESHOLD = 500_000_000  # ~2 GB at float32; above this stream to zarr on disk
 _spage_repl_pending = False   # set by run_spage(); cleared once poll_spage_repl fires
@@ -308,6 +334,21 @@ CELLTYPIST_MODELS = {
 
 
 # ─── Callbacks ────────────────────────────────────────────────────────────────
+
+_IMP_SUFFIX_RE = re.compile(r" \[(?:corr\+)?imp\]$")
+
+
+def _gene_base(gene) -> str:
+    """The name a gene is stored under: the dropdown value of an imputed gene carries the
+    label suffix " [imp]" (older stores: " [corr+imp]"), while every matrix, cache and
+    gene list holds the plain name. Every lookup of a gene picked in the UI goes through
+    here."""
+    return _IMP_SUFFIX_RE.sub("", str(gene))
+
+
+def _gene_is_imp_label(gene) -> bool:
+    return bool(_IMP_SUFFIX_RE.search(str(gene)))
+
 
 def _seg_tool(seg_source: str) -> str:
     """Extract tool name from seg-source value: 'xenium', 'baysor', 'proseg' or 'imgseg'."""

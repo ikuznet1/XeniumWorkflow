@@ -147,8 +147,8 @@ def _csc_view(holder: dict, key: str):
 
 def _get_expr_values(gene: str, alt_res=None, use_corrected: bool = False) -> "np.ndarray | None":
     """Unified expression lookup supporting original and SPLIT-corrected counts."""
-    lookup = gene.replace(" [imp]", "").replace(" [corr+imp]", "")
-    is_imputed_gene = ("[imp]" in gene) or ("[corr+imp]" in gene)
+    lookup = core._gene_base(gene)
+    is_imputed_gene = core._gene_is_imp_label(gene)
     if alt_res is not None:
         _corr = _csc_view(alt_res, "split_corrected_expr") if use_corrected else None
         expr = _corr if _corr is not None else _csc_view(alt_res, "expr")
@@ -168,7 +168,10 @@ def _get_expr_values(gene: str, alt_res=None, use_corrected: bool = False) -> "n
         if lookup not in _corr_imp:
             return None
         expr = _csc_view(alt_res, "expr") if alt_res is not None else core.DATA.get("expr_csc")
-    if expr is not None and lookup in gni:
+    from . import spage
+    # the stored column of an imputed gene is served unless the current SpaGE result is
+    # another one (streamed, or not written back): then the result reference below is
+    if expr is not None and lookup in gni and not spage._spage_supersedes(lookup, alt_res):
         idx = gni[lookup]
         if idx < expr.shape[1]:
             _col = expr.getcol(idx).toarray().ravel().astype(np.float32)
@@ -218,6 +221,14 @@ def _get_expr_values(gene: str, alt_res=None, use_corrected: bool = False) -> "n
                         # streamed under another subset(): rows cannot be matched to cells
                         raise ValueError(f"result has {len(_zcol):,} rows for "
                                          f"{len(core.DATA['df']):,} cells — re-run SpaGE")
+                else:
+                    # a run's streamed result is positional too: the same check as for the
+                    # Xenium cells (never drawn on the cells of another subset or run)
+                    _rows = spage._spage_run_rows(alt_res, len(_zcol))
+                    if _rows is None:
+                        raise ValueError("the result was computed for other cells of this run (another "
+                                         "subset, or a re-run) — re-run SpaGE")
+                    _zcol = _zcol[_rows]
                 return np.log1p(_zcol)
             if alt_res is not None and os.path.isfile(_rp):
                 # a run's result kept in the SpaGE cache file only (its write into the run's
@@ -252,7 +263,7 @@ def _get_reseg_expr_values(gene: str, alt_res: dict) -> "np.ndarray | None":
     if expr is None:
         return None
     # Strip [imp] suffix if present
-    lookup = gene[:-6] if gene.endswith(" [imp]") else gene
+    lookup = core._gene_base(gene)
     gni = alt_res.get("gene_name_to_idx") or core.DATA["gene_name_to_idx"]
     if lookup not in gni:
         return None

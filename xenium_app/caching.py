@@ -105,6 +105,12 @@ def _seg_stage_commit(stage: str, final_dir: str) -> None:
     a re-run has other cells, possibly under the same ids."""
     import shutil
     import uuid
+    from . import jobs
+    _busy = jobs._run_in_use(final_dir, "replaced by the new run (the new run is discarded)")
+    if _busy:
+        # another job still works on the run stored there (its output is written into
+        # this directory by path and matched by cell id): never replaced under it
+        raise RuntimeError(_busy)
     with open(os.path.join(stage, core._SEG_RUN_ID_FILE), "w") as fh:
         fh.write(uuid.uuid4().hex[:16])
     if os.path.isdir(final_dir):
@@ -264,7 +270,12 @@ def _format_seg_label(tool: str, params: dict) -> str:
     else:
         parts = []
         vs = params.get("voxel_size")
-        parts.append(f"voxel={'auto' if not vs else str(vs)+'µm'}")
+        if vs and not params.get("voxel_applied") and abs(float(vs) - 4.0) > 1e-9:
+            # a run of an earlier version: the size was given beside --xenium, whose preset
+            # resets it to 4 µm (proseg 1.x), so this run was made with 4 µm voxels
+            parts.append(f"voxel=4µm ({vs}µm was requested but not applied)")
+        else:
+            parts.append(f"voxel={'auto' if not vs else str(vs)+'µm'}")
         x_min, x_max = params.get("x_min"), params.get("x_max")
         y_min, y_max = params.get("y_min"), params.get("y_max")
         if any(v is not None for v in [x_min, x_max, y_min, y_max]):

@@ -276,6 +276,48 @@ def _an_panels_differ(samples, genes) -> bool:
     return any(len(s["genes"]) != len(genes) for s in samples)
 
 
+def _an_lib_cols(s: dict, genes=None) -> np.ndarray:
+    """Matrix columns the library size (depth) of a cell of sample *s* is summed over: the
+    sample's measured panel genes, or *genes* when given. THE RULE, for every analysis: a
+    result that pools or compares the cells of several samples takes the library over the
+    genes those samples share (_an_common_genes), and says so when the panels differ
+    (_an_lib_note); only a statistic that stays within one sample uses the sample's own
+    panel. Every depth / library computation gets its columns here."""
+    use = s["genes"] if genes is None else genes
+    return np.array([s["gni"][g] for g in use if g in s["gni"]], dtype=np.int64)
+
+
+def _an_depth(s: dict, genes=None) -> np.ndarray:
+    """Library size per MATRIX ROW of sample *s* (float64): the total count over
+    _an_lib_cols(s, genes)."""
+    csc = s["csc"]
+    cols = _an_lib_cols(s, genes)
+    if len(cols) == csc.shape[1]:
+        return np.asarray(csc.sum(axis=1), dtype=np.float64).ravel()
+    w = np.zeros(csc.shape[1])
+    w[cols] = 1.0
+    return np.asarray(csc @ w, dtype=np.float64).ravel()
+
+
+def _an_lib_genes(samples) -> "list | None":
+    """The genes the library size of a pooled analysis of *samples* is summed over: the
+    genes they share when their panels differ, None (each sample's own panel, which is
+    then the same list) otherwise."""
+    if len(samples) < 2:
+        return None
+    genes = _an_common_genes(samples)
+    return genes if _an_panels_differ(samples, genes) else None
+
+
+def _an_lib_note(n_shared) -> str:
+    """Statement for status lines, CSV headers and methods text ('' when the panels are
+    the same)."""
+    if not n_shared:
+        return ""
+    return (f"library size (depth) of a cell: its total over the {int(n_shared):,} genes shared by the "
+            f"pooled samples (their panels differ)")
+
+
 def _an_size_factors(s: dict, genes=None):
     """(sf, in_view) per matrix row of sample *s*: sf = _AN_SCALE / library size, where
     the library size is the cell's total count over the measured panel genes of the
@@ -286,11 +328,7 @@ def _an_size_factors(s: dict, genes=None):
     the other samples never measured, and its values for the shared genes come out lower
     for that reason alone."""
     csc = s["csc"]
-    cols = np.array([s["gni"][g] for g in (s["genes"] if genes is None else genes)], dtype=np.int64)
-    if len(cols) == csc.shape[1]:
-        lib = np.asarray(csc.sum(axis=1), dtype=np.float64).ravel()
-    else:
-        lib = np.asarray(csc[:, cols].sum(axis=1), dtype=np.float64).ravel()
+    lib = _an_depth(s, genes)
     in_view = np.zeros(csc.shape[0], dtype=bool)
     rows = s["rows"]
     in_view[rows[rows >= 0]] = True
@@ -327,16 +365,30 @@ def _an_lognorm_col_sums(csc, sf, cols, power: int = 1, chunk_nnz: int = 8_000_0
 def _an_polygon_mask(polygon_xy, s: dict) -> np.ndarray:
     """Cells of sample *s* inside an outline given in plot space (x incl. the sample's
     offset, y = -µm), as the ROI code does."""
-    df = s["df"]
-    if s["x_offset"]:
-        df = pd.DataFrame({"x_centroid": df["x_centroid"].to_numpy(dtype=float) + s["x_offset"],
-                           "y_centroid": df["y_centroid"].to_numpy(dtype=float)})
-    return regions._roi_mask_in_polygon(polygon_xy, df)
+    return regions._roi_mask_in_polygon(polygon_xy, s["df"], s["x_offset"])
 
 
-def _an_cluster_labels(samples, method, use_corrected, alt) -> list:
+def _an_cluster_set_of(ds, method, strict: bool):
+    """The cluster set sample *ds* is read with when *method* is the chosen one. The view
+    (strict False) shows a sample that lacks the chosen set by its own first set, so every
+    panel has colours. A statistic that puts the ids of several samples side by side
+    (strict True) must not do that: ids of two different clusterings are not the same
+    clusters, so a sample without the chosen set has no labels (None). Without a chosen
+    set the first one of the primary sample is the chosen one."""
+    cm = ds.get("cluster_methods") or []
+    if strict:
+        want = method or ((core.DATA.get("cluster_methods") or [None])[0])
+        return want if want in cm else None
+    return method if method in cm else (cm or [method])[0]
+
+
+def _an_cluster_labels(samples, method, use_corrected, alt, strict: bool = False) -> list:
     """Per sample: the active cluster set's label of each cell as str (None: no such
-    column). With several samples the labels are per sample ("S0:C3"), as in the view."""
+    column). With several samples the labels are per sample ("S0:C3"), as in the view.
+
+    *strict*: a sample that does not hold the chosen cluster set gets None instead of the
+    labels of its own first set (_an_cluster_set_of); the statistics that compare or pool
+    cluster ids across samples (stats._raw_cluster_labels) ask for this."""
     from . import clustersets          # (clustersets imports this module)
     multi = len(samples) > 1
     out = []
@@ -352,8 +404,10 @@ def _an_cluster_labels(samples, method, use_corrected, alt) -> list:
             col = col or (pref or cands or [None])[0]
         else:
             ds = s.get("ds") or core.DATA
-            cm = ds.get("cluster_methods") or []
-            m_use = method if method in cm else (cm or [method])[0]
+            m_use = _an_cluster_set_of(ds, method, strict)
+            if m_use is None:
+                out.append(None)
+                continue
             col = f"clust__{m_use}"
             own = m_use in clustersets._cs_registry
             shared = own and m_use == method and clustersets._cs_is_shared(m_use)

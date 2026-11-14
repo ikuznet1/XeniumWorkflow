@@ -429,6 +429,77 @@ def _baysor_run_single(tx_df, patch_dir, baysor_bin, scale, min_mol, use_prior, 
     return cells_df, cell_bounds, seg
 
 
+# What `proseg --xenium` sets (proseg 1.1.9, src/main.rs set_xenium_presets). The preset also
+# sets the initial voxel size to 4 µm AFTER the command line was parsed, so with --xenium a
+# --initial-voxel-size on the command line has no effect. A run with another voxel size is
+# therefore started with these column options spelled out instead of the preset.
+_PROSEG_PRESET_VOXEL = 4.0
+_PROSEG_XENIUM_COLUMNS = (
+    ("--gene-column", "feature_name"), ("--transcript-id-column", "transcript_id"),
+    ("--x-column", "x_location"), ("--y-column", "y_location"), ("--z-column", "z_location"),
+    ("--compartment-column", "overlaps_nucleus"), ("--compartment-nuclear", "1"),
+    ("--cell-id-column", "cell_id"), ("--cell-id-unassigned", "UNASSIGNED"),
+    ("--qv-column", "qv"), ("--fov-column", "fov_name"))
+
+
+def _proseg_voxel(voxel_size) -> "float | None":
+    """The initial voxel size a Proseg run is asked for, as a number; None when it is the
+    preset's own (blank, or 4 µm): such a run uses `--xenium` unchanged."""
+    if voxel_size in (None, "", 0):
+        return None
+    v = float(voxel_size)                      # (a string that is not a number raises)
+    return None if abs(v - _PROSEG_PRESET_VOXEL) < 1e-9 else v
+
+
+def _proseg_input_args(voxel_size) -> list:
+    """How the transcript file is described to Proseg: the --xenium preset, or - when a
+    voxel size other than the preset's is asked for - the preset's column options given
+    one by one followed by --initial-voxel-size (see _PROSEG_XENIUM_COLUMNS)."""
+    v = _proseg_voxel(voxel_size)
+    if v is None:
+        return ["--xenium"]
+    return [x for pair in _PROSEG_XENIUM_COLUMNS for x in pair] + ["--initial-voxel-size", str(v)]
+
+
+def _ring_area(xs, ys) -> float:
+    """Area enclosed by a ring (shoelace formula), in the square of its units."""
+    x = np.asarray(xs, dtype=np.float64)
+    y = np.asarray(ys, dtype=np.float64)
+    if x.ndim != 1 or len(x) < 3 or len(x) != len(y):
+        return float("nan")
+    return 0.5 * abs(float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))))
+
+
+def _proseg_cell_area(cells_df, cell_bounds) -> bool:
+    """cell_area (µm²) of a Proseg run = the area of each cell's outline (the polygon the
+    app draws: the largest part of the cell's consensus 2D polygon); NaN for a cell without
+    one. Proseg's own `volume` is a volume (µm³: voxel x·y·z size summed over the cell's
+    voxels) and is kept as `cell_volume`.
+
+    Runs stored before this rule hold that volume under the name cell_area (shown,
+    filtered and compared as µm²): a table without cell_volume gets its cell_area moved
+    there first. Called by the live run and by every cache load; True when the table was
+    changed (the caller then writes both columns back to the run's store, once)."""
+    changed = False
+    if "cell_volume" not in cells_df.columns and "cell_area" in cells_df.columns:
+        cells_df["cell_volume"] = pd.to_numeric(cells_df["cell_area"], errors="coerce")
+        changed = True
+    bounds = cell_bounds or {}
+    area = np.full(len(cells_df), np.nan)
+    for i, cid in enumerate(cells_df.index):
+        ring = bounds.get(cid)
+        if ring is None:
+            ring = bounds.get(str(cid))
+        if ring is not None:
+            area[i] = _ring_area(ring[0], ring[1])
+    old = (pd.to_numeric(cells_df["cell_area"], errors="coerce").to_numpy(dtype=np.float64)
+           if "cell_area" in cells_df.columns else None)
+    if old is None or not np.allclose(old, area, rtol=1e-4, atol=1e-6, equal_nan=True):
+        cells_df["cell_area"] = area
+        changed = True
+    return changed
+
+
 def _proseg_run_single(tx_df, patch_dir, proseg_bin, voxel_size, n_threads, n_samples=None,
                        recorded_samples=None, schedule=None,
                        nuclear_reassign_prob=None, prior_seg_prob=None,
@@ -464,9 +535,11 @@ def _proseg_run_single(tx_df, patch_dir, proseg_bin, voxel_size, n_threads, n_sa
             tx_df["overlaps_nucleus"] = _in_cell.astype(tx_df["overlaps_nucleus"].dtype)
         tx_df.to_parquet(tx_path, index=False)
 
-    # Always the --xenium preset: proseg 1.x has no mode without an initial segmentation
-    # (without the preset it stops on the missing --gene-column / --cell-id-column).
-    cmd = [proseg_bin, "--xenium", tx_path,
+    # The Xenium column layout, always: proseg 1.x has no mode without an initial
+    # segmentation (it stops on a missing --gene-column / --cell-id-column). Given as the
+    # --xenium preset, or column by column when the voxel size is not the preset's
+    # (_proseg_input_args: the preset would overwrite it).
+    cmd = [proseg_bin] + _proseg_input_args(voxel_size) + [tx_path,
            "--output-cell-polygons",       poly_out,
            "--output-cell-metadata",       meta_out,
            "--output-transcript-metadata", tx_meta_out]
@@ -475,8 +548,6 @@ def _proseg_run_single(tx_df, patch_dir, proseg_bin, voxel_size, n_threads, n_sa
     cmd += ["--min-qv", "20"]
     # every value is converted to a number here (a string that is not one raises): no
     # request value reaches the command line as free text
-    if voxel_size:
-        cmd += ["--initial-voxel-size", str(float(voxel_size))]
     if n_threads:
         cmd += ["--nthreads", str(int(n_threads))]
     if n_samples:
@@ -500,11 +571,11 @@ def _proseg_run_single(tx_df, patch_dir, proseg_bin, voxel_size, n_threads, n_sa
     cells_df = cell_meta.rename(columns={
         "cell": "cell_id", "centroid_x": "x_centroid",
         "centroid_y": "y_centroid", "population": "transcript_counts",
-        "volume": "cell_area",
+        "volume": "cell_volume",          # µm³; cell_area is set from the outlines (_proseg_cell_area)
     }).set_index("cell_id")
     _keep_cols = ["x_centroid", "y_centroid", "transcript_counts"]
-    if "cell_area" in cells_df.columns:
-        _keep_cols.append("cell_area")
+    if "cell_volume" in cells_df.columns:
+        _keep_cols.append("cell_volume")
     cells_df = cells_df[_keep_cols]
 
     cell_bounds: dict = {}
@@ -687,6 +758,28 @@ def _reseg_cluster_cols(columns) -> list:
     return [c for c in columns if str(c).startswith("cluster_")]
 
 
+def _spage_ref_restore(out_dir: str) -> tuple:
+    """(path, genes, extra result-dict entries) of the SpaGE result reference a run
+    directory holds (spage_result.json, written by spage._run_spage_imputation); (None,
+    None, {}) without one or when its file is gone. The extra entries say whether the
+    matrix columns hold this result ("spage_result_stored") and, for a streamed
+    (positional) result, the hash of the cell ids its rows belong to
+    ("spage_result_ids_tag"): the readers check both (spage._spage_supersedes,
+    spage._spage_run_rows). Every loader of a run restores the reference through here."""
+    ref = os.path.join(out_dir, "spage_result.json")
+    if not os.path.exists(ref):
+        return None, None, {}
+    try:
+        with open(ref) as f:
+            sref = json.load(f)
+        if not os.path.exists(sref.get("path", "")):          # zarr (streamed) or parquet
+            return None, None, {}
+        return sref["path"], list(sref.get("genes", [])), {
+            "spage_result_stored": sref.get("stored"), "spage_result_ids_tag": sref.get("ids_tag")}
+    except Exception:
+        return None, None, {}
+
+
 def _reseg_display_cluster_col(columns):
     """Column used for "Color by Cluster" / the cluster filter on a reseg run: the
     original-count clusters first, the SPLIT clusters only when nothing else exists."""
@@ -815,7 +908,7 @@ def _update_reseg_zarr_obs(zarr_path: str, cells_df: pd.DataFrame, force_cols=()
         new_cols = [c for c in cells_df.columns
                     if c not in existing_cols or c.startswith("roi_")
                     or c.startswith("split_umap_") or c == "cluster_split_10"
-                    or c == "cell_area" or c in force_cols]
+                    or c == "cell_area" or c in force_cols]      # (cell_area: see _proseg_cell_area)
         if not new_cols:
             return
         # Read the existing index to align values correctly
@@ -1160,19 +1253,9 @@ def _load_cached_baysor(out_dir: str) -> None:
     try:
         _set("running", "Loading cached Baysor result…")
         # Restore SpaGE result reference written by _run_spage_imputation
-        _spage_rpath, _spage_rgenes = None, None
-        _spage_ref_file = os.path.join(out_dir, "spage_result.json")
-        if os.path.exists(_spage_ref_file):
-            try:
-                import json as _jref
-                with open(_spage_ref_file) as _jf:
-                    _sref = _jref.load(_jf)
-                if os.path.exists(_sref.get("path", "")):     # zarr (streamed) or parquet
-                    _spage_rpath  = _sref["path"]
-                    _spage_rgenes = _sref.get("genes", [])
-                    print(f"  Baysor: restored SpaGE result ({len(_spage_rgenes)} genes)", flush=True)
-            except Exception:
-                pass
+        _spage_rpath, _spage_rgenes, _spage_extra = _spage_ref_restore(out_dir)
+        if _spage_rpath:
+            print(f"  Baysor: restored SpaGE result ({len(_spage_rgenes)} genes)", flush=True)
         zarr_path_fast = os.path.join(out_dir, "spatialdata_baysor.zarr")
         if os.path.isdir(zarr_path_fast):
             try:
@@ -1210,7 +1293,7 @@ def _load_cached_baysor(out_dir: str) -> None:
                     "split_corrected_expr": _baysor_corr,
                     "split_corrected_imputed_genes": _baysor_corr_imp,
                     "spage_result_path": _spage_rpath,
-                    "spage_result_genes": _spage_rgenes,
+                    "spage_result_genes": _spage_rgenes, **_spage_extra,
                     **_reseg_zarr_gene_index(zarr_path_fast, expr_mat.shape[1]),
                 })
                 print(f"Loaded cached Baysor (fast): {n_cells:,} cells, "
@@ -1341,7 +1424,7 @@ def _load_cached_baysor(out_dir: str) -> None:
             "split_corrected_expr": _baysor_corr,
             "split_corrected_imputed_genes": _baysor_corr_imp,
             "spage_result_path": _spage_rpath,
-            "spage_result_genes": _spage_rgenes,
+            "spage_result_genes": _spage_rgenes, **_spage_extra,
         })
         print(f"Loaded cached Baysor: {n_cells:,} cells, {len(cell_bounds):,} boundaries "
               f"from {os.path.basename(out_dir)}", flush=True)
@@ -1444,19 +1527,9 @@ def _load_cached_proseg(out_dir: str) -> None:
     try:
         _set("running", "Loading cached Proseg result…")
         # Restore SpaGE result reference written by _run_spage_imputation
-        _spage_rpath, _spage_rgenes = None, None
-        _spage_ref_file = os.path.join(out_dir, "spage_result.json")
-        if os.path.exists(_spage_ref_file):
-            try:
-                import json as _jref
-                with open(_spage_ref_file) as _jf:
-                    _sref = _jref.load(_jf)
-                if os.path.exists(_sref.get("path", "")):     # zarr (streamed) or parquet
-                    _spage_rpath  = _sref["path"]
-                    _spage_rgenes = _sref.get("genes", [])
-                    print(f"  Proseg: restored SpaGE result ({len(_spage_rgenes)} genes)", flush=True)
-            except Exception:
-                pass
+        _spage_rpath, _spage_rgenes, _spage_extra = _spage_ref_restore(out_dir)
+        if _spage_rpath:
+            print(f"  Proseg: restored SpaGE result ({len(_spage_rgenes)} genes)", flush=True)
         zarr_path_fast = os.path.join(out_dir, "spatialdata_proseg.zarr")
         if os.path.isdir(zarr_path_fast):
             try:
@@ -1485,10 +1558,12 @@ def _load_cached_proseg(out_dir: str) -> None:
                     _update_reseg_zarr_obs(zarr_path_fast, cells_df)
                     print(f"  Proseg: recomputed SPLIT UMAP ({cells_df['split_umap_1'].notna().sum()} "
                           f"non-NaN values)", flush=True)
-                # One-time migration: read cell_area from cell-metadata.csv.gz if missing from zarr
+                # One-time migration: Proseg's volume from cell-metadata.csv.gz when the zarr
+                # holds neither cell_volume nor the older (mislabelled) cell_area
                 _need_cell_area = (
-                    "cell_area" not in cells_df.columns
-                    or cells_df["cell_area"].notna().sum() < len(cells_df) * 0.9
+                    "cell_volume" not in cells_df.columns
+                    and ("cell_area" not in cells_df.columns
+                         or cells_df["cell_area"].notna().sum() < len(cells_df) * 0.9)
                 )
                 if _need_cell_area:
                     try:
@@ -1498,8 +1573,8 @@ def _load_cached_proseg(out_dir: str) -> None:
                         if os.path.exists(_top_cm_path):
                             _cm = pd.read_csv(_top_cm_path, usecols=["cell", "volume"])
                             _cm["cell"] = _cm["cell"].astype(str)
-                            _cm = _cm.rename(columns={"volume": "cell_area"}).set_index("cell")
-                            cells_df["cell_area"] = _cm["cell_area"].reindex(cells_df.index)
+                            _cm = _cm.rename(columns={"volume": "cell_volume"}).set_index("cell")
+                            cells_df["cell_volume"] = _cm["cell_volume"].reindex(cells_df.index)
                         else:
                             # Patch-based: read volumes from each patch, remap IDs
                             _patch_dirs = _proseg_patch_offsets(out_dir)
@@ -1511,20 +1586,21 @@ def _load_cached_proseg(out_dir: str) -> None:
                                     for _lid, _vol in zip(_cm["cell"].values, _cm["volume"].values):
                                         _gid = str(int(_lid) + _poff)
                                         _area_map[_gid] = _vol
-                                cells_df["cell_area"] = cells_df.index.map(
+                                cells_df["cell_volume"] = cells_df.index.map(
                                     lambda x: _area_map.get(str(x), np.nan)
                                 )
-                        _matched = cells_df["cell_area"].notna().sum()
+                        _matched = (cells_df["cell_volume"].notna().sum()
+                                    if "cell_volume" in cells_df.columns else 0)
                         if _matched > 0:
-                            _update_reseg_zarr_obs(zarr_path_fast, cells_df)
-                            print(f"  Proseg: migrated cell_area ({_matched:,}/{len(cells_df):,} cells)", flush=True)
+                            _update_reseg_zarr_obs(zarr_path_fast, cells_df, force_cols=("cell_volume",))
+                            print(f"  Proseg: migrated cell_volume ({_matched:,}/{len(cells_df):,} cells)", flush=True)
                         else:
-                            print(f"  Proseg: cell_area migration found 0 matches "
+                            print(f"  Proseg: cell_volume migration found 0 matches "
                                   f"(index sample: {list(cells_df.index[:3])})", flush=True)
                     except Exception as _ce:
                         import traceback
                         traceback.print_exc()
-                        print(f"  Proseg: could not migrate cell_area: {_ce}", flush=True)
+                        print(f"  Proseg: could not migrate cell_volume: {_ce}", flush=True)
 
                 # Patch runs build the zarr without cell_boundaries shapes — load from polygon files
                 if not cell_bounds:
@@ -1537,6 +1613,12 @@ def _load_cached_proseg(out_dir: str) -> None:
                         if cell_bounds:
                             print(f"  Proseg: loaded {len(cell_bounds):,} patch boundaries "
                                   f"(polygon files)", flush=True)
+                # cell_area = area of the outline (µm²); a run stored before held Proseg's
+                # volume (µm³) under that name: corrected here and in the zarr, once
+                if _proseg_cell_area(cells_df, cell_bounds):
+                    _update_reseg_zarr_obs(zarr_path_fast, cells_df, force_cols=("cell_volume",))
+                    print("  Proseg: cell_area set to the outline areas (µm²); Proseg's volume "
+                          "(µm³) is kept as cell_volume", flush=True)
                 _fp_gidx = _reseg_zarr_gene_index(zarr_path_fast, expr_mat.shape[1])
                 # transcript_counts = row sums of the matrix (caches written before this
                 # rule hold Proseg's `population`: corrected here and in the zarr, once)
@@ -1555,7 +1637,7 @@ def _load_cached_proseg(out_dir: str) -> None:
                     "split_corrected_expr": _proseg_corr,
                     "split_corrected_imputed_genes": _proseg_corr_imp,
                     "spage_result_path": _spage_rpath,
-                    "spage_result_genes": _spage_rgenes,
+                    "spage_result_genes": _spage_rgenes, **_spage_extra,
                     **_fp_gidx,
                 })
                 print(f"Loaded cached Proseg (fast): {n_cells:,} cells, "
@@ -1613,7 +1695,7 @@ def _load_cached_proseg(out_dir: str) -> None:
         tx_meta   = pd.concat(tx_parts,   ignore_index=True) if tx_parts else pd.DataFrame()
         cells_df = cell_meta.rename(columns={
             "cell": "cell_id", "centroid_x": "x_centroid", "centroid_y": "y_centroid",
-            "population": "transcript_counts", "volume": "cell_area",
+            "population": "transcript_counts", "volume": "cell_volume",
         })
         if "cell_id" in cells_df.columns:
             cells_df = cells_df.set_index("cell_id")
@@ -1621,7 +1703,7 @@ def _load_cached_proseg(out_dir: str) -> None:
         # Same columns as the live run (_proseg_run_single): Proseg's own `cluster`,
         # `fov`, `centroid_z` … are not carried into the result or its zarr.
         cells_df = cells_df[[c for c in ("x_centroid", "y_centroid", "transcript_counts",
-                                         "cell_area", "_patch") if c in cells_df.columns]]
+                                         "cell_volume", "_patch") if c in cells_df.columns]]
         # Patch run: sopa patches overlap, and the live run gave each cell of an overlap
         # to one patch only - keep the cells the live run kept.
         # Cell boundaries from the polygon files come first: the patch merge uses them
@@ -1701,9 +1783,6 @@ def _load_cached_proseg(out_dir: str) -> None:
                 clustering._compute_reseg_clusters_umap(cells_df, expr_mat,
                                              progress_fn=lambda msg: _set("running", msg))
                 _update_reseg_zarr_obs(zarr_path, cells_df)
-            elif "cell_area" in cells_df.columns and os.path.isdir(zarr_path):
-                # cell_area present in CSV but may be missing from old zarr — write back
-                _update_reseg_zarr_obs(zarr_path, cells_df)
 
             # Load expr (if missing), corrected expr + cell boundaries from zarr
             try:
@@ -1737,6 +1816,10 @@ def _load_cached_proseg(out_dir: str) -> None:
             except Exception as _ze2:
                 print(f"  Warning: could not read Proseg zarr: {_ze2}", flush=True)
 
+        # cell_area = outline area (µm²); the zarr of an older run holds Proseg's volume
+        # under that name (see _proseg_cell_area)
+        if _proseg_cell_area(cells_df, cell_bounds) and os.path.isdir(zarr_path):
+            _update_reseg_zarr_obs(zarr_path, cells_df, force_cols=("cell_volume",))
         with core._roi_lock:
             regions._roi_apply_metadata_to_df(cells_df, core._roi_state["rois"])
         _set("done", f"Loaded — {n_cells:,} cells", result={
@@ -1746,7 +1829,7 @@ def _load_cached_proseg(out_dir: str) -> None:
             "split_corrected_expr": _proseg_corr,
             "split_corrected_imputed_genes": _proseg_corr_imp,
             "spage_result_path": _spage_rpath,
-            "spage_result_genes": _spage_rgenes,
+            "spage_result_genes": _spage_rgenes, **_spage_extra,
         })
         print(f"Loaded cached Proseg: {n_cells:,} cells, {len(cell_bounds):,} boundaries "
               f"from {os.path.basename(out_dir)}", flush=True)
@@ -2190,6 +2273,12 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
         _A = lambda v: "A" if v is None else v
         _param_str = (f"v{voxel_size or 'A'}_t{n_threads or 'A'}"
                       f"_x{_A(x_min)}-{_A(x_max)}_y{_A(y_min)}-{_A(y_max)}")
+        if _proseg_voxel(voxel_size) is not None:
+            # a voxel size other than the preset's is applied since the run is started
+            # without --xenium (_proseg_input_args). A directory of an earlier version with
+            # the same options ran at 4 µm whatever it was asked for: it keeps its tag (and
+            # is listed as such, caching._format_seg_label), this run gets its own.
+            _param_str += "_vapplied"
         # Every option that changes the result is part of the tag; appended only when
         # non-default so runs made with the defaults keep their previous tag.
         for _k, _v in (("nc", None if n_samples in (None, 10) else n_samples),
@@ -2348,12 +2437,19 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
         # seam duplicates by Proseg's `population`, like the slow cache load does)
         cells_df = cells_df.copy()
         _proseg_counts_from_expr(cells_df, expr_mat)
+        # cell_area: the outline's area in µm² (Proseg reports a volume: kept as cell_volume)
+        _proseg_cell_area(cells_df, cell_bounds)
 
         n_cells = len(cells_df)
         jobs._check_dataset_gen(_gen)   # params.json / zarr below describe this run's dataset
         import json as _json
         _params_out = {
             "tool": "proseg", "voxel_size": voxel_size, "n_threads": n_threads,
+            # the voxel size Proseg started from (runs stored before "voxel_applied" asked
+            # for theirs beside --xenium, which resets it to 4: see _proseg_input_args)
+            "voxel_applied": True,
+            "initial_voxel_size_used": _proseg_voxel(voxel_size) or _PROSEG_PRESET_VOXEL,
+            "cell_area": "outline area in µm² (Proseg's volume is cell_volume, µm³)",
             "n_samples": n_samples, "recorded_samples": recorded_samples,
             "schedule": schedule, "nuclear_reassign_prob": nuclear_reassign_prob,
             "prior_seg_prob": prior_seg_prob, "prior_type": prior_type,

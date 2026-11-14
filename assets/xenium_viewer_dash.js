@@ -38,6 +38,17 @@
   var lost = { spatial: false, umap: false };   // WebGL context lost: remount on the next sync
 
   // Status line: the viewer's own text plus the glue's messages (image layer, missing bundle).
+  // What the selected-cell store holds for a clicked cell: the id, {id, sample} for a cell
+  // of an added sample, {id, source} for a cell of a segmentation run (the server looks the
+  // id up in that run first: a numeric id can exist in the Xenium table as well).
+  function selectedCell(cell, source) {
+    if (cell.sample) return { id: cell.id, sample: cell.sample };
+    // (the UMAP viewer's source is "<segmentation>|emb:<set>": the segmentation part)
+    var seg = String(source || "xenium").split("|")[0];
+    var tool = seg.split(":")[0];
+    return tool && tool !== "xenium" ? { id: cell.id, source: seg } : cell.id;
+  }
+
   var viewerStatus = "";
   var glueMsg = {};
   function renderStatus() {
@@ -183,8 +194,9 @@
           .then(function (r) { return r.json(); })
           .then(function (cell) {
             if (!cell || !cell.id) return;
-            // a cell of a sample shown beside the primary one is named with its sample
-            setProps("selected-cell", { data: cell.sample ? { id: cell.id, sample: cell.sample } : cell.id });
+            // a cell of a sample shown beside the primary one is named with its sample,
+            // a cell of a segmentation run with its source (ids are not unique across tables)
+            setProps("selected-cell", { data: selectedCell(cell, info.source) });
           })
           .catch(function () { /* cell info is optional */ });
       },
@@ -233,7 +245,7 @@
           .then(function (cell) {
             if (!cell || !cell.id) return;
             // the joint UMAP shows every sample: a cell of an added sample is named with it
-            setProps("selected-cell", { data: cell.sample ? { id: cell.id, sample: cell.sample } : cell.id });
+            setProps("selected-cell", { data: selectedCell(cell, info.source) });
           })
           .catch(function () { /* cell info is optional */ });
       },

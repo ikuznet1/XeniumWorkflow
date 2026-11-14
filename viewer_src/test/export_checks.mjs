@@ -16,7 +16,7 @@ import {tmpdir} from 'node:os';
 import {resolve} from 'node:path';
 import {inflateSync} from 'node:zlib';
 import {Checks, DATA, fetchBin, hasBundle, launch, newPage, startServer} from './lib.mjs';
-import {buildScene, DEFAULT_MAX_VECTOR, planFigure, scaleBarLength, sceneToPdf, sceneToSvg, textWidth} from '../src/figure.js';
+import {buildScene, DEFAULT_MAX_VECTOR, pdfText, planFigure, scaleBarLength, sceneToPdf, sceneToSvg, textWidth, xmlText} from '../src/figure.js';
 import {colormapLut} from '../src/colormap.js';
 
 const T = new Checks();
@@ -248,6 +248,22 @@ function quartzRender(pdfPath) {
     /\n1 0 0 rg\n206 100 m /.test(pdf.content) && /16 582 100 3 re f/.test(pdf.content) && /\(50 \\265m\) Tj/.test(pdf.content) &&
     /\(B & NK\) Tj/.test(pdf.content) && /\(ROI <1> & "x"\) Tj/.test(pdf.content) && /q 0 0 800 600 re W n/.test(pdf.content),
     '1 PDF: the same shapes as the SVG (circles, closed rings, 100-unit scale bar, text), y flipped once', JSON.stringify({circles: count(pdf.content, / c f\n/g)}));
+  // every character of Windows-1252 has its byte (the fonts are WinAnsiEncoding); only what is
+  // outside the code page prints as '?'
+  const cp1252 = new TextDecoder('windows-1252');
+  const high = [];
+  for (let b = 0x80; b <= 0xff; b++) {
+    const ch = cp1252.decode(Uint8Array.of(b));
+    if (ch.codePointAt(0) >= 0xa0 || ch.codePointAt(0) > 0xff) high.push([b, ch]);
+  }
+  const wrong = high.filter(([b, ch]) => pdfText(ch) !== `(\\${b.toString(8)})`).map(([b, ch]) => `${ch}:${pdfText(ch)}`);
+  T.ok(high.length === 123 && wrong.length === 0 && pdfText('Cellules œsophagiennes') === '(Cellules \\234sophagiennes)' &&
+    pdfText('αβ 細胞 (x)') === '(?? ?? \\(x\\))',
+    '1 PDF: all of Windows-1252 is written with its own byte; other characters as ?', wrong.slice(0, 6).join(' '));
+  // a name with a code point XML 1.0 forbids must not make the SVG ill-formed
+  const dirty = 'T\uffffcell\ufffe \u0001a\ud83d b \ud83e\udda0 <&>';
+  T.ok(xmlText(dirty) === 'Tcell a b \ud83e\udda0 &lt;&amp;&gt;' && xmlText('tab\there\nline') === 'tab\there\nline',
+    '1 SVG: code points XML does not allow (controls, U+FFFE/FFFF, lone surrogates) are dropped from text', JSON.stringify(xmlText(dirty)));
   const gsNames = [...pdf.page.dict.matchAll(/\/(GS\d+) << \/ca ([\d.]+) \/CA [\d.]+ >>/g)].map((m) => +m[2]);
   T.ok(gsNames.includes(0.8) && gsNames.includes(0.119) && gsNames.includes(1) && [...pdf.content.matchAll(/\/(GS\d+) gs/g)].every((m) => pdf.page.dict.includes(`/${m[1]} <<`)),
     '1 PDF: opacities as graphics states that the page declares', JSON.stringify(gsNames));

@@ -360,7 +360,7 @@ def download_moran_table(n_clicks):
     for i in res["samples"]:
         header += (f"# sample {i['label']} ({i['name']}): {i['n_cells']} cells; E[I] = "
                    f"{i['expected']:.6g}; Var[I] = {i['variance']:.6g}\n")
-    return dict(content=provenance._prov_csv_stamp(res, header + t.to_csv(index=False)), filename="spatially_variable_genes_moran.csv")
+    return dict(content=provenance._prov_csv_stamp(res, provenance._csv_comments(header) + t.to_csv(index=False)), filename="spatially_variable_genes_moran.csv")
 
 
 # ─── Ligand-receptor scores ───────────────────────────────────────────────────
@@ -521,7 +521,7 @@ def download_lr_table(n_clicks):
               f"frac_ligand / frac_receptor: cells with count >= 1 transcript\n")
     if res.get("n_uncorrected"):
         header += f"# {analysis._an_uncorrected_note(res['n_uncorrected'])}\n"
-    return dict(content=provenance._prov_csv_stamp(res, header + t.to_csv(index=False)), filename="ligand_receptor_scores.csv")
+    return dict(content=provenance._prov_csv_stamp(res, provenance._csv_comments(header) + t.to_csv(index=False)), filename="ligand_receptor_scores.csv")
 
 
 # ─── Counts mode with several samples ─────────────────────────────────────────

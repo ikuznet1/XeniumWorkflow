@@ -1247,7 +1247,7 @@ def _txf_csv(res) -> str:
         lines.append(f"# dominant factor x {res['category']}: n = {a['n']}; purity {a['purity']:.4g}; adjusted "
                      f"Rand index {a['ari']:.4g}")
     top = res["top"][["factor_name", "rank", "gene", "loading", "lift", "share_of_gene", "score"]]
-    out = ("\n".join(lines) + "\n# factors\n" + res["factors"].to_csv(index=False)
+    out = (provenance._csv_comments(lines) + "# factors\n" + res["factors"].to_csv(index=False)
            + "\n# top genes per factor\n" + top.to_csv(index=False))
     if res["crosstab"] is not None and res["crosstab"].size:
         out += "\n# cells by dominant factor (rows) and label (columns)\n" + res["crosstab"].to_csv()

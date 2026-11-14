@@ -3,6 +3,7 @@
 import os
 import json
 import hashlib
+import threading
 import numpy as np
 import pandas as pd
 from dash import html
@@ -125,8 +126,53 @@ def _hex_to_rgba(hex_color: str, alpha: float) -> str:
     return f"rgba({r},{g},{b},{alpha})"
 
 
+def _roi_selection_hull(points, src_df=None):
+    """Convex hull (plot space) of a Plotly selection: *points* are the selectedData
+    points. THE rule for every caller that turns selected points into an outline:
+
+    with several samples side by side (and no segmentation run as the source) the cell ids
+    of the points are unique within a sample only and every extra sample is drawn at an x
+    offset, so an id cannot be looked up in the primary sample's table - the hull is built
+    from the points' own plot coordinates (what the user selected). In a single-sample view
+    the ids are resolved against the table (*src_df*, or the primary sample)."""
+    points = list(points or [])
+    if src_df is None and dataview.EXTRA_DATASETS:
+        xy = []
+        for p in points:
+            try:
+                x, y = float(p.get("x")), float(p.get("y"))
+            except (TypeError, ValueError):
+                continue
+            if np.isfinite(x) and np.isfinite(y):
+                xy.append((x, y))
+        return _roi_hull_of_xy(xy)
+    ids = [p.get("customdata") for p in points if p.get("customdata") is not None]
+    return _roi_compute_hull(ids, src_df=src_df)
+
+
+def _roi_hull_of_xy(pts):
+    """Convex hull exterior [[x, y], ...] of plot-space points; None for fewer than 3 or
+    for collinear points with no extent."""
+    try:
+        from shapely.geometry import MultiPoint
+        pts = list(pts)
+        if len(pts) < 3:
+            return None
+        hull = MultiPoint(pts).convex_hull
+        if hull.geom_type == "Polygon":
+            return [list(c) for c in hull.exterior.coords]
+        elif hull.geom_type == "LineString":
+            return [list(c) for c in hull.coords]
+        return None
+    except Exception as e:
+        print(f"  ROI hull error: {e}", flush=True)
+        return None
+
+
 def _roi_compute_hull(cell_ids, src_df=None):
-    """Return convex hull exterior coords [[x,y],...] for the given cell_ids, or None."""
+    """Return convex hull exterior coords [[x,y],...] for the given cell_ids, or None.
+    The ids are looked up in ONE table (*src_df*, or the primary sample): callers with a
+    Plotly selection use _roi_selection_hull, which handles the multi-sample view."""
     try:
         from shapely.geometry import MultiPoint
         df = src_df if src_df is not None else core.DATA["df"]
@@ -146,15 +192,17 @@ def _roi_compute_hull(cell_ids, src_df=None):
         return None
 
 
-def _roi_mask_in_polygon(polygon_xy: list, df: "pd.DataFrame") -> np.ndarray:
+def _roi_mask_in_polygon(polygon_xy: list, df: "pd.DataFrame", x_offset: float = 0.0) -> np.ndarray:
     """Boolean mask over df rows whose centroids lie strictly inside polygon_xy
-    (vectorised; same result as shapely poly.contains(Point) per cell)."""
+    (vectorised; same result as shapely poly.contains(Point) per cell). The outline is in
+    plot space: y = -µm, and x includes *x_offset*, the shift a sample is drawn at in the
+    side-by-side view (0 for the primary sample and for a segmentation run)."""
     mask = np.zeros(len(df), dtype=bool)
     try:
         import shapely
         from shapely.geometry import Polygon as _SPoly
         poly = _SPoly(polygon_xy)
-        xs = df["x_centroid"].to_numpy(dtype=float)
+        xs = df["x_centroid"].to_numpy(dtype=float) + float(x_offset or 0.0)
         ys = -df["y_centroid"].to_numpy(dtype=float)
         minx, miny, maxx, maxy = poly.bounds
         cand = (xs >= minx) & (xs <= maxx) & (ys >= miny) & (ys <= maxy)
@@ -172,21 +220,58 @@ def _roi_cells_in_polygon(polygon_xy: list, src_df=None) -> list:
     return df.index[_roi_mask_in_polygon(polygon_xy, df)].tolist()
 
 
-def _roi_apply_metadata_to_df(df: "pd.DataFrame", rois: list) -> None:
-    """Add/update roi_{cls} columns in df based on rois list."""
-    # Reset ALL existing roi_* columns first (handles deletions of last ROI in a class)
+def _roi_known_names(rois: list) -> dict:
+    """{class: names} of every ROI the app has held a polygon for since the ROI list of
+    this dataset was loaded (the current ones and those deleted or renamed since);
+    emptied by _roi_forget_known when another dataset's list is loaded. (Under its own
+    lock: callers hold core._roi_lock while they apply the ROIs.)"""
+    with _roi_known_lock:
+        for r in rois:
+            _roi_known.setdefault(str(r["cls"]), set()).add(str(r["name"]))
+        return {k: set(v) for k, v in _roi_known.items()}
+
+
+_roi_known: dict = {}
+_roi_known_lock = threading.Lock()
+
+
+def _roi_forget_known() -> None:
+    with _roi_known_lock:
+        _roi_known.clear()
+
+
+def _roi_apply_metadata_to_df(df: "pd.DataFrame", rois: list, x_offset: float = 0.0) -> None:
+    """Add/update roi_{cls} columns in df based on rois list (*x_offset*: the shift the
+    table's sample is drawn at; the outlines are in plot space).
+
+    Only the app's own labels are re-derived: a value is cleared when it is the name of a
+    ROI the app holds (or held) a polygon for, and set again from the current polygons. A
+    roi_* value that came with the loaded store and has no polygon here (another cache
+    directory, a store exported elsewhere) is NOT blanked: the polygons to re-derive it
+    from do not exist, and the blank column would be written back into the store."""
+    known = _roi_known_names(rois)
     for col in [c for c in df.columns if c.startswith("roi_")]:
-        df[col] = pd.NA
+        names = known.get(col[4:])
+        if not names:
+            continue                       # no polygon of this class was ever held: not ours
+        if isinstance(df[col].dtype, pd.CategoricalDtype):
+            df[col] = df[col].astype(object)
+        v = df[col]
+        mine = v.notna().to_numpy() & v.astype(str).isin(names).to_numpy()
+        if mine.any():
+            df.loc[mine, col] = pd.NA
     # Ensure columns exist for all current classes
     for cls in {r["cls"] for r in rois}:
         col = f"roi_{cls}"
         if col not in df.columns:
             df[col] = pd.NA
+        elif isinstance(df[col].dtype, pd.CategoricalDtype):
+            df[col] = df[col].astype(object)
 
     overlap_warned: set = set()
     for roi in rois:
         col = f"roi_{roi['cls']}"
-        _in_roi = _roi_mask_in_polygon(roi["polygon_xy"], df)
+        _in_roi = _roi_mask_in_polygon(roi["polygon_xy"], df, x_offset)
         # Warn on overlaps with existing same-class assignments
         existing = df.loc[_in_roi, col]
         overlapping = existing.dropna()
@@ -213,9 +298,26 @@ def _roi_apply_everywhere(rois: list) -> None:
             _rorig = _res.get("_cells_df_original")
             if _rorig is not None and _rorig is not _res["cells_df"]:
                 _roi_apply_metadata_to_df(_rorig, rois)
+    # the other samples of the side-by-side view: their cells are counted in the Save ROI
+    # preview (offset-aware), so they get the label too
+    for eds in list(dataview.EXTRA_DATASETS):
+        _roi_apply_to_sample(eds, rois)
     # UMAP df cache holds dropna() copies of DATA["df"] without the new columns
     dataview._umap_df_cache.clear()
     dataview._umap_fig_cache.clear()
+
+
+def _roi_apply_to_sample(eds: dict, rois: list) -> None:
+    """roi_* columns of one extra sample (and its pre-subset frame), with its x offset.
+    Called for every sample by _roi_apply_everywhere, and when a sample is added."""
+    off = float(eds.get("x_offset") or 0.0)
+    df = eds.get("df")
+    if df is None:
+        return
+    _roi_apply_metadata_to_df(df, rois, off)
+    orig = eds.get("_df_original")
+    if orig is not None and orig is not df:
+        _roi_apply_metadata_to_df(orig, rois, off)
 
 
 def _roi_manager_contents(rois: list):
@@ -316,6 +418,7 @@ def _auto_load_rois() -> None:
                 except Exception:
                     pass
                 break
+    _roi_forget_known()                    # (the names known for the previous dataset)
     with core._roi_lock:
         core._roi_state["rois"] = rois
     if rois and "df" in core.DATA:

@@ -288,7 +288,11 @@ def test_shutdown_hook_stops_the_worker_and_removes_its_directory(xe):
     j = _Job(xe, T.sleep_once, {"seconds": 600})
     pid = j.wait_in_step()
     (d,) = tuple(xe._rw_live_dirs)
-    xe._jobs_kill_all_processes()            # what atexit and the SIGTERM / SIGHUP handler call
+    try:
+        xe._jobs_kill_all_processes()        # what atexit and the SIGTERM / SIGHUP handler call
+    finally:
+        sys.modules["xenium_app.jobs"]._jobs_shutdown_reset()    # this process goes on (round 9: no
+        #                                                          tool process starts after the sweep)
     assert not _pid_alive(pid) and not os.path.exists(d)
     j.job.thread.join(20)
     assert j.job.state == "error" and "ended unexpectedly" in j.state["message"]

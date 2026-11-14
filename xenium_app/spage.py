@@ -43,6 +43,67 @@ def _spage_ids_tag(index) -> str:
     return h.hexdigest()[:10]
 
 
+def _spage_supersedes(gene, alt_res=None) -> bool:
+    """True when the CURRENT SpaGE result lists *gene* (plain name) and is not what the
+    stored matrix column of that gene holds: a streamed result (never written back), or a
+    result whose write into the store was skipped (subset active, no store, failed write).
+    Both expression readers ask this before they serve a stored imputed column - the
+    column may be that of an EARLIER run of the same gene (other reference, other n_pv),
+    while status line and provenance name the current run."""
+    gene = str(gene)
+    if alt_res is not None:
+        path = alt_res.get("spage_result_path")
+        if not path or gene not in (alt_res.get("spage_result_genes") or []):
+            return False
+        stored = alt_res.get("spage_result_stored")
+        if stored is None:                     # a reference recorded before the flag existed
+            stored = not os.path.isdir(path)   # a streamed (zarr) result was never stored
+        return not stored
+    with core._spage_lock:
+        res = core._spage_state.get("result")
+        path = core._spage_state.get("result_path")
+        genes = core._spage_state.get("result_genes") or []
+        stored = core._spage_state.get("result_stored")
+    if res is not None and gene in getattr(res, "columns", ()):
+        return stored is False
+    return bool(path) and gene in genes
+
+
+def _spage_run_rows(alt_res: dict, n_rows: int):
+    """Row positions, in a positional (streamed, no cell ids) SpaGE result of a
+    segmentation run with *n_rows* rows, of the cells now in alt_res["cells_df"]: slice(None)
+    when the result has exactly these cells in this order, an index array when it was
+    computed for the whole run and a subset() is active now, None when the rows cannot be
+    matched to the cells (computed under another subset, another number of rows). The
+    reference carries the hash of the cell ids it was computed for
+    (alt_res["spage_result_ids_tag"]); one recorded before that existed is taken to cover
+    the whole run."""
+    cur = alt_res["cells_df"].index
+    full = alt_res.get("_cells_df_original")
+    full = full.index if full is not None else None
+    tag = alt_res.get("spage_result_ids_tag")
+
+    def _tag_of(index, key):
+        memo = alt_res.get(key)
+        if memo is None or memo[0] is not index:
+            memo = alt_res[key] = (index, _spage_ids_tag(index))
+        return memo[1]
+
+    if tag:
+        if n_rows == len(cur) and _tag_of(cur, "_spage_tag_cur") == tag:
+            return slice(None)
+        if full is not None and n_rows == len(full) and _tag_of(full, "_spage_tag_full") == tag:
+            pos = full.get_indexer(cur)
+            return pos if (pos >= 0).all() else None
+        return None
+    if full is None:
+        return slice(None) if n_rows == len(cur) else None
+    if n_rows != len(full):
+        return None
+    pos = full.get_indexer(cur)
+    return pos if (pos >= 0).all() else None
+
+
 def _spage_requested_genes(genes_input) -> list:
     """The gene names of the free-text field (one per line or comma-separated), each once,
     in the order entered: a name entered twice would become duplicate rows of the reference
@@ -303,18 +364,11 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
             return
 
         # ── Determine active reseg (if any) ──────────────────────────────
-        _alt_res = None
-        if seg_source and core._seg_tool(seg_source) != "xenium":
-            if core._seg_tool(seg_source) == "baysor":
-                with core._baysor_lock:
-                    if core._baysor_state["status"] == "done":
-                        _alt_res = core._baysor_state["result"]
-            elif core._seg_tool(seg_source) == "proseg":
-                with core._proseg_lock:
-                    if core._proseg_state["status"] == "done":
-                        _alt_res = core._proseg_state["result"]
-            else:
-                _alt_res = core._seg_result(seg_source, done_only=True)
+        _alt_res, _seg_err = core._seg_job_result(seg_source, "nothing was imputed")
+        if _seg_err:
+            # never the Xenium cells (their store and cache file) under the name of a run
+            _set("error", _seg_err)
+            return
 
         # ── Load reference gene list ─────────────────────────────────────
         from rpy2.rinterface_lib import openrlib
@@ -410,19 +464,47 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
         # under a subset() it must not be registered for auto-load at startup.
         _xen_subset = _alt_res is None and "_df_original" in core.DATA
 
-        def _record_reseg_result(_path, _genes):
+        def _record_reseg_result(_path, _genes, stored=False, positional=False):
             """Reseg results are indexed by reseg cells: keep them on the run, not
-            in the global (Xenium) SpaGE state / startup index."""
-            try:
-                import json as _json_sc
-                with open(os.path.join(_alt_res["out_dir"], "spage_result.json"), "w") as _sjf:
-                    _json_sc.dump({"path": _path, "genes": list(_genes)}, _sjf)
-            except Exception as _sje:
-                print(f"  SpaGE: could not persist result ref: {_sje}", flush=True)
+            in the global (Xenium) SpaGE state / startup index.
+
+            stored: the genes are (also) columns of the run's matrix and store with these
+            values (False: the reference is the only place that holds this result, and it
+            supersedes stored columns of an earlier run - _spage_supersedes). positional: a
+            streamed result, one row per cell of the run's table as it is NOW and no cell
+            ids: the reference carries the hash of those ids (_spage_run_rows), and under
+            an active subset() it is not persisted with the run - a later load of the run
+            has other rows."""
+            _genes = list(_genes)
+            _tag = _spage_ids_tag(_alt_res["cells_df"].index) if positional else None
+            _n = int(len(_alt_res["cells_df"]))
+            if not (positional and "_cells_df_original" in _alt_res):
+                try:
+                    import json as _json_sc
+                    with open(os.path.join(_alt_res["out_dir"], "spage_result.json"), "w") as _sjf:
+                        _json_sc.dump({"path": _path, "genes": _genes, "stored": bool(stored),
+                                       "ids_tag": _tag, "n_rows": _n}, _sjf)
+                except Exception as _sje:
+                    print(f"  SpaGE: could not persist result ref: {_sje}", flush=True)
             _alock = core._seg_state(core._seg_tool(seg_source or ""))[1] or core._proseg_lock
             with _alock:
                 _alt_res["spage_result_path"]  = _path
-                _alt_res["spage_result_genes"] = list(_genes)
+                _alt_res["spage_result_genes"] = _genes
+                _alt_res["spage_result_stored"] = bool(stored)
+                _alt_res["spage_result_ids_tag"] = _tag
+
+        def _record_xenium_streamed(_path, _genes):
+            """A streamed result of the Xenium cells is the current result: the in-memory
+            frame of an earlier run is dropped (readers would serve it first)."""
+            with core._spage_lock:
+                core._spage_state["result"] = None
+                core._spage_state["result_path"]  = _path
+                core._spage_state["result_genes"] = list(_genes)
+                core._spage_state["result_ids_tag"] = _subset_ids_tag
+                core._spage_state["result_stored"] = False
+            dataview._gene_expr_cache.clear()
+            if not _xen_subset:
+                _spage_index_update(_path, _ds_key)
 
         def _publish(imp_df, cached: bool = False):
             """Install an in-memory result: the cache file (a fresh run), the result
@@ -430,6 +512,7 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
             result read from the cache goes the same way: the columns on display may be
             those of another run of the same genes (other n_pv, other reference)."""
             # ── Publish an in-memory result (fresh, or read from the parquet cache) ──
+            _wrote_store = False            # the imputed columns of store and matrix are this result
             _set("running", "Installing cached SpaGE results…" if cached else "Saving imputed results…")
             # Last cancellation point. The cache file, the run's result reference, the
             # zarr table (deleted, then rewritten) and DATA are written as one unit.
@@ -569,6 +652,7 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                     new_genes = result_pair[0] if result_pair else []
                     adata_new = result_pair[1] if len(result_pair) > 1 else None
                     if adata_new is not None:
+                        _wrote_store = True
                         print(f"  SpaGE reseg: wrote {len(new_genes)} genes to {os.path.basename(sdata_path)}", flush=True)
                         with core._spage_lock:
                             _prev_imp = list(_alt_res.get("imputed_genes") or [])
@@ -609,6 +693,7 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                     new_genes = result_pair[0] if result_pair else []
                     adata_new  = result_pair[1] if len(result_pair) > 1 else None
                     if adata_new is not None:
+                        _wrote_store = True
                         print(f"  SpaGE: wrote {len(new_genes)} imputed genes to zarr", flush=True)
                         with core._spage_lock:
                             jobs._check_dataset_gen(_gen)
@@ -626,7 +711,19 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
             # a run's result that could not be written into its store (subset active, no
             # store, failed write) is read from the cache file, by cell id: say so
             _not_stored = (_alt_res is not None
-                           and not all(g in (_alt_res.get("gene_name_to_idx") or {}) for g in imp_df.columns))
+                           and not (_wrote_store and all(g in (_alt_res.get("gene_name_to_idx") or {})
+                                                         for g in imp_df.columns)))
+            if _alt_res is not None:
+                _record_reseg_result(cache_file, list(imp_df.columns), stored=not _not_stored)
+            else:
+                # the frame is the current result; a streamed reference of an earlier run
+                # is not (readers serve the reference of a gene before its column)
+                with core._spage_lock:
+                    core._spage_state["result_path"] = None
+                    core._spage_state["result_genes"] = None
+                    core._spage_state["result_ids_tag"] = None
+                    core._spage_state["result_stored"] = bool(_wrote_store)
+                dataview._gene_expr_cache.clear()
             _set("done", f"Done{' (cached)' if cached else ''} — {len(imp_df.columns):,} genes imputed"
                  + (" (not written into the run's store: read from the SpaGE cache file)" if _not_stored else ""),
                  result=imp_df if _alt_res is None else None)
@@ -640,24 +737,12 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                 if _genes_c:
                     jobs._job_shield()      # Cancel before this point publishes nothing
                     if _alt_res is None:
-                        with core._spage_lock:
-                            core._spage_state["result_path"]  = zarr_cache
-                            core._spage_state["result_genes"] = _genes_c
-                            core._spage_state["result_ids_tag"] = _subset_ids_tag
-                    if _alt_res is not None:
-                        try:
-                            import json as _json_sc
-                            _sj = {"path": zarr_cache, "genes": _genes_c}
-                            with open(os.path.join(_alt_res["out_dir"], "spage_result.json"), "w") as _sjf:
-                                _json_sc.dump(_sj, _sjf)
-                        except Exception:
-                            pass
-                        _alock = core._seg_state(core._seg_tool(seg_source or ""))[1] or core._proseg_lock
-                        with _alock:
-                            _alt_res["spage_result_path"]  = zarr_cache
-                            _alt_res["spage_result_genes"] = _genes_c
-                    elif not _xen_subset:
-                        _spage_index_update(zarr_cache, _ds_key)
+                        _record_xenium_streamed(zarr_cache, _genes_c)
+                    else:
+                        if int(_zc.shape[0]) != len(_alt_res["cells_df"]):
+                            raise ValueError(f"cached result has {int(_zc.shape[0]):,} rows for "
+                                             f"{len(_alt_res['cells_df']):,} cells")
+                        _record_reseg_result(zarr_cache, _genes_c, positional=True)
                     _set("done", f"Done (cached) — {len(_genes_c):,} genes (streaming)", result=None)
                     return
             except jobs._DatasetChanged:
@@ -675,14 +760,9 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
                     _genes_c = _pf_c.schema_arrow.names
                     jobs._job_shield()      # Cancel before this point publishes nothing
                     if _alt_res is None:
-                        with core._spage_lock:
-                            core._spage_state["result_path"]  = cache_file
-                            core._spage_state["result_genes"] = list(_genes_c)
-                            core._spage_state["result_ids_tag"] = _subset_ids_tag
-                        if not _xen_subset:
-                            _spage_index_update(cache_file, _ds_key)
+                        _record_xenium_streamed(cache_file, _genes_c)
                     else:
-                        _record_reseg_result(cache_file, _genes_c)
+                        _record_reseg_result(cache_file, _genes_c)      # by cell id; not stored
                     _set("done", f"Done (cached, streaming) — {_nc_c:,} genes", result=None)
                     return
             except jobs._DatasetChanged:
@@ -824,24 +904,9 @@ writeLines(colnames(mat_sub), "{cells_file}")
             jobs._check_dataset_gen(_gen)
             jobs._job_shield()              # Cancel before this point publishes nothing
             if _alt_res is None:
-                with core._spage_lock:
-                    core._spage_state["result_path"]  = zarr_cache
-                    core._spage_state["result_genes"] = genes_to_predict
-                    core._spage_state["result_ids_tag"] = _subset_ids_tag
-                if not _xen_subset:
-                    _spage_index_update(zarr_cache, _ds_key)
+                _record_xenium_streamed(zarr_cache, genes_to_predict)
             else:
-                try:
-                    import json as _json_sc
-                    _sj = {"path": zarr_cache, "genes": genes_to_predict}
-                    with open(os.path.join(_alt_res["out_dir"], "spage_result.json"), "w") as _sjf:
-                        _json_sc.dump(_sj, _sjf)
-                except Exception as _sje:
-                    print(f"  SpaGE: could not persist result ref: {_sje}", flush=True)
-                _alock = core._seg_state(core._seg_tool(seg_source or ""))[1] or core._proseg_lock
-                with _alock:
-                    _alt_res["spage_result_path"]  = zarr_cache
-                    _alt_res["spage_result_genes"] = genes_to_predict
+                _record_reseg_result(zarr_cache, genes_to_predict, positional=True)
             _set("done", f"Done — {len(genes_to_predict):,} genes imputed (streaming)")
             return
 

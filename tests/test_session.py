@@ -484,8 +484,8 @@ def test_restore_is_refused_while_a_job_runs(xe, D):
         report = _restore(xe, saved)
         assert not report["ok"] and report["refused"].startswith("Still running: UMAP")
         assert report["controls"] == {} and not xe._roi_state["rois"]
-        out = xe.session_action({"action": "upload", "controls": _defaults(xe)},
-                                "data:application/json;base64," + base64.b64encode(json.dumps(saved).encode()).decode(),
+        out = xe.session_action({"action": "upload", "controls": _defaults(xe), "upload":
+                                 "data:application/json;base64," + base64.b64encode(json.dumps(saved).encode()).decode()},
                                 0, 0, 0, 0, 0)
         assert out[0].startswith("Not restored. Still running: UMAP") and out[2] is xe.no_update
     finally:
@@ -589,28 +589,30 @@ def test_dialog_callbacks_save_download_upload_and_restore(xe, D):
     nu = xe.no_update
     is_open, slots = xe.open_session_modal(1)
     assert is_open is True and "Saved session: none" in slots and xe.close_session_modal(1) is False
-    out = xe.session_action({"action": "save", "controls": page}, None, 0, 0, 0, 0, 0)
-    assert len(out) == 11 and out[0].startswith("Session saved in the cache directory") and out[2] is nu
+    out = xe.session_action({"action": "save", "controls": page}, 0, 0, 0, 0, 0)
+    assert len(out) == 10 and out[0].startswith("Session saved in the cache directory") and out[2] is nu
     assert "Saved session: 20" in out[1]
     on_disk = json.load(open(xe._session_path("saved")))
     assert on_disk["state"]["controls"]["moran-k"] == 7
     assert "repl-input" not in on_disk["state"]["controls"] and "annot-rds-path" not in on_disk["state"]["controls"]
-    out = xe.session_action({"action": "download", "controls": page}, None, 0, 0, 0, 0, 0)
+    out = xe.session_action({"action": "download", "controls": page}, 0, 0, 0, 0, 0)
     assert out[3]["filename"].startswith("xenium_session_") and out[3]["filename"].endswith(".json")
     upload = "data:application/json;base64," + base64.b64encode(out[3]["content"].encode()).decode()
     doc = json.loads(out[3]["content"])
     doc["state"]["rois"] = [{"name": "r", "cls": "region", "polygon_xy": _rect(D)}]
     doc["state"]["controls"]["point-size"] = 4
     upload = "data:application/json;base64," + base64.b64encode(json.dumps(doc).encode()).decode()
-    out = xe.session_action({"action": "upload", "t": 5, "controls": page}, upload, 3, 10, 0, 0, 2)
+    # (round 9: the file is part of the request, and the page empties the upload component
+    # itself - no callback writes it; see test_review_round9 and session_checks.mjs)
+    out = xe.session_action({"action": "upload", "t": 5, "controls": page, "upload": upload}, 3, 10, 0, 0, 2)
     assert out[0].startswith("Session restored") and out[2] == {"t": 5, "controls": {"point-size": 4}}
-    assert out[4] is None, "the upload is cleared so the same file can be chosen again"
-    assert out[6] is nu and out[7] == 11 and out[8] is nu and out[10] is nu
-    out = xe.session_action({"action": "restore-saved", "controls": {**page, "moran-k": 3}}, None, 0, 0, 0, 0, 0)
+    assert out[5] is nu and out[6] == 11 and out[7] is nu and out[9] is nu
+    out = xe.session_action({"action": "restore-saved", "controls": {**page, "moran-k": 3}}, 0, 0, 0, 0, 0)
     assert out[2]["controls"] == {"moran-k": 7}
-    out = xe.session_action({"action": "upload", "controls": page}, "data:application/json;base64,!!!", 0, 0, 0, 0, 0)
+    out = xe.session_action({"action": "upload", "controls": page, "upload": "data:application/json;base64,!!!"},
+                            0, 0, 0, 0, 0)
     assert out[0].startswith("Not done. the upload could not be decoded") and out[2] is nu
-    out = xe.session_action({"action": "auto", "controls": page}, None, 0, 0, 0, 0, 0)
+    out = xe.session_action({"action": "auto", "controls": page}, 0, 0, 0, 0, 0)
     assert all(o is nu for o in out)
     with pytest.raises(Exception):
         xe.session_action(None)

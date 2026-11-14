@@ -147,11 +147,9 @@ def populate_cellnest_filters(ccc_version, annot_col):
         from_col = f"from_{annot_col}"
         to_col   = f"to_{annot_col}"
         if from_col in ccc_df.columns:
-            sender_opts   = [{"label": str(v), "value": str(v)}
-                             for v in sorted(ccc_df[from_col].dropna().unique(), key=str)]
+            sender_opts   = [{"label": v, "value": v} for v in cellnest._cellnest_filter_values(ccc_df[from_col])]
         if to_col in ccc_df.columns:
-            receiver_opts = [{"label": str(v), "value": str(v)}
-                             for v in sorted(ccc_df[to_col].dropna().unique(), key=str)]
+            receiver_opts = [{"label": v, "value": v} for v in cellnest._cellnest_filter_values(ccc_df[to_col])]
     return ligands, receptors, sender_opts, receiver_opts, annot_opts
 
 
@@ -402,16 +400,10 @@ def start_annotation(n_clicks, source, model_name, rds_path, label_col,
                      rctd_mode, rctd_cores, rctd_umi_min, rctd_umi_min_sigma, seg_source):
     """Kick off background annotation thread."""
     seg_source = seg_source or "xenium"
-    with core._proseg_lock:
-        pres = core._proseg_state["result"] if core._seg_tool(seg_source) == "proseg" and core._proseg_state["status"] == "done" else None
-    with core._baysor_lock:
-        bres = core._baysor_state["result"] if core._seg_tool(seg_source) == "baysor" and core._baysor_state["status"] == "done" else None
-    alt_res = pres or bres or (core._seg_result(seg_source, done_only=True)
-                               if core._seg_tool(seg_source) == "imgseg" else None)
-    if alt_res is None and core._seg_tool(seg_source) != "xenium":
-        # a run that is named but not loaded is never replaced by the Xenium cells
-        msg = (f"✗ The selected segmentation ({seg_source}) is not loaded (it is still loading, or its "
-               f"load failed): nothing was annotated.")
+    # a run that is named but not loaded is never replaced by the Xenium cells
+    alt_res, _seg_err = core._seg_job_result(seg_source, "nothing was annotated")
+    if _seg_err:
+        msg = f"✗ {_seg_err}"
         return True, msg, False, msg   # no job started: keep the poll off
 
     if alt_res is not None:
@@ -465,7 +457,7 @@ def start_annotation(n_clicks, source, model_name, rds_path, label_col,
         core._annot_state.update({"status": "running", "message": "Starting…",
                               labels_key: None, mode_labels_key: None})
 
-    _job_kw = dict(state=core._annot_state, lock=core._annot_lock)
+    _job_kw = dict(state=core._annot_state, lock=core._annot_lock, uses_run=alt_res)
     if source == "seurat":
         jobs._job_start("annotation", "Annotation: Seurat kNN", annotation._run_seurat_annotation,
                    args=(rds_path or "", label_col or "Names"),

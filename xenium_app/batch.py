@@ -72,7 +72,9 @@ _BATCH_STEPS = {
                      "figures": [("volcano", "analysis", "make_de_volcano_fig")]},
     "contact":      {"run": ("cb_analysis", "run_de"), "state": ("analysis", "_de_state", "_de_lock"),
                      "download": ("cb_analysis", "download_de_table"), "fixed": {"de-mode": "contact"},
-                     "figures": [("volcano", "analysis", "make_de_volcano_fig")], "design": True},
+                     "figures": [("volcano", "analysis", "make_de_volcano_fig")]},
+    # (no "design": contact-group DE compares contact and comparator cells WITHIN samples;
+    # it reads the donors of the design for the blocks, never the conditions A / B)
     "geneset":      {"run": ("cb_analysis", "run_geneset_score"),
                      "state": ("analysis", "_geneset_state", "_geneset_lock")},
     "density":      {"run": ("cb_analysis", "run_density"), "state": ("analysis", "_density_state", "_density_lock"),
@@ -778,8 +780,8 @@ def _batch_validate(cfg, log=None) -> tuple:
                      "and methods text say so")
     rows = stats._design_samples()
     n_a, n_b = sum(r["cond"] == "A" for r in rows), sum(r["cond"] == "B" for r in rows)
-    have_tx = bool(core.DATA.get("data_dir")) and os.path.exists(
-        os.path.join(str(core.DATA.get("data_dir")), "transcripts.parquet"))
+    # as the jobs: any loaded sample with a transcript file, parquet or zarr.zip
+    have_tx = any(dataview._ds_has_transcripts(ds) for ds in [core.DATA] + list(dataview.EXTRA_DATASETS))
     label_kinds = _batch_label_kinds(ctx)
     _lk_seg = ctx["seg-source"]              # the segmentation label_kinds was read for
     annotated_later = False
@@ -826,8 +828,8 @@ def _batch_validate(cfg, log=None) -> tuple:
         if spec.get("multi") and len(rows) < 2:
             errors.append(f"{where}: needs at least two loaded samples (data.extra_samples)")
         if spec.get("transcripts") and not have_tx:
-            errors.append(f"{where}: needs the transcript file (transcripts.parquet) of a Xenium bundle; "
-                          f"this dataset was loaded without one")
+            errors.append(f"{where}: needs the transcript file (transcripts.parquet or transcripts.zarr.zip) "
+                          f"of a Xenium bundle; no loaded sample has one")
         for cid, val in resolved.items():
             role, ref = _BATCH_ROLES.get(cid, (None, None))
             if role is None or _batch_unset(val):

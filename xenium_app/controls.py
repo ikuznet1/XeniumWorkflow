@@ -442,8 +442,12 @@ def _type_profiles(samples, labels, genes=None, masks=None) -> dict:
     cells. Returns {types, genes, counts (types × genes, float64), depth (Σ of all panel
     counts of the type's cells), n (cells per type), per_sample: [{counts, depth, n}]}.
     The rate of a gene in a type is counts / depth (ratio of sums: defined for fractional
-    counts, and not moved by the depth of single cells)."""
+    counts, and not moved by the depth of single cells). The depth is summed over the
+    genes the samples share when their panels differ (analysis._an_lib_cols: a type that
+    sits mostly in a sample of a larger panel would otherwise get lower rates for that
+    reason alone); "lib_shared_genes" is then their number, else None."""
     genes = analysis._an_common_genes(samples) if genes is None else list(genes)
+    lib_genes = analysis._an_lib_genes(samples)
     vc = _pooled_types(labels)
     types = sorted(vc.index, key=str)
     tpos = {t: i for i, t in enumerate(types)}
@@ -465,7 +469,7 @@ def _type_profiles(samples, labels, genes=None, masks=None) -> dict:
         csc = s["csc"]
         H = sp.csr_matrix((np.ones(int(ok.sum())), (code[ok], rows[ok])), shape=(T, csc.shape[0]))
         cols = np.array([s["gni"][g] for g in genes], dtype=np.int64)
-        panel = np.array([s["gni"][g] for g in s["genes"]], dtype=np.int64)
+        panel = analysis._an_lib_cols(s, lib_genes)
         M = H @ csc                                   # types × all matrix columns
         M = np.asarray(M.todense()) if sp.issparse(M) else np.asarray(M)
         c["counts"] = M[:, cols].astype(np.float64)
@@ -474,7 +478,8 @@ def _type_profiles(samples, labels, genes=None, masks=None) -> dict:
         for k in tot:
             tot[k] = tot[k] + c[k]
     return {"types": types, "genes": genes, "counts": tot["counts"], "depth": tot["depth"],
-            "n": tot["n"], "per_sample": per}
+            "n": tot["n"], "per_sample": per,
+            "lib_shared_genes": len(lib_genes) if lib_genes is not None else None}
 
 
 def _cpm(counts, depth) -> np.ndarray:
@@ -567,18 +572,17 @@ _SPILL_NOTE = (
     "genes is largely a readout of its neighbours.")
 
 
-def _marker_counts(s: dict, genes) -> tuple:
+def _marker_counts(s: dict, genes, lib_genes=None) -> tuple:
     """(Σ counts over *genes*, Σ counts over all panel genes) per cell of sample *s*
-    (NaN for a cell without a matrix row)."""
+    (NaN for a cell without a matrix row). lib_genes: the genes the second sum runs over
+    instead of the sample's panel; a caller that compares the share between samples
+    passes analysis._an_lib_genes(samples)."""
     csc = s["csc"]
     cols = np.array([s["gni"][g] for g in genes if g in s["gni"]], dtype=np.int64)
-    panel = np.array([s["gni"][g] for g in s["genes"]], dtype=np.int64)
     w = np.zeros(csc.shape[1])
     w[cols] = 1.0
     m_row = np.asarray(csc @ w).ravel()
-    wp = np.zeros(csc.shape[1])
-    wp[panel] = 1.0
-    t_row = np.asarray(csc @ wp).ravel()
+    t_row = analysis._an_depth(s, lib_genes)
     rows = np.asarray(s["rows"])
     ok = rows >= 0
     r = np.clip(rows, 0, None)
@@ -653,8 +657,9 @@ def _spillover(samples, labels, source, markers, local_r=_SPILL_LOCAL_R_UM, near
     distance band), flags (non-source cells per flag), by_type (share of each type's
     cells at or above the first flag edge), by_depth (flag rate per depth quintile)."""
     per = []
+    lib_genes = analysis._an_lib_genes(samples)      # one reference share is pooled over the samples
     for s, lab in zip(samples, labels):
-        m, tot = _marker_counts(s, markers)
+        m, tot = _marker_counts(s, markers, lib_genes)
         share = m / np.maximum(tot, 1.0)                 # a cell with no counts has share 0
         lab_s = (pd.Series(lab, dtype=object) if lab is not None
                  else pd.Series([None] * len(s["df"]), dtype=object))
@@ -797,7 +802,7 @@ def _run_spillover(seg_source, method, label_kind, source, markers_text, n_marke
         res.update({"source": src, "markers": markers, "marker_info": minfo, "ownership": own,
                     "category": cat, "corrected": corrected, "seg_source": seg_source or "xenium",
                     "n_uncorrected": analysis._an_uncorrected(samples),
-                    "own_frac": own_frac,
+                    "own_frac": own_frac, "lib_shared_genes": prof.get("lib_shared_genes"),
                     "types": prof["types"], "n_cells_type": dict(zip(prof["types"], prof["n"].tolist())),
                     "samples": [{"label": s["label"], "name": s["name"], "n_cells": len(s["df"])} for s in samples],
                     "seconds": _time.time() - _t0})
@@ -851,6 +856,9 @@ def _run_spillover(seg_source, method, label_kind, source, markers_text, n_marke
                 f"transcripts; owner = highest rate, co-owners at ≥ {100 * float(own_frac or _OWN_FRAC):.0f} % "
                 f"of it); {int((own['n_owners'] > 1).sum()):,} are shared by several types. "
                 f"Color By: 'Control: Spillover score'.")
+        if prof.get("lib_shared_genes"):
+            _ln = analysis._an_lib_note(prof["lib_shared_genes"])
+            msg += f" {_ln[0].upper() + _ln[1:]}."
         if use_corrected and not corrected:
             msg += " Original counts were used: not every sample has SPLIT-corrected counts."
         if res["n_uncorrected"]:
@@ -978,8 +986,10 @@ def _leak_gate(O0, O1, P0, P1, share_max: float = _LEAK_SHARE_MAX,
 
 
 def _group_profile(samples, masks, genes) -> tuple:
-    """(Σ counts per gene, Σ panel counts, cells) over the masked cells of the samples."""
+    """(Σ counts per gene, Σ panel counts, cells) over the masked cells of the samples;
+    the panel counts over the genes the samples share when their panels differ."""
     cnt, dep, n = np.zeros(len(genes)), 0.0, 0
+    lib_genes = analysis._an_lib_genes(samples)
     for s, m in zip(samples, masks):
         if m is None:
             continue
@@ -991,7 +1001,7 @@ def _group_profile(samples, masks, genes) -> tuple:
         w[sel] = 1.0
         tot = np.asarray(s["csc"].T @ w).ravel()
         cnt += tot[np.array([s["gni"][g] for g in genes], dtype=np.int64)]
-        dep += float(tot[np.array([s["gni"][g] for g in s["genes"]], dtype=np.int64)].sum())
+        dep += float(tot[analysis._an_lib_cols(s, lib_genes)].sum())
         n += int(len(sel))
     return cnt, dep, n
 
@@ -1161,6 +1171,8 @@ def _de_leak_annotate(res: dict, ctx: dict) -> None:
     n_own = int((t["owner"] != "").sum())
     head = (f"Gene ownership ({name} labels): {n_own:,} of {len(t):,} genes have an owner (highest "
             f"Σ counts / Σ depth; ≥ {_OWN_MIN_COUNT} transcripts).")
+    if prof.get("lib_shared_genes"):
+        head += f" Depth: the {analysis._an_lib_note(prof['lib_shared_genes'])}."
     if not g["applicable"]:
         res["leak_summary"] = head + f" Leak gate not applied: {g['reason']}."
         res["leak_gate"] = g
@@ -1297,7 +1309,7 @@ def _qc_metrics(s: dict, labels, sets: dict, source_type=None, radius: float = _
         member[cols, j] = 1.0
         n_in.append(len(cols))
     panel = np.zeros(csc.shape[1])
-    panel[[s["gni"][g] for g in s["genes"]]] = 1.0
+    panel[analysis._an_lib_cols(s)] = 1.0            # (one sample, compared with itself)
     ident = np.asarray(csc @ member)[r] * okr[:, None]
     tot = np.asarray(csc @ panel).ravel()[r] * okr
     # genes per cell: panel genes with a count ≥ 1 transcript (no copy of the matrix)
@@ -1457,7 +1469,7 @@ def _frac_assigned(s: dict) -> float:
         return np.nan
     w = np.zeros(s["csc"].shape[0])
     w[rows[ok]] = 1.0
-    panel = np.array([s["gni"][x] for x in s["genes"]], dtype=np.int64)
+    panel = analysis._an_lib_cols(s)                 # (one sample: counts per area)
     return float(np.asarray(s["csc"].T @ w).ravel()[panel].sum() / den)
 
 
@@ -2021,23 +2033,23 @@ def _coloc_placebo(prep, focal, n_samples, draws=_COLOC_PLACEBO_DRAWS, seed=1, p
 def _coloc_across(e_corr, testable, conds, donors, labels) -> dict:
     """Sample-level inference for every pair. e_corr / testable: [samples, a, b]. Returns
     {mode, note, p_enrich, mean, n_units (each [a, b]), p_diff, effect_diff (or None),
-    min_p, min_p_diff}. Enrichment: exact sign-flip of the per-unit effects (a unit is a
-    donor when every included sample has one, else a sample); difference between
-    conditions: stats._sl_test."""
+    min_p, min_p_diff}. Enrichment: exact sign-flip of the per-unit effects (the units are
+    those of stats._sl_unit_groups: the samples of one donor are one unit, a sample without
+    a donor label is its own); difference between conditions: stats._sl_test."""
     S, T, _ = e_corr.shape
     inc = [i for i in range(S) if conds[i] in ("A", "B")] if any(c in ("A", "B") for c in conds) else list(range(S))
     dn = [str(donors[i] or "") for i in range(S)]
-    by_donor = bool(inc) and all(dn[i] for i in inc)
-    groups: dict = {}
-    for i in inc:
-        groups.setdefault(dn[i] if by_donor else f"sample{i}", []).append(i)
+    ug = stats._sl_unit_groups(inc, dn)
+    groups, by_donor = ug["groups"], ug["by_donor"]
     n_units = len(groups)
     out = {"inc": list(inc), "groups": [list(ix) for ix in groups.values()],
            "n_units_max": n_units, "p_enrich": np.full((T, T), np.nan), "mean": np.full((T, T), np.nan),
            "n_units": np.zeros((T, T), dtype=np.int64), "p_diff": None, "effect_diff": None,
            "min_p": np.nan, "min_p_diff": np.nan, "diff_note": "",
            "units_note": (f"n = {len(inc)} samples" + (f" ({n_units} donors; samples of a donor averaged)"
-                                                       if by_donor else ""))}
+                                                       if by_donor else "")
+                          if by_donor or not ug["n_donors"] else
+                          ug["note"] + " (samples of a donor averaged)" if ug["combined"] else ug["note"])}
     ev = np.where(testable, e_corr, np.nan)
     with np.errstate(invalid="ignore"):
         unit_vals = np.stack([_nanmean(ev[ix], axis=0) for ix in groups.values()]) if groups else np.zeros((0, T, T))
@@ -2460,7 +2472,9 @@ def _spill_csv(res) -> str:
         lines.append(f"# distance {p['band']} um: {p['n']} non-source cells, mean marker share {p['mean_share']:.6g}")
     if res.get("n_uncorrected"):
         lines.append(f"# {analysis._an_uncorrected_note(res['n_uncorrected'])}")
-    return provenance._prov_csv_stamp(res, ("\n".join(lines) + "\n" + res["ownership"].to_csv(index=False)))
+    if res.get("lib_shared_genes"):
+        lines.append(f"# {analysis._an_lib_note(res['lib_shared_genes'])}")
+    return provenance._prov_csv_stamp(res, (provenance._csv_comments(lines) + res["ownership"].to_csv(index=False)))
 
 
 _SEGQC_COLS = [("id", "ID"), ("source", "Source"), ("counts", "Counts"), ("labels", "Labels"), ("n_cells", "Cells"),
@@ -2525,7 +2539,7 @@ def _segqc_csv(res) -> str:
         lines.append(f"# note: {nt}")
     body = res["table"].drop(columns=["value"]).to_csv(index=False)
     per = res["per_type"]
-    return provenance._prov_csv_stamp(res, ("\n".join(lines) + "\n" + body
+    return provenance._prov_csv_stamp(res, (provenance._csv_comments(lines) + body
             + ("\n# per cell type\n" + per.to_csv(index=False) if len(per) else "")))
 
 
@@ -2618,7 +2632,7 @@ def _coloc_csv(res) -> str:
                      f"{smp['cond'] or '-'}; donor {smp['donor'] or '-'}")
     s = res["summary"].rename(columns={c: f"pair_{c}" for c in res["summary"].columns if c not in ("focal", "target")})
     out = res["long"].merge(s, on=["focal", "target"], how="left")
-    txt = "\n".join(lines) + "\n" + out.to_csv(index=False)
+    txt = provenance._csv_comments(lines) + out.to_csv(index=False)
     if res.get("placebo") is not None:
         txt += (f"\n# placebo anchors for {res['placebo_focal']}: compartment-level expectation; random = "
                 f"count-matched random anchors within sample x compartment\n" + res["placebo"].to_csv(index=False))

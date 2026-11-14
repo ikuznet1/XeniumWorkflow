@@ -179,6 +179,39 @@ def switch_reseg_tab(algo):
     return show, hide, run_btn_baysor_style
 
 
+def _loaded_run_busy(tool: str) -> str:
+    """'' or why a new run of *tool* cannot start now: another job works on the run of
+    this tool that is loaded. Starting a run unloads it, and a re-run with the same
+    parameters replaces its directory - under a job that writes its result into that
+    directory by path (SPLIT, SpaGE, Rerun UMAP). The message names the job."""
+    state, lock = core._seg_state(tool)
+    if state is None:
+        return ""
+    with lock:
+        res = state.get("result")
+    if not res:
+        return ""
+    msg = jobs._run_in_use(res, "replaced")
+    return msg and (f"{core._SEG_TOOL_LABELS.get(tool, tool)} not started. " + msg)
+
+
+def _run_delete_refusal(tool: str, out_dir: str) -> str:
+    """'' or why the run directory *out_dir* cannot be deleted now: a job works on it, or
+    it is being loaded from the cache (the load would be published with its files gone)."""
+    msg = jobs._run_in_use(out_dir, "deleted")
+    if msg:
+        return msg
+    state, lock = core._seg_state(tool)
+    if state is not None:
+        with lock:
+            loading = (state.get("status") == "running" and state.get("loading_out_dir")
+                       and os.path.realpath(state["loading_out_dir"]) == os.path.realpath(out_dir))
+        if loading:
+            return (f"The run {os.path.basename(out_dir)} is being loaded from the cache: it was not "
+                    f"deleted. Wait for the load to finish and try again.")
+    return ""
+
+
 @app_layout.app.callback(
     Output("reseg-modal-run-status", "children"),
     Output("reseg-modal", "is_open", allow_duplicate=True),
@@ -225,6 +258,9 @@ def run_reseg_modal(n_clicks, algo, patches_confirmed,
         return "✗ Please confirm patches in Step 1 before running segmentation.", no_update, no_update, no_update
     # "Skip - run on full tissue" overrides patches left over from earlier in the session
     skip_patches = patches_confirmed == "skip"
+    _busy = _loaded_run_busy(algo)
+    if _busy:
+        return f"✗ {_busy}", no_update, no_update, no_update
     if algo == "baysor":
         with core._baysor_lock:
             if core._baysor_state["status"] == "running":
@@ -393,6 +429,7 @@ def toggle_seg_delete_modal(delete_clicks, cancel_clicks, seg_value):
     Output("seg-source",       "value",    allow_duplicate=True),
     Output("baysor-done",      "data",     allow_duplicate=True),
     Output("proseg-done",      "data",     allow_duplicate=True),
+    Output("seg-delete-confirm-text", "children", allow_duplicate=True),
     Input("seg-delete-confirm-btn", "n_clicks"),
     State("seg-source",             "value"),
     State("baysor-done",            "data"),
@@ -401,12 +438,17 @@ def toggle_seg_delete_modal(delete_clicks, cancel_clicks, seg_value):
 )
 def confirm_seg_delete(n_clicks, seg_value, baysor_ver, proseg_ver):
     if not n_clicks:
-        return no_update, no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update, no_update
     import shutil
     runs = caching._list_cached_seg_runs()
     run  = next((r for r in runs if r["value"] == seg_value), None)
     if run:
         out_dir = run["out_dir"]
+        _refusal = _run_delete_refusal(core._seg_tool(seg_value), out_dir)
+        if _refusal:
+            # the dialog stays open with the reason; nothing is removed, nothing unloaded
+            print(f"  Delete refused: {_refusal}", flush=True)
+            return True, no_update, no_update, no_update, f"✗ {_refusal}"
         try:
             shutil.rmtree(out_dir)
             print(f"  Deleted seg run: {os.path.basename(out_dir)}", flush=True)
@@ -426,7 +468,7 @@ def confirm_seg_delete(n_clicks, seg_value, baysor_ver, proseg_ver):
             with core._imgseg_lock:
                 if (core._imgseg_state.get("result") or {}).get("out_dir", "") == out_dir:
                     core._imgseg_state.update({"status": "idle", "message": "", "result": None})
-    return False, "xenium", (baysor_ver or 0) + 1, (proseg_ver or 0) + 1
+    return False, "xenium", (baysor_ver or 0) + 1, (proseg_ver or 0) + 1, no_update
 
 
 @app_layout.app.callback(
@@ -542,7 +584,7 @@ def load_seg_run_from_cache(seg_value, baysor_ver, proseg_ver):
               f"current {'load' if busy_dir else 'run'} has finished", flush=True)
         return (no_update, no_update, back) + poll_on[1:]
     jobs._job_start(tool, f"Load cached {tool.capitalize()} run [{param_tag}]", loader,
-               args=(out_dir,), state=state, lock=lock)
+               args=(out_dir,), state=state, lock=lock, uses_run=out_dir)
     return (no_update, no_update) + poll_on
 
 
@@ -654,6 +696,9 @@ def run_imgseg_modal(n_clicks, algo, patches_confirmed, backend, channel, channe
                 "SpatialData store)."), no_update, no_update
     if diameter is None or diameter <= 0:
         return "✗ The nucleus diameter must be positive.", no_update, no_update
+    _busy = _loaded_run_busy("imgseg")
+    if _busy:
+        return f"✗ {_busy}", no_update, no_update
     with core._imgseg_lock:
         if core._imgseg_state["status"] == "running":
             return "Already running…", True, False
@@ -751,7 +796,7 @@ def load_imgseg_run_from_cache(request):
         back = f"imgseg:{os.path.basename(busy_dir).split('_')[-1]}" if busy_dir else "xenium"
         return (no_update if back == seg_value else back), False
     jobs._job_start("imgseg", f"Load cached image segmentation [{param_tag}]", imgseg._load_cached_imgseg,
-                    args=(out_dir,), state=state, lock=lock)
+                    args=(out_dir,), state=state, lock=lock, uses_run=out_dir)
     return no_update, False
 
 

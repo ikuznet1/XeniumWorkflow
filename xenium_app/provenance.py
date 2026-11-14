@@ -653,6 +653,23 @@ def _prov_csv_line(res) -> str:
             "or computed before records were kept)\n")
 
 
+def _csv_comments(lines) -> str:
+    """The comment block of a CSV download: *lines* (a list of lines, or one text) with
+    every physical line starting with '#', and a final newline. A note that carries a line
+    break of its own (a warning on a second line) would otherwise put a prose line without
+    '#' into the header block, which a reader with comment='#' takes for the column header.
+    Every CSV builder passes its header through here."""
+    if isinstance(lines, str):
+        lines = [lines]
+    out = []
+    for ln in lines:
+        for part in str(ln).replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            if not part.strip():
+                continue
+            out.append(part if part.startswith("#") else "# " + part)
+    return "\n".join(out) + "\n" if out else ""
+
+
 def _prov_csv_stamp(res, text: str) -> str:
     """*text* (a CSV with leading '#' comment lines, or only such lines) with the
     provenance line added as the last line of that leading comment block."""
@@ -1057,13 +1074,17 @@ def _pm_proximity(r):
 def _pm_contact(r):
     H, P = r["headline"], r["params"]
     by_donor = bool(H.get("by_donor"))
-    unit = "donor" if by_donor else "sample"
+    mixed = by_donor and str(H.get("unit_word") or "donors") != "donors"
+    unit = ("independent unit (a donor, or a sample without a donor label)" if mixed else
+            "donor" if by_donor else "sample")
     return ([f"Contact-group pseudobulk differential expression: cells of type '{_pm_v(P, 'target')}' with a "
              f"cell of type '{_pm_v(P, 'anchor')}' within the radius were compared with those without, on "
              f"{_pm_seg(r)}.",
              "Within each sample the comparator cells were weighted so that their mix of compartment x "
              "edge-distance bin x density quintile equals that of the contact cells. Weighted counts were "
-             + ("summed per donor and group (the sections of one donor pooled; rounded to whole counts) and "
+             + ("summed per independent unit and group (the sections of one donor pooled, a sample without a "
+                "donor label on its own; rounded to whole counts) and fitted with ~ unit + group" if mixed else
+                "summed per donor and group (the sections of one donor pooled; rounded to whole counts) and "
                 "fitted with ~ donor + group" if by_donor else
                 "summed per sample and group (rounded to whole counts) and fitted with ~ sample + group")
              + f" in R (DESeq2, or edgeR when DESeq2 is not installed); the unit of the p-values is the {unit}.",
@@ -1142,6 +1163,13 @@ def _pm_lr(r):
              "signalling."], ["cellphonedb", "bh"])
 
 
+def _pm_lib_shared(r) -> list:
+    """Sentence for a pooled analysis whose samples have different panels."""
+    n = (r.get("headline") or {}).get("lib_shared_genes")
+    return ([f"The pooled samples have different panels: the depth (library size) of a cell is its total "
+             f"over the {_pm_num(n)} genes they share."] if n else [])
+
+
 def _pm_lrdecomp(r):
     return (["Ligand-receptor exposure decomposition: for each sender type, receiver type, ligand and "
              "receptor, the exposure E (sender contacts per receiver x the contact-weighted product of "
@@ -1152,7 +1180,7 @@ def _pm_lrdecomp(r):
              "Tests are across the independent units of the sample design (donors, or samples): the exact "
              "sign-flip test of the per-donor log2 ratios when paired, exact label permutation otherwise; "
              "with one condition, one sample or fewer than 3 units per condition the decomposition is "
-             "descriptive, without p-values.",
+             "descriptive, without p-values."] + _pm_lib_shared(r) + [
              "Like every expression-based score this is not evidence of signalling."], [])
 
 
@@ -1225,7 +1253,8 @@ def _pm_spillover(r):
              "the nearest source cell and rise with the fraction of source cells nearby; when a check fails "
              "the score is reported as not usable as a contamination mask.",
              "Gene ownership: per gene, the cell type with the highest rate (sum of counts / sum of depth) "
-             "and every type at 20 % of it or more (threshold as recorded in the parameters)."], [])
+             "and every type at 20 % of it or more (threshold as recorded in the parameters)."]
+            + _pm_lib_shared(r), [])
 
 
 def _pm_segqc(r):

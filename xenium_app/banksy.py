@@ -693,7 +693,7 @@ def _bk_csv(res) -> str:
                      f"{'SPLIT-corrected ' if res['corrected'] else ''}counts were left out and have no cluster")
     heat = pd.DataFrame(np.asarray(res["heat"], dtype=float), columns=res["heat_genes"])
     heat.insert(0, "domain", res["table"]["domain"].to_numpy())
-    return provenance._prov_csv_stamp(res, ("\n".join(lines) + "\n# clusters\n" + res["table"].to_csv(index=False)
+    return provenance._prov_csv_stamp(res, (provenance._csv_comments(lines) + "# clusters\n" + res["table"].to_csv(index=False)
             + "\n# mean expression of the top genes, SD from the mean of all cells\n" + heat.to_csv(index=False)))
 
 

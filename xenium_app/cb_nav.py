@@ -102,9 +102,7 @@ def _nav_transcript_samples() -> tuple:
     have, lack = [], []
     dsets = [core.DATA] + list(dataview.EXTRA_DATASETS)
     for i, ds in enumerate(dsets):
-        d = ds.get("data_dir")
-        ok = bool(d) and any(os.path.exists(os.path.join(str(d), f))
-                             for f in ("transcripts.parquet", "transcripts.zarr.zip"))
+        ok = dataview._ds_has_transcripts(ds)
         (have if ok else lack).append(f"S{i}" if len(dsets) > 1 else "the dataset")
     return have, lack
 

@@ -254,14 +254,16 @@ def _active_corrected(use_corrected=None) -> bool:
 
 def _raw_cluster_labels(samples, method, alt, use_corrected=None) -> list:
     """Per sample: the active cluster set's label of each cell without the sample prefix
-    the multi-sample view adds ("3", not "S1:C3"); None for a sample without the set.
+    the multi-sample view adds ("3", not "S1:C3"); None for a sample without the set
+    (never the ids of another set of that sample: analysis._an_cluster_set_of).
     Whether cluster 3 of one sample is cluster 3 of another depends on how the samples
     were clustered: the ids are comparable only when they were clustered together.
 
     On a Baysor / Proseg run the cluster column depends on the counts mode (the SPLIT
     clusters in corrected mode), as on the map and in the DE group picker:
     *use_corrected* is the mode of the calling analysis, None the active one."""
-    labs = analysis._an_cluster_labels(samples, method, _active_corrected(use_corrected), alt)
+    labs = analysis._an_cluster_labels(samples, method, _active_corrected(use_corrected), alt,
+                                       strict=True)
     out = []
     for lab in labs:
         if lab is None:
@@ -463,6 +465,47 @@ def _sl_units(conds, donors=None) -> dict:
     return out
 
 
+_SL_MIXED_UNITS = "independent units (donors; a sample without a donor label is its own unit)"
+
+
+def _sl_unit_groups(inc, donors, names=None) -> dict:
+    """The independent units of the samples *inc* (indices) when no condition is involved:
+    THE donor rule of every sample-level test. Samples with the same donor label are one
+    unit - also when other samples have no label; a sample without a donor label is its
+    own unit. (Two sections of one donor are never two replicates because a third sample
+    is unlabelled.) _sl_units applies the same rule within each condition.
+
+    donors: label per sample index ("" / None: none); names: display name per sample
+    index for an unlabelled sample's unit (default: an internal placeholder).
+    Returns {groups: {unit name: [sample indices]}, by_donor (every included sample has a
+    donor), combined (some donor has several samples), n_donors, n_unlabelled, word
+    ("donors" / "samples" / _SL_MIXED_UNITS), note ("n = 3 samples (1 donor, 1 sample
+    without a donor), 2 independent units after combining the samples of one donor")}."""
+    inc = list(inc)
+    dn = {i: str((donors[i] if donors is not None else "") or "").strip() for i in inc}
+    groups: dict = {}
+    for i in inc:
+        if dn[i]:
+            name = dn[i]
+        else:
+            name = str(names[i]) if names is not None else f"\x00sample{i}"
+            if name in set(dn.values()):
+                name = f"\x00{name}"            # a sample named like a donor stays its own unit
+        groups.setdefault(name, []).append(i)
+    n_unl = sum(1 for i in inc if not dn[i])
+    n_d = len({d for d in dn.values() if d})
+    by_donor = bool(inc) and n_unl == 0
+    combined = len(groups) < len(inc)
+    note = (f"n = {len(inc)} samples"
+            + (f" ({n_d} donor{'s' if n_d != 1 else ''}"
+               + (f", {n_unl} sample{'s' if n_unl != 1 else ''} without a donor" if n_unl else "") + ")"
+               if n_d else "")
+            + (f", {len(groups)} independent units after combining the samples of one donor" if combined else ""))
+    return {"groups": groups, "by_donor": by_donor, "combined": combined, "n_donors": n_d,
+            "n_unlabelled": n_unl, "note": note,
+            "word": "donors" if by_donor else "samples" if not n_d else _SL_MIXED_UNITS}
+
+
 def _sl_test(values, conds, donors=None, units=None) -> dict:
     """Sample-level test of A − B for one value per sample.
 
@@ -483,9 +526,34 @@ def _sl_test(values, conds, donors=None, units=None) -> dict:
         b = np.array([_avg(ix) for _n, c, ix in u["units"] if c == "B"])
         res = _sl_permutation(a, b)
         res["per_unit"] = (a, b)
+    # "min_p" of a sample-level test is the floor of the DESIGN (what these units could give
+    # at best), not that of this one value vector: every status line, CSV header and FDR
+    # reach warning quotes it for a whole family of tests.
+    res["min_p_data"] = res["min_p"]
+    res["min_p"] = _sl_design_floor(res)
     res.update({"effect": res["mean"], "paired": u["paired"], "n_units": u["n_units"],
                 "units_note": u["note"], "dropped": u["dropped"]})
     return res
+
+
+def _sl_design_floor(res: dict) -> float:
+    """Smallest two-sided p the units of a _sl_signflip / _sl_permutation result can give
+    whatever the values: 2 / 2^n for an enumerated sign-flip, 1 / C(n, n_a) for an
+    enumerated relabelling (2 / C when both groups have the same size: the mirror
+    relabelling gives the same |difference|), 1 / (n_mc + 1) for random assignments. The
+    result's own "min_p" is the share of assignments that reach ITS largest |statistic|,
+    which ties and zero differences raise (a category absent from all but one sample gives
+    1): that is a property of that value vector, not of the design."""
+    from math import comb
+    own = res.get("min_p")
+    if own is None or not np.isfinite(own):
+        return float("nan")
+    if not res.get("exact"):
+        return float(own)                               # 1 / (n_mc + 1): already data-independent
+    if "n_a" in res:
+        na, nb = int(res["n_a"]), int(res["n_b"])
+        return float((2.0 if na == nb else 1.0) / comb(na + nb, na))
+    return float(min(1.0, 2.0 / 2.0 ** int(res["n"])))
 
 
 def _sl_reach(min_p, n_tests: int, alpha: float = 0.05) -> "str | None":
@@ -575,8 +643,14 @@ def _pb_population_masks(spec, samples, seg_source, method, color_by) -> tuple:
         labs = _raw_cluster_labels(samples, method, alt)
         if all(l is None for l in labs):
             raise ValueError("The active view has no cluster set.")
+        # a sample without the chosen cluster set has no cells of the population (never
+        # the cells of the same id in another of its sets); the label says which
+        missing = [str(s["label"]) for s, l in zip(samples, labs) if l is None]
+        label = f"cluster {want}"
+        if missing:
+            label += f" ({', '.join(missing)}: without this cluster set, no cells)"
         return ([np.zeros(len(s["df"]), dtype=bool) if l is None else (l == want)
-                 for s, l in zip(samples, labs)], f"cluster {want}")
+                 for s, l in zip(samples, labs)], label)
     if spec.startswith("roicls:"):
         cls = spec[7:]
         with core._roi_lock:
@@ -606,7 +680,8 @@ def _counts_are_integer(s: dict) -> bool:
     sample comes from). For a sample of an .h5ad the verdict of the conversion wins: it
     was made on every stored value at full precision (the matrix in memory is float32,
     where 2.0000000001 is 2), and it is what the load status told the user."""
-    data = s["csc"].data
+    csc = s["csc"]
+    data = csc.data
     ds = s.get("ds")
     if isinstance(ds, dict) and ds.get("counts_noninteger"):
         return False
@@ -614,20 +689,51 @@ def _counts_are_integer(s: dict) -> bool:
         return True
     if data.dtype.kind == "u":
         return True
-    if data.dtype.kind == "i":
-        return not bool((data < 0).any())
+    # Only the measured genes (s["genes"]) are counts: the matrix can also hold SpaGE-imputed
+    # columns (fractions by construction), which no count analysis sums. They do not make
+    # the measured counts "not raw".
+    spans = _measured_spans(s)
     memo = ds.get("_counts_integer") if isinstance(ds, dict) else None
-    if memo is not None and memo[0] is data:
-        return memo[1]
+    if memo is not None and memo[0] is data and memo[1] == spans:
+        return memo[2]
     ok = True
-    for a in range(0, len(data), 8_000_000):           # in blocks: no full-size temporary
-        blk = data[a:a + 8_000_000]
-        if blk.min() < 0 or not np.array_equal(blk, np.rint(blk)):
-            ok = False                                  # fractions, or negative values: not raw counts
+    for lo, hi in ([(0, len(data))] if spans is None else spans):
+        for a in range(lo, hi, 8_000_000):             # in blocks: no full-size temporary
+            blk = data[a:min(hi, a + 8_000_000)]
+            if not len(blk):
+                continue
+            if blk.min() < 0 or (data.dtype.kind == "f" and not np.array_equal(blk, np.rint(blk))):
+                ok = False                              # fractions, or negative values: not raw counts
+                break
+        if not ok:
             break
     if isinstance(ds, dict):
-        ds["_counts_integer"] = (data, ok)
+        ds["_counts_integer"] = (data, spans, ok)
     return ok
+
+
+def _measured_spans(s: dict) -> "tuple | None":
+    """The stretches of the CSC value array of analysis sample *s* that belong to its
+    measured genes (s["genes"]), as ((start, stop), ...) with adjacent columns merged; None
+    when every column of the matrix is a measured gene (the whole array)."""
+    csc = s["csc"]
+    if not hasattr(csc, "indptr") or getattr(csc, "format", "csc") != "csc":
+        return None
+    if s.get("genes") is None or s.get("gni") is None:
+        return None                              # a bare matrix: every column is checked
+    gni = s.get("gni") or {}
+    cols = sorted({int(gni[g]) for g in (s.get("genes") or []) if g in gni and 0 <= int(gni[g]) < csc.shape[1]})
+    if len(cols) >= csc.shape[1]:
+        return None
+    ptr = csc.indptr
+    spans = []
+    for c in cols:
+        lo, hi = int(ptr[c]), int(ptr[c + 1])
+        if spans and spans[-1][1] == lo:
+            spans[-1][1] = hi
+        elif hi > lo:
+            spans.append([lo, hi])
+    return tuple((a, b) for a, b in spans)
 
 
 def _counts_round_sums(s: dict) -> bool:
@@ -757,7 +863,7 @@ def _pb_prepare(samples, masks, conds, batches, min_cells=_PB_MIN_CELLS,
         tot, n = _pb_sum_values(s, masks[i])
         tots.append(np.asarray(tot, dtype=np.float64))
         ns.append(n)
-        own = np.array([s["gni"][g] for g in s["genes"] if g in s["gni"]], dtype=np.int64)
+        own = analysis._an_lib_cols(s)
         if conds[i] not in ("A", "B"):
             note[i] = "excluded"
         elif n < min_cells:
@@ -1134,7 +1240,7 @@ def _pb_csv_header(res: dict) -> str:
                      + (f"; {r['note']}" if r["note"] else ""))
     for w in list(res.get("warnings") or []) + list(res.get("notes") or []):
         lines.append(f"# note: {w}")
-    return provenance._prov_csv_stamp(res, ("\n".join(lines) + "\n"))
+    return provenance._prov_csv_stamp(res, (provenance._csv_comments(lines)))
 
 
 def _samples_table(rows, columns) -> "html.Table":
@@ -1457,7 +1563,7 @@ def _comp_exact(sub, t_idx, n_tables, conds, donors, transform, names, cat_name)
         pfull = np.full(n_tables, np.nan)
         pfull[t_idx] = props[ci]
         r = _sl_test(full, c_use, donors, units=u)
-        first = first or r
+        first = first or r                      # (test name and assignments: the same for all)
         # mean proportion per condition over the units that are tested (a donor's samples
         # averaged first), so that the descriptive columns and the test use the same n
         ma = float(np.nanmean([np.nanmean(pfull[ix]) for _n, c, ix in u["units"] if c == "A"]))
@@ -1763,7 +1869,7 @@ def _comp_csv(res) -> str:
         if r["used"]:
             out[f"n_{r['label']}"] = res["counts"][r["label"]].to_numpy()
             out[f"prop_{r['label']}"] = res["props"][r["label"]].to_numpy()
-    return provenance._prov_csv_stamp(res, ("\n".join(lines) + "\n" + out.to_csv(index=False)))
+    return provenance._prov_csv_stamp(res, (provenance._csv_comments(lines) + out.to_csv(index=False)))
 
 
 def _dark_table_style(page_size: int = 12) -> dict:

@@ -158,25 +158,27 @@ def _load_cellnest_data(folder: str, dataset_name: str, strip_suffix: str = ""):
 
 def _apply_cellnest_filters(ccc_df, f_ligand=None, f_receptor=None,
                              f_sender=None, f_receiver=None, annot_col=None):
-    """Apply ligand/receptor/sender/receiver filters to a CellNEST interactions DataFrame."""
+    """Apply ligand/receptor/sender/receiver filters to a CellNEST interactions DataFrame.
+    The filter values come from dropdowns, whose option values are text
+    (_cellnest_filter_values): every column is compared as text, so a numeric cluster
+    column (cluster_kmeans_10: integers, or floats after a join with unmatched cells) is
+    filtered by the values the dropdown offered for it."""
     sub = ccc_df
-    if f_ligand:
-        vals = f_ligand if isinstance(f_ligand, list) else [f_ligand]
-        sub = sub[sub["ligand"].isin(vals)]
-    if f_receptor:
-        vals = f_receptor if isinstance(f_receptor, list) else [f_receptor]
-        sub = sub[sub["receptor"].isin(vals)]
-    if annot_col and f_sender:
-        col = f"from_{annot_col}"
-        if col in sub.columns:
-            vals = f_sender if isinstance(f_sender, list) else [f_sender]
-            sub = sub[sub[col].isin(vals)]
-    if annot_col and f_receiver:
-        col = f"to_{annot_col}"
-        if col in sub.columns:
-            vals = f_receiver if isinstance(f_receiver, list) else [f_receiver]
-            sub = sub[sub[col].isin(vals)]
+    for col, picked in (("ligand", f_ligand), ("receptor", f_receptor),
+                        (f"from_{annot_col}" if annot_col else None, f_sender),
+                        (f"to_{annot_col}" if annot_col else None, f_receiver)):
+        if not col or not picked or col not in sub.columns:
+            continue
+        vals = {str(v) for v in (picked if isinstance(picked, (list, tuple, set)) else [picked])}
+        sub = sub[sub[col].astype(str).isin(vals)]
     return sub
+
+
+def _cellnest_filter_values(series) -> list:
+    """Option values of a filter dropdown for a column of the interactions table: its
+    distinct non-missing values as text, sorted. _apply_cellnest_filters compares the
+    column as text with them."""
+    return sorted({str(v) for v in pd.Series(series).dropna().unique()})
 
 
 def _cellnest_split_pair(pair: str, ccc_df) -> tuple:

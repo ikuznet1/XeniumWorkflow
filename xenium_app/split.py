@@ -270,6 +270,21 @@ def _split_publish_labels(state: dict, labels, mode_key: str, generic_key: str, 
     return written
 
 
+def _split_n_changed(corrected, original, returned_cols=None) -> int:
+    """Number of cells (rows) whose counts SPLIT changed: the "N cells corrected" of the
+    status line and the provenance record. *corrected* and *original* are cells × panel
+    genes for the same cells. Only the genes purify() returned values for are compared
+    (*returned_cols*; None: every column): a panel gene that is not in the reference has an
+    all-zero corrected column - "no corrected count", not "corrected to 0" - and a cell
+    with a count in such a gene is not a cell purify() touched."""
+    corrected, original = sp.csr_matrix(corrected), sp.csr_matrix(original)
+    if returned_cols is not None:
+        cols = np.asarray(returned_cols, dtype=np.int64)
+        corrected, original = corrected[:, cols], original[:, cols]
+    diff = corrected - original.astype(corrected.dtype)
+    return int((np.asarray(abs(diff).sum(axis=1)).ravel() > 1e-6).sum())
+
+
 def _run_split_correction(rds_path: str, label_col: str = "Names",
                            max_cores: int = 4, seg_source: str = "xenium",
                            min_umi: int = 10, min_umi_sigma: int = 100,
@@ -312,16 +327,11 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
 
         # ── 1. Get active data ──────────────────────────────────────────────
         _tool = core._seg_tool(seg_source)
-        with core._baysor_lock:
-            bres = core._baysor_state["result"] if core._baysor_state["status"] == "done" else None
-        with core._proseg_lock:
-            pres = core._proseg_state["result"] if core._proseg_state["status"] == "done" else None
-        if _tool == "baysor":
-            _alt_res = bres
-        elif _tool == "proseg":
-            _alt_res = pres
-        else:
-            _alt_res = core._seg_result(seg_source, done_only=True)
+        _alt_res, _seg_err = core._seg_job_result(seg_source, "nothing was corrected")
+        if _seg_err:
+            # never the Xenium cells (and the Xenium store) under the name of a run
+            _set("error", _seg_err)
+            return
 
         if _alt_res is not None:
             expr       = _alt_res["expr"]
@@ -444,6 +454,7 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
         purified_csr_t = _r_out["purified"]                   # gene × cells
         corrected_mat  = purified_csr_t.T.tocsr()             # cells × genes
         corrected_mat.data = np.clip(corrected_mat.data, 0, None)
+        _ret_cols = None      # panel columns purify() returned values for (None: all of them)
         if corrected_gene_ids is not None and corrected_gene_ids != list(panel_genes):
             # Put every column back at its panel-gene position (one column per panel
             # gene, as all readers assume); genes purify() dropped stay zero.
@@ -451,6 +462,7 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
             _gcols  = np.array([_pg_pos.get(str(g), -1) for g in corrected_gene_ids], dtype=np.int64)
             _coo    = corrected_mat.tocoo()
             _gok    = _gcols[_coo.col] >= 0
+            _ret_cols = np.unique(_gcols[_gcols >= 0])
             corrected_mat = sp_.csr_matrix(
                 (_coo.data[_gok], (_coo.row[_gok], _gcols[_coo.col[_gok]])),
                 shape=(corrected_mat.shape[0], n_panel))
@@ -483,9 +495,7 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
                 [str(c) for c in corrected_cell_ids])
             if (len(_cpos) == corrected_mat.shape[0] and (_cpos >= 0).all()
                     and expr_panel.shape[1] == corrected_mat.shape[1]):
-                _cdiff = corrected_mat - sp_.csr_matrix(expr_panel)[_cpos, :].astype(corrected_mat.dtype)
-                n_changed = int((np.asarray(abs(_cdiff).sum(axis=1)).ravel() > 1e-6).sum())
-                del _cdiff
+                n_changed = _split_n_changed(corrected_mat, sp_.csr_matrix(expr_panel)[_cpos, :], _ret_cols)
         except Exception as _nce:
             print(f"  SPLIT: could not count changed cells: {_nce}", flush=True)
 
@@ -616,8 +626,13 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
                           f"({n_corr:,} of {n_cells:,} submitted cells classified by RCTD)")
         else:
             _split_msg = f"{n_corr:,} of {n_cells:,} submitted cells returned by SPLIT"
+        _n_no_ref = None if _ret_cols is None else int(n_panel - len(_ret_cols))
+        if _n_no_ref:
+            _split_msg += (f"; {_n_no_ref:,} of {n_panel:,} panel genes are not in the reference and have no "
+                           f"corrected counts (they are not part of the count of corrected cells)")
         _set("done", f"SPLIT complete — {_split_msg}{_split_note}",
-             result={"n_cells": n_cells, "n_returned": n_corr, "n_changed": n_changed})
+             result={"n_cells": n_cells, "n_returned": n_corr, "n_changed": n_changed,
+                     "n_genes_without_corrected": _n_no_ref})
         print(f"  SPLIT: done — {_split_msg}{_split_note}", flush=True)
 
     except jobs._JobCancelled:

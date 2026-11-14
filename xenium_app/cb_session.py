@@ -4,7 +4,9 @@ The values of the controls live in the browser page. Three callbacks move them:
 
 1. in the page, a click on a button of the Session dialog, an upload or the tick of the
    automatic save collects the value of every control of the allow-list into the store
-   ``session-request`` ({action, controls});
+   ``session-request`` ({action, controls, page; for an upload also the file: upload});
+   after an upload the collector empties the upload component in the page
+   (``dash_clientside.set_props``), so that choosing the same file again is a change;
 2. ``session_action`` (the only server callback that does something) saves or restores;
    for a restore it returns the control values to set in ``session-apply``;
 3. in the page, ``session-apply`` is written into the controls. Each control then fires
@@ -38,16 +40,32 @@ app_layout.app.clientside_callback(
             var v = arguments[first + i];
             controls[ids[i]] = (v === undefined) ? null : v;
         }
-        return {action: action, t: Date.now(), controls: controls};
+        // one id per page load: the automatic save tells a page that was only (re)opened
+        // from one that goes on (session._session_autosave)
+        if (!window.__xeSessionPage) {
+            window.__xeSessionPage = Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+        }
+        var req = {action: action, t: Date.now(), page: window.__xeSessionPage, controls: controls};
+        if (action === 'upload') {
+            // The file travels in the request, and the upload component is emptied here, in
+            // the page - not by an Output of the server callback (an Input on a property
+            // that a callback downstream writes is a dependency cycle), and not left as it
+            // is (the same file chosen again would then change nothing and fire nothing).
+            // The null this writes comes back as a trigger without a value: ignored above.
+            req.upload = trig.value;
+            window.dash_clientside.set_props('session-upload',
+                                             {contents: null, filename: null, last_modified: null});
+        }
+        return req;
     }""" % (json.dumps(_SESSION_TRIGGERS), json.dumps(_SESSION_IDS)),
     Output("session-request", "data"),
     Input("session-save-btn", "n_clicks"),
     Input("session-download-btn", "n_clicks"),
     Input("session-restore-saved-btn", "n_clicks"),
     Input("session-restore-last-btn", "n_clicks"),
-    # last_modified, not contents: session_action clears contents after an upload, and an
-    # Input on the property it writes would be a dependency cycle (Dash reports it in the page).
-    Input("session-upload", "last_modified"),
+    # contents is the trigger (it changes with every file chosen, once the collector has
+    # emptied it); no callback has it as an Output - see the collector.
+    Input("session-upload", "contents"),
     Input("session-autosave", "n_intervals"),
     [State(cid, "value") for cid in _SESSION_IDS],
     prevent_initial_call=True,
@@ -95,7 +113,6 @@ def close_session_modal(n_clicks):
     Output("session-slots", "children", allow_duplicate=True),
     Output("session-apply", "data"),
     Output("session-download", "data"),
-    Output("session-upload", "contents"),
     Output("session-autosave-note", "data"),
     Output("design-version", "data", allow_duplicate=True),
     Output("roi-done", "data", allow_duplicate=True),
@@ -103,7 +120,6 @@ def close_session_modal(n_clicks):
     Output("de-groups-version", "data", allow_duplicate=True),
     Output("extra-datasets-version", "data", allow_duplicate=True),
     Input("session-request", "data"),
-    State("session-upload", "contents"),
     State("design-version", "data"),
     State("roi-done", "data"),
     State("geneset-version", "data"),
@@ -111,17 +127,18 @@ def close_session_modal(n_clicks):
     State("extra-datasets-version", "data"),
     prevent_initial_call=True,
 )
-def session_action(request, upload=None, design_v=None, roi_v=None, geneset_v=None, groups_v=None, extra_v=None):
-    """Save, download or restore, as the page asked in ``session-request``."""
+def session_action(request, design_v=None, roi_v=None, geneset_v=None, groups_v=None, extra_v=None):
+    """Save, download or restore, as the page asked in ``session-request`` (an uploaded
+    file is part of the request: request["upload"], the value of the upload component)."""
     nu = no_update
-    quiet = (nu,) * 11
+    quiet = (nu,) * 10
     if not isinstance(request, dict):
         raise dash.exceptions.PreventUpdate
     action = request.get("action")
     controls = request.get("controls") if isinstance(request.get("controls"), dict) else {}
     if action == "auto":
-        done = session._session_autosave(controls)
-        return quiet[:5] + (done or nu,) + quiet[6:]
+        done = session._session_autosave(controls, request.get("page"))
+        return quiet[:4] + (done or nu,) + quiet[5:]
     try:
         if action in ("save", "download"):
             doc, msg = session._session_save(controls, "saved" if action == "save" else "download")
@@ -132,21 +149,22 @@ def session_action(request, upload=None, design_v=None, roi_v=None, geneset_v=No
                             "type": "application/json"}
             return (msg, session._session_slots_text(), nu, download) + quiet[4:]
         if action == "upload":
-            report = session._session_restore_text(session._session_upload_bytes(upload), controls, "uploaded file")
+            report = session._session_restore_text(session._session_upload_bytes(request.get("upload")), controls,
+                                                   "uploaded file")
         elif action in ("restore-saved", "restore-last"):
             report = session._session_restore_slot(action.split("-", 1)[1], controls)
         else:
             raise dash.exceptions.PreventUpdate
     except session._SessionError as exc:
-        return (f"Not done. {exc}", nu, nu, nu, None if action == "upload" else nu) + quiet[5:]
+        return (f"Not done. {exc}",) + quiet[1:]
     except dash.exceptions.PreventUpdate:
         raise
     except Exception as exc:
         import traceback
         traceback.print_exc()
-        return (f"Error: {type(exc).__name__}: {exc}", nu, nu, nu, None if action == "upload" else nu) + quiet[5:]
+        return (f"Error: {type(exc).__name__}: {exc}",) + quiet[1:]
     bump = lambda name, cur: (cur or 0) + 1 if name in report["bump"] else nu
     apply_ = {"t": request.get("t"), "controls": report["controls"]} if report["ok"] and report["controls"] else nu
-    return (report["text"], session._session_slots_text(), apply_, nu, None if action == "upload" else nu, nu,
+    return (report["text"], session._session_slots_text(), apply_, nu, nu,
             bump("design-version", design_v), bump("roi-done", roi_v), bump("geneset-version", geneset_v),
             bump("de-groups-version", groups_v), bump("extra-datasets-version", extra_v))

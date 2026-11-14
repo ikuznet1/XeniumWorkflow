@@ -208,7 +208,10 @@ def test_pseudobulk_populations(xe, D, six, labels):
     assert label == "Alpha" and int(masks[1].sum()) == len(np.arange(220)[::3])
     assert int(masks[0].sum()) == int((labels == "Alpha").sum())
     masks, label = xe._pb_population_masks("cluster:3", samples, "xenium", "k", "cluster")
-    assert label == "cluster 3" and [int(m.sum()) for m in masks[1:3]] == [55, 58]     # 220 / 4, 235 // 4
+    assert [int(m.sum()) for m in masks[1:3]] == [55, 58]     # 220 / 4, 235 // 4
+    # the primary sample has no cluster set "k": none of its cells, and the label says so
+    # (round 9: it used to contribute cluster 3 of its own first cluster set)
+    assert label == "cluster 3 (S0: without this cluster set, no cells)" and not masks[0].any()
     with pytest.raises(ValueError, match="Pick the cell population"):
         xe._pb_population_masks("rest", samples, "xenium", "k", "cluster")
     # a ROI class is the union of its ROIs (one drawn over each of two samples)

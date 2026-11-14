@@ -828,7 +828,7 @@ def _agg_csv(res) -> str:
                          + (f"no test ({tt['why']})" if tt["p"] is None else
                             f"A - B = {tt['effect']:.4g}; p = {tt['p']:.4g}; {tt['test']}; {tt['units_note']}; "
                             f"smallest achievable p {tt['min_p']:.4g}"))
-    return provenance._prov_csv_stamp(res, ("\n".join(lines) + "\n# samples\n" + res["samples"].to_csv(index=False)
+    return provenance._prov_csv_stamp(res, (provenance._csv_comments(lines) + "# samples\n" + res["samples"].to_csv(index=False)
             + "\n# aggregates\n" + res["aggregates"].to_csv(index=False)
             + "\n# composition per aggregate\n" + res["oe"].to_csv(index=False)
             + "\n# composition pooled over the aggregates\n" + res["pooled"].to_csv(index=False)))

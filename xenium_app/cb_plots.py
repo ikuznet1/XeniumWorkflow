@@ -327,9 +327,10 @@ def update_plots(color_by, method, gene, size, opacity, boundary_toggles,
     Input("spatial-plot", "clickData"),
     Input("umap-plot",    "clickData"),
     State("measure-store", "data"),
+    State("seg-source", "value"),
     prevent_initial_call=True,
 )
-def capture_click(spatial_click, umap_click, measure_state):
+def capture_click(spatial_click, umap_click, measure_state, seg_source=None):
     # Don't select cells when the ruler is active
     if measure_state and measure_state.get("active"):
         return no_update
@@ -357,8 +358,45 @@ def capture_click(spatial_click, umap_click, measure_state):
                                                    + float(eds["x_offset"]) - px) < 1e-3):
                         return {"id": cell_id, "sample": si}
     if triggered == "umap-plot":
-        return _sample_prefixed_cell(cell_id)
-    return cell_id
+        cell_id = _sample_prefixed_cell(cell_id)
+    return _cell_with_source(cell_id, seg_source)
+
+
+def _cell_with_source(cell, seg_source):
+    """What selected-cell holds for a clicked cell: the id alone for the Xenium cells
+    ({"id", "sample"} for an added sample), {"id", "source"} for a cell of a segmentation
+    run. An id does not say which table it belongs to - numeric ids ("57") occur in the
+    Xenium table of an older bundle and in a Proseg run alike - so the view the click was
+    made in is carried with it and show_cell_info looks there first."""
+    if cell is None or isinstance(cell, dict) or core._seg_tool(seg_source) == "xenium":
+        return cell
+    return {"id": cell, "source": seg_source}
+
+
+def _cell_run_row(cell_id, source=None):
+    """(display name, result, index key) of the loaded segmentation run that holds
+    *cell_id*: the run *source* names when it holds the id, else the first of Proseg,
+    Baysor, image segmentation that does; None when no loaded run has it."""
+    runs = [("proseg", "Proseg", core._proseg_state, core._proseg_lock),
+            ("baysor", "Baysor", core._baysor_state, core._baysor_lock),
+            ("imgseg", "Image segmentation", core._imgseg_state, core._imgseg_lock)]
+    tool = core._seg_tool(source) if source else None
+    runs.sort(key=lambda r: r[0] != tool)             # the named tool first (stable)
+    for _t, name, state, lock in runs:
+        with lock:
+            res = state.get("result")
+        if res is None:
+            continue
+        bdf = res["cells_df"]
+        key = cell_id                                  # direct match, then type-coerced
+        if key not in bdf.index:
+            try:
+                key = int(cell_id)
+            except (ValueError, TypeError):
+                pass
+        if key in bdf.index:
+            return name, res, key
+    return None
 
 
 def _sample_prefixed_cell(point_id):
@@ -521,6 +559,13 @@ def show_cell_info(cell_id, method):
     # A cell of a sample shown beside the primary one arrives as {"id", "sample"} (sample 1
     # = first extra sample): cell ids are unique within a sample only.
     ds, sample_tag, cell_pos = core.DATA, "", None
+    # ... and a cell clicked in the view of a segmentation run as {"id", "source"}: it is
+    # looked up in that run first (_cell_with_source)
+    _run_hit = None
+    if isinstance(cell_id, dict) and cell_id.get("source") and not cell_id.get("sample"):
+        _src, cell_id = cell_id.get("source"), cell_id.get("id")
+        if core._seg_tool(_src) != "xenium":
+            _run_hit = _cell_run_row(cell_id, _src)
     if isinstance(cell_id, dict):
         _sample, cell_id = cell_id.get("sample"), cell_id.get("id")
         _extras = list(dataview.EXTRA_DATASETS)
@@ -537,7 +582,7 @@ def show_cell_info(cell_id, method):
     df = ds["df"]
 
     # ── Try Xenium cells first, then Proseg, then Baysor ─────────────────────
-    if cell_pos is not None or cell_id in df.index:
+    if _run_hit is None and (cell_pos is not None or cell_id in df.index):
         # Original Xenium cell (of the primary or of an extra sample)
         if cell_pos is None:
             cell_pos = df.index.get_loc(cell_id)
@@ -586,28 +631,12 @@ def show_cell_info(cell_id, method):
         row       = None
         alt_expr  = None
         source_tag = ""
-        for src_name, state, lock in (
-            ("Proseg", core._proseg_state, core._proseg_lock),
-            ("Baysor", core._baysor_state, core._baysor_lock),
-            ("Image segmentation", core._imgseg_state, core._imgseg_lock),
-        ):
-            with lock:
-                res = state.get("result")
-            if res is None:
-                continue
-            bdf = res["cells_df"]
-            # Try direct match first, then type-coerced match
-            key = cell_id
-            if key not in bdf.index:
-                try:
-                    key = int(cell_id)
-                except (ValueError, TypeError):
-                    pass
-            if key in bdf.index:
-                row        = bdf.loc[key]
-                alt_expr   = res.get("expr")
-                source_tag = f" [{src_name}]"
-                break
+        _hit = _run_hit or _cell_run_row(cell_id)
+        if _hit is not None:
+            src_name, res, key = _hit
+            row        = res["cells_df"].loc[key]
+            alt_expr   = res.get("expr")
+            source_tag = f" [{src_name}]"
 
         if row is None:
             return html.Div(f"Cell '{cell_id}' not found.", style={"color": "#f85149"})
@@ -645,8 +674,12 @@ def show_cell_info(cell_id, method):
             ui.info_chip("Y",           f"{row['y_centroid']:.1f} µm"),
             ui.info_chip("Transcripts", str(int(row["transcript_counts"]))),
         ]
-        if "cell_area" in row.index:
-            chips.append(ui.info_chip("Cell Area", f"{row['cell_area']:.0f} µm²"))
+        # (a Proseg run: cell_area is the area of the outline, cell_volume Proseg's own
+        # volume - reseg._proseg_cell_area; a cell without an outline has no area)
+        for _col, _name, _unit in (("cell_area", "Cell Area", "µm²"), ("cell_volume", "Cell Volume", "µm³")):
+            if _col in row.index:
+                _v = pd.to_numeric(row[_col], errors="coerce")
+                chips.append(ui.info_chip(_name, f"{_v:.0f} {_unit}" if pd.notna(_v) else "—"))
 
     # ── Bar chart ─────────────────────────────────────────────────────────────
     bar_fig = go.Figure(go.Bar(

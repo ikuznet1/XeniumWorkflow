@@ -112,6 +112,7 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
             if not _alt_res:
                 _set("error", f"No {tool.capitalize()} result loaded. Select and load the run first.")
                 return
+            jobs._job_use_run(_alt_res)      # the run's store is read below: not deleted meanwhile
             sdata_path = _alt_res.get("sdata_path", "")
             if not sdata_path or not os.path.isdir(sdata_path):
                 _set("error", f"No SpatialData found for {tool}. Run resegmentation first.")

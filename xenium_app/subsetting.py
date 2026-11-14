@@ -43,7 +43,7 @@ def _subset_xenium_labels(state: dict):
 def _subset_reseg_gene_col(gene, alt_res, n_cols) -> "int | None":
     """Column of *gene* ("G" or "G [imp]") in the matrix of a segmentation run, by the
     run's own gene index; None when the run does not have the gene."""
-    base = gene[:-6] if str(gene).endswith(" [imp]") else gene
+    base = core._gene_base(gene)
     gni = (alt_res or {}).get("gene_name_to_idx") or core.DATA["gene_name_to_idx"]
     j = gni.get(base)
     return int(j) if j is not None and 0 <= int(j) < int(n_cols) else None
@@ -134,7 +134,7 @@ def subset(cluster=None, cell_type=None,
     if gene is not None and (min_expr is not None or max_expr is not None):
         # Compute against the ORIGINAL cell→expr mapping: get_gene_expression() is
         # aligned to the current (possibly already subset) DATA["df"].
-        _base = gene[:-6] if gene.endswith(" [imp]") else gene
+        _base = core._gene_base(gene)
         if _base in core.DATA["gene_name_to_idx"]:
             _raw = core.DATA["expr_csc"][:, core.DATA["gene_name_to_idx"][_base]].toarray().ravel()
             _idx = _df_to_expr_o
@@ -263,7 +263,7 @@ def subset(cluster=None, cell_type=None,
     _skip = set()
     if cell_type is not None and labels is None:
         _skip.add("cell_type")
-    _gene_ok = gene is not None and (gene[:-6] if gene.endswith(" [imp]") else gene) in core.DATA["gene_name_to_idx"]
+    _gene_ok = gene is not None and core._gene_base(gene) in core.DATA["gene_name_to_idx"]
     if not _gene_ok or (min_expr is None and max_expr is None):
         _skip |= {k for k in ("gene", "min_expr", "max_expr") if _asked[k] is not None}
     for _ncol, _names in (("transcript_counts", ("min_transcripts", "max_transcripts")),

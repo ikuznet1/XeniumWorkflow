@@ -137,6 +137,7 @@ class _Job:
         self.state_dict = state_dict   # the job kind's status dict (e.g. _baysor_state)
         self.state_lock = state_lock
         self.cleanup  = []             # callables(job) run when the job ends
+        self.uses     = set()          # run directories this job works on (_job_use_run)
 
     def elapsed(self) -> float:
         return (self.ended or _time.time()) - self.started
@@ -156,6 +157,55 @@ class _Job:
 def _job_current():
     """The _Job running in the calling thread, or None."""
     return getattr(_job_local, "job", None)
+
+
+# ─── Which job works on which segmentation run ────────────────────────────────
+# A job that works on a Baysor / Proseg / image-segmentation run keeps the run's result
+# dict and writes into the run's directory by path (SPLIT, SpaGE, Rerun UMAP, annotation
+# caches, a cached load). Replacing or deleting that directory under it would put its
+# output on other cells (rows are matched by cell id, and ids repeat between runs) or
+# publish a run whose files are gone. So every such job is registered with the directory
+# (_job_use_run: by core._seg_result() when it is called in a job, or uses_run= of
+# _job_start), and a re-run, a commit into the directory and Delete run ask
+# _run_in_use() first and refuse with a message naming the job.
+def _run_key(run) -> str:
+    """Registry key of a run: its directory (a result dict, or a path), '' for none."""
+    out_dir = run.get("out_dir") if isinstance(run, dict) else run
+    return os.path.realpath(str(out_dir)) if out_dir else ""
+
+
+def _job_use_run(run, job=None) -> None:
+    """Record that the job running in this thread (or *job*) works on *run* (a result dict
+    or a run directory). No effect outside a job."""
+    job = job or _job_current()
+    key = _run_key(run)
+    if job is not None and key:
+        with _jobs_lock:
+            job.uses.add(key)
+
+
+core._seg_result_hooks.append(_job_use_run)
+
+
+def _jobs_using_run(run, skip_current: bool = True) -> list:
+    """Labels of the active jobs registered on *run*, without the calling job itself."""
+    key = _run_key(run)
+    if not key:
+        return []
+    me = _job_current() if skip_current else None
+    with _jobs_lock:
+        return [j.label for j in _jobs.values() if j.active() and j is not me and key in j.uses]
+
+
+def _run_in_use(run, action: str) -> str:
+    """'' when no other job works on *run*; else the refusal for *action* ("re-run",
+    "delete", …), naming the job(s)."""
+    busy = _jobs_using_run(run)
+    if not busy:
+        return ""
+    name = os.path.basename(_run_key(run))
+    return (f"The run {name} is in use by {', '.join(dict.fromkeys(busy))}: it was not "
+            f"{action}. Wait for the job to finish, or cancel it in the Jobs panel, and try again.")
 
 
 def _job_check() -> None:
@@ -216,7 +266,8 @@ def _job_on_end(fn) -> None:
 
 
 def _job_start(kind: str, label: str, target, args=(), kwargs=None, *,
-               state=None, lock=None, name=None, copy_context: bool = False) -> "_Job":
+               state=None, lock=None, name=None, copy_context: bool = False,
+               uses_run=None) -> "_Job":
     """Start *target* in a registered daemon thread and return its _Job.
 
     state / lock: the job kind's status dict and its lock. When the job ends after a
@@ -224,9 +275,14 @@ def _job_start(kind: str, label: str, target, args=(), kwargs=None, *,
     existing polls treat as "finished, nothing loaded": the state is released and the
     same job can be started again.
     copy_context: run inside a copy of the caller's contextvars context (rpy2
-    conversion rules set by the callback, see start_annotation)."""
+    conversion rules set by the callback, see start_annotation).
+    uses_run: the segmentation run (result dict or directory) the job works on, when the
+    caller resolved it (see _job_use_run)."""
     kwargs = kwargs or {}
     job = _Job(kind, label, state, lock, name)
+    if uses_run:
+        job.uses.add(_run_key(uses_run))
+        job.uses.discard("")
     if copy_context:
         _ctx = contextvars.copy_context()
         call = lambda: _ctx.run(target, *args, **kwargs)
@@ -403,6 +459,11 @@ def _job_popen(cmd, **popen_kw):
     with _jobs_lock:
         # under the lock: a Cancel either sees the process or is seen here
         _job_check()
+        if _jobs_shutting_down:
+            # the shutdown sweep has taken (or is taking) its list of processes: one
+            # started now would outlive the app (a job that retries after its tool was
+            # stopped, e.g. the shuffle loop of the contact job, would start a new R worker)
+            raise _JobCancelled("Shutting down")
         proc = subprocess.Popen(cmd, **popen_kw)
         proc._xe_new_group = new_group
         proc._xe_job = job
@@ -515,9 +576,21 @@ _job_procs_all: set = set()     # every live tool process (also those started ou
 
 def _jobs_kill_all_processes() -> None:
     """At interpreter exit: tools run in their own session, so Ctrl-C in the terminal
-    no longer reaches them - stop them here."""
-    for proc in list(_job_procs_all):
-        _kill_proc_tree(proc, grace=2.0)
+    no longer reaches them - stop them here. From the first line on no job can start
+    another process (_job_popen refuses), and the sweep repeats until it finds no process
+    it has not stopped: one started just before the flag was set is stopped as well."""
+    global _jobs_shutting_down
+    with _jobs_lock:
+        _jobs_shutting_down = True
+    swept: set = set()
+    while True:
+        with _jobs_lock:
+            todo = [p for p in _job_procs_all if p not in swept]
+        if not todo:
+            break
+        for proc in todo:
+            swept.add(proc)
+            _kill_proc_tree(proc, grace=2.0)
     for stage in list(caching._seg_stage_active):     # the runs these tools were working on
         caching._seg_stage_discard(stage)
     for hook in list(_job_exit_hooks):                # e.g. the R worker's exchange directories
@@ -528,6 +601,15 @@ def _jobs_kill_all_processes() -> None:
 
 
 _job_exit_hooks: list = []      # callables() run after the tool processes were stopped at exit
+_jobs_shutting_down = False     # set by _jobs_kill_all_processes: no new tool process after it
+
+
+def _jobs_shutdown_reset() -> None:
+    """Allow tool processes again after _jobs_kill_all_processes (the process did not
+    exit: a test, or a host that calls the sweep to stop the tools and keeps running)."""
+    global _jobs_shutting_down
+    with _jobs_lock:
+        _jobs_shutting_down = False
 
 
 _atexit.register(_jobs_kill_all_processes)

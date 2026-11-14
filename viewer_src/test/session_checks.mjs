@@ -13,7 +13,8 @@
 //   XS_PORT   port (default 8211)        XV_PYTHON   python to start the app with
 import {chromium} from 'playwright';
 import {spawn} from 'node:child_process';
-import {existsSync, mkdirSync, readdirSync, readFileSync} from 'node:fs';
+import {existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync} from 'node:fs';
+import {tmpdir} from 'node:os';
 import {resolve} from 'node:path';
 import {DATA, GL_ARGS, ROOT, hasBundle} from './lib.mjs';
 
@@ -200,6 +201,34 @@ try {
   await upload(page, {...first.doc, version: 2});
   await waitStatus(page, /Not restored\. the session file has format version 2/);
   check('upload of a newer format version is refused', true, (await status(page)).slice(0, 120));
+
+  // the SAME file chosen again must fire again (the page empties the upload component after
+  // reading it; a trigger on the file's modification time alone would not change). A file on
+  // disk, chosen twice: same name, same content, same modification time.
+  const sameFile = resolve(mkdtempSync(resolve(tmpdir(), 'xs-upload-')), 'same.json');
+  writeFileSync(sameFile, JSON.stringify({...first.doc, version: 2}));
+  // As a user does it: the component empties its file input before it opens the dialog
+  // (Upload.open: fileInputEl.value = null), then the file is chosen. Without that step
+  // React itself drops the second change event of an input whose value did not change.
+  const choose = async (path) => {
+    await page.evaluate(() => { document.querySelector('#session-upload input[type=file]').value = null; });
+    await page.setInputFiles('#session-upload input[type=file]', path);
+  };
+  await page.evaluate(() => document.querySelector('#session-save-btn').click());
+  await waitStatus(page, /^Session saved/);
+  await choose(sameFile);
+  await waitStatus(page, /Not restored\. the session file has format version 2/);
+  await page.evaluate(() => document.querySelector('#session-save-btn').click());
+  await waitStatus(page, /^Session saved/);
+  let again = true;
+  try {
+    await choose(sameFile);
+    await page.waitForFunction(() => /Not restored\. the session file has format version 2/
+      .test(document.querySelector('#session-status')?.innerText || ''), null, {timeout: 20000});
+  } catch { again = false; }
+  check('the same file uploaded a second time is read again', again, (await status(page)).slice(0, 80));
+  check('no dependency cycle is reported after the uploads', !errors.some((e) => /Dependency Cycle/.test(e)),
+    errors.filter((e) => /Dependency Cycle/.test(e)).slice(0, 1).join(''));
 
   // another dataset: only what does not depend on the data; server settings are never read
   const other = JSON.parse(JSON.stringify(first.doc));

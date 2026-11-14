@@ -145,8 +145,13 @@ def _lrd_match_pairs(pairs, genes_all) -> list:
 
 
 def _lrd_sample_sums(s: dict, lab, kept, types, radius=_LRD_RADIUS_UM, tile=_LRD_TILE_UM,
-                     binary: bool = False, progress=None) -> "dict | None":
+                     binary: bool = False, progress=None, lib_genes=None) -> "dict | None":
     """The sums of one sample that every term is a ratio of.
+
+    lib_genes: the genes the depth of a cell is summed over instead of the sample's own
+    panel; _lrd_compute passes the genes the samples share when their panels differ
+    (analysis._an_lib_genes), so that the rates Σ counts / Σ depth of two samples have the
+    same denominator.
 
     s: analysis sample; lab: type per cell (None: unlabelled); kept: [(ligand, receptor)]
     on the panel; types: the type names. Returns {n_cells [T], sum_s [T], sum_x [T, G],
@@ -173,9 +178,7 @@ def _lrd_sample_sums(s: dict, lab, kept, types, radius=_LRD_RADIUS_UM, tile=_LRD
     code = code[ok]
     csc = s["csc"]
     X = csc[:, np.array([s["gni"][g] for g in G], dtype=np.int64)].tocsr()[rows[ok]].astype(np.float64)
-    wp = np.zeros(csc.shape[1])
-    wp[np.array([s["gni"][g] for g in s["genes"]], dtype=np.int64)] = 1.0
-    depth = np.asarray(csc @ wp, dtype=np.float64).ravel()[rows[ok]]
+    depth = analysis._an_depth(s, lib_genes)[rows[ok]]
     B = X.copy()
     B.data = (B.data >= analysis._DETECT_MIN).astype(np.float64)
     B.eliminate_zeros()
@@ -632,9 +635,10 @@ def _lrd_compute(samples, labels, pairs, conds=None, donors=None, radius=_LRD_RA
     if not types:
         raise ValueError(f"No cell type has at least {min_cells} cells.")
     sums, n_adj = [], []
+    lib_genes = analysis._an_lib_genes(samples)
     for i, (s, lab) in enumerate(zip(samples, labels)):
         jobs._job_check()
-        sm = _lrd_sample_sums(s, lab, kept, types, radius, tile, binary,
+        sm = _lrd_sample_sums(s, lab, kept, types, radius, tile, binary, lib_genes=lib_genes,
                               progress=(None if progress is None else
                                         (lambda f, _i=i: progress((_i + f) / len(samples)))))
         sums.append(sm)
@@ -643,7 +647,8 @@ def _lrd_compute(samples, labels, pairs, conds=None, donors=None, radius=_LRD_RA
     res.update({"types": types, "types_dropped": dropped, "pairs_kept": kept, "n_pairs_input": len(pairs),
                 "n_adj": n_adj, "n_cells": [0 if x is None else int(x["n_cells"].sum()) for x in sums],
                 "radius": float(radius), "tile": float(tile) if tile else None, "binary": bool(binary),
-                "own": float(own), "floor": float(floor), "min_cells": int(min_cells)})
+                "own": float(own), "floor": float(floor), "min_cells": int(min_cells),
+                "lib_shared_genes": len(lib_genes) if lib_genes is not None and not binary else None})
     return res
 
 
@@ -716,6 +721,9 @@ def _run_lrdecomp(pairs_text, label_kind, seg_source, method, use_corrected, rad
                f"{res['n_not_owned']:,} with a gene its type does not own (< {own:g} of the top type's rate)"
                + (f", {res.get('n_incomplete', 0):,} with an undefined term in a unit" if res["mode"] != "descriptive" else "")
                + ". Exposure = K × R × L × γ × π exactly.")
+        if res.get("lib_shared_genes"):
+            _ln = analysis._an_lib_note(res["lib_shared_genes"])
+            msg += f" {_ln[0].upper() + _ln[1:]}."
         if not len(t):
             msg += (" No interaction passed: lower the floor (it applies to the shallowest unit), the "
                     "ownership share or the minimum number of cells.")
@@ -910,6 +918,8 @@ def _lrd_csv(res) -> str:
              "# why an exposure differs (expression vs contact vs geometry); not evidence of signalling"]
     if res.get("n_uncorrected"):
         lines.append(f"# {analysis._an_uncorrected_note(res['n_uncorrected'])}")
+    if res.get("lib_shared_genes"):
+        lines.append(f"# {analysis._an_lib_note(res['lib_shared_genes'])}")
     for smp in res["samples"]:
         lines.append(f"# sample {smp['label']} ({smp['name']}): {smp['n_cells']} labelled cells, {smp['n_adj']} "
                      f"contact pairs; condition {smp['cond'] or '-'}; donor {smp['donor'] or '-'}"
@@ -917,7 +927,7 @@ def _lrd_csv(res) -> str:
     for k, v in (res.get("omnibus") or {}).items():
         lines.append(f"# omnibus {k}: T = {v['T']:.4g}, p = {v['p']:.4g} over {v['n_pairs']} between-type pairs; "
                      f"shared shift {v['shared_shift']:+.4g} (p = {v['shared_p']:.4g})")
-    txt = "\n".join(lines) + "\n" + res["table"].to_csv(index=False)
+    txt = provenance._csv_comments(lines) + res["table"].to_csv(index=False)
     if len(res["pairs"]):
         txt += ("\n# sender -> receiver pairs: mean over the pair's interactions per unit, tested across the units\n"
                 + res["pairs"].to_csv(index=False))

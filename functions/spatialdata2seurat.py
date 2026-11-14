@@ -156,7 +156,7 @@ def spatialdata2seurat(
     # sd.read_zarr may miss obs columns added after initial write (stale consolidated
     # metadata). Check for specific missing columns directly from the raw zarr obs group.
     _wanted_extra = ["split_umap_1", "split_umap_2", "cluster_split_10",
-                     "cell_area", "nucleus_area"]
+                     "cell_area", "cell_volume", "nucleus_area"]
     _missing = [c for c in _wanted_extra if c not in adata.obs.columns]
     if _missing:
         try:
@@ -414,9 +414,10 @@ def spatialdata2seurat(
         if src in meta.columns and dst not in meta.columns:
             meta[dst] = meta[src]
 
-    # Proseg stores cell area as 'volume' — rename to cell_area
-    if "cell_area" not in meta.columns and "volume" in meta.columns:
-        meta["cell_area"] = meta["volume"]
+    # Proseg's 'volume' is a volume (µm³: voxel x·y·z size summed over the cell's voxels),
+    # not an area: it is exported as cell_volume, never under the name cell_area
+    if "cell_volume" not in meta.columns and "volume" in meta.columns:
+        meta["cell_volume"] = meta["volume"]
 
     # Drop columns that Seurat can't handle (list/dict dtype)
     for col in list(meta.columns):

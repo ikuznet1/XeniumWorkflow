@@ -85,6 +85,7 @@ _SESSION_AUTOSAVE_MS = 60_000        # the page sends its control values this of
 _SESSION_PROCESS = secrets.token_hex(6)     # tells the autosave of this server run from an earlier one
 _session_lock = threading.RLock()
 _session_auto: dict = {"baseline": None, "written": None}   # signatures of the autosave (see _session_autosave)
+_SESSION_AUTO_PAGES = 32          # page loads whose starting state is remembered
 _session_memo: dict = {}
 
 
@@ -273,8 +274,23 @@ def _session_show(v, n: int = 60) -> str:
     return repr(s[:n] + ("…" if len(s) > n else ""))
 
 
+def _session_gene_lines(text: str) -> list:
+    """The genes of a gene-list text, one per non-empty line (as fill_geneset_form writes
+    a stored set)."""
+    return [ln.strip() for ln in str(text or "").replace("\r", "\n").split("\n") if ln.strip()]
+
+
 def _session_is_num(v) -> bool:
-    return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    """A finite JSON number. Total: an integer of any size is answered, never raised on
+    (json accepts integers of hundreds of digits, which math.isfinite cannot convert)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return False
+    if isinstance(v, int):
+        return abs(v) < _SESSION_NUM_MAX
+    return math.isfinite(v)
+
+
+_SESSION_NUM_MAX = 10 ** 300     # no control, coordinate or threshold of the app is near it
 
 
 def _session_is_text(v, n: int, multiline: bool = False) -> bool:
@@ -782,24 +798,41 @@ def _session_signature(doc: dict) -> str:
     return json.dumps({"dataset": doc["dataset"], "state": doc["state"]}, sort_keys=True, default=str)
 
 
-def _session_autosave(controls) -> str:
+def _session_autosave(controls, page=None) -> str:
     """The automatic save of the "last session" of the loaded dataset (called with the
-    control values the page sends every _SESSION_AUTOSAVE_MS). Nothing is written while the
-    state is the one the first call of this server run saw (a page that was only opened
-    must not replace the session of the run before), and nothing when it did not change.
-    The first write of a run keeps the file of the run before as the "prev" slot. Never
-    raises; returns what it did ("" for nothing)."""
+    control values the page sends every _SESSION_AUTOSAVE_MS). *page*: the id of the page
+    load that sends them (one per browser page load; None: one unnamed page).
+
+    Nothing is written while a page still shows the state of its first call - a page that
+    was only opened, reloaded or reopened sends the default control values, and must
+    replace neither the session of the run before nor what this run has already saved -
+    and nothing when the state did not change. Once a page has shown another state, all
+    its states are saved (also a return to the first one). The first write of a run keeps
+    the file of the run before as the "prev" slot. Never raises; returns what it did (""
+    for nothing)."""
     try:
         if not caching._dataset_key():
             return ""
         doc = _session_snapshot(controls, "auto")
         sig = (doc["dataset"]["key"], _session_signature(doc))
+        page = str(page)[:64] if page is not None else None
         with _session_lock:
             if _session_auto["baseline"] is None or _session_auto["baseline"][0] != sig[0]:
-                _session_auto.update({"baseline": sig, "written": None})
+                # first call of this server run for this dataset
+                _session_auto.update({"baseline": sig, "written": None, "pages": {page: [sig, False]}})
                 return ""
-            if sig == _session_auto["baseline"] and _session_auto["written"] is None:
+            pages = _session_auto.setdefault("pages", {None: [_session_auto["baseline"], False]})
+            mine = pages.get(page)
+            if mine is None:
+                # a page that was just opened: what it shows now is its starting point
+                while len(pages) >= _SESSION_AUTO_PAGES:
+                    pages.pop(next(iter(pages)))
+                pages[page] = [sig, False]
                 return ""
+            if not mine[1]:
+                if sig == mine[0]:
+                    return ""                     # still as opened: nothing of this page to save
+                mine[1] = True
             if sig == _session_auto["written"]:
                 return ""
             last = _session_path("last")
@@ -900,7 +933,7 @@ def _session_dynamic_problem(cid, value, ctx, applied, current, memo) -> "str | 
     if role in ("gene", "genes"):
         genes = memo.setdefault("genes", _session_genes())
         vals = value if isinstance(value, list) else [value]
-        bad = [v for v in vals if (v[:-6] if str(v).endswith(" [imp]") else str(v)) not in genes]
+        bad = [v for v in vals if core._gene_base(v) not in genes]
         return None if not bad else f"not on the gene panel: {', '.join(_session_show(b, 20) for b in bad[:5])}"
     if role == "label_kind":
         kinds = memo.setdefault(("kinds", seg), {o["value"] for o in stats._comp_category_options(seg, ctx["color-by"])})
@@ -1080,7 +1113,7 @@ def _session_apply_subset(sub, report: dict) -> None:
     if f.get("method") and f["method"] not in (core.DATA.get("cluster_methods") or []):
         report["missing"].append(f"subset: the cluster set {_session_show(f['method'], 60)} it filters on does not exist")
         return
-    if f.get("gene") and (f["gene"][:-6] if f["gene"].endswith(" [imp]") else f["gene"]) not in _session_genes():
+    if f.get("gene") and core._gene_base(f["gene"]) not in _session_genes():
         report["missing"].append(f"subset: the gene {_session_show(f['gene'], 30)} it filters on is not on the panel")
         return
     try:
@@ -1204,6 +1237,25 @@ def _session_restore(doc: dict, current=None, source: str = "file", record: bool
                     else (banksy._BK_LAMBDA_CELLTYPE, banksy._BK_RESOLUTION_CELLTYPE)) if banksy else None
             if want and (applied.get("bk-lambda", want[0]), applied.get("bk-resolution", want[1])) != want:
                 applied["bk-preset"] = "custom"
+        # the gene-set picker fills the gene text from the stored set when it changes in the
+        # page (cb_analysis.fill_geneset_form): a restored text that differs from that set
+        # (it was edited and not saved as a set) would be overwritten. The text wins; the
+        # picker is left empty and the report says so.
+        _gs_pick, _gs_text = applied.get("geneset-select"), applied.get("geneset-genes")
+        if _gs_pick and isinstance(_gs_text, str):
+            _an = _session_module("analysis")
+            _stored = None
+            if _an is not None:
+                with _an._geneset_lock:
+                    _stored = _an._geneset_state["sets"].get(_gs_pick)
+            _lines = _session_gene_lines(_gs_text)
+            # (an empty text is not an edit: the picker then fills it, as it does in the page)
+            if _stored is not None and _lines and _lines != [str(g) for g in _stored]:
+                applied["geneset-select"] = None
+                report["skipped"].append(
+                    f"The gene-set picker was left empty: the gene list of the session differs from the stored "
+                    f"set {_session_show(_gs_pick, 40)} (it was edited after the set was saved), and selecting "
+                    f"the set would replace the text.")
         # the two switches the server mirrors, through the callbacks that own the mirror
         cbs = _session_module("cb_spatial")
         if cbs is not None:

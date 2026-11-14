@@ -48,6 +48,9 @@ def run_split(n_clicks, rds_path, label_col, max_cores, min_umi, min_umi_sigma, 
     _problem = core._ref_rds_problem(rds_path)
     if _problem:
         return f"⚠ {_problem}", True, False
+    _alt, _seg_err = core._seg_job_result(seg_source, "nothing was corrected")
+    if _seg_err:
+        return f"⚠ {_seg_err}", True, False
     with core._split_lock:
         if core._split_state["status"] == "running":
             return "Already running…", False, True
@@ -62,7 +65,7 @@ def run_split(n_clicks, rds_path, label_col, max_cores, min_umi, min_umi_sigma, 
     jobs._job_start("split", "SPLIT correction", split._run_split_correction,
                args=(rds_path, label_col, max_cores, seg_source,
                      min_umi, min_umi_sigma, do_purify_singlets),
-               state=core._split_state, lock=core._split_lock, copy_context=True)
+               state=core._split_state, lock=core._split_lock, copy_context=True, uses_run=_alt)
     return "Starting SPLIT correction…", False, True
 
 
@@ -219,15 +222,10 @@ def run_niche(n_clicks, n_clusters, n_neighbors, label_key, seg_source):
     n_neighbors = int(n_neighbors or 20)
 
     tool = core._seg_tool(seg_source)
-    with core._baysor_lock:
-        bres = core._baysor_state["result"] if tool == "baysor" and core._baysor_state["result"] else None
-    with core._proseg_lock:
-        pres = core._proseg_state["result"] if tool == "proseg" and core._proseg_state["result"] else None
-    alt_res = pres or bres or (core._seg_result(seg_source) if tool == "imgseg" else None)
-    if alt_res is None and tool != "xenium":
-        # a run that is named but not loaded is never replaced by the Xenium cells
-        return (False, True, f"The selected segmentation ({seg_source}) is not loaded (it is still loading, "
-                             f"or its load failed): no niches were computed.")
+    # a run that is named but not loaded is never replaced by the Xenium cells
+    alt_res, _seg_err = core._seg_job_result(seg_source, "no niches were computed")
+    if _seg_err:
+        return False, True, _seg_err
 
     # Label keys are per segmentation (Xenium ids vs the ids of one Baysor/Proseg
     # run): use the chosen method's labels for the active one, or refuse.
@@ -243,7 +241,7 @@ def run_niche(n_clicks, n_clusters, n_neighbors, label_key, seg_source):
 
     jobs._job_start("niches", f"Spatial niches (k={n_clusters})", spatial._run_spatial_niches,
                args=(n_clusters, n_neighbors, label_key, alt_res),
-               state=core._niche_state, lock=core._niche_lock, copy_context=True)
+               state=core._niche_state, lock=core._niche_lock, copy_context=True, uses_run=alt_res)
     return True, False, "Starting niche computation…"
 
 
@@ -304,15 +302,9 @@ def run_spatial_analysis(n_clicks, label_key, n_neighbors, seg_source):
         return False, True, "Select a cell type annotation from the dropdown first."
     n_neighbors = int(n_neighbors or 10)
     tool = core._seg_tool(seg_source)
-    alt_res = None
-    if tool == "baysor":
-        with core._baysor_lock:
-            alt_res = core._baysor_state.get("result")
-    elif tool == "proseg":
-        with core._proseg_lock:
-            alt_res = core._proseg_state.get("result")
-    elif tool == "imgseg":
-        alt_res = core._seg_result(seg_source)
+    alt_res, _seg_err = core._seg_job_result(seg_source, "nothing was computed")
+    if _seg_err:
+        return False, True, _seg_err
     # Label keys are per segmentation: use the chosen method's labels for the active one
     label_key = annotation._label_key_for_active_seg(label_key, alt_res)
     if label_key is None:
@@ -439,7 +431,7 @@ def capture_lasso_selection(selected_data, seg_source, roi_done):
     if len(cell_ids) < 3:
         return None, True, "", "Need at least 3 cells to define an ROI.", dash.no_update
 
-    hull = regions._roi_compute_hull(cell_ids, src_df=src_df)
+    hull = regions._roi_selection_hull(pts, src_df=src_df)
     if hull is None:
         return None, True, "", "Could not compute hull (need ≥3 non-collinear cells).", dash.no_update
 

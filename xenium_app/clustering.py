@@ -182,17 +182,11 @@ def _run_reseg_umap() -> None:
     try:
         # Get the reseg result for the segmentation source selected in the UI
         with core._umap_reseg_lock:
-            _tool = core._seg_tool(core._umap_reseg_state.get("seg_source", "xenium"))
-        pres = bres = None
-        if _tool == "proseg":
-            with core._proseg_lock:
-                pres = core._proseg_state["result"] if core._proseg_state["status"] == "done" else None
-        elif _tool == "baysor":
-            with core._baysor_lock:
-                bres = core._baysor_state["result"] if core._baysor_state["status"] == "done" else None
-        alt_res = pres or bres or (core._seg_result(_tool, done_only=True) if _tool == "imgseg" else None)
-        if _tool != "xenium" and alt_res is None:
-            _set("error", "Selected segmentation is not loaded")
+            _seg_src = core._umap_reseg_state.get("seg_source", "xenium")
+            _tool = core._seg_tool(_seg_src)
+        alt_res, _seg_err = core._seg_job_result(_seg_src, "no UMAP was computed")
+        if _seg_err:
+            _set("error", _seg_err)
             return
 
         if alt_res is None:
@@ -497,7 +491,7 @@ def _run_reseg_umap() -> None:
 
         # ── Write UMAP coords back to cells_df + zarr for caching ────
         _set("running", "Caching UMAP to zarr…")
-        _lock = core._proseg_lock if pres else core._baysor_lock if bres else core._seg_state(_tool)[1]
+        _lock = core._seg_state(_tool)[1]
         _sdata_path = alt_res.get("sdata_path", "")
         # Build full-length arrays (NaN for cells not in this UMAP's index)
         _u1 = np.full(len(_all_cell_ids), np.nan)

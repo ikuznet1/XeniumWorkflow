@@ -68,10 +68,8 @@ def de_capture_plotly_selection(selected_data, version, seg_source):
         poly = [[float(xa), float(ya)], [float(xb), float(ya)],
                 [float(xb), float(yb)], [float(xa), float(yb)]]
     else:
-        ids = [pt.get("customdata") for pt in selected_data["points"]
-               if pt.get("customdata") is not None]
         _alt = analysis._an_alt_res(seg_source)
-        poly = regions._roi_compute_hull(ids, src_df=_alt["cells_df"] if _alt else None)
+        poly = regions._roi_selection_hull(selected_data["points"], src_df=_alt["cells_df"] if _alt else None)
     return _de_set_selection(poly, len(selected_data["points"]), version)
 
 
@@ -397,7 +395,7 @@ def download_de_table(n_clicks):
         header += f"# {analysis._an_uncorrected_note(res['n_uncorrected'])}\n"
     if res.get("leak_summary"):
         header += "".join(f"# {ln}\n" for ln in str(res["leak_summary"]).splitlines())
-    return dict(content=provenance._prov_csv_stamp(res, header + t.to_csv(index=False)),
+    return dict(content=provenance._prov_csv_stamp(res, provenance._csv_comments(header) + t.to_csv(index=False)),
                 filename=f"de_{_safe(res['label_a'])}_vs_{_safe(res['label_b'])}.csv")
 
 

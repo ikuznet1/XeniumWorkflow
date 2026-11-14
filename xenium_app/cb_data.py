@@ -460,7 +460,8 @@ def _reset_dataset_state() -> None:
                 core._annot_state[_k] = None
     with core._spage_lock:
         core._spage_state.update({"status": "idle", "message": "", "result": None,
-                              "result_path": None, "result_genes": None, "result_ids_tag": None})
+                              "result_path": None, "result_genes": None, "result_ids_tag": None,
+                              "result_stored": None})
     with core._sdata_lock:
         core._sdata_state.update({"status": "idle", "message": "", "sdata": None,
                               "roi": None, "patches": None})
@@ -475,6 +476,7 @@ def _reset_dataset_state() -> None:
     with core._roi_lock:
         core._roi_state["rois"] = []
         core._roi_state["pending_hull"] = None
+    regions._roi_forget_known()
     # CellNEST results (edges drawn from their own coordinates) and the extra
     # side-by-side samples (offsets computed against the previous primary)
     # belong to the previous dataset.
@@ -618,6 +620,15 @@ def add_sample(n_clicks, picked_path, custom_path, extra_ver):
                 print(f"  Extra sample: cached annotations found for {', '.join(sorted(_by))}", flush=True)
         except Exception as _lab_exc:
             print(f"  Extra sample: annotation cache not read: {_lab_exc}", flush=True)
+        # the ROIs that exist are outlines in the plot: cells of the new sample inside one
+        # (at its offset) get the label, as they would when the ROI is saved afterwards
+        try:
+            with core._roi_lock:
+                _rois_now = list(core._roi_state["rois"])
+            if _rois_now:
+                regions._roi_apply_to_sample(new_data, _rois_now)
+        except Exception as _roi_exc:
+            print(f"  Extra sample: ROI labels not applied: {_roi_exc}", flush=True)
         dataview.EXTRA_DATASETS.append(new_data)
         n_total = 1 + len(dataview.EXTRA_DATASETS)
         status_msg = f"{n_total} samples loaded"

@@ -769,13 +769,14 @@ def _sfree_csv(res) -> str:
                      f"donor {s['donor'] or '-'}")
     if res.get("skipped"):
         lines.append(f"# left out (no transcript file): {' '.join(res['skipped'])}")
-    txt = "\n".join(lines) + "\n" + res["table"].to_csv(index=False)
+    txt = provenance._csv_comments(lines) + res["table"].to_csv(index=False)
     if len(res["genes"]):
         txt += "\n# per marker gene (whole sample; area of the tile size named in area_bin_um)\n" + res["genes"].to_csv(index=False)
+    across = provenance._csv_comments(f"# between conditions: {res.get('across_note')}")
     if len(res["across"]):
-        txt += f"\n# between conditions: {res['across_note']}\n" + res["across"].to_csv(index=False)
+        txt += "\n" + across + res["across"].to_csv(index=False)
     elif res.get("across_note"):
-        txt += f"\n# between conditions: {res['across_note']}\n"
+        txt += "\n" + across
     return provenance._prov_csv_stamp(res, (txt))
 
 
