@@ -440,7 +440,7 @@ def test_a_session_of_other_data_only_applies_what_does_not_depend_on_the_data(x
                       "prox-labels": "cluster", "seg-source": "xenium",
                       # options of the loaded images / data size: bound to the data as well
                       "morph-channels": ["dapi"], "morph-enable": ["show"], "morph-zlevel": 1,
-                      "renderer-mode": "webgl"},
+                      "renderer-mode": "plotly"},
                  rois=[{"name": "r", "cls": "region", "polygon_xy": _rect(D)}],
                  gene_sets={"s": list(D["gene_names"][:3])},
                  de_groups=[{"name": "g", "polygon_xy": _rect(D)}],

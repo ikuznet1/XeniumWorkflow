@@ -2,7 +2,7 @@
 
 An interactive web application for visualizing and analyzing 10x Genomics Xenium spatial transcriptomics data. Supports cell clustering, gene expression, morphology overlays, cell type annotation, gene imputation, resegmentation, and ambient RNA correction (SPLIT) — all in a browser-based interface.
 
-Works with standard Xenium panels (a few hundred genes) and with **Xenium Prime 5K** output. A GPU-accelerated **WebGL view** (beta) is available alongside the default Plotly view for large datasets; see [WebGL view](#webgl-view-beta).
+Works with standard Xenium panels (a few hundred genes) and with **Xenium Prime 5K** output. A GPU-accelerated **WebGL view** is the default spatial renderer, with the **Plotly** view kept alongside it as a fallback (Firefox and Safari remain untested); see [WebGL view](#webgl-view).
 
 ## Contents
 
@@ -21,7 +21,7 @@ Works with standard Xenium panels (a few hundred genes) and with **Xenium Prime 
 - [Features](#features)
   - [Sidebar](#sidebar)
   - [Visualization](#visualization)
-  - [WebGL view (beta)](#webgl-view-beta)
+  - [WebGL view](#webgl-view)
   - [Overlays](#overlays)
   - [Plot Tab (right panel)](#plot-tab-right-panel)
   - [Differential expression](#differential-expression)
@@ -128,7 +128,7 @@ Opens at **http://localhost:8050**. The server listens on localhost only; set `X
 Useful start-up variants:
 
 ```bash
-XENIUM_RENDERER=webgl python xenium_explorer.py <bundle>     # start in the WebGL view
+XENIUM_RENDERER=plotly python xenium_explorer.py <bundle>    # start in the Plotly fallback view (default: WebGL)
 XENIUM_PLOTLY_MAX_CELLS=1500000 python xenium_explorer.py …   # cells the Plotly map may draw (default 900,000)
 XENIUM_ENABLE_REPL=1  python xenium_explorer.py <bundle>     # enable the in-app Python REPL
 XENIUM_R_INPROCESS=1  python xenium_explorer.py <bundle>     # run R inside the app instead of in a worker process (see Jobs panel)
@@ -150,7 +150,7 @@ One pass through the app on public data: the Xenium Prime 5K human skin (melanom
 | # | Step | Where to click | What to expect | Time | The caveat that matters |
 |---|------|----------------|----------------|------|-------------------------|
 | 1 | Load | `python xenium_explorer.py <bundle>`, open http://localhost:8050 | The section coloured by cluster | server ready in 5 s, page drawn in 7 s | The app loads one bundle per process; "+ Add sample" adds more |
-| 2 | Look around | Pan and zoom the map; **Plotly / WebGL (beta)** under the map switches the renderer (or start with `XENIUM_RENDERER=webgl`) | The same cells in both views | page drawn in 7 s in either | The WebGL view is a beta: see [WebGL view](#webgl-view-beta) for what it does not draw |
+| 2 | Look around | Pan and zoom the map; **Plotly / WebGL** under the map switches between the default WebGL renderer and the Plotly fallback (or start with `XENIUM_RENDERER=plotly`) | The same cells in both views | page drawn in 7 s in either | See [WebGL view](#webgl-view) for differences between the two views and browser notes |
 | 3 | Annotate | Sidebar → **Annotate Cells** → CellTypist, model `Immune_All_Low.pkl` → **Run Annotation** | "Done — 13 cell types"; the annotation becomes a label source (`cell type (CellTypist)`) in every tab | 81 s | CellTypist needs no reference, but the model must fit the tissue. This one is an immune model: on skin it called 82,413 of 112,551 cells "Tcm/Naive helper T cells". The steps below show the mechanics on these labels; they are not a skin annotation |
 | 4 | Compare segmentations | QC → Segmentation QC → **Run** | One row per segmentation source and counts mode. With the bundle alone: 1 row (Xenium). On a copy of the same data with cached Baysor, Proseg and image-based runs of small regions: 13 rows for 11 sources | 2.7 s (1 row), 3.5 s (13 rows) | Baysor and Proseg are optional tools. A run without its own annotation gets the Xenium label of the nearest centroid, which favours segmentations close to Xenium's; a region run and the whole section are not the same cells |
 | 5 | Compartments | QC → Compartments & spillover → Cell types from: `cell type (CellTypist)` → **Compute compartments** | Edge distance, local density and dense core per cell (median edge distance 335 µm; 63.6 % core, 28.9 % edge), offered under Color By and used as strata later | 0.2 s | The columns say where a cell sits, not what it is; the "core" is that of the dominant type, here the mislabelled majority |
@@ -553,21 +553,23 @@ Click the **📏** button in the bottom-right corner of the spatial map to activ
 - The plots row and the bottom info bar are separated by a **vertical drag handle** — drag it to resize the panels.
 - The bottom info bar can be **fully collapsed** with the ▼ button (the spatial/UMAP plots expand to fill the space). Click ▲ to restore.
 
-### WebGL view (beta)
+<a id="webgl-view-beta"></a>
+### WebGL view
 
-**Large data starts here.** The Plotly map ships every cell to the browser inside one figure and
+**Default spatial renderer.** The WebGL view (deck.gl) is the default spatial renderer: it keeps cell positions on the GPU and asks the server only for what changes — one value per cell on a recolour, and boundaries, transcripts and image tiles for the current viewport.
+
+Switch between **WebGL** and **Plotly** at any time with the **Plotly / WebGL** selector at the bottom left of the spatial panel, or start in the Plotly view with `XENIUM_RENDERER=plotly` (`XENIUM_RENDERER=webgl` explicitly selects the default WebGL view). Switching to Plotly rebuilds the Plotly figures on demand; **Firefox and Safari remain untested**, so the Plotly fallback (`XENIUM_RENDERER=plotly` at startup and the in-app **Plotly / WebGL** switch) is kept working.
+
+The Plotly map ships every cell to the browser inside one figure and
 rebuilds it on every change of colour. Measured in headless Chromium with a GPU on a 5,006-gene
 section replicated side by side, the first draw took 3 s at 113,000 cells, 4 s at 225,000, 5 s
 at 450,000 and 7–10 s at 900,000, and a recolour 2.5, 3.5, 6 and 10 s (a slower machine or a
 remote server takes longer). When the loaded samples hold more than `XENIUM_PLOTLY_MAX_CELLS`
-cells (default 900,000, where the first draw stayed under about 15 s; 0 = no limit) the app starts in the WebGL view, an `.h5ad` loaded from the dialog switches to
-it, and choosing Plotly shows a message with the cell count instead of building the figure.
+cells (default 900,000, where the first draw stayed under about 15 s; 0 = no limit), choosing
+Plotly shows a message with the cell count instead of building the figure, and an `.h5ad` loaded
+from the dialog switches back to WebGL if Plotly was active.
 `XENIUM_RENDERER=plotly` still selects the Plotly switch position at start; the limit applies
 all the same.
-
-The WebGL view (deck.gl) keeps cell positions on the GPU and asks the server only for what changes: one value per cell on a recolour, and boundaries, transcripts and image tiles for the current viewport.
-
-Switch with the **Plotly / WebGL (beta)** selector at the bottom left of the spatial panel, or start with `XENIUM_RENDERER=webgl`. Plotly remains the default. Switching back rebuilds the Plotly figures.
 
 What it draws:
 
@@ -595,7 +597,7 @@ Both views degrade the same way when the selected colour cannot be drawn: a gene
 
 Measured on a Xenium Prime 5K run with 112,551 cells: a recolour transfers about 0.45 MB per view and takes a few milliseconds of server time, against 5–7 MB of JSON per Plotly figure and roughly a second of server time.
 
-Requirements and limits: a browser with WebGL2. When WebGL2 is missing or its context cannot be created, the app switches back to the Plotly view by itself, greys out the WebGL option and says why in the status line next to the selector (reload the page to try again). The Plotly view draws its points with WebGL 1, so with WebGL switched off altogether neither view can draw cells; the status line says so. The feature is new, so switch to the Plotly view if something looks wrong. The browser bundle is prebuilt in `assets/`; Node.js is needed only to rebuild it (see [Developing the WebGL viewer](#developing-the-webgl-viewer)).
+Requirements and limits: a browser with WebGL2 (tested in Chromium / Chrome; **Firefox and Safari remain untested**, so the Plotly fallback is kept working — switch to **Plotly** under the map or start with `XENIUM_RENDERER=plotly` if anything looks wrong). When WebGL2 is missing or its context cannot be created, the app switches back to the Plotly view by itself, greys out the WebGL option and says why in the status line next to the selector (reload the page to try again). The Plotly view draws its points with WebGL 1, so with WebGL switched off altogether neither view can draw cells; the status line says so. The browser bundle is prebuilt in `assets/`; Node.js is needed only to rebuild it (see [Developing the WebGL viewer](#developing-the-webgl-viewer)).
 
 ### Overlays
 
@@ -2021,11 +2023,11 @@ All optional locally, required or useful on Cloud Run:
 | `PORT` | Server port (default: 8050; Cloud Run sets this automatically) |
 | `XENIUM_HOST` | Bind address (default: `127.0.0.1`; set `0.0.0.0` in a container or to serve other machines). The address in use is printed at start-up |
 | `XENIUM_ENABLE_REPL` | Enables the in-app Python REPL, which runs arbitrary code. Unset = disabled; `1` = requests made from this machine to `localhost` / `127.0.0.1` / `[::1]` only (not through a reverse proxy); `remote` = any client (trusted networks only) |
-| `XENIUM_RENDERER` | Spatial renderer shown at startup: unset = Plotly; `webgl` = the WebGL view (it can also be switched in the app) |
+| `XENIUM_RENDERER` | Spatial renderer shown at startup: unset (or `webgl`) = the WebGL view (default); `plotly` = the Plotly fallback view (Firefox and Safari remain untested; can also be switched in the app) |
 | `XENIUM_REF_RDS` | Path of the reference `.rds` file (a Seurat object with cell-type labels) that prefills the *RDS File Path* fields of Cell Type Annotation (Seurat kNN, RCTD), SPLIT and SpaGE. Unset = the fields start empty; Run then asks for the path instead of starting |
 | `XENIUM_IMPUTE_GENES` | Path of a text file with gene names (one per line or comma-separated) that prefills *Genes to Impute* of the SpaGE dialog. Unset = empty (the 200 most variable reference genes outside the panel are imputed) |
 
-Further variables are described where they are used: `XENIUM_PLOTLY_MAX_CELLS` ([WebGL view](#webgl-view-beta)), `XENIUM_H5AD_*` ([AnnData `.h5ad`](#anndata-h5ad-processed-cells-one-or-several-sections)), `XENIUM_ALLOW_LARGE_JOBS` ([Working at study scale](#working-at-study-scale-a-million-cells-and-more)) and `SPAGE_REPO` ([SpaGE Gene Imputation](#spage-gene-imputation)).
+Further variables are described where they are used: `XENIUM_PLOTLY_MAX_CELLS` ([WebGL view](#webgl-view)), `XENIUM_H5AD_*` ([AnnData `.h5ad`](#anndata-h5ad-processed-cells-one-or-several-sections)), `XENIUM_ALLOW_LARGE_JOBS` ([Working at study scale](#working-at-study-scale-a-million-cells-and-more)) and `SPAGE_REPO` ([SpaGE Gene Imputation](#spage-gene-imputation)).
 
 ## Continuous integration
 
@@ -2108,7 +2110,7 @@ python viewer_src/dev_server.py /path/to/xenium_bundle 8070     # http://127.0.0
 # tests (headless Chromium via Playwright)
 node test/run.mjs                                  # viewer core against dev_server.py (bundles: XV_SKIN, XV_TINY or XV_TEST_DATA, see test/lib.mjs)
 node image_test/verify.mjs                         # image layer: decode and placement
-node test/app_smoke.mjs http://127.0.0.1:8050 out/ # the real app, started with XENIUM_RENDERER=webgl
+node test/app_smoke.mjs http://127.0.0.1:8050 out/ # the real app (starts in the WebGL view by default)
 node test/glue_checks.mjs http://127.0.0.1:8050    # renderer switching, selection and image handling in the real app
 node test/jobs_panel.mjs http://127.0.0.1:8050 out/ # jobs panel: starts Proseg on cached patches, checks progress, clicks Cancel
 node test/nav_checks.mjs http://127.0.0.1:8050 out/  # the two-level navigation: every tab opens, figures fill their box, no tab switch recomputes

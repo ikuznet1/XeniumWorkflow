@@ -76,7 +76,7 @@ def _install_dataset(new_data: dict) -> None:
 # ─── Size limit of the Plotly renderer ────────────────────────────────────────
 # The Plotly map sends every cell of the view to the browser inside one figure (tens of
 # bytes of JSON per cell, rebuilt on every change of colour). Above this many cells it is
-# not built: the app starts in the WebGL view, and the Plotly view says why it is empty.
+# not built: the default WebGL view draws all cells, and the Plotly view says why it is empty.
 # XENIUM_PLOTLY_MAX_CELLS changes the limit (0: no limit).
 # The default is where the first draw stayed under about 15 s when it was measured
 # (headless Chromium with a GPU, local server, a 5,006-gene section replicated side by

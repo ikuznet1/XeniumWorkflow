@@ -482,15 +482,16 @@ _REPL_ENABLED      = _REPL_MODE in ("1", "true", "yes", "on", "remote")
 _REPL_ALLOW_REMOTE = _REPL_MODE == "remote"
 
 
-# Spatial renderer shown at startup: "plotly" or "webgl" (deck.gl view, beta), as
-# XENIUM_RENDERER says; without it Plotly, unless the loaded samples exceed what the Plotly
-# map can draw (dataview.PLOTLY_MAX_CELLS), in which case the app starts in the WebGL view.
+# Spatial renderer shown at startup: "webgl" (deck.gl view, default) or "plotly"
+# (fallback view), as XENIUM_RENDERER selects. When XENIUM_RENDERER=plotly on a dataset
+# larger than dataview.PLOTLY_MAX_CELLS, the Plotly switch position is selected at start
+# and the Plotly map shows a placeholder explaining the cell limit.
 _RENDERER_ENV = os.environ.get("XENIUM_RENDERER", "").strip().lower()
-_DEFAULT_RENDERER = (_RENDERER_ENV if _RENDERER_ENV in ("webgl", "plotly")
-                     else ("webgl" if dataview._plotly_too_large() else "plotly"))
-if _DEFAULT_RENDERER == "webgl" and _RENDERER_ENV != "webgl":
-    print(f"  {dataview._loaded_cell_count():,} cells: starting in the WebGL view (the Plotly map is "
-          f"limited to {dataview.PLOTLY_MAX_CELLS:,} cells; XENIUM_PLOTLY_MAX_CELLS changes that)", flush=True)
+_DEFAULT_RENDERER = _RENDERER_ENV if _RENDERER_ENV in ("webgl", "plotly") else "webgl"
+if _DEFAULT_RENDERER == "plotly" and dataview._plotly_too_large():
+    print(f"  {dataview._loaded_cell_count():,} cells exceed the Plotly limit "
+          f"({dataview.PLOTLY_MAX_CELLS:,} cells; XENIUM_PLOTLY_MAX_CELLS changes that): "
+          f"the Plotly map will show a placeholder until switched to WebGL", flush=True)
 
 app.layout = html.Div([
     dcc.Store(id="selected-cell",    data=None),
@@ -1646,7 +1647,7 @@ dbc.Modal([
                         dcc.RadioItems(
                             id="renderer-mode",
                             options=[{"label": " Plotly", "value": "plotly"},
-                                     {"label": " WebGL (beta)", "value": "webgl"}],
+                                     {"label": " WebGL", "value": "webgl"}],
                             value=_DEFAULT_RENDERER,
                             inline=True,
                             inputStyle={"marginRight": "3px"},
