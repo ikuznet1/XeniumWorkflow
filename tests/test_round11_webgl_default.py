@@ -311,14 +311,14 @@ def test_headless_batch_exports_spatial_figures_under_webgl_default(xe, D, bundl
             {"kind": "spatial", "name": "spatial_figs",
              "params": {"label_key": "labels_celltypist", "n_neighbors": 5}},
             {"kind": "aggregates", "name": "agg_figs",
-             "params": {"labels": "cluster", "classes": [first_cluster], "n_perm": 19}},
+             "params": {"labels": "cluster", "classes": [first_cluster]}},
             {"kind": "composition", "name": "comp_figs",
              "params": {"labels": "cluster"}},
         ],
     }
     try:
         res = xe._batch_run(cfg, log=lambda _line: None)
-        assert res["ok"] is True and res["n_done"] == 3 and res["n_failed"] == 0
+        assert res["ok"] is True and res["n_done"] == 3 and res["n_failed"] == 0, res
 
         expected_figs = [
             (out_dir / "01_spatial_figs", "cooccurrence"),
