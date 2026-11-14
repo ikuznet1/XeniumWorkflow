@@ -393,6 +393,8 @@ def download_de_table(n_clicks):
               f"# {analysis._P_FLOOR_NOTE}\n")
     if res.get("n_uncorrected"):
         header += f"# {analysis._an_uncorrected_note(res['n_uncorrected'])}\n"
+    if res.get("n_genes_uncorrected"):
+        header += f"# {analysis._an_uncorrected_genes_note(res['n_genes_uncorrected'])}\n"
     if res.get("leak_summary"):
         header += "".join(f"# {ln}\n" for ln in str(res["leak_summary"]).splitlines())
     return dict(content=provenance._prov_csv_stamp(res, provenance._csv_comments(header) + t.to_csv(index=False)),
@@ -557,7 +559,12 @@ def run_density(n_clicks, gene):
         return False, True, "Pick a gene (or 'All genes')."
     if analysis._density_virtual(gene) is not None:
         return False, True, "This layer is not a gene's transcript grid: it is computed in its own tab."
-    if not any(s["data_dir"] for s in analysis._density_samples()):
+    _dsmps = analysis._density_samples()
+    if not any(dataview._ds_has_transcripts(s["ds"]) for s in _dsmps):
+        if any(s["ds"].get("data_dir") for s in _dsmps):
+            return False, True, ("Transcript density needs transcripts.parquet or transcripts.zarr.zip; "
+                                 + ("this bundle directory has cells only (no transcript file)."
+                                    if len(_dsmps) == 1 else "none of the loaded samples has a transcript file."))
         return False, True, ("Transcript density needs the Xenium output directory "
                              "(transcripts.parquet); this dataset was " + dataview._origin_phrase() + ".")
     if gene != analysis._DENSITY_ALL and gene not in set(dataview._panel_gene_names()):
@@ -632,7 +639,11 @@ def update_density_store(enable, gene, bin_um, opacity, vmax, done_ver, ds_versi
             if st["missing"]:
                 hint += f" No grid yet for {', '.join(st['missing'])}: press Compute."
             if st["unavailable"]:
-                hint += f" {', '.join(st['unavailable'])} loaded from a .zarr: no transcripts."
+                _unav_ds = [s["ds"] for s in analysis._density_samples() if s["label"] in set(st["unavailable"])]
+                if any(d.get("data_dir") or d.get("h5ad") for d in _unav_ds):
+                    hint += f" {', '.join(st['unavailable'])}: no transcript file."
+                else:
+                    hint += f" {', '.join(st['unavailable'])} loaded from a .zarr: no transcripts."
     return ({"on": bool(want and ready), "gene": gene, "bin": bin_um or 10,
              "opacity": 0.7 if opacity is None else opacity,
              "max": vmax if vmax else None,

@@ -802,6 +802,7 @@ def _run_spillover(seg_source, method, label_kind, source, markers_text, n_marke
         res.update({"source": src, "markers": markers, "marker_info": minfo, "ownership": own,
                     "category": cat, "corrected": corrected, "seg_source": seg_source or "xenium",
                     "n_uncorrected": analysis._an_uncorrected(samples),
+                    "n_genes_uncorrected": analysis._an_uncorrected_genes(samples),
                     "own_frac": own_frac, "lib_shared_genes": prof.get("lib_shared_genes"),
                     "types": prof["types"], "n_cells_type": dict(zip(prof["types"], prof["n"].tolist())),
                     "samples": [{"label": s["label"], "name": s["name"], "n_cells": len(s["df"])} for s in samples],
@@ -863,6 +864,8 @@ def _run_spillover(seg_source, method, label_kind, source, markers_text, n_marke
             msg += " Original counts were used: not every sample has SPLIT-corrected counts."
         if res["n_uncorrected"]:
             msg += " " + analysis._an_uncorrected_note(res["n_uncorrected"]) + "."
+        if res["n_genes_uncorrected"]:
+            msg += " " + analysis._an_uncorrected_genes_note(res["n_genes_uncorrected"]) + "."
         _set("done", msg, result=res)
         print(f"  {msg}", flush=True)
     except jobs._JobCancelled:
@@ -1490,8 +1493,11 @@ def _segqc_sources(run_values=None) -> list:
             if m.shape[0] != core.DATA["expr"].shape[0]:
                 rows = np.arange(len(prim["df"])) if m.shape[0] == len(prim["df"]) else None
             if rows is not None:
+                _x_ccols = dataview._corrected_cols(core.DATA)
+                _x_cgenes = ([g for g in prim["genes"] if g in _x_ccols]
+                             if _x_ccols is not None else prim["genes"])
                 corr = {**prim, "csc": figures._csc_view(core.DATA, "split_corrected_expr"),
-                        "rows": np.asarray(rows), "corrected": True}
+                        "rows": np.asarray(rows), "genes": _x_cgenes, "corrected": True}
         out.append({"label": "Xenium", "value": "xenium", "tool": "xenium", "sample": prim,
                     "corrected": corr, "alt": None})
     panel = dataview._panel_gene_names()
@@ -1502,9 +1508,11 @@ def _segqc_sources(run_values=None) -> list:
         state, lock = core._seg_state(tool)
         with lock:
             loaded = state.get("result")
+        _corr_holder = None
         if loaded is not None and os.path.realpath(str(loaded.get("out_dir", ""))) == os.path.realpath(o["out_dir"]):
             df, expr, xcorr = loaded["cells_df"], loaded.get("expr"), loaded.get("split_corrected_expr")
             gni = loaded.get("gene_name_to_idx") or core.DATA.get("gene_name_to_idx", {})
+            _corr_holder = loaded
         else:
             zarr_path = os.path.join(o["out_dir"], f"spatialdata_{tool}.zarr")
             if not os.path.isdir(zarr_path):
@@ -1519,14 +1527,21 @@ def _segqc_sources(run_values=None) -> list:
                 continue
             gni = (reseg._reseg_zarr_gene_index(zarr_path, expr.shape[1]).get("gene_name_to_idx")
                    or core.DATA.get("gene_name_to_idx", {}))
+            if xcorr is not None:
+                _corr_holder = {"split_corrected_expr": xcorr, "sdata_path": zarr_path}
         if expr is None or not sp.issparse(expr):
             continue
 
         def _smp(m, corrected):
             csc = m.tocsc()
+            s_genes = [g for g in panel if g in gni and gni[g] < csc.shape[1]]
+            if corrected and _corr_holder is not None:
+                _r_ccols = dataview._corrected_cols(_corr_holder)
+                if _r_ccols is not None:
+                    s_genes = [g for g in s_genes if g in _r_ccols]
             return {"label": o["label"], "name": o["label"], "key": dataview._ds_key(core.DATA), "df": df,
                     "csc": csc, "rows": np.arange(len(df)), "gni": gni, "x_offset": 0.0,
-                    "genes": [g for g in panel if g in gni and gni[g] < csc.shape[1]],
+                    "genes": s_genes,
                     "corrected": corrected, "ds": core.DATA}
 
         ok_corr = xcorr is not None and sp.issparse(xcorr) and xcorr.shape[0] == len(df)
@@ -1594,7 +1609,7 @@ def _run_segqc(method, sets_text, source_type, radius, run_values=None) -> None:
         # the denominator of "fraction of transcripts assigned": all gene transcripts of the
         # section, binned once (cached) - computed here when the grid does not exist yet
         scan_needed = (analysis._density_grid(analysis._DENSITY_ALL, analysis._DENSITY_BASE_UM) is None
-                       and bool(core.DATA.get("data_dir")))
+                       and dataview._ds_has_transcripts(core.DATA))
         if scan_needed:
             _set("running", "Segmentation QC: counting all transcripts of the section (once; kept in the cache)…")
         no_grid = _ensure_all_tx_grid(_gen, progress=lambda f: jobs._job_progress(
@@ -1646,8 +1661,8 @@ def _run_segqc(method, sets_text, source_type, radius, run_values=None) -> None:
                         continue
                     smp = {**smp, "rows": np.where(covered, rws, -1)}
                     r0 = np.asarray(s0["rows"])
-                    ref_ident = _qc_metrics({**s0, "rows": np.where(covered, r0, -1)}, lab, sets, None,
-                                            radius, user_pairs or None)["ident_sums"]
+                    ref_ident = _qc_metrics({**s0, "rows": np.where(covered, r0, -1), "genes": smp["genes"]},
+                                            lab, sets, None, radius, user_pairs or None)["ident_sums"]
                 m = _qc_metrics(smp, lab, sets, src_type, radius, user_pairs or None, ref_ident)
                 row = {"id": src["short"], "source": src["label"], "value": src["value"], "counts": mode,
                        "labels": origin, **m["row"], "coverage": coverage,
@@ -2265,7 +2280,8 @@ def _run_coloc(seg_source, method, label_kind, radius, n_perm, placebo_focal=Non
                       f"describe this section only and do not generalise to other sections or donors.")
             if n_perm:
                 msg += f" Smallest achievable p {floor:.3g}."
-                reach = stats._sl_reach(floor, m_tests if S == 1 else int(long.groupby('sample').size().max()))
+                _m_fam = m_tests if S == 1 else (int(long.groupby("sample").size().max()) if len(long) else 0)
+                reach = stats._sl_reach(floor, _m_fam)
                 if reach:
                     msg += f"\n⚠ {reach[0].upper() + reach[1:]} (raise the number of permutations)."
         if prep["computed_defaults"]:
@@ -2472,6 +2488,8 @@ def _spill_csv(res) -> str:
         lines.append(f"# distance {p['band']} um: {p['n']} non-source cells, mean marker share {p['mean_share']:.6g}")
     if res.get("n_uncorrected"):
         lines.append(f"# {analysis._an_uncorrected_note(res['n_uncorrected'])}")
+    if res.get("n_genes_uncorrected"):
+        lines.append(f"# {analysis._an_uncorrected_genes_note(res['n_genes_uncorrected'])}")
     if res.get("lib_shared_genes"):
         lines.append(f"# {analysis._an_lib_note(res['lib_shared_genes'])}")
     return provenance._prov_csv_stamp(res, (provenance._csv_comments(lines) + res["ownership"].to_csv(index=False)))

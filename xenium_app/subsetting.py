@@ -245,6 +245,8 @@ def subset(cluster=None, cell_type=None,
 
     # Masks built without error: save the originals (first subset call) and switch
     if "_df_original" not in core.DATA:
+        if core.DATA.get("split_corrected_expr") is not None and "split_corrected_cols" not in core.DATA:
+            dataview._corrected_cols(core.DATA)
         core.DATA["_df_original"]      = df
         core.DATA["_df_to_expr_orig"]  = _df_to_expr_o
 
@@ -291,9 +293,13 @@ def subset(cluster=None, cell_type=None,
     for _tool, _alt_res, bdf, bmask in _reseg_plans:
         # Save originals on first subset
         if "_cells_df_original" not in _alt_res:
+            if _alt_res.get("split_corrected_expr") is not None and "split_corrected_cols" not in _alt_res:
+                dataview._corrected_cols(_alt_res)
             _alt_res["_cells_df_original"] = _alt_res["cells_df"]
             _alt_res["_expr_original"]      = _alt_res["expr"]
             _alt_res["_corrected_original"] = _alt_res.get("split_corrected_expr")
+            if "split_corrected_cols" in _alt_res:
+                _alt_res["_corrected_cols_original"] = _alt_res["split_corrected_cols"]
 
         _kept_pos = np.where(bmask.values)[0]
         _bdf_sub  = bdf.iloc[_kept_pos]
@@ -301,6 +307,8 @@ def subset(cluster=None, cell_type=None,
         _alt_res["expr"]     = _alt_res["_expr_original"][_kept_pos, :]
         if _alt_res["_corrected_original"] is not None:
             _alt_res["split_corrected_expr"] = _alt_res["_corrected_original"][_kept_pos, :]
+            if "_corrected_cols_original" in _alt_res:
+                _alt_res["split_corrected_cols"] = _alt_res["_corrected_cols_original"]
         print(f"  subset reseg ({_tool}): {len(_bdf_sub):,} / {len(bdf):,} cells selected", flush=True)
 
     dataview._umap_df_cache.clear()
@@ -329,12 +337,17 @@ def unsubset():
         _alt_res["cells_df"] = _alt_res.pop("_cells_df_original")
         _alt_res["expr"]     = _alt_res.pop("_expr_original")
         _orig_corr = _alt_res.pop("_corrected_original")
+        _has_orig_cols = "_corrected_cols_original" in _alt_res
+        _orig_cols = _alt_res.pop("_corrected_cols_original", None)
         if _orig_corr is not None:
             _alt_res["split_corrected_expr"] = _orig_corr
+            if _has_orig_cols:
+                _alt_res["split_corrected_cols"] = _orig_cols
         elif (_alt_res.get("split_corrected_expr") is not None
               and _alt_res["split_corrected_expr"].shape[0] != len(_alt_res["cells_df"])):
             # Corrected matrix sized to the subset cannot be paired with the full cells_df
             _alt_res["split_corrected_expr"] = None
+            _alt_res.pop("split_corrected_cols", None)
             print(f"  unsubset: dropped {_tool} SPLIT-corrected counts computed on the subset "
                   "(re-run SPLIT on the full dataset)", flush=True)
 
@@ -370,7 +383,10 @@ def retry_split_zarr_write(seg_source: str = None) -> None:
     # cells_df row; Xenium: per DATA["expr"] row), while split_corrected_cell_ids
     # lists only the cells RCTD kept - so rows are paired with cell ids here.
     if res is not None:
+        if res.get("split_corrected_expr") is not None and "split_corrected_cols" not in res:
+            dataview._corrected_cols(res)
         corrected_mat     = res.get("split_corrected_expr")
+        corrected_cols    = res.get("split_corrected_cols")
         panel_genes       = res.get("split_panel_genes")
         sdata_path        = res.get("sdata_path", "")
         cells_df          = res.get("cells_df")
@@ -378,8 +394,15 @@ def retry_split_zarr_write(seg_source: str = None) -> None:
             # subset() active: write the full-size copy
             corrected_mat = res["_corrected_original"]
             cells_df      = res["_cells_df_original"]
+            if "_corrected_cols_original" in res:
+                corrected_cols = res["_corrected_cols_original"]
+            elif "split_corrected_cols" not in res:
+                corrected_cols = dataview._read_zarr_corrected_cols(res)
     else:
+        if core.DATA.get("split_corrected_expr") is not None and "split_corrected_cols" not in core.DATA:
+            dataview._corrected_cols(core.DATA)
         corrected_mat     = core.DATA.get("split_corrected_expr")
+        corrected_cols    = core.DATA.get("split_corrected_cols")
         panel_genes       = core.DATA.get("split_panel_genes")
         sdata_path        = core.DATA.get("sdata_path", "")
         cells_df          = core.DATA.get("_df_original", core.DATA.get("df"))
@@ -409,7 +432,7 @@ def retry_split_zarr_write(seg_source: str = None) -> None:
     print(f"  retry_split_zarr_write: writing {corrected_mat.shape} matrix to {sdata_path}",
           flush=True)
     split._split_write_zarr(sdata_path, corrected_mat, cells_df, panel_genes,
-                      corrected_cell_ids=None)
+                      corrected_cell_ids=None, corrected_cols=corrected_cols)
 
 
 def get_genes(file: str = None) -> list:

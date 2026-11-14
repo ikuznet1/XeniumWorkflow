@@ -822,7 +822,17 @@ def _load_zarr_obs_into_df(zarr_path: str, cells_df: pd.DataFrame) -> None:
                 continue
             if _col not in cells_df.columns:
                 try:
-                    _vals = _obs[_col][:]
+                    _node = _obs[_col]
+                    if hasattr(_node, "shape"):
+                        _vals = _node[:]
+                    elif _col == "cluster_split_10" or _col == "niche" or str(_col).startswith("roi_"):
+                        try:
+                            from anndata.io import read_elem as _read_elem
+                        except ImportError:
+                            from anndata.experimental import read_elem as _read_elem
+                        _vals = np.asarray(_read_elem(_node))
+                    else:
+                        continue
                     if _zarr_idx is not None:
                         cells_df[_col] = pd.Series(_vals, index=_zarr_idx).reindex(
                             cells_df.index.astype(str)).values
@@ -830,6 +840,7 @@ def _load_zarr_obs_into_df(zarr_path: str, cells_df: pd.DataFrame) -> None:
                         cells_df[_col] = _vals
                 except Exception:
                     pass
+        regions._normalize_obs_placeholders(cells_df)
     except Exception as _ze:
         print(f"  Warning: could not load obs from zarr: {_ze}", flush=True)
 
@@ -1081,13 +1092,22 @@ def _fast_load_reseg_zarr(zarr_path: str):
         if _col in _RESEG_FOREIGN_OBS:
             continue
         try:
-            _df_data[_col] = _obs[_col][:]
+            _node = _obs[_col]
+            if hasattr(_node, "shape"):
+                _df_data[_col] = _node[:]
+            elif _col == "cluster_split_10" or _col == "niche" or str(_col).startswith("roi_"):
+                try:
+                    from anndata.io import read_elem as _read_elem
+                except ImportError:
+                    from anndata.experimental import read_elem as _read_elem
+                _df_data[_col] = np.asarray(_read_elem(_node))
         except Exception:
             pass
     if "x_centroid" not in _df_data or "y_centroid" not in _df_data:
         raise ValueError("zarr obs missing centroid columns — zarr predates centroid storage")
     cells_df = pd.DataFrame(_df_data, index=pd.Index(_ids, name="cell_id"))
     cells_df.index = cells_df.index.astype(str)
+    regions._normalize_obs_placeholders(cells_df)
 
     # ── expr_mat from X ──────────────────────────────────────────────
     _xgrp = _tbl["X"]
@@ -1411,9 +1431,17 @@ def _load_cached_baysor(out_dir: str) -> None:
                 _baysor_corr = _align_zarr_rows_to_cells(
                     _baysor_corr, _adata_b.obs_names, cells_df, "Baysor")
                 _baysor_corr_imp = list(_adata_b.uns.get("split_corrected_imputed_genes", []))
+                for _acol in _adata_b.obs.columns:
+                    if (_acol not in cells_df.columns
+                            and (_acol == "cluster_split_10" or _acol == "niche"
+                                 or str(_acol).startswith("roi_"))):
+                        _aser = _adata_b.obs[_acol].copy()
+                        _aser.index = _aser.index.astype(str)
+                        cells_df[_acol] = _aser.reindex(cells_df.index.astype(str)).values
                 _load_zarr_boundaries_into_dict(_sdata_b, cell_bounds, "Baysor")
             except Exception as _ze2:
                 print(f"  Warning: could not read Baysor zarr: {_ze2}", flush=True)
+            regions._normalize_obs_placeholders(cells_df)
 
         with core._roi_lock:
             regions._roi_apply_metadata_to_df(cells_df, core._roi_state["rois"])
@@ -1812,9 +1840,17 @@ def _load_cached_proseg(out_dir: str) -> None:
                 _proseg_corr = _align_zarr_rows_to_cells(
                     _proseg_corr, _adata_p.obs_names, cells_df, "Proseg")
                 _proseg_corr_imp = list(_adata_p.uns.get("split_corrected_imputed_genes", []))
+                for _acol in _adata_p.obs.columns:
+                    if (_acol not in cells_df.columns
+                            and (_acol == "cluster_split_10" or _acol == "niche"
+                                 or str(_acol).startswith("roi_"))):
+                        _aser = _adata_p.obs[_acol].copy()
+                        _aser.index = _aser.index.astype(str)
+                        cells_df[_acol] = _aser.reindex(cells_df.index.astype(str)).values
                 _load_zarr_boundaries_into_dict(_sdata_p, cell_bounds, "Proseg")
             except Exception as _ze2:
                 print(f"  Warning: could not read Proseg zarr: {_ze2}", flush=True)
+            regions._normalize_obs_placeholders(cells_df)
 
         # cell_area = outline area (µm²); the zarr of an older run holds Proseg's volume
         # under that name (see _proseg_cell_area)
@@ -2159,6 +2195,12 @@ def _run_baysor(scale: float, min_mol: int, use_prior: bool, prior_conf: float,
         if zarr_path:
             zarr_path = os.path.join(final_dir, os.path.basename(zarr_path))
         out_dir = final_dir
+        cells_df.index = cells_df.index.astype(str)
+        with core._roi_lock:
+            _rois_now = list(core._roi_state["rois"])
+            regions._roi_apply_metadata_to_df(cells_df, _rois_now)
+        if _rois_now and zarr_path and os.path.isdir(zarr_path):
+            _update_reseg_zarr_obs(zarr_path, cells_df)
         _set("done", f"Done — {n_cells:,} cells", result={
             "cells_df":    cells_df,
             "cell_bounds": cell_bounds,
@@ -2490,6 +2532,11 @@ def _run_proseg(voxel_size=None, n_threads=None, n_samples=None,
         # Same string index as the cache-load paths, so plot customdata (str ids)
         # matches for lasso ROIs / ROI metadata in the session that ran Proseg.
         cells_df.index = cells_df.index.astype(str)
+        with core._roi_lock:
+            _rois_now = list(core._roi_state["rois"])
+            regions._roi_apply_metadata_to_df(cells_df, _rois_now)
+        if _rois_now and zarr_path and os.path.isdir(zarr_path):
+            _update_reseg_zarr_obs(zarr_path, cells_df)
         _set("done", f"Done — {n_cells:,} cells", result={
             "cells_df":    cells_df,
             "cell_bounds": cell_bounds,

@@ -61,36 +61,57 @@ def _label_key_for_active_seg(label_key, alt_res=None):
 
 
 def _reseg_cell_type_labels(method: str, alt_res, cell_ids_str):
-    """Cell-type labels of *method* for a Baysor / Proseg run, aligned to *cell_ids_str*
-    ("Unknown" where a cell has none), or None when there are none. Labels that match
-    fewer than 5 % of the run's cells belong to another segmentation (stale): they are
-    removed from _annot_state and None is returned. Every view of a reseg source - Plotly
-    spatial and UMAP, the WebGL colour endpoint - goes through here, so all of them fall
-    back to transcript counts in the same state and leave the same state behind."""
+    """Cell-type labels of *method* for a Baysor / Proseg / Imgseg run, aligned to
+    *cell_ids_str* ("Unknown" where a cell has none), or None when 0 displayed cells
+    have labels. Labels whose own cell IDs match fewer than 5 % of the run's full cell IDs
+    belong to another segmentation (stale): they are removed from _annot_state and None is
+    returned. Valid labels computed on a small (<5 %) subset keep >= 5 % membership in the
+    run's full IDs and are never deleted on unsubset(). Every view of a reseg source -
+    Plotly spatial and UMAP, the WebGL colour endpoint - goes through here."""
     lkey = _labels_key_for_method(method, alt_res)
     with core._annot_lock:
         labels = core._annot_state.get(lkey)
     if labels is None:
         return None
-    aligned = labels.reindex(pd.Index(cell_ids_str)).fillna("Unknown")
-    n_unknown = int((aligned == "Unknown").sum())
-    if n_unknown > len(aligned) * 0.95:
-        print(f"  Warning: cell_type:{method} produced {n_unknown}/{len(aligned)} Unknown "
-              f"— labels index sample: {list(labels.index[:3])!r}, "
-              f"cells sample: {list(cell_ids_str[:3])!r}"
+    raw_idx = labels.index.astype(str)
+    if len(raw_idx) == 0:
+        return None
+    full_df = None
+    if isinstance(alt_res, dict):
+        full_df = alt_res.get("_cells_df_original")
+        if full_df is None:
+            full_df = alt_res.get("cells_df")
+    full_ids = (pd.Index(full_df.index.astype(str))
+                if full_df is not None else pd.Index(cell_ids_str).astype(str))
+    n_in_run = int(raw_idx.isin(full_ids).sum())
+    if n_in_run < len(raw_idx) * 0.05:
+        print(f"  Warning: cell_type:{method} matched only {n_in_run}/{len(raw_idx)} run cells "
+              f"— labels index sample: {list(raw_idx[:3])!r}, "
+              f"cells sample: {list(full_ids[:3])!r}"
               f" — stale labels cleared, re-run annotation", flush=True)
         with core._annot_lock:
             if core._annot_state.get(lkey) is labels:
                 core._annot_state.pop(lkey, None)
         return None
-    return aligned
+    disp_idx = pd.Index(cell_ids_str).astype(str)
+    if len(disp_idx) == 0:
+        return None
+    s = labels if labels.index.equals(raw_idx) else labels.set_axis(raw_idx)
+    if not s.index.is_unique:
+        s = s[~s.index.duplicated()]
+    matched = s.reindex(disp_idx)
+    if not matched.notna().any():
+        return None
+    return matched.fillna("Unknown")
 
 
 def _run_celltypist(model_name: str, labels_key: str = "labels",
-                    expr_override=None, cell_ids_override=None, cache_sig=None) -> None:
+                    expr_override=None, cell_ids_override=None, cache_sig=None,
+                    seg_source: str = None) -> None:
     """Background thread: annotate cells with CellTypist and store results."""
     core._redirect_rpy2_console()
     _gen = jobs._dataset_gen
+    _prov_seg = seg_source if seg_source is not None else provenance._prov_labels_source(labels_key)
 
     def _set(status, message, labels=None):
         with core._annot_lock:
@@ -101,7 +122,7 @@ def _run_celltypist(model_name: str, labels_key: str = "labels",
             if labels is not None:
                 core._annot_state[labels_key] = labels
         if status == "done":
-            provenance._prov_record("annotation", "Cell type annotation: CellTypist", seg_source=provenance._prov_labels_source(labels_key), params={"method": "celltypist", "model": model_name, "labels_key": labels_key}, packages=("celltypist", "scanpy", "anndata"), message=message, result=provenance._prov_labels_summary(labels))
+            provenance._prov_record("annotation", "Cell type annotation: CellTypist", seg_source=_prov_seg, params={"method": "celltypist", "model": model_name, "labels_key": labels_key}, packages=("celltypist", "scanpy", "anndata"), message=message, result=provenance._prov_labels_summary(labels))
 
     try:
         # imports inside the try so a missing package reports an error instead of
@@ -206,7 +227,8 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
                           n_cores: int = 4, labels_key: str = "labels",
                           expr_override=None, cell_ids_override=None,
                           umi_min: int = 20, umi_min_sigma: int = 100,
-                          mode_labels_key: str = None, cache_sig=None) -> None:
+                          mode_labels_key: str = None, cache_sig=None,
+                          seg_source: str = None) -> None:
     """
     Background thread: run RCTD (spacexr) for cell-type assignment.
     Requires the spacexr R package:
@@ -218,6 +240,7 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
 
     _key_for_cache = mode_labels_key or labels_key
     _gen = jobs._dataset_gen
+    _prov_seg = seg_source if seg_source is not None else provenance._prov_labels_source(labels_key)
 
     def _set(status, message, labels=None):
         with core._annot_lock:
@@ -230,7 +253,7 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
                 if mode_labels_key and mode_labels_key != labels_key:
                     core._annot_state[mode_labels_key] = labels
         if status == "done":
-            provenance._prov_record("annotation", "Cell type annotation: RCTD", seg_source=provenance._prov_labels_source(labels_key), params={"method": "rctd", "reference": os.path.basename(str(rds_path or '')), "label_col": label_col, "mode": mode, "n_cores": n_cores, "umi_min": umi_min, "umi_min_sigma": umi_min_sigma, "labels_key": labels_key}, r_packages=("spacexr", "Seurat", "SeuratObject"), message=message, result=provenance._prov_labels_summary(labels))
+            provenance._prov_record("annotation", "Cell type annotation: RCTD", seg_source=_prov_seg, params={"method": "rctd", "reference": os.path.basename(str(rds_path or '')), "label_col": label_col, "mode": mode, "n_cores": n_cores, "umi_min": umi_min, "umi_min_sigma": umi_min_sigma, "labels_key": labels_key}, r_packages=("spacexr", "Seurat", "SeuratObject"), message=message, result=provenance._prov_labels_summary(labels))
 
     try:
         # inside the try so a missing rpy2 reports an error instead of a stuck "running"
@@ -390,7 +413,8 @@ def _run_rctd_annotation(rds_path: str, label_col: str = "Names", mode: str = "f
 
 
 def _run_seurat_annotation(rds_path: str, label_col: str = "Names", labels_key: str = "labels",
-                            expr_override=None, cell_ids_override=None, cache_sig=None) -> None:
+                            expr_override=None, cell_ids_override=None, cache_sig=None,
+                            seg_source: str = None) -> None:
     """
     Background thread: transfer cell type labels from a Seurat RDS reference
     to Xenium cells via PCA + cosine kNN majority voting.
@@ -398,6 +422,7 @@ def _run_seurat_annotation(rds_path: str, label_col: str = "Names", labels_key: 
     """
     core._redirect_rpy2_console()
     _gen = jobs._dataset_gen
+    _prov_seg = seg_source if seg_source is not None else provenance._prov_labels_source(labels_key)
 
     def _set(status, message, labels=None):
         with core._annot_lock:
@@ -408,7 +433,7 @@ def _run_seurat_annotation(rds_path: str, label_col: str = "Names", labels_key: 
             if labels is not None:
                 core._annot_state[labels_key] = labels
         if status == "done":
-            provenance._prov_record("annotation", "Cell type annotation: Seurat kNN", seg_source=provenance._prov_labels_source(labels_key), params={"method": "seurat", "reference": os.path.basename(str(rds_path or '')), "label_col": label_col, "labels_key": labels_key}, r_packages=("Seurat", "SeuratObject"), message=message, result=provenance._prov_labels_summary(labels))
+            provenance._prov_record("annotation", "Cell type annotation: Seurat kNN", seg_source=_prov_seg, params={"method": "seurat", "reference": os.path.basename(str(rds_path or '')), "label_col": label_col, "labels_key": labels_key}, r_packages=("Seurat", "SeuratObject"), message=message, result=provenance._prov_labels_summary(labels))
 
     tmpdir = None        # MatrixMarket export of the reference; removed in the finally
     _r_loaded = False    # the reference was put into R's global env

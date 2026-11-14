@@ -1,6 +1,7 @@
 """SpaGE gene imputation: cache, autoload, the vectorised implementation and the job."""
 
 import os
+import re
 import hashlib
 import numpy as np
 import pandas as pd
@@ -8,6 +9,17 @@ import scipy.sparse as sp
 
 from . import compat, core, jobs, caching, loading, dataview, reseg
 from . import provenance
+
+
+def _spage_parquet_genes(pf) -> list:
+    """Return the imputed gene column names of a ParquetFile *pf*, stripping pandas index
+    columns (string entries in schema.pandas_metadata['index_columns'] and
+    '__index_level_N__' columns) so index metadata is never counted or listed as a gene."""
+    schema = pf.schema_arrow
+    meta = getattr(schema, "pandas_metadata", None) or {}
+    idx_cols = {c for c in (meta.get("index_columns") or []) if isinstance(c, str)}
+    return [name for name in schema.names
+            if name not in idx_cols and not re.match(r"^__index_level_\d+__$", str(name))]
 
 
 # ─── SpaGE imputation ─────────────────────────────────────────────────────────
@@ -159,7 +171,7 @@ def _spage_autoload() -> None:
                 import pyarrow.parquet as _pq_al
                 _pfal = _pq_al.ParquetFile(cache_file)
                 _nr_al = _pfal.metadata.num_rows
-                _genes_al = _pfal.schema_arrow.names
+                _genes_al = _spage_parquet_genes(_pfal)
                 _nc_al = len(_genes_al)
                 if _nr_al * _nc_al > core.SPAGE_STREAM_THRESHOLD:
                     with core._spage_lock:
@@ -412,9 +424,12 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
             _set("running", f"Ranking {len(predict_candidates):,} reference genes by variance…")
             try:
                 with openrlib.rlock:
-                    ro.globalenv[".spage_cand"] = ro.StrVector(predict_candidates)
-                    _auto_top = [str(g) for g in ro.r(_SPAGE_HVG_R)]
-                    ro.r('rm(.spage_cand)')
+                    try:
+                        ro.globalenv[".spage_cand"] = ro.StrVector([str(g) for g in predict_candidates])
+                        _auto_top = [str(g) for g in ro.r(_SPAGE_HVG_R)]
+                    finally:
+                        ro.r('suppressWarnings(rm(list = intersect(".spage_cand", '
+                             'ls(all.names = TRUE, envir = globalenv())), envir = globalenv()))')
             except Exception as _hve:
                 print(f"  SpaGE: variance ranking over the whole reference failed ({_hve}) — "
                       f"falling back to the first 2000 non-panel genes as candidates", flush=True)
@@ -754,10 +769,10 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
             try:
                 import pyarrow.parquet as _pq_c
                 _pf_c = _pq_c.ParquetFile(cache_file)
-                _nc_c = len(_pf_c.schema_arrow.names)
+                _genes_c = _spage_parquet_genes(_pf_c)
+                _nc_c = len(_genes_c)
                 _nr_c = _pf_c.metadata.num_rows
                 if _nr_c * _nc_c > core.SPAGE_STREAM_THRESHOLD:
-                    _genes_c = _pf_c.schema_arrow.names
                     jobs._job_shield()      # Cancel before this point publishes nothing
                     if _alt_res is None:
                         _record_xenium_streamed(cache_file, _genes_c)
@@ -782,17 +797,23 @@ def _run_spage_imputation(rds_path: str, n_pv: int, genes_input: str,
             genes_file = os.path.join(tmpdir, "genes.txt").replace("\\", "/")
             cells_file = os.path.join(tmpdir, "cells.txt").replace("\\", "/")
 
-            # Build R character vector of needed genes
-            genes_r = "c(" + ",".join(f'"{g}"' for g in genes_needed) + ")"
             with openrlib.rlock:
-                ro.r(f"""
-genes_needed <- {genes_r}
-genes_needed <- genes_needed[genes_needed %in% rna_genes]
-mat_sub <- rna_mat_data[genes_needed, ]
-Matrix::writeMM(mat_sub, "{mat_file}")
-writeLines(rownames(mat_sub), "{genes_file}")
-writeLines(colnames(mat_sub), "{cells_file}")
+                try:
+                    ro.globalenv[".spage_need"] = ro.StrVector([str(g) for g in genes_needed])
+                    ro.globalenv[".spage_mat_file"] = str(mat_file)
+                    ro.globalenv[".spage_genes_file"] = str(genes_file)
+                    ro.globalenv[".spage_cells_file"] = str(cells_file)
+                    ro.r("""
+.spage_need <- .spage_need[.spage_need %in% rna_genes]
+mat_sub <- rna_mat_data[.spage_need, , drop = FALSE]
+Matrix::writeMM(mat_sub, .spage_mat_file)
+writeLines(rownames(mat_sub), .spage_genes_file)
+writeLines(colnames(mat_sub), .spage_cells_file)
 """)
+                finally:
+                    ro.r('suppressWarnings(rm(list = intersect(c(".spage_need", ".spage_mat_file", '
+                         '".spage_genes_file", ".spage_cells_file", "mat_sub"), '
+                         'ls(all.names = TRUE, envir = globalenv())), envir = globalenv()))')
             mat_sp = sio.mmread(mat_file).T.tocsr()   # cells × genes
             with open(genes_file) as f:
                 rna_genes_sub = [l.strip() for l in f]
@@ -801,7 +822,7 @@ writeLines(colnames(mat_sub), "{cells_file}")
 
         # Free R memory
         with openrlib.rlock:
-            ro.r("rm(seurat_ref, rna_ref, rna_mat_data, mat_sub); gc()")
+            ro.r('suppressWarnings(rm(seurat_ref, rna_ref, rna_mat_data)); gc()')
 
         # ── Convert to dense DataFrame ───────────────────────────────────
         _set("running", f"Building expression matrices ({len(rna_cells):,} ref cells)…")
@@ -931,7 +952,8 @@ writeLines(colnames(mat_sub), "{cells_file}")
                 from rpy2.rinterface_lib import openrlib as _orl_fin
                 with _orl_fin.rlock:
                     _ro_fin.r('suppressWarnings(rm(list = intersect(c("seurat_ref", "rna_ref", '
-                              '"rna_mat_data", "mat_sub", "rna_genes", "genes_needed", ".spage_cand"), '
+                              '"rna_mat_data", "mat_sub", "rna_genes", "genes_needed", ".spage_cand", '
+                              '".spage_need", ".spage_mat_file", ".spage_genes_file", ".spage_cells_file"), '
                               'ls(all.names = TRUE, envir = globalenv())), envir = globalenv())); '
                               'invisible(gc())')
             except Exception:
@@ -1011,21 +1033,25 @@ def run_spage(rds_path: str, genes_file: str = None, n_pv: int = 50,
 
     # Detect active reseg so imputation runs against the right cells
     seg_source = None
+    _alt_res = None
     with core._proseg_lock:
         if core._proseg_state["status"] == "done" and core._proseg_state.get("result"):
-            _res_od = core._proseg_state["result"].get("out_dir", "")
+            _alt_res = core._proseg_state["result"]
+            _res_od = _alt_res.get("out_dir", "")
             _tag = os.path.basename(_res_od).rsplit("_", 1)[-1] if _res_od else ""
             seg_source = f"proseg:{_tag}" if _tag else "proseg"
     if seg_source is None:
         with core._baysor_lock:
             if core._baysor_state["status"] == "done" and core._baysor_state.get("result"):
-                _res_od = core._baysor_state["result"].get("out_dir", "")
+                _alt_res = core._baysor_state["result"]
+                _res_od = _alt_res.get("out_dir", "")
                 _tag = os.path.basename(_res_od).rsplit("_", 1)[-1] if _res_od else ""
                 seg_source = f"baysor:{_tag}" if _tag else "baysor"
     if seg_source is None:
         with core._imgseg_lock:
             if core._imgseg_state["status"] == "done" and core._imgseg_state.get("result"):
-                _res_od = core._imgseg_state["result"].get("out_dir", "")
+                _alt_res = core._imgseg_state["result"]
+                _res_od = _alt_res.get("out_dir", "")
                 _tag = os.path.basename(_res_od).rsplit("_", 1)[-1] if _res_od else ""
                 seg_source = f"imgseg:{_tag}" if _tag else "imgseg"
     if seg_source:
@@ -1052,4 +1078,5 @@ def run_spage(rds_path: str, genes_file: str = None, n_pv: int = 50,
     jobs._job_start("spage", "SpaGE imputation", _run_spage_imputation,
                args=(rds_path, n_pv, genes_input, seg_source),
                kwargs=dict(use_corrected=use_corrected),
-               state=core._spage_state, lock=core._spage_lock, copy_context=True)
+               state=core._spage_state, lock=core._spage_lock, copy_context=True,
+               uses_run=_alt_res)

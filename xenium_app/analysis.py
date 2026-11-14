@@ -179,7 +179,17 @@ def _an_samples(seg_source="xenium", use_corrected: bool = False) -> list:
         genes = [g for g in panel if g in gni and gni[g] < csc.shape[1]]
         ds = core.DATA if ds is None else ds
         n_unc = 0
+        n_unc_genes = 0
+        unc_genes = ()
         if key == "split_corrected_expr":
+            # Panel genes absent from the SPLIT reference carry zero padding columns, not
+            # measured zeros: restrict the sample's gene list to columns SPLIT covered.
+            ccols = dataview._corrected_cols(holder)
+            if ccols is not None:
+                unc_genes = tuple(g for g in genes if g not in ccols)
+                n_unc_genes = len(unc_genes)
+                if n_unc_genes:
+                    genes = [g for g in genes if g in ccols]
             # Cells without corrected counts (dropped by RCTD, or outside the subset SPLIT
             # ran on) have an empty padding row: they are not in this view of the matrix.
             cov = dataview._corrected_covered(holder)
@@ -191,6 +201,7 @@ def _an_samples(seg_source="xenium", use_corrected: bool = False) -> list:
         out.append({"label": label, "df": df, "csc": csc, "rows": rows, "gni": gni,
                     "genes": genes, "x_offset": float(x_off or 0.0),
                     "corrected": key == "split_corrected_expr", "n_uncorrected": n_unc,
+                    "n_genes_uncorrected": n_unc_genes, "_uncorrected_genes": unc_genes,
                     "ds": ds, "key": dataview._ds_key(ds), "name": dataview._ds_name(ds)})
 
     if alt is not None:
@@ -241,6 +252,28 @@ def _an_uncorrected_note(n) -> str:
             f"correction or outside the cells it was run on) {'were' if n != 1 else 'was'} left out")
 
 
+def _an_uncorrected_genes(samples) -> int:
+    """Panel genes left out because the SPLIT reference lacked them (no corrected counts)."""
+    if not samples:
+        return 0
+    named = set()
+    for s in samples:
+        for g in s.get("_uncorrected_genes") or ():
+            named.add(str(g))
+    if named:
+        return len(named)
+    return int(max((int(s.get("n_genes_uncorrected") or 0) for s in samples), default=0))
+
+
+def _an_uncorrected_genes_note(n) -> str:
+    """Sentence for status lines and CSV headers ("" when no panel gene was left out)."""
+    n = int(n or 0)
+    if not n:
+        return ""
+    return (f"{n:,} panel gene{'s' if n != 1 else ''} absent from the SPLIT reference "
+            f"(no corrected counts) {'were' if n != 1 else 'was'} left out")
+
+
 def _an_matrix_digest(m) -> str:
     """Content fingerprint of a count matrix for disk-cache keys: shape, number of stored
     values and a CRC of the values and of their positions. Two matrices of the same cells
@@ -256,7 +289,7 @@ def _an_matrix_digest(m) -> str:
 def _an_view_key(seg_source, use_corrected, samples) -> tuple:
     """Identifies the cells and matrices of a view (for the caches below)."""
     return (jobs._dataset_gen, core._subset_version, str(seg_source or "xenium"), bool(use_corrected),
-            tuple((id(s["csc"]), len(s["df"]), s["corrected"]) for s in samples))
+            tuple((id(s["csc"]), len(s["df"]), s["corrected"], len(s["genes"])) for s in samples))
 
 
 def _an_common_genes(samples) -> list:
@@ -836,6 +869,7 @@ def _de_compute(samples, masks_a, masks_b, progress=None) -> dict:
     return {"table": table, "n_a": n_a, "n_b": n_b, "n_overlap": n_overlap,
             "n_no_matrix": n_nomat, "n_genes": len(genes), "n_samples": len(samples),
             "corrected": bool(samples[0]["corrected"]),
+            "n_genes_uncorrected": _an_uncorrected_genes(samples),
             # number of shared genes the libraries were summed over, when panels differ
             "lib_shared_genes": len(genes) if _an_panels_differ(samples, genes) else None,
             "median_counts_a": med_a, "median_counts_b": med_b,
@@ -950,6 +984,8 @@ def _run_de(spec_a, spec_b, seg_source, method, color_by, use_corrected, options
                      f"{res['lib_shared_genes']:,} shared genes that are tested.")
         if res.get("n_uncorrected"):
             _msg += " " + _an_uncorrected_note(res["n_uncorrected"]) + "."
+        if res.get("n_genes_uncorrected"):
+            _msg += " " + _an_uncorrected_genes_note(res["n_genes_uncorrected"]) + "."
         _msg += (f"\nUnit of the p-values: {res['units_note']} (they are not, when the groups come "
                  f"from few samples: the p-values are then far too small).")
         _msg += "\n" + _depth_note(res["median_counts_a"], res["median_counts_b"], res["depth_ratio"])
@@ -1425,16 +1461,19 @@ def _run_geneset_score(name, seg_source, use_corrected) -> None:
         _dropped = len(info["found"]) - len(info["used"])
         _smp = _an_samples(seg_source, use_corrected)
         _unc_note = _an_uncorrected_note(_an_uncorrected(_smp))
+        _unc_g_note = _an_uncorrected_genes_note(_an_uncorrected_genes(_smp))
         _corr = bool(_smp) and all(s["corrected"] for s in _smp)
         _set("done", f"Gene set '{name}': {len(info['used'])} genes scored against "
                      f"{info['n_control']} control genes."
                      + (f" {_dropped} gene(s) without any variance left out." if _dropped else "")
                      + _miss
                      + (f" {_unc_note}; they have no score." if _unc_note else "")
+                     + (f" {_unc_g_note}." if _unc_g_note else "")
                      + (" Original counts were used: SPLIT-corrected counts do not exist for every sample "
                         "of the view." if use_corrected and not _corr else "")
                      + f" Pick 'Gene set: {name}' under Color By.",
              used={"corrected": _corr, "n_uncorrected": int(_an_uncorrected(_smp)),
+                   "n_genes_uncorrected": int(_an_uncorrected_genes(_smp)),
                    "n_genes_used": len(info["used"]), "n_control": int(info["n_control"])})
     except jobs._JobCancelled:
         raise
@@ -1606,16 +1645,16 @@ def _density_write(path: str, scan: dict, gene: str) -> None:
 
 
 def _density_ready(gene) -> bool:
-    return bool(gene) and core.DATA.get("data_dir") is not None and os.path.exists(_density_cache_file(gene))
+    return bool(gene) and dataview._ds_has_transcripts(core.DATA) and os.path.exists(_density_cache_file(gene))
 
 
 def _density_status(gene) -> dict:
     """Per sample of the view, whether *gene*'s grid exists: {ready, missing (has
-    transcripts, no grid yet), unavailable (loaded from a .zarr)} as lists of labels."""
+    transcripts, no grid yet), unavailable (no transcript file)} as lists of labels."""
     out = {"ready": [], "missing": [], "unavailable": []}
     prov = _density_virtual(gene)
     for smp in _density_samples():
-        if not smp["data_dir"]:
+        if not dataview._ds_has_transcripts(smp["ds"]):
             out["unavailable"].append(smp["label"])
         elif gene and (prov["grid"](gene, smp["ds"]) is not None if prov is not None
                        else os.path.exists(_density_cache_file(gene, smp["ds"]))):
@@ -1855,11 +1894,16 @@ def _run_density(genes, _unused=None) -> None:
         # every sample of the view that has its transcripts (a sample loaded from a .zarr
         # has none): one grid per sample and gene, in that sample's own cache directory
         smps = _density_samples()
-        todo = [s for s in smps if s["data_dir"]]
-        skipped = [s["label"] for s in smps if not s["data_dir"]]
+        todo = [s for s in smps if dataview._ds_has_transcripts(s["ds"])]
+        skipped = [s["label"] for s in smps if not dataview._ds_has_transcripts(s["ds"])]
         if not todo:
-            _set("error", "Transcript density needs the Xenium output directory "
-                          "(transcripts.parquet); this dataset was " + dataview._origin_phrase() + ".")
+            if any(s["ds"].get("data_dir") for s in smps):
+                _set("error", "Transcript density needs transcripts.parquet or transcripts.zarr.zip; "
+                              + ("this bundle directory has cells only (no transcript file)."
+                                 if len(smps) == 1 else "none of the loaded samples has a transcript file."))
+            else:
+                _set("error", "Transcript density needs the Xenium output directory "
+                              "(transcripts.parquet); this dataset was " + dataview._origin_phrase() + ".")
             return
         multi = len(smps) > 1
         _t0 = _time.time()
@@ -1879,7 +1923,11 @@ def _run_density(genes, _unused=None) -> None:
             msgs.append(f"{name}{' (' + smp['label'] + ')' if multi else ''}: {scan['total']:,} transcripts")
         with _density_lock:
             _density_state["version"] += 1
-        _skip = (f" No transcripts for {', '.join(skipped)} (loaded from a .zarr): no grid there."
+        _skip_ds = [s["ds"] for s in smps if not dataview._ds_has_transcripts(s["ds"])]
+        _skip_why = ("no transcript file"
+                     if any(d.get("data_dir") or d.get("h5ad") for d in _skip_ds)
+                     else "loaded from a .zarr")
+        _skip = (f" No transcripts for {', '.join(skipped)} ({_skip_why}): no grid there."
                  if skipped else "")
         _set("done", ("Binned " + "; ".join(msgs) + f" ({_time.time() - _t0:.1f} s)." if msgs
                       else "Grid loaded from the cache.") + _skip)

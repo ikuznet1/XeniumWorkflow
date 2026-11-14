@@ -641,90 +641,109 @@ def spatialdata2seurat(
         print("Building Seurat object in R …", flush=True)
 
         output_rds_r = output_rds.replace("\\", "/")
-        assay_r      = assay_name
-        fov_r        = fov_name
+        assay_r      = str(assay_name)
+        fov_r        = str(fov_name)
 
-        ro.r(f"""
+        try:
+            ro.globalenv[".sd2s_panel_mtx"] = str(panel_mtx)
+            ro.globalenv[".sd2s_panel_genes_file"] = str(panel_genes_file)
+            ro.globalenv[".sd2s_panel_cells_file"] = str(panel_cells_file)
+            ro.globalenv[".sd2s_meta_file"] = str(meta_file)
+            ro.globalenv[".sd2s_assay"] = assay_r
+            ro.globalenv[".sd2s_fov"] = fov_r
+            ro.globalenv[".sd2s_output_rds"] = str(output_rds_r)
+            ro.globalenv[".sd2s_cents_file"] = str(cents_file)
+            ro.globalenv[".sd2s_imp_mtx"] = str(imp_mtx) if (include_imputed and imp_mtx) else ""
+            ro.globalenv[".sd2s_imp_genes_file"] = str(imp_genes_file or "")
+            ro.globalenv[".sd2s_imp_cells_file"] = str(imp_cells_file or "")
+            ro.globalenv[".sd2s_cell_seg_file"] = str(cell_seg_file or "")
+            ro.globalenv[".sd2s_nuc_seg_file"] = str(nuc_seg_file or "")
+            ro.globalenv[".sd2s_umap_file"] = str(umap_file or "")
+
+            ro.r("""
 # ── Read panel matrix ──────────────────────────────────────────────────────────
-.panel_mat   <- Matrix::readMM("{panel_mtx}")
-.panel_genes <- readLines("{panel_genes_file}")
-.panel_cells <- readLines("{panel_cells_file}")
+.panel_mat   <- Matrix::readMM(.sd2s_panel_mtx)
+.panel_genes <- readLines(.sd2s_panel_genes_file)
+.panel_cells <- readLines(.sd2s_panel_cells_file)
 rownames(.panel_mat) <- .panel_genes
 colnames(.panel_mat) <- .panel_cells
 .panel_mat   <- as(.panel_mat, "CsparseMatrix")
 
 # ── Read metadata ──────────────────────────────────────────────────────────────
-.meta_df <- read.csv("{meta_file}", row.names=1, stringsAsFactors=FALSE)
+.meta_df <- read.csv(.sd2s_meta_file, row.names=1, stringsAsFactors=FALSE)
 
 # ── Create Seurat object ───────────────────────────────────────────────────────
 .seurat <- CreateSeuratObject(
     counts    = .panel_mat,
-    assay     = "{assay_r}",
+    assay     = .sd2s_assay,
     meta.data = .meta_df
 )
 
 # ── Add imputed assay (if present) ────────────────────────────────────────────
-{"" if not (include_imputed and imp_mtx) else f'''
-.imp_mat   <- Matrix::readMM("{imp_mtx}")
-.imp_genes <- readLines("{imp_genes_file}")
-.imp_cells <- readLines("{imp_cells_file}")
-rownames(.imp_mat) <- .imp_genes
-colnames(.imp_mat) <- .imp_cells
-.imp_mat   <- as(.imp_mat, "CsparseMatrix")
-.seurat[["Imputed"]] <- CreateAssayObject(counts = .imp_mat)
-'''}
+if (nzchar(.sd2s_imp_mtx)) {
+    .imp_mat   <- Matrix::readMM(.sd2s_imp_mtx)
+    .imp_genes <- readLines(.sd2s_imp_genes_file)
+    .imp_cells <- readLines(.sd2s_imp_cells_file)
+    rownames(.imp_mat) <- .imp_genes
+    colnames(.imp_mat) <- .imp_cells
+    .imp_mat   <- as(.imp_mat, "CsparseMatrix")
+    .seurat[["Imputed"]] <- CreateAssayObject(counts = .imp_mat)
+}
 
 # ── Build FOV with centroids ──────────────────────────────────────────────────
-.cents_df      <- read.csv("{cents_file}", stringsAsFactors=FALSE)
+.cents_df      <- read.csv(.sd2s_cents_file, stringsAsFactors=FALSE)
 rownames(.cents_df) <- .cents_df$cell
 .cents_df$cell <- NULL
 .centroids     <- CreateCentroids(.cents_df)
 
 .fov_coords <- list(centroids = .centroids)
 
-{"" if not cell_seg_file else f'''
-.cell_seg_long <- read.csv("{cell_seg_file}", stringsAsFactors=FALSE)
-.fov_coords[["segmentation"]] <- CreateSegmentation(.cell_seg_long)
-'''}
+if (nzchar(.sd2s_cell_seg_file)) {
+    .cell_seg_long <- read.csv(.sd2s_cell_seg_file, stringsAsFactors=FALSE)
+    .fov_coords[["segmentation"]] <- CreateSegmentation(.cell_seg_long)
+}
 
-{"" if not nuc_seg_file else f'''
-.nuc_seg_long <- read.csv("{nuc_seg_file}", stringsAsFactors=FALSE)
-.fov_coords[["nucleus_segmentation"]] <- CreateSegmentation(.nuc_seg_long)
-'''}
+if (nzchar(.sd2s_nuc_seg_file)) {
+    .nuc_seg_long <- read.csv(.sd2s_nuc_seg_file, stringsAsFactors=FALSE)
+    .fov_coords[["nucleus_segmentation"]] <- CreateSegmentation(.nuc_seg_long)
+}
 
 .fov <- CreateFOV(
     coords = .fov_coords,
     type   = names(.fov_coords),
-    assay  = "{assay_r}"
+    assay  = .sd2s_assay
 )
-.seurat[["{fov_r}"]] <- .fov
+.seurat[[.sd2s_fov]] <- .fov
 
 # ── Add UMAP reduction ────────────────────────────────────────────────────────
-{"" if not umap_file else f'''
-.umap_df         <- read.csv("{umap_file}", stringsAsFactors=FALSE)
-rownames(.umap_df) <- .umap_df$cell
-.umap_df$cell    <- NULL
-.umap_mat        <- as.matrix(.umap_df)
-colnames(.umap_mat) <- c("UMAP_1", "UMAP_2")
-.seurat[["umap"]] <- CreateDimReducObject(
-    embeddings = .umap_mat,
-    key        = "UMAP_",
-    assay      = "{assay_r}"
-)
-rm(.umap_df, .umap_mat)
-'''}
+if (nzchar(.sd2s_umap_file)) {
+    .umap_df         <- read.csv(.sd2s_umap_file, stringsAsFactors=FALSE)
+    rownames(.umap_df) <- .umap_df$cell
+    .umap_df$cell    <- NULL
+    .umap_mat        <- as.matrix(.umap_df)
+    colnames(.umap_mat) <- c("UMAP_1", "UMAP_2")
+    .seurat[["umap"]] <- CreateDimReducObject(
+        embeddings = .umap_mat,
+        key        = "UMAP_",
+        assay      = .sd2s_assay
+    )
+}
 
 # ── Save ───────────────────────────────────────────────────────────────────────
-saveRDS(.seurat, file="{output_rds_r}")
-cat(sprintf("Saved: %s\\n", "{output_rds_r}"))
-
-# Cleanup large temporaries
-rm(.panel_mat, .meta_df, .cents_df, .centroids, .fov_coords, .fov)
-if (exists(".imp_mat"))     rm(.imp_mat)
-if (exists(".cell_seg_long")) rm(.cell_seg_long)
-if (exists(".nuc_seg_long"))  rm(.nuc_seg_long)
-gc()
+saveRDS(.seurat, file = .sd2s_output_rds)
+cat(sprintf("Saved: %s\\n", .sd2s_output_rds))
 """)
+        finally:
+            ro.r('suppressWarnings(rm(list = intersect(c('
+                 '".sd2s_panel_mtx", ".sd2s_panel_genes_file", ".sd2s_panel_cells_file", '
+                 '".sd2s_meta_file", ".sd2s_assay", ".sd2s_fov", ".sd2s_output_rds", '
+                 '".sd2s_cents_file", ".sd2s_imp_mtx", ".sd2s_imp_genes_file", '
+                 '".sd2s_imp_cells_file", ".sd2s_cell_seg_file", ".sd2s_nuc_seg_file", '
+                 '".sd2s_umap_file", ".panel_mat", ".panel_genes", ".panel_cells", '
+                 '".meta_df", ".seurat", ".imp_mat", ".imp_genes", ".imp_cells", '
+                 '".cents_df", ".centroids", ".fov_coords", ".fov", '
+                 '".cell_seg_long", ".nuc_seg_long", ".umap_df", ".umap_mat"), '
+                 'ls(all.names = TRUE, envir = globalenv())), envir = globalenv())); gc()')
 
     print(f"Done → {output_rds}", flush=True)
     return output_rds

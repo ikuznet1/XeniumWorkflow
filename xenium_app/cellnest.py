@@ -13,7 +13,8 @@ from . import core, jobs
 
 # ─── CellNEST helper functions ────────────────────────────────────────────────
 
-def _load_cellnest_data(folder: str, dataset_name: str, strip_suffix: str = ""):
+def _load_cellnest_data(folder: str, dataset_name: str, strip_suffix: str = "",
+                        seg_source: str = None):
     """Load CellNEST output files in a background thread and store in _cellnest_state."""
     import os, traceback
     _gen = jobs._dataset_gen
@@ -66,6 +67,8 @@ def _load_cellnest_data(folder: str, dataset_name: str, strip_suffix: str = ""):
         # ── Map CellNEST barcodes → Proseg/app cell IDs ──────────────────────
         # Barcode format: "{cell_id}_4" — strip suffix to get the app cell ID directly.
         # Build barcode → app_cell_id map from the barcodes list.
+        strip_suffix = str(strip_suffix or "")
+
         def _strip(barcode_str):
             s = str(barcode_str)
             if strip_suffix and s.endswith(strip_suffix):
@@ -82,48 +85,109 @@ def _load_cellnest_data(folder: str, dataset_name: str, strip_suffix: str = ""):
         print(f"[CellNEST] Direct barcode→ID mapping; "
               f"sample from_app_id={ccc_df['from_app_id'].head(3).tolist()}", flush=True)
 
-        # ── Join Proseg/app annotations onto ccc_df ───────────────────────────
+        # ── Join segmentation annotations onto ccc_df ─────────────────────────
         annot_cols = []
-        with core._proseg_lock:
-            _pr = core._proseg_state.get("result")
-        with core._baysor_lock:
-            _br = core._baysor_state.get("result")
+
+        def _reseg_full_df(tool_name):
+            st, lk = core._seg_state(tool_name)
+            if st is None or lk is None:
+                return None
+            with lk:
+                if st.get("status") != "done":
+                    return None
+                res = st.get("result")
+                if not isinstance(res, dict) or res.get("cells_df") is None:
+                    return None
+                orig = res.get("_cells_df_original")
+                return orig if orig is not None else res["cells_df"]
+
+        def _xenium_full_df():
+            orig = core.DATA.get("_df_original")
+            if orig is not None:
+                return orig
+            return core.DATA.get("df")
+
+        active_tool = core._seg_tool(seg_source) if seg_source else None
+        ordered_sources = []
+        if active_tool in ("proseg", "baysor", "imgseg", "xenium"):
+            ordered_sources.append(active_tool)
+        for _src in ("proseg", "baysor", "imgseg", "xenium"):
+            if _src not in ordered_sources:
+                ordered_sources.append(_src)
+
         seg_df = None
-        if _pr is not None and "cells_df" in _pr:
-            seg_df = _pr["cells_df"]
-        elif _br is not None and "cells_df" in _br:
-            seg_df = _br["cells_df"]
-        else:
-            seg_df = core.DATA["df"]
+        best_src = None
+        best_frac = 0.0
+        n_endpoints = 2 * len(ccc_df)
+        if n_endpoints > 0:
+            from_ids = ccc_df["from_app_id"].astype(str)
+            to_ids = ccc_df["to_app_id"].astype(str)
+            for _src in ordered_sources:
+                cand_df = _xenium_full_df() if _src == "xenium" else _reseg_full_df(_src)
+                if cand_df is None or len(cand_df) == 0:
+                    continue
+                cand_idx = pd.Index(cand_df.index.astype(str))
+                n_matched = int(from_ids.isin(cand_idx).sum()) + int(to_ids.isin(cand_idx).sum())
+                if n_matched <= 0:
+                    continue
+                frac = n_matched / n_endpoints
+                if frac > best_frac:
+                    best_frac = frac
+                    best_src = _src
+                    seg_df = cand_df
 
         if seg_df is not None:
+            print(f"[CellNEST] Matched segmentation table '{best_src}' "
+                  f"(endpoint match fraction={best_frac:.1%})", flush=True)
             cand_cols = [c for c in seg_df.columns
                          if c.startswith("cluster") or c.startswith("cell_type")]
             if cand_cols:
                 seg_sub = seg_df[cand_cols].copy()
                 seg_sub.index = seg_sub.index.astype(str)
+                if not seg_sub.index.is_unique:
+                    seg_sub = seg_sub[~seg_sub.index.duplicated()]
                 for col in cand_cols:
-                    ccc_df[f"from_{col}"] = ccc_df["from_app_id"].map(seg_sub[col])
-                    ccc_df[f"to_{col}"]   = ccc_df["to_app_id"].map(seg_sub[col])
-                    annot_cols.append(col)
+                    f_vals = ccc_df["from_app_id"].map(seg_sub[col])
+                    t_vals = ccc_df["to_app_id"].map(seg_sub[col])
+                    if f_vals.isna().all() and t_vals.isna().all():
+                        print(f"[CellNEST] Skipping column {col!r} from {best_src}: "
+                              f"all mapped edge values are NaN", flush=True)
+                        continue
+                    ccc_df[f"from_{col}"] = f_vals
+                    ccc_df[f"to_{col}"]   = t_vals
+                    if col not in annot_cols:
+                        annot_cols.append(col)
                 print(f"[CellNEST] Joined {len(annot_cols)} annotation columns: {annot_cols[:5]}", flush=True)
             else:
                 print("[CellNEST] No cluster/cell_type columns found in seg df", flush=True)
+        else:
+            print("[CellNEST] No segmentation table matched CellNEST barcodes (>0 matches required)", flush=True)
 
         # ── Also join annotation labels from _annot_state (Seurat/RCTD/CellTypist) ──
         with core._annot_lock:
             annot_series = [(k, v.copy()) for k, v in core._annot_state.items()
                             if isinstance(v, pd.Series) and len(v) > 0]
+        joined_annot_keys = []
         for key, labels in annot_series:
             # key like "labels_proseg", "labels_seurat_proseg:abc12345"
             # Make a short human-readable column name
             col_name = key.replace("labels_", "celltype_", 1)
             labels.index = labels.index.astype(str)
-            ccc_df[f"from_{col_name}"] = ccc_df["from_app_id"].map(labels)
-            ccc_df[f"to_{col_name}"]   = ccc_df["to_app_id"].map(labels)
-            annot_cols.append(col_name)
-        if annot_series:
-            print(f"[CellNEST] Joined annotation-state labels: {[k for k,_ in annot_series]}", flush=True)
+            if not labels.index.is_unique:
+                labels = labels[~labels.index.duplicated()]
+            f_vals = ccc_df["from_app_id"].map(labels)
+            t_vals = ccc_df["to_app_id"].map(labels)
+            if f_vals.isna().all() and t_vals.isna().all():
+                print(f"[CellNEST] Skipping annotation {key!r} ({col_name!r}): "
+                      f"all mapped edge values are NaN", flush=True)
+                continue
+            ccc_df[f"from_{col_name}"] = f_vals
+            ccc_df[f"to_{col_name}"]   = t_vals
+            if col_name not in annot_cols:
+                annot_cols.append(col_name)
+            joined_annot_keys.append(key)
+        if joined_annot_keys:
+            print(f"[CellNEST] Joined annotation-state labels: {joined_annot_keys}", flush=True)
 
         jobs._job_check()   # last cancellation point
         with core._cellnest_lock:

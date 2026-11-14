@@ -3,10 +3,11 @@
 import os
 import json
 import hashlib
+import numpy as np
 import pandas as pd
 
 from . import provenance
-from . import compat, core, jobs, caching, annotation
+from . import compat, core, jobs, caching, annotation, regions
 
 
 # ─── SpatialData / Sopa backend ───────────────────────────────────────────────
@@ -91,14 +92,30 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
     """Background thread: write current SpatialData + analysis results to disk."""
     _gen = jobs._dataset_gen
 
-    def _set(status, msg):
+    def _set(status, msg, *, roi_filter_applied: bool = False, n_cells_exported: int = 0):
         with core._save_sdata_lock:
             core._save_sdata_state["status"]  = status
             core._save_sdata_state["message"] = msg
         if status == "running":
             jobs._job_progress(msg)
         if status == "done":
-            provenance._prov_record("save", seg_source=seg_source, params={"file": os.path.basename(str(save_path).rstrip("/")), "roi_only": roi_only}, packages=("spatialdata", "anndata", "zarr"), message=msg)
+            provenance._prov_record(
+                "save",
+                seg_source=seg_source,
+                params={
+                    "file": os.path.basename(str(save_path).rstrip("/")),
+                    "roi_only": bool(roi_only),
+                    "roi_filter_applied": bool(roi_filter_applied),
+                    "n_cells_exported": int(n_cells_exported),
+                },
+                result={
+                    "roi_filter_applied": bool(roi_filter_applied),
+                    "n_cells_exported": int(n_cells_exported),
+                    "n_cells": int(n_cells_exported),
+                },
+                packages=("spatialdata", "anndata", "zarr"),
+                message=msg,
+            )
 
     try:
         import spatialdata as sd
@@ -153,22 +170,65 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
 
         # ── Determine ROI cell-ID filter ───────────────────────────────────────
         roi_ids = None
+        roi_notice = None
         if roi_only and cells_df is not None:
             with core._roi_lock:
                 rois = list(core._roi_state["rois"])
+            roi_cols = [c for c in cells_df.columns if c.startswith("roi_")]
+
+            def _valid_roi_mask(cols):
+                m = np.zeros(len(cells_df), dtype=bool)
+                for _rc in cols:
+                    _v = cells_df[_rc]
+                    m |= (_v.notna() & ~_v.astype(str).isin(regions._OBS_PLACEHOLDERS)).fillna(False).to_numpy(dtype=bool)
+                return m
+
             if rois:
-                roi_cols = [c for c in cells_df.columns if c.startswith("roi_")]
                 if roi_cols:
-                    mask    = cells_df[roi_cols].notna().any(axis=1)
-                    roi_ids = set(cells_df[mask].index.astype(str))
+                    mask    = _valid_roi_mask(roi_cols)
+                    roi_ids = set(cells_df.index[mask].astype(str))
                     print(f"  save_spatialdata: ROI filter — {len(roi_ids):,} of {len(cells_df):,} cells", flush=True)
                 else:
+                    roi_notice = "ROI only: no ROI columns found — all cells exported"
                     print("  save_spatialdata: roi_only requested but no ROI columns found — exporting all cells", flush=True)
+            else:
+                mask = _valid_roi_mask(roi_cols) if roi_cols else np.zeros(len(cells_df), dtype=bool)
+                if mask.any():
+                    roi_ids = set(cells_df.index[mask].astype(str))
+                    print(f"  save_spatialdata: ROI filter (stored columns) — {len(roi_ids):,} of {len(cells_df):,} cells", flush=True)
+                else:
+                    roi_notice = "ROI only: no ROIs defined — all cells exported"
+                    print("  save_spatialdata: roi_only requested but no ROIs defined — exporting all cells", flush=True)
+        elif roi_only:
+            roi_notice = "ROI only: no ROIs defined — all cells exported"
+            print("  save_spatialdata: roi_only requested but no ROIs defined — exporting all cells", flush=True)
 
         # ── Attach analysis results to sdata table ─────────────────────────────
         out_tbl = None
+        _preserved_ccols = None
         if "table" in sdata.tables:
             tbl = sdata.tables["table"]
+            if "X_corrected" in tbl.layers:
+                _src_holder = _alt_res if _alt_res is not None else core.DATA
+                if isinstance(_src_holder, dict) and "split_corrected_cols" in _src_holder:
+                    _raw_ccols = _src_holder.get("split_corrected_cols")
+                    if _raw_ccols is not None:
+                        _preserved_ccols = [str(g) for g in list(_raw_ccols)]
+                    else:
+                        tbl.uns.pop("split_corrected_cols", None)
+                elif tbl.uns.get("split_corrected_cols") is not None:
+                    _preserved_ccols = [str(g) for g in list(tbl.uns["split_corrected_cols"])]
+                elif sdata_path and os.path.isdir(sdata_path):
+                    try:
+                        import zarr as _zarr_mod
+                        _zr = _zarr_mod.open_group(sdata_path, mode="r", use_consolidated=False)
+                        _raw_attr = _zr["tables"]["table"]["layers"]["X_corrected"].attrs.get("corrected_cols")
+                        if _raw_attr is not None:
+                            _preserved_ccols = [str(g) for g in list(_raw_attr)]
+                    except Exception:
+                        pass
+                if _preserved_ccols is not None:
+                    tbl.uns["split_corrected_cols"] = list(_preserved_ccols)
             has_cell_id   = "cell_id" in tbl.obs.columns
             zarr_cell_ids = tbl.obs["cell_id"].astype(str) if has_cell_id else None
 
@@ -190,7 +250,9 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
             def _map_na(series: "pd.Series") -> list:
                 """As _map, but a cell without a value stays without one ("" in the
                 store, read back as missing) instead of joining a group "Unknown"."""
-                _al = _align(series.dropna().astype(str))
+                _s = series.dropna().astype(str)
+                _s = _s[~_s.isin(regions._OBS_PLACEHOLDERS)]
+                _al = _align(_s)
                 return _al.where(_al.notna(), "").tolist()
 
             if cells_df is not None:
@@ -253,6 +315,8 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
                 else:
                     keep_mask = tbl.obs.index.astype(str).isin(roi_ids)
                 tbl = tbl[keep_mask].copy()
+                if _preserved_ccols is not None:
+                    tbl.uns["split_corrected_cols"] = list(_preserved_ccols)
                 print(f"  save_spatialdata: table filtered to {tbl.n_obs:,} cells", flush=True)
             out_tbl = tbl
 
@@ -274,9 +338,20 @@ def _save_sdata_to_disk(save_path: str, seg_source: str = "xenium", roi_only: bo
         )
         jobs._check_dataset_gen(_gen)   # reported as an error: the export would mix two datasets
         sdata_out.write(save_path, overwrite=True)
-        n_cells = out_tbl.n_obs if out_tbl is not None else 0
+        if out_tbl is not None and "X_corrected" in out_tbl.layers and _preserved_ccols is not None:
+            try:
+                import zarr as _zarr_mod
+                _zw = _zarr_mod.open_group(save_path, mode="r+", use_consolidated=False)
+                _zw["tables"]["table"]["layers"]["X_corrected"].attrs["corrected_cols"] = list(_preserved_ccols)
+            except Exception:
+                pass
+        n_cells = (
+            int(out_tbl.n_obs) if out_tbl is not None
+            else int(len(roi_ids) if roi_ids is not None else (len(cells_df) if cells_df is not None else 0))
+        )
         print(f"  save_spatialdata: done → {save_path} ({n_cells:,} cells)", flush=True)
-        _set("done", f"Saved to {save_path}")
+        done_msg = f"Saved to {save_path}" + (f"\n⚠ {roi_notice}" if roi_notice else "")
+        _set("done", done_msg, roi_filter_applied=(roi_ids is not None), n_cells_exported=n_cells)
     except jobs._JobCancelled:
         raise
     except Exception as exc:

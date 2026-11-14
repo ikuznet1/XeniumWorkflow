@@ -305,7 +305,9 @@ def _sfree_ensure_grids(ds: dict, genes, progress=None) -> list:
     bundles with transcripts.zarr.zip only, and the all-transcripts grid, go through
     analysis._density_scan."""
     data_dir = ds.get("data_dir")
-    if not data_dir:
+    if not dataview._ds_has_transcripts(ds):
+        if data_dir:
+            raise ValueError("This bundle directory has no transcripts.parquet and no transcripts.zarr.zip.")
         raise ValueError(f"This sample was {dataview._origin_phrase(ds)}: it has no transcript file.")
     missing = [g for g in dict.fromkeys(genes) if not os.path.exists(analysis._density_cache_file(g, ds))]
     if not missing:
@@ -497,7 +499,9 @@ def _run_segfree(seg_source, method, label_kind, cell_type, markers_text, n_mark
         if user:
             markers = user
         elif str(markers_text or "").strip():
-            _set("error", "None of the listed marker genes is on the panel of this view.")
+            _unc_g = analysis._an_uncorrected_genes(samples)
+            _unc_tail = f" ({analysis._an_uncorrected_genes_note(_unc_g)})" if _unc_g else ""
+            _set("error", f"None of the listed marker genes is on the panel of this view{_unc_tail}.")
             return
         else:
             if ctype is None:
@@ -516,13 +520,18 @@ def _run_segfree(seg_source, method, label_kind, cell_type, markers_text, n_mark
                 return
         jobs._job_check()
         need = list(markers) + ([analysis._DENSITY_ALL] if area_mode == "transcripts" else [])
-        usable = [i for i, t in enumerate(tables) if t["ds"].get("data_dir")]
+        usable = [i for i, t in enumerate(tables) if dataview._ds_has_transcripts(t["ds"])]
         skipped = [tables[i]["label"] for i in range(len(tables)) if i not in usable]
         if not usable:
-            _set("error", "Segmentation-free abundance needs the Xenium output directory "
-                          "(transcripts.parquet or transcripts.zarr.zip); "
-                          + ("this dataset was" if len(tables) == 1 else "these samples were")
-                          + f" {dataview._origin_phrase(tables[0]['ds'])}, which has cells but no transcripts.")
+            if any(t["ds"].get("data_dir") for t in tables):
+                _set("error", "Segmentation-free abundance needs transcripts.parquet or transcripts.zarr.zip; "
+                              + ("this bundle directory has cells only (no transcript file)."
+                                 if len(tables) == 1 else "none of the loaded samples has a transcript file."))
+            else:
+                _set("error", "Segmentation-free abundance needs the Xenium output directory "
+                              "(transcripts.parquet or transcripts.zarr.zip); "
+                              + ("this dataset was" if len(tables) == 1 else "these samples were")
+                              + f" {dataview._origin_phrase(tables[0]['ds'])}, which has cells but no transcripts.")
             return
         rows, gene_rows, scanned = [], [], []
         unlabelled = []            # samples without labels while a cell type is picked
@@ -587,7 +596,8 @@ def _run_segfree(seg_source, method, label_kind, cell_type, markers_text, n_mark
         res = {"table": table, "genes": pd.DataFrame(gene_rows), "markers": list(markers),
                "marker_info": info, "markers_missing": missing, "cell_type": ctype, "category": cat,
                "bins": bins, "area_mode": area_mode, "hole_max_bins": hole, "n_null": n_null, "seed": seed,
-               "seg_source": seg_source or "xenium", "corrected": corrected, "skipped": skipped,
+               "seg_source": seg_source or "xenium", "corrected": corrected,
+               "n_genes_uncorrected": analysis._an_uncorrected_genes(samples), "skipped": skipped,
                "across": pd.DataFrame(across), "across_note": across_note,
                "samples": [{"label": tables[i]["label"], "name": tables[i]["name"], "cond": conds[i],
                             "donor": donors[i], "n_cells": int(len(tables[i]["df"]))} for i in usable],
@@ -658,7 +668,11 @@ def _run_segfree(seg_source, method, label_kind, cell_type, markers_text, n_mark
         if missing:
             msg += f"\nNot on the panel: {', '.join(missing[:12])}."
         if skipped:
-            msg += (f"\nLeft out (loaded from a .zarr, no transcript file): {', '.join(skipped)}.")
+            _skip_ds = [tables[i]["ds"] for i in range(len(tables)) if i not in set(usable)]
+            _skip_why = ("loaded from a .zarr, no transcript file"
+                         if all(not ds.get("data_dir") and not ds.get("h5ad") for ds in _skip_ds)
+                         else "no transcript file")
+            msg += f"\nLeft out ({_skip_why}): {', '.join(skipped)}."
         if unlabelled:
             res["unlabelled"] = list(unlabelled)
             msg += (f"\nNo {cat} labels in {', '.join(unlabelled)}: the segmented cells of '{ctype}' are "
@@ -668,6 +682,8 @@ def _run_segfree(seg_source, method, label_kind, cell_type, markers_text, n_mark
             msg += "\nNote: a cell subset is active; with the area from all transcripts it is not applied."
         if use_corrected and not corrected and samples:
             msg += "\nNote: original counts were used for the markers and the assigned share."
+        if res.get("n_genes_uncorrected"):
+            msg += f"\nNote: {analysis._an_uncorrected_genes_note(res['n_genes_uncorrected'])}."
         _set("done", msg, result=res)
         print(f"  Segmentation-free abundance: {msg}", flush=True)
     except jobs._JobCancelled:
@@ -769,6 +785,8 @@ def _sfree_csv(res) -> str:
                      f"donor {s['donor'] or '-'}")
     if res.get("skipped"):
         lines.append(f"# left out (no transcript file): {' '.join(res['skipped'])}")
+    if res.get("n_genes_uncorrected"):
+        lines.append(f"# {analysis._an_uncorrected_genes_note(res['n_genes_uncorrected'])}")
     txt = provenance._csv_comments(lines) + res["table"].to_csv(index=False)
     if len(res["genes"]):
         txt += "\n# per marker gene (whole sample; area of the tile size named in area_bin_um)\n" + res["genes"].to_csv(index=False)

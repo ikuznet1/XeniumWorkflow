@@ -1,10 +1,29 @@
 """Spatial analysis (neighbourhood enrichment, co-occurrence) and spatial niches."""
 
+import os
 import numpy as np
 import pandas as pd
 
-from . import core, jobs, dataview
+from . import core, jobs, caching, dataview
 from . import provenance
+
+
+def _spatial_forget_run(final_dir) -> None:
+    """A run at *final_dir* was committed or deleted: forget spatial-analysis results
+    computed on an earlier run stored in the same directory."""
+    if not final_dir:
+        return
+    want_real = os.path.realpath(str(final_dir))
+    want_abs = os.path.abspath(str(final_dir))
+    with core._spatial_lock:
+        res = core._spatial_state.get("result")
+        out_dir = res.get("out_dir") if isinstance(res, dict) else None
+        if out_dir and (os.path.realpath(str(out_dir)) == want_real
+                        or os.path.abspath(str(out_dir)) == want_abs):
+            core._spatial_state.update({"status": "idle", "message": "", "result": None})
+
+
+caching._seg_commit_hooks.append(_spatial_forget_run)
 
 
 def _build_raw_neighbor_matrix(label_arr, neighbor_indices, n_types):
@@ -46,7 +65,7 @@ def _compute_enrichment_from_raw(raw_matrix, row_counts, freqs):
     return np.log2(matrix / safe_freq[None, :] + 1e-9)
 
 
-def _run_spatial_analysis(label_key, n_neighbors, alt_res):
+def _run_spatial_analysis(label_key, n_neighbors, alt_res, seg_source: str = None):
     """Background thread: compute spatial analysis plots."""
     _gen = jobs._dataset_gen
     try:
@@ -148,14 +167,19 @@ def _run_spatial_analysis(label_key, n_neighbors, alt_res):
                 "freqs": freqs,
                 "niche_labels": niche_labels,
                 "umap_coords": umap_coords,
+                "out_dir": alt_res.get("out_dir") if isinstance(alt_res, dict) else None,
             }
             _done_msg = core._spatial_state["message"]
+        _prov_seg = (seg_source if seg_source is not None
+                     else provenance._prov_labels_source(label_key))
         provenance._prov_record(
-            "spatial", seg_source=provenance._prov_labels_source(label_key),
+            "spatial", seg_source=_prov_seg,
             params={"n_neighbors": n_neighbors, "labels_key": label_key},
             result={"n_cell_types": n_types, "n_cells": int(len(coords_valid)),
                     "n_cells_unlabelled": int(len(coords) - len(coords_valid))},
             message=_done_msg, labels=(label_key, None))
+    except jobs._JobCancelled:
+        raise
     except Exception as e:
         import traceback
         with core._spatial_lock:

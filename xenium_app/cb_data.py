@@ -1,6 +1,7 @@
 """Callbacks: SpatialData patches, tissue info, jobs panel, samples, cache clean-up, Save."""
 
 import os
+import threading
 from dash import no_update, Patch
 import dash
 from dash import html, Input, Output, State, callback_context, ALL
@@ -30,6 +31,9 @@ from . import h5ad
 )
 def start_sdata_clear(n_clicks, qv):
     """Delete cache then trigger a forced re-read from raw files."""
+    _busy = _running_jobs()
+    if _busy:
+        return True, f"Not re-built — still running: {', '.join(_busy)}", False, False, no_update, no_update
     with core._sdata_lock:
         if core._sdata_state["status"] == "running":
             return False, "Already running…", True, True, no_update, no_update
@@ -563,6 +567,9 @@ def load_sample(n_clicks, picked_path, custom_path, ds_version, roi_done,
         return (f"Error: {exc}", no_update, no_update) + _nu3
 
 
+_add_sample_lock = threading.Lock()
+
+
 @app_layout.app.callback(
     Output("sample-load-status",       "children",  allow_duplicate=True),
     Output("sample-modal",             "is_open",   allow_duplicate=True),
@@ -576,28 +583,46 @@ def load_sample(n_clicks, picked_path, custom_path, ds_version, roi_done,
 )
 def add_sample(n_clicks, picked_path, custom_path, extra_ver):
     """Load a new Xenium dataset and append it to EXTRA_DATASETS side-by-side."""
-    new_dir = (custom_path or "").strip() or picked_path
-    if not new_dir:
-        return "Select a sample or enter a path.", no_update, no_update, no_update
-    new_dir = os.path.abspath(new_dir)
-    if h5ad._is_h5ad_path(new_dir):
-        return (_H5AD_ROUTE_MSG + " (An .h5ad replaces the loaded samples; it cannot be added beside them.)",
-                no_update, no_update, no_update)
-    is_zarr = new_dir.rstrip("/").endswith(".zarr")
-    if is_zarr:
-        if not _is_zarr_store(new_dir):
-            return f"Not a valid SpatialData zarr: {new_dir}", no_update, no_update, no_update
-    else:
-        if not os.path.exists(os.path.join(new_dir, "experiment.xenium")):
-            return f"Not a valid Xenium directory: {new_dir}", no_update, no_update, no_update
-    # Check for duplicates (use sdata_path for zarr, data_dir for Xenium)
-    all_dirs = [core.DATA.get("sdata_path") if is_zarr else core.DATA["data_dir"]] + [
-        eds.get("sdata_path") if is_zarr else eds["data_dir"] for eds in dataview.EXTRA_DATASETS
-    ]
-    if new_dir in all_dirs:
-        return "Sample already loaded.", no_update, no_update, no_update
+    if not _add_sample_lock.acquire(blocking=False):
+        return "A sample is already being added.", no_update, no_update, no_update
     try:
+        new_dir = (custom_path or "").strip() or picked_path
+        if not new_dir:
+            return "Select a sample or enter a path.", no_update, no_update, no_update
+        new_dir = os.path.abspath(new_dir)
+        if h5ad._is_h5ad_path(new_dir):
+            return (_H5AD_ROUTE_MSG + " (An .h5ad replaces the loaded samples; it cannot be added beside them.)",
+                    no_update, no_update, no_update)
+        is_zarr = new_dir.rstrip("/").endswith(".zarr")
+        if is_zarr:
+            if not _is_zarr_store(new_dir):
+                return f"Not a valid SpatialData zarr: {new_dir}", no_update, no_update, no_update
+        else:
+            if not os.path.exists(os.path.join(new_dir, "experiment.xenium")):
+                return f"Not a valid Xenium directory: {new_dir}", no_update, no_update, no_update
+
+        def _already_loaded(cand_dir: str, cand_key: str = "") -> bool:
+            all_dirs = [core.DATA.get("sdata_path") if is_zarr else core.DATA.get("data_dir")] + [
+                eds.get("sdata_path") if is_zarr else eds.get("data_dir")
+                for eds in dataview.EXTRA_DATASETS
+            ]
+            if cand_dir in all_dirs:
+                return True
+            loaded_keys = {dataview._ds_key(core.DATA)} | {
+                dataview._ds_key(eds) for eds in dataview.EXTRA_DATASETS
+            }
+            return cand_dir in loaded_keys or (bool(cand_key) and cand_key in loaded_keys)
+
+        # Check for duplicates before the slow load
+        if _already_loaded(new_dir):
+            return "Sample already loaded.", no_update, no_update, no_update
+
         new_data = loading.load_from_sdata_zarr(new_dir) if is_zarr else loading.load_xenium_data(new_dir)
+        _new_key = dataview._ds_key(new_data)
+        # Re-check immediately before mutating EXTRA_DATASETS in case primary/extras changed mid-load
+        if _already_loaded(new_dir, _new_key):
+            return "Sample already loaded.", no_update, no_update, no_update
+
         # Compute x_offset: place new sample to the right of all current ones
         # x_offset = max(x_centroid) of the last dataset + 500 µm gap - min(x_centroid) of new dataset
         if dataview.EXTRA_DATASETS:
@@ -614,7 +639,7 @@ def add_sample(n_clicks, picked_path, custom_path, extra_ver):
         # the primary dataset before) by method; a store written by Save as SpatialData
         # carries them as cell_type_<method> columns (dataview._extra_cell_type_labels)
         try:
-            _by = annotation._annot_cached_labels(dataview._ds_key(new_data))
+            _by = annotation._annot_cached_labels(_new_key)
             if _by:
                 new_data["_cell_type_labels_by_method"] = _by
                 print(f"  Extra sample: cached annotations found for {', '.join(sorted(_by))}", flush=True)
@@ -629,6 +654,8 @@ def add_sample(n_clicks, picked_path, custom_path, extra_ver):
                 regions._roi_apply_to_sample(new_data, _rois_now)
         except Exception as _roi_exc:
             print(f"  Extra sample: ROI labels not applied: {_roi_exc}", flush=True)
+        if _already_loaded(new_dir, _new_key):
+            return "Sample already loaded.", no_update, no_update, no_update
         dataview.EXTRA_DATASETS.append(new_data)
         n_total = 1 + len(dataview.EXTRA_DATASETS)
         status_msg = f"{n_total} samples loaded"
@@ -638,6 +665,8 @@ def add_sample(n_clicks, picked_path, custom_path, extra_ver):
         import traceback
         traceback.print_exc()
         return f"Error: {exc}", no_update, no_update, no_update
+    finally:
+        _add_sample_lock.release()
 
 
 # ─── AnnData .h5ad ────────────────────────────────────────────────────────────
@@ -796,6 +825,13 @@ def _h5ad_install(datasets, man, cache_dir) -> str:
     h5ad._h5ad_register(man, cache_dir)
     _reset_dataset_state()
     dataview.EXTRA_DATASETS[:] = list(datasets[1:])
+    with core._roi_lock:
+        _rois = list(core._roi_state["rois"])
+    if _rois and dataview.EXTRA_DATASETS:
+        for _eds in list(dataview.EXTRA_DATASETS):
+            regions._roi_apply_to_sample(_eds, _rois)
+        dataview._umap_df_cache.clear()
+        dataview._umap_fig_cache.clear()
     h5ad._h5ad_primary_labels()
     msg = h5ad._h5ad_design(force=False)
     print(f"  Loaded .h5ad: {man['source']} ({len(datasets)} sample(s))", flush=True)

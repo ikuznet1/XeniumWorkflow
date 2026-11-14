@@ -8,7 +8,7 @@ import pandas as pd
 import scipy.sparse as sp
 import h5py
 
-from . import reseg
+from . import regions, reseg
 
 
 # ─── Data loading ─────────────────────────────────────────────────────────────
@@ -433,18 +433,11 @@ def _load_from_xenium_sdata(zarr_path: str, data_dir: str) -> dict:
     # obs columns added later through the low-level zarr API (SPLIT clusters /
     # UMAP) are not in the table's column-order, so read_zarr does not return them.
     reseg._load_zarr_obs_into_df(zarr_path, obs_df)
-    for _nacol in [c for c in obs_df.columns
-                   if c == "cluster_split_10" or c == "niche" or str(c).startswith("roi_")]:
-        # stored as plain strings with "" for cells without a value (dropped by
-        # SPLIT, outside every ROI, outside the subset the niches were computed on)
-        _cs = obs_df[_nacol].astype(str)
-        if _nacol == "cluster_split_10" or _cs.isin(["", "nan", "<NA>"]).any():
-            obs_df[_nacol] = pd.array(
-                [v if v not in ("", "nan", "<NA>") else pd.NA for v in _cs], dtype="string")
+    regions._normalize_obs_placeholders(obs_df)
     cluster_methods = list(adata.uns.get("cluster_methods", []))
     print(f"  Done: {n:,} cells | {len(gene_names)} genes | {len(cluster_methods)} cluster sets", flush=True)
 
-    return {
+    res = {
         "metadata":          dict(adata.uns.get("metadata", {})),
         "df":                obs_df,
         "gene_names":        gene_names,
@@ -464,6 +457,9 @@ def _load_from_xenium_sdata(zarr_path: str, data_dir: str) -> dict:
         ),
         "split_corrected_imputed_genes": list(adata.uns.get("split_corrected_imputed_genes", [])),
     }
+    if "X_corrected" in adata.layers and adata.uns.get("split_corrected_cols") is not None:
+        res["split_corrected_cols"] = [str(g) for g in list(adata.uns["split_corrected_cols"])]
+    return res
 
 
 def load_from_sdata_zarr(zarr_path: str) -> dict:

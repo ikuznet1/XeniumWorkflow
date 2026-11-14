@@ -357,6 +357,8 @@ def download_moran_table(n_clicks):
               f"# {analysis._P_FLOOR_NOTE}\n")
     if res.get("n_uncorrected"):
         header += f"# {analysis._an_uncorrected_note(res['n_uncorrected'])}\n"
+    if res.get("n_genes_uncorrected"):
+        header += f"# {analysis._an_uncorrected_genes_note(res['n_genes_uncorrected'])}\n"
     for i in res["samples"]:
         header += (f"# sample {i['label']} ({i['name']}): {i['n_cells']} cells; E[I] = "
                    f"{i['expected']:.6g}; Var[I] = {i['variance']:.6g}\n")
@@ -521,6 +523,8 @@ def download_lr_table(n_clicks):
               f"frac_ligand / frac_receptor: cells with count >= 1 transcript\n")
     if res.get("n_uncorrected"):
         header += f"# {analysis._an_uncorrected_note(res['n_uncorrected'])}\n"
+    if res.get("n_genes_uncorrected"):
+        header += f"# {analysis._an_uncorrected_genes_note(res['n_genes_uncorrected'])}\n"
     return dict(content=provenance._prov_csv_stamp(res, provenance._csv_comments(header) + t.to_csv(index=False)), filename="ligand_receptor_scores.csv")
 
 

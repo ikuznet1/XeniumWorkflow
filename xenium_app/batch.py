@@ -738,6 +738,18 @@ def _batch_cell_types(kind, ctx) -> "set | None":
         return None
 
 
+_BATCH_CLUSTER_CREATORS = ("banksy", "joint", "clustering")
+
+
+def _batch_known_clusters(seg_source, methods) -> set:
+    try:
+        from . import clustersets
+        clustersets._cs_restore(seg_source)
+        return {o["value"] for o in clustersets._cs_options(seg_source)}
+    except Exception:
+        return set(methods or ())
+
+
 def _batch_validate(cfg, log=None) -> tuple:
     """(errors, warnings) of the config against the loaded data, without computing. The
     checks of a step are made on the segmentation the step names: a cached run is loaded
@@ -755,15 +767,15 @@ def _batch_validate(cfg, log=None) -> tuple:
             _batch_ensure_seg(ctx["seg-source"], log or (lambda s: None))
         except _BatchError as exc:
             return [str(exc)], warns
-    if cfg.get("cluster_method") and methods and cfg["cluster_method"] not in methods:
-        try:
-            from . import clustersets
-            known = {o["value"] for o in clustersets._cs_options(ctx["seg-source"])}
-        except Exception:
-            known = set(methods)
-        if cfg["cluster_method"] not in known:
-            errors.append(f"cluster_method '{cfg['cluster_method']}' is not a cluster set of the data "
-                          f"({', '.join(map(str, sorted(known)))})")
+    known = _batch_known_clusters(ctx["seg-source"], methods)
+    first_cluster_creator = next((st["kind"] for st in cfg["steps"] if st["kind"] in _BATCH_CLUSTER_CREATORS), None)
+    if cfg.get("cluster_method") and (methods or known) and cfg["cluster_method"] not in known:
+        msg = (f"cluster_method '{cfg['cluster_method']}' is not a cluster set of the data "
+               f"({', '.join(map(str, sorted(known)))})")
+        if first_cluster_creator:
+            warns.append(f"{msg} - an earlier {first_cluster_creator} step may provide it")
+        else:
+            errors.append(msg)
     if ctx["counts-mode-store"] == "corrected" and seg_tool == "xenium":
         st = dataview._corrected_status()
         if not st.get("all"):
@@ -785,6 +797,9 @@ def _batch_validate(cfg, log=None) -> tuple:
     label_kinds = _batch_label_kinds(ctx)
     _lk_seg = ctx["seg-source"]              # the segmentation label_kinds was read for
     annotated_later = False
+    niches_later = False
+    clustered_later = None
+    txfactor_later = False
     for st in cfg["steps"]:
         spec, where = _BATCH_STEPS[st["kind"]], f"step {st['index']} ({st['name']})"
         try:
@@ -816,6 +831,16 @@ def _batch_validate(cfg, log=None) -> tuple:
         else:
             label_kinds = _batch_label_kinds(ctx) if _lk_seg != ctx["seg-source"] else label_kinds
         _lk_seg = sctx["seg-source"]
+        known_s = known if sctx["seg-source"] == ctx["seg-source"] else _batch_known_clusters(sctx["seg-source"], methods)
+        step_cm = sctx.get("cluster-method")
+        step_cm_overridden = "cluster_method" in st["params"] or "cluster-method" in st["params"]
+        if step_cm_overridden and step_cm and (methods or known_s) and step_cm not in known_s:
+            cm_msg = (f"{where}: cluster_method '{step_cm}' is not a cluster set of the data "
+                      f"({', '.join(map(str, sorted(known_s)))})")
+            if clustered_later:
+                warns.append(f"{cm_msg} - an earlier {clustered_later} step may provide it")
+            else:
+                errors.append(cm_msg)
         if spec.get("design") and (n_a < 1 or n_b < 1):
             errors.append(f"{where}: needs the sample design (samples in condition A and in B); "
                           f"the design has {n_a} in A and {n_b} in B")
@@ -838,8 +863,20 @@ def _batch_validate(cfg, log=None) -> tuple:
                 if val not in label_kinds:
                     msg = (f"{where}: label source '{val}' is not available "
                            f"(available: {', '.join(sorted(label_kinds)) or 'none'})")
-                    (warns if annotated_later and str(val).startswith("celltype:") else errors).append(
-                        msg + (" - an earlier annotation step may provide it" if annotated_later else ""))
+                    is_annot_kind = (str(val).startswith("celltype:")
+                                     and str(val).split(":", 1)[1] in core._ANNOT_METHODS)
+                    if annotated_later and is_annot_kind:
+                        warns.append(msg + " - an earlier annotation step may provide it")
+                    elif niches_later and val == "niche":
+                        warns.append(msg + " - an earlier niches step may provide it")
+                    elif clustered_later and val == "cluster":
+                        warns.append(msg + f" - an earlier {clustered_later} step may provide it")
+                    else:
+                        errors.append(msg)
+                elif (val == "cluster" and step_cm and (methods or known_s)
+                      and step_cm not in known_s and not clustered_later and not step_cm_overridden):
+                    errors.append(f"{where}: cluster_method '{step_cm}' is not a cluster set of the data "
+                                  f"({', '.join(map(str, sorted(known_s)))})")
             elif role in ("cell_type", "cell_types"):
                 kind_val = resolved.get(ref)
                 types = _batch_cell_types(kind_val, sctx) if kind_val in label_kinds else None
@@ -848,10 +885,27 @@ def _batch_validate(cfg, log=None) -> tuple:
                 vals = val if isinstance(val, (list, tuple)) else [val]
                 missing = [str(v) for v in vals if str(v) not in types and not _batch_unset(v)]
                 if missing:
-                    errors.append(f"{where}: no cell is labelled {', '.join(repr(m) for m in missing)} in "
-                                  f"'{kind_val}' (labels: {', '.join(sorted(types)[:30])})")
+                    msg = (f"{where}: no cell is labelled {', '.join(repr(m) for m in missing)} in "
+                           f"'{kind_val}' (labels: {', '.join(sorted(types)[:30])})")
+                    if kind_val == "cluster" and clustered_later:
+                        warns.append(msg + f" - an earlier {clustered_later} step may provide it")
+                    elif kind_val == "niche" and niches_later:
+                        warns.append(msg + " - an earlier niches step may provide it")
+                    elif (str(kind_val).startswith("celltype:")
+                          and str(kind_val).split(":", 1)[1] in core._ANNOT_METHODS and annotated_later):
+                        warns.append(msg + " - an earlier annotation step may provide it")
+                    else:
+                        errors.append(msg)
             elif role == "gene":
-                if str(val) not in genes and str(val) != str(getattr(analysis, "_DENSITY_ALL", "")):
+                vprov = analysis._density_virtual(val) if cid == "density-gene" else None
+                if vprov is not None:
+                    vopts = {o["value"] for o in vprov["options"]()}
+                    if val not in vopts:
+                        if txfactor_later:
+                            warns.append(f"{where}: layer '{val}' is not available - an earlier txfactor step may provide it")
+                        else:
+                            errors.append(f"{where}: gene '{val}' is not on the panel")
+                elif str(val) not in genes and str(val) != str(getattr(analysis, "_DENSITY_ALL", "")):
                     errors.append(f"{where}: gene '{val}' is not on the panel")
             elif role == "genes_text":
                 listed = [g for g in re.split(r"[\s,;]+", str(val)) if g]
@@ -879,7 +933,12 @@ def _batch_validate(cfg, log=None) -> tuple:
                     opts = None
                 if st["kind"] == "de" and opts is not None and val not in opts:
                     msg = f"{where}: group '{val}' is not available (e.g. {', '.join(sorted(opts)[:12])})"
-                    (warns if annotated_later else errors).append(msg)
+                    if annotated_later and str(val).startswith("celltype:"):
+                        warns.append(msg + " - an earlier annotation step may provide it")
+                    elif clustered_later and str(val).startswith("cluster:"):
+                        warns.append(msg + f" - an earlier {clustered_later} step may provide it")
+                    else:
+                        errors.append(msg)
             elif role == "population":
                 try:
                     opts = {o["value"] for o in stats._pb_population_options(
@@ -889,7 +948,12 @@ def _batch_validate(cfg, log=None) -> tuple:
                 if opts is not None and val not in opts:
                     msg = (f"{where}: population '{val}' is not available (e.g. "
                            f"{', '.join(sorted(map(str, opts))[:12])})")
-                    (warns if annotated_later else errors).append(msg)
+                    if annotated_later and str(val).startswith("celltype:"):
+                        warns.append(msg + " - an earlier annotation step may provide it")
+                    elif clustered_later and str(val).startswith("cluster:"):
+                        warns.append(msg + f" - an earlier {clustered_later} step may provide it")
+                    else:
+                        errors.append(msg)
             elif role == "file" and val and not os.path.exists(os.path.expanduser(str(val))):
                 if st["kind"] != "annotation" or str(resolved.get("annot-source")) != "celltypist":
                     errors.append(f"{where}: file not found: {val}")
@@ -897,6 +961,12 @@ def _batch_validate(cfg, log=None) -> tuple:
                 errors.append(f"{where}: directory not found: {val}")
         if st["kind"] == "annotation":
             annotated_later = True
+        elif st["kind"] == "niches":
+            niches_later = True
+        elif st["kind"] in _BATCH_CLUSTER_CREATORS:
+            clustered_later = clustered_later or st["kind"]
+        elif st["kind"] == "txfactor":
+            txfactor_later = True
     return errors, warns
 
 
@@ -963,16 +1033,17 @@ def _batch_run(cfg: dict, dry_run: bool = False, log=None) -> dict:
     log = log or (lambda s: print(s, flush=True))
     cfg = _batch_norm_config(cfg)
     _batch_check_data(cfg)
-    _batch_setup_samples(cfg, log, save=not dry_run)
-    _batch_apply_session(cfg, log, save=not dry_run)
-    ctx = _batch_context(cfg)
-    summary = {"ok": True, "dry_run": bool(dry_run), "data": cfg["data"]["path"], "steps": [],
-               "errors": [], "warnings": [], "kaleido": _batch_kaleido()}
-    # The run seg_source names is loaded before anything is checked or computed - in a dry
-    # run too: its labels, clusters and groups are what the checks have to be made on.
-    _batch_ensure_seg(ctx["seg-source"], log)
-    errors, warns = _batch_validate(cfg, log)
-    _batch_ensure_seg(ctx["seg-source"], log)      # the checks of a step may have loaded another run
+    with provenance._prov_suppress(dry_run):
+        _batch_setup_samples(cfg, log, save=not dry_run)
+        _batch_apply_session(cfg, log, save=not dry_run)
+        ctx = _batch_context(cfg)
+        summary = {"ok": True, "dry_run": bool(dry_run), "data": cfg["data"]["path"], "steps": [],
+                   "errors": [], "warnings": [], "kaleido": _batch_kaleido()}
+        # The run seg_source names is loaded before anything is checked or computed - in a dry
+        # run too: its labels, clusters and groups are what the checks have to be made on.
+        _batch_ensure_seg(ctx["seg-source"], log)
+        errors, warns = _batch_validate(cfg, log)
+        _batch_ensure_seg(ctx["seg-source"], log)      # the checks of a step may have loaded another run
     summary["errors"], summary["warnings"] = errors, warns
     for w in warns:
         log(f"  warning: {w}")

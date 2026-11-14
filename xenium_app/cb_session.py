@@ -24,7 +24,7 @@ from . import session, app_layout
 _SESSION_IDS = sorted(session._session_controls())
 _SESSION_TRIGGERS = {"session-save-btn": "save", "session-download-btn": "download",
                      "session-restore-saved-btn": "restore-saved", "session-restore-last-btn": "restore-last",
-                     "session-upload": "upload", "session-autosave": "auto"}
+                     "session-upload": "upload", "session-init-tick": "auto", "session-autosave": "auto"}
 
 # 1. collect (browser)
 app_layout.app.clientside_callback(
@@ -66,6 +66,7 @@ app_layout.app.clientside_callback(
     # contents is the trigger (it changes with every file chosen, once the collector has
     # emptied it); no callback has it as an Output - see the collector.
     Input("session-upload", "contents"),
+    Input("session-init-tick", "n_intervals"),
     Input("session-autosave", "n_intervals"),
     [State(cid, "value") for cid in _SESSION_IDS],
     prevent_initial_call=True,
@@ -163,6 +164,8 @@ def session_action(request, design_v=None, roi_v=None, geneset_v=None, groups_v=
         import traceback
         traceback.print_exc()
         return (f"Error: {type(exc).__name__}: {exc}",) + quiet[1:]
+    if report["ok"]:
+        session._session_note_baseline({**controls, **report["controls"]}, request.get("page"))
     bump = lambda name, cur: (cur or 0) + 1 if name in report["bump"] else nu
     apply_ = {"t": request.get("t"), "controls": report["controls"]} if report["ok"] and report["controls"] else nu
     return (report["text"], session._session_slots_text(), apply_, nu, nu,

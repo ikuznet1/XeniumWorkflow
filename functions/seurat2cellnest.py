@@ -177,8 +177,8 @@ def _detect_fov_from_images(ro, rds, meta_df):
         print(f"  Detecting FOVs from {len(image_names)} Seurat images…")
         cell_to_fov = {}
         for img in image_names:
-            ro.r.assign("._s2c_img", img)
             try:
+                ro.r.assign("._s2c_img", str(img))
                 cells_r = ro.r('tryCatch(Cells(Images(._s2c_obj)[[._s2c_img]]), error=function(e) character(0))')
                 cells = list(cells_r)
                 valid = [c for c in cells if c in meta_df.index]
@@ -187,6 +187,9 @@ def _detect_fov_from_images(ro, rds, meta_df):
                 print(f"    {img}: {len(valid)} cells")
             except Exception as e:
                 print(f"    Warning: could not get cells for image '{img}': {e}")
+            finally:
+                ro.r('suppressWarnings(rm(list = intersect(c("._s2c_img"), '
+                     'ls(all.names = TRUE, envir = globalenv())), envir = globalenv()))')
 
         fov_series = meta_df.index.map(cell_to_fov)
         fov_series = pd.Series(fov_series, index=meta_df.index)
@@ -222,17 +225,21 @@ def _extract_spatial_coords(ro, rds, meta_df):
             all_coords = []
             for img in image_names:
                 try:
+                    ro.r.assign("._s2c_img", str(img))
                     # Ask for centroids: the default boundary may be a segmentation
                     # (one row per polygon vertex)
-                    ro.r(f'._s2c_coords <- tryCatch('
-                         f'GetTissueCoordinates(._s2c_obj[["{img}"]], which="centroids"), '
-                         f'error=function(e) GetTissueCoordinates(._s2c_obj, image="{img}"))')
+                    ro.r('._s2c_coords <- tryCatch('
+                         'GetTissueCoordinates(._s2c_obj[[._s2c_img]], which="centroids"), '
+                         'error=function(e) GetTissueCoordinates(._s2c_obj, image=._s2c_img))')
                     coords_r = ro.r("._s2c_coords")
                     from rpy2.robjects import pandas2ri
                     coords_df = pandas2ri.rpy2py(coords_r)
                     all_coords.append(coords_df)
                 except Exception as e:
                     print(f"  Warning: GetTissueCoordinates failed for '{img}': {e}")
+                finally:
+                    ro.r('suppressWarnings(rm(list = intersect(c("._s2c_img", "._s2c_coords"), '
+                         'ls(all.names = TRUE, envir = globalenv())), envir = globalenv()))')
             if all_coords:
                 coords_all = pd.concat(all_coords)
                 # FOV coordinates carry cell IDs in a "cell" column (row names are 1..n)
@@ -290,6 +297,12 @@ def _extract_spatial_coords(ro, rds, meta_df):
                 return x, y
     except Exception:
         pass
+    finally:
+        try:
+            ro.r('suppressWarnings(rm(list = intersect(c("._s2c_emb"), '
+                 'ls(all.names = TRUE, envir = globalenv())), envir = globalenv()))')
+        except Exception:
+            pass
 
     # Check if we got partial coords from Strategy 1
     if not np.all(np.isnan(x)):
@@ -321,34 +334,41 @@ def _extract_counts_mtx(ro, rds, assay, layer, cell_subset=None):
     cell_ids : list of str
     """
     ro.r.assign("._s2c_obj", rds)
-    ro.r.assign("._s2c_assay", assay)
-    ro.r.assign("._s2c_layer", layer)
+    ro.r.assign("._s2c_assay", str(assay))
+    ro.r.assign("._s2c_layer", str(layer))
 
     with tempfile.TemporaryDirectory() as tmpdir:
         mat_file = os.path.join(tmpdir, "mat.mtx").replace("\\", "/")
         genes_file = os.path.join(tmpdir, "genes.txt").replace("\\", "/")
         cells_file = os.path.join(tmpdir, "cells.txt").replace("\\", "/")
 
-        if cell_subset is not None:
-            ro.r.assign("._s2c_cells", ro.StrVector(cell_subset))
-            ro.r(f"""
+        try:
+            ro.r.assign("._s2c_mat_file", str(mat_file))
+            ro.r.assign("._s2c_genes_file", str(genes_file))
+            ro.r.assign("._s2c_cells_file", str(cells_file))
+            if cell_subset is not None:
+                ro.r.assign("._s2c_cells", ro.StrVector([str(c) for c in cell_subset]))
+                ro.r("""
 ._s2c_mat <- LayerData(._s2c_obj[[._s2c_assay]], layer=._s2c_layer)
 ._s2c_mat <- ._s2c_mat[, ._s2c_cells, drop=FALSE]
 ._s2c_mat <- as(._s2c_mat, 'dgCMatrix')
-Matrix::writeMM(._s2c_mat, "{mat_file}")
-writeLines(rownames(._s2c_mat), "{genes_file}")
-writeLines(colnames(._s2c_mat), "{cells_file}")
-rm(._s2c_mat); gc()
+Matrix::writeMM(._s2c_mat, ._s2c_mat_file)
+writeLines(rownames(._s2c_mat), ._s2c_genes_file)
+writeLines(colnames(._s2c_mat), ._s2c_cells_file)
 """)
-        else:
-            ro.r(f"""
+            else:
+                ro.r("""
 ._s2c_mat <- LayerData(._s2c_obj[[._s2c_assay]], layer=._s2c_layer)
 ._s2c_mat <- as(._s2c_mat, 'dgCMatrix')
-Matrix::writeMM(._s2c_mat, "{mat_file}")
-writeLines(rownames(._s2c_mat), "{genes_file}")
-writeLines(colnames(._s2c_mat), "{cells_file}")
-rm(._s2c_mat); gc()
+Matrix::writeMM(._s2c_mat, ._s2c_mat_file)
+writeLines(rownames(._s2c_mat), ._s2c_genes_file)
+writeLines(colnames(._s2c_mat), ._s2c_cells_file)
 """)
+        finally:
+            ro.r('suppressWarnings(rm(list = intersect(c('
+                 '"._s2c_assay", "._s2c_layer", "._s2c_cells", "._s2c_mat_file", '
+                 '"._s2c_genes_file", "._s2c_cells_file", "._s2c_mat"), '
+                 'ls(all.names = TRUE, envir = globalenv())), envir = globalenv())); gc()')
 
         mat = sio.mmread(mat_file).T.tocsr()  # genes×cells → cells×genes
         with open(genes_file) as f:

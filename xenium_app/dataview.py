@@ -227,6 +227,63 @@ def _corrected_covered(holder: dict):
     return holder["_split_cov"]
 
 
+def _read_zarr_corrected_cols(holder: dict) -> "list[str] | None":
+    """Read SPLIT-corrected panel gene names from *holder*'s SpatialData zarr store
+    (`layers/X_corrected.attrs['corrected_cols']` or `tables/table/uns/split_corrected_cols`),
+    returning `list[str]` or `None`."""
+    zpath = holder.get("sdata_path")
+    if not zpath and holder.get("out_dir") and holder.get("source"):
+        zpath = os.path.join(str(holder["out_dir"]), f"spatialdata_{holder['source']}.zarr")
+    if not zpath and holder.get("data_dir"):
+        _cand = os.path.join(str(holder["data_dir"]), "spatialdata_xenium.zarr")
+        if os.path.isdir(_cand):
+            zpath = _cand
+    if zpath and os.path.isdir(str(zpath)):
+        try:
+            import zarr as _zarr_mod
+            zroot = _zarr_mod.open_group(str(zpath), mode="r", use_consolidated=False)
+            if "tables" in zroot and "table" in zroot["tables"]:
+                tgrp = zroot["tables"]["table"]
+                if "layers" in tgrp and "X_corrected" in tgrp["layers"]:
+                    raw = tgrp["layers"]["X_corrected"].attrs.get("corrected_cols")
+                    if raw is not None:
+                        return [str(g) for g in raw]
+                    if "uns" in tgrp:
+                        ugrp = tgrp["uns"]
+                        if "split_corrected_cols" in ugrp:
+                            elem = ugrp["split_corrected_cols"]
+                            if isinstance(elem, _zarr_mod.Array):
+                                vals = elem[:]
+                                return [v.decode("utf-8") if isinstance(v, (bytes, bytearray)) else str(v)
+                                        for v in vals]
+                            try:
+                                from anndata.io import read_elem as _read_elem
+                            except ImportError:
+                                from anndata.experimental import read_elem as _read_elem
+                            return [str(g) for g in _read_elem(elem)]
+                        raw_u = ugrp.attrs.get("split_corrected_cols")
+                        if raw_u is not None:
+                            return [str(g) for g in raw_u]
+        except Exception:
+            return None
+    return None
+
+
+def _corrected_cols(holder: dict) -> "set[str] | None":
+    """Panel gene names that carry SPLIT-corrected counts in *holder* (DATA, an extra
+    sample or a segmentation run), or None when every panel gene is covered (including
+    legacy SpatialData stores written before 'corrected_cols' was recorded)."""
+    if holder.get("split_corrected_cols") is not None:
+        return set(map(str, holder["split_corrected_cols"]))
+    if "split_corrected_cols" in holder:
+        return None
+    if holder.get("split_corrected_expr") is None:
+        return None
+    cols = _read_zarr_corrected_cols(holder)
+    holder["split_corrected_cols"] = cols
+    return set(cols) if cols is not None else None
+
+
 def _corrected_status() -> dict:
     """Which samples of the Xenium view carry SPLIT-corrected counts: {labels, have,
     missing (labels without them), all, any}. Corrected counts are shown and tested only

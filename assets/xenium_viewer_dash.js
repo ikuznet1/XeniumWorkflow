@@ -699,7 +699,7 @@
     lastTool = tool_;
     cur = { source: source, tool: tool, colorBy: colorBy || "cluster", dataVersion: dataVersion,
             colorVersion: colorVersion,
-            overlayBase: [datasetVer, roiDone, source, extraVer || 0].join("|"),
+            overlayBase: [dataVersion, roiDone].join("|"),
             umapBase: null, jointEmb: false };
     syncOverlays();
     syncCellnest();

@@ -637,7 +637,10 @@ def _run_imgseg(backend: str = "classical", channels=None, diameter_um: float = 
         zarr_path = os.path.join(final_dir, os.path.basename(zarr_path))
         out_dir = final_dir
         with core._roi_lock:
-            regions._roi_apply_metadata_to_df(cells_df, core._roi_state["rois"])
+            _rois_now = list(core._roi_state["rois"])
+            regions._roi_apply_metadata_to_df(cells_df, _rois_now)
+        if _rois_now and zarr_path and os.path.isdir(zarr_path):
+            reseg._update_reseg_zarr_obs(zarr_path, cells_df)
         frac = f"{100.0 * n_kept_tx / n_tx:.1f} %" if n_tx else "n/a"
         msg = (f"Done — {n_cells:,} cells ({info['label']}); {frac} of {n_tx:,} gene transcripts assigned"
                + (f"; {n_failed} patch(es) failed" if n_failed else ""))

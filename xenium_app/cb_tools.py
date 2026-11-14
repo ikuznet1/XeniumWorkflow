@@ -7,7 +7,7 @@ import dash
 from dash import Input, Output, State, callback_context
 import plotly.graph_objects as go
 
-from . import core, jobs, dataview, annotation, figures, cellnest, app_layout
+from . import core, jobs, dataview, annotation, figures, cellnest, provenance, app_layout
 
 
 @app_layout.app.callback(
@@ -70,9 +70,10 @@ def detect_cellnest_datasets(n_clicks, folder_path):
     State("cellnest-folder-path", "value"),
     State("cellnest-dataset-dropdown", "value"),
     State("cellnest-strip-suffix", "value"),
+    State("seg-source", "value"),
     prevent_initial_call=True,
 )
-def load_cellnest(n_clicks, folder, dataset, strip_suffix):
+def load_cellnest(n_clicks, folder, dataset, strip_suffix, seg_source=None):
     import threading as _thr
     if not n_clicks or not folder or not dataset:
         raise dash.exceptions.PreventUpdate
@@ -86,6 +87,7 @@ def load_cellnest(n_clicks, folder, dataset, strip_suffix):
         core._cellnest_state["data"]   = None
     jobs._job_start("cellnest", f"CellNEST load: {dataset}", cellnest._load_cellnest_data,
                args=(folder.strip(), dataset, strip_suffix or ""),
+               kwargs={"seg_source": seg_source},
                state=core._cellnest_state, lock=core._cellnest_lock)
     return "Loading…", False   # enable poll interval
 
@@ -457,12 +459,15 @@ def start_annotation(n_clicks, source, model_name, rds_path, label_col,
         core._annot_state.update({"status": "running", "message": "Starting…",
                               labels_key: None, mode_labels_key: None})
 
+    _prov_seg = ("xenium" if alt_res is None
+                 else provenance._prov_run_source(core._seg_tool(seg_source), alt_res))
     _job_kw = dict(state=core._annot_state, lock=core._annot_lock, uses_run=alt_res)
     if source == "seurat":
         jobs._job_start("annotation", "Annotation: Seurat kNN", annotation._run_seurat_annotation,
                    args=(rds_path or "", label_col or "Names"),
                    kwargs=dict(labels_key=labels_key, expr_override=expr_override,
-                               cell_ids_override=cell_ids_override, cache_sig=cache_sig),
+                               cell_ids_override=cell_ids_override, cache_sig=cache_sig,
+                               seg_source=_prov_seg),
                    copy_context=True, **_job_kw)
     elif source == "rctd":
         jobs._job_start("annotation", f"Annotation: RCTD ({rctd_mode or 'full'})", annotation._run_rctd_annotation,
@@ -472,13 +477,15 @@ def start_annotation(n_clicks, source, model_name, rds_path, label_col,
                                cell_ids_override=cell_ids_override,
                                umi_min=int(rctd_umi_min or 20),
                                umi_min_sigma=int(rctd_umi_min_sigma or 100),
-                               mode_labels_key=mode_labels_key, cache_sig=cache_sig),
+                               mode_labels_key=mode_labels_key, cache_sig=cache_sig,
+                               seg_source=_prov_seg),
                    copy_context=True, **_job_kw)
     else:
         jobs._job_start("annotation", f"Annotation: CellTypist ({model_name})", annotation._run_celltypist,
                    args=(model_name,),
                    kwargs={"labels_key": labels_key, "expr_override": expr_override,
-                           "cell_ids_override": cell_ids_override, "cache_sig": cache_sig},
+                           "cell_ids_override": cell_ids_override, "cache_sig": cache_sig,
+                           "seg_source": _prov_seg},
                    **_job_kw)
     return False, "Starting…", True, "Starting…"
 

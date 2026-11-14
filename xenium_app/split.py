@@ -102,7 +102,8 @@ def _compute_split_clusters_umap(cells_df: pd.DataFrame, corrected_mat,
 
 
 def _split_write_zarr(sdata_path: str, corrected_mat, cells_df: pd.DataFrame,
-                       gene_names: list, corrected_cell_ids=None) -> None:
+                       gene_names: list, corrected_cell_ids=None,
+                       corrected_cols=None) -> None:
     """Write SPLIT corrected counts + cluster/UMAP obs columns to a SpatialData zarr.
     Uses zarr low-level API to avoid spatialdata 'target path in use' error."""
     try:
@@ -192,6 +193,18 @@ def _split_write_zarr(sdata_path: str, corrected_mat, cells_df: pd.DataFrame,
             if "X_corrected" in layers_grp:
                 del layers_grp["X_corrected"]
             _write_elem(layers_grp, "X_corrected", mat_aligned)
+            uns_grp = table_grp.require_group("uns")
+            if "encoding-type" not in uns_grp.attrs:
+                uns_grp.attrs["encoding-type"] = "dict"
+                uns_grp.attrs["encoding-version"] = "0.1.0"
+            if corrected_cols is not None:
+                _cols_str = [str(g) for g in corrected_cols]
+                layers_grp["X_corrected"].attrs["corrected_cols"] = _cols_str
+                if "split_corrected_cols" in uns_grp:
+                    del uns_grp["split_corrected_cols"]
+                _write_elem(uns_grp, "split_corrected_cols", np.asarray(_cols_str, dtype=object))
+            elif "split_corrected_cols" in uns_grp:
+                del uns_grp["split_corrected_cols"]
 
             # Write obs columns — delete then rewrite so reruns fully replace old values
             for col in ["cluster_split_10", "split_umap_1", "split_umap_2"]:
@@ -223,6 +236,14 @@ def _split_write_zarr(sdata_path: str, corrected_mat, cells_df: pd.DataFrame,
 # The sparse-matrix exchange with R (_scipy_to_r_dgc, _scipy_csc_parts,
 # _r_dgcmatrix_to_scipy) and the R part of SPLIT itself (_rw_split) are in rworker.py:
 # they run in the R worker process, which cannot import this module.
+
+
+def _merge_corrected_cols(new_cols: list, prev_cols, panel_genes: list) -> list:
+    """Panel gene names that have SPLIT-corrected counts across both a subset run
+    (*new_cols*) and the existing full-dataset matrix (*prev_cols*; None when that
+    earlier matrix covered all *panel_genes*)."""
+    keep = set(map(str, panel_genes if prev_cols is None else prev_cols))
+    return [str(g) for g in new_cols if str(g) in keep]
 
 
 def _split_onto_cells(mat, job_df, cur_df, cols=("cluster_split_10", "split_umap_1", "split_umap_2")) -> tuple:
@@ -383,6 +404,7 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
                 (_alt_res is None and "_df_original" in core.DATA):
             _cells_extra = (f"_n{len(cell_ids)}_"
                             + hashlib.md5("\n".join(cell_ids).encode()).hexdigest()[:8])
+        _ran_on_subset = bool(_cells_extra)
         # "_cmi5pp": SPLIT's RCTD configuration (CELL_MIN_INSTANCE=5 plus
         # run_post_process_RCTD) differs from the annotation modal's doublet run,
         # so the two do not share a cache file even with equal UMI thresholds.
@@ -472,6 +494,8 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
         elif corrected_gene_ids is None and corrected_mat.shape[1] != n_panel:
             raise RuntimeError(f"SPLIT::purify returned {corrected_mat.shape[1]} genes without names "
                                f"for a {n_panel}-gene panel — cannot align the corrected counts")
+        _corr_cols = ([panel_genes[int(i)] for i in _ret_cols]
+                      if _ret_cols is not None else list(panel_genes))
         n_corr = corrected_mat.shape[0]
         n_orig = len(cells_df)
         print(f"  SPLIT: corrected matrix shape {corrected_mat.shape} "
@@ -500,11 +524,11 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
             print(f"  SPLIT: could not count changed cells: {_nce}", flush=True)
 
         # ── 11. Write to zarr ────────────────────────────────────────────────
-        # Not under an active subset(): the store holds one X_corrected row and one
-        # cluster / UMAP value per cell of the whole dataset, and writing a subset
-        # run would replace an earlier full-dataset correction with zero rows.
-        _split_subset = ((_alt_res is not None and "_cells_df_original" in _alt_res)
-                         or (_alt_res is None and "_df_original" in core.DATA))
+        # Not when the job started under an active subset(): the store holds one
+        # X_corrected row and one cluster / UMAP value per cell of the whole dataset,
+        # and writing a subset run (even if unsubset() ran mid-job) would replace an
+        # earlier full-dataset correction with zero rows.
+        _split_subset = _ran_on_subset
         _split_note = ""
         # Last cancellation point: the store and the in-memory result are updated together
         jobs._job_shield()
@@ -517,7 +541,8 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
         elif sdata_path and os.path.isdir(sdata_path):
             _set("running", "Writing corrected counts to SpatialData zarr…")
             _split_write_zarr(sdata_path, corrected_mat, cells_df, list(panel_genes),
-                              corrected_cell_ids=corrected_cell_ids)
+                              corrected_cell_ids=corrected_cell_ids,
+                              corrected_cols=_corr_cols)
 
         # Expand corrected_mat to full cells_df size before storing in memory.
         # After RCTD, n_corr ≤ n_orig; _get_expr_values returns a column of length
@@ -550,11 +575,43 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
         if _alt_res is not None:
             _lock = core._seg_state(_tool)[1] or core._proseg_lock
             with _lock:
+                # Resolve lazy zarr corrected_cols before mutating _alt_res so merges
+                # never treat an unresolved disk-loaded matrix as covering all panel genes.
+                if _alt_res.get("split_corrected_expr") is not None and "split_corrected_cols" not in _alt_res:
+                    dataview._corrected_cols(_alt_res)
+                _prev_cur_cols = _alt_res.get("split_corrected_cols")
+                if "_corrected_cols_original" in _alt_res:
+                    _prev_orig_cols = _alt_res.get("_corrected_cols_original")
+                elif _alt_res.get("_corrected_original") is not None:
+                    _prev_orig_cols = (
+                        _prev_cur_cols if "split_corrected_cols" in _alt_res
+                        else dataview._read_zarr_corrected_cols(_alt_res)
+                    )
+                else:
+                    _prev_orig_cols = None
                 # The run's cell table may have changed while SPLIT ran (subset() /
                 # unsubset() in the REPL): rows are paired with the cells now in the
                 # table by cell id, never by position.
+                _cur_df = _alt_res["cells_df"]
                 _mat_cur, _cols_cur = _split_onto_cells(corrected_mat, cells_df, _alt_res["cells_df"])
+                _cur_cols_list = list(_corr_cols)
+                if _ran_on_subset:
+                    # If unsubset() (or another subset()) ran mid-job, preserve existing
+                    # corrected rows outside the cells this subset job actually ran on.
+                    _in_job = pd.Index(_cur_df.index.astype(str)).isin(
+                        pd.Index(cells_df.index.astype(str)))
+                    if not _in_job.all():
+                        _prev_cur = _alt_res.get("split_corrected_expr")
+                        if (_prev_cur is not None and _prev_cur.shape[0] == len(_cur_df)
+                                and _prev_cur.shape[1] >= _mat_cur.shape[1]):
+                            _keep_cur = (~_in_job).astype(np.float32)
+                            _mat_cur = (sp_.diags(_keep_cur).dot(
+                                sp_.csr_matrix(_prev_cur)[:, :_mat_cur.shape[1]])
+                                + _mat_cur).tocsr()
+                            _cur_cols_list = _merge_corrected_cols(
+                                _corr_cols, _prev_cur_cols, panel_genes)
                 _alt_res["split_corrected_expr"] = _mat_cur
+                _alt_res["split_corrected_cols"] = _cur_cols_list
                 _alt_res["split_corrected_cell_ids"] = corrected_cell_ids
                 _alt_res["split_panel_genes"] = list(panel_genes)
                 _alt_res["split_corrected_imputed_genes"] = []
@@ -571,6 +628,7 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
                         _full_new = sp_.csr_matrix(
                             (_coo.data, (_opos[_coo.row], _coo.col)),
                             shape=(len(_orig_df), corrected_mat.shape[1]))
+                        _orig_cols_list = list(_corr_cols)
                         # An earlier full-run correction keeps its rows outside the subset
                         _full_old = _alt_res.get("_corrected_original")
                         if _full_old is not None and _full_old.shape == _full_new.shape:
@@ -578,17 +636,36 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
                             _keep[_opos] = 0.0
                             _full_new = (sp_.diags(_keep).dot(sp_.csr_matrix(_full_old))
                                          + _full_new).tocsr()
+                            if (_keep > 0).any():
+                                _orig_cols_list = _merge_corrected_cols(
+                                    _corr_cols, _prev_orig_cols, panel_genes)
                         _alt_res["_corrected_original"] = _full_new
+                        _alt_res["_corrected_cols_original"] = _orig_cols_list
                         for col in ["cluster_split_10", "split_umap_1", "split_umap_2"]:
                             if col in cells_df.columns:
                                 _orig_df[col] = cells_df[col].reindex(_orig_df.index).values
         else:
-            if _x_d2e is not None:
+            if core.DATA.get("split_corrected_expr") is not None and "split_corrected_cols" not in core.DATA:
+                dataview._corrected_cols(core.DATA)
+            _prev_x_cols = core.DATA.get("split_corrected_cols")
+            _x_cols = list(_corr_cols)
+            _scatter_d2e = _x_d2e
+            if _scatter_d2e is None and corrected_mat.shape[0] != core.DATA["expr"].shape[0]:
+                # Fallback if DATA["df"] / expr rows diverged without _x_d2e (e.g. mid-run change)
+                _full_xdf = core.DATA.get("_df_original", core.DATA["df"])
+                _full_d2e = np.asarray(core.DATA.get("_df_to_expr_orig", core.DATA["df_to_expr"]))
+                _fpos = pd.Index(_full_xdf.index.astype(str)).get_indexer(
+                    pd.Index(cells_df.index.astype(str)))
+                if len(_fpos) == corrected_mat.shape[0] and (_fpos >= 0).all():
+                    _cand_d2e = _full_d2e[_fpos]
+                    if (_cand_d2e >= 0).all():
+                        _scatter_d2e = _cand_d2e
+            if _scatter_d2e is not None:
                 # Keep the invariant "one row per DATA['expr'] row": scatter the
                 # rows (in cells_df order) back to their expression-matrix rows.
                 _coo = corrected_mat.tocoo()
                 corrected_mat = sp_.csr_matrix(
-                    (_coo.data, (_x_d2e[_coo.row], _coo.col)),
+                    (_coo.data, (_scatter_d2e[_coo.row], _coo.col)),
                     shape=(core.DATA["expr"].shape[0], corrected_mat.shape[1]))
                 # An earlier correction of the whole dataset keeps its rows for the
                 # cells this (subset) run did not cover, instead of turning to zero.
@@ -596,28 +673,36 @@ def _run_split_correction(rds_path: str, label_col: str = "Names",
                 if _prev_corr is not None and _prev_corr.shape[0] == corrected_mat.shape[0] \
                         and _prev_corr.shape[1] >= corrected_mat.shape[1]:
                     _keep = np.ones(corrected_mat.shape[0], dtype=np.float32)
-                    _keep[_x_d2e] = 0.0
+                    _keep[_scatter_d2e] = 0.0
                     corrected_mat = (sp_.diags(_keep).dot(
                         sp_.csr_matrix(_prev_corr)[:, :corrected_mat.shape[1]])
                         + corrected_mat).tocsr()
+                    if (_keep > 0).any():
+                        _x_cols = _merge_corrected_cols(
+                            _corr_cols, _prev_x_cols, panel_genes)
             core.DATA["split_corrected_expr"] = corrected_mat
+            core.DATA["split_corrected_cols"] = _x_cols
             core.DATA["split_corrected_cell_ids"] = corrected_cell_ids
             core.DATA["split_panel_genes"] = list(panel_genes)
             core.DATA["split_corrected_imputed_genes"] = []
+            _need_reindex = (_scatter_d2e is not None or _ran_on_subset
+                             or not cells_df.index.equals(core.DATA["df"].index))
             for col in ["cluster_split_10", "split_umap_1", "split_umap_2"]:
                 if col in cells_df.columns:
-                    if _x_d2e is not None:
-                        # cells_df is a subset of DATA["df"]: write back by cell id
+                    if _need_reindex:
+                        # cells_df is a subset of (or differs from) DATA["df"]: write back by cell id
                         core.DATA["df"][col] = cells_df[col].reindex(core.DATA["df"].index).values
-                        if "_df_original" in core.DATA:
-                            core.DATA["_df_original"][col] = \
-                                cells_df[col].reindex(core.DATA["_df_original"].index).values
                     else:
                         core.DATA["df"][col] = cells_df[col].values
+                    if "_df_original" in core.DATA:
+                        core.DATA["_df_original"][col] = \
+                            cells_df[col].reindex(core.DATA["_df_original"].index).values
                     print(f"  [SPLIT] wrote {col} to DATA['df']", flush=True)
                 else:
                     print(f"  [SPLIT] WARNING: {col} NOT in cells_df — skipping", flush=True)
             dataview._umap_df_cache.clear()  # split_umap_1/2 added; invalidate cached UMAP df
+            dataview._gene_expr_cache.clear()
+            dataview._viewport_arrays.clear()
 
         # n_cells = cells submitted; n_corr = cells RCTD kept (returned by purify());
         # n_changed = cells whose counts differ from the input

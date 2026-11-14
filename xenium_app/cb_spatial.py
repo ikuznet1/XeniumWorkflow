@@ -6,7 +6,7 @@ from dash import no_update
 import dash
 from dash import Input, Output, State, callback_context, ALL
 
-from . import core, jobs, dataview, annotation, split, spatial, figures, analysis, regions, app_layout
+from . import core, jobs, dataview, annotation, split, spatial, figures, analysis, regions, provenance, app_layout
 
 
 # ─── SPLIT correction callbacks ───────────────────────────────────────────────
@@ -310,9 +310,11 @@ def run_spatial_analysis(n_clicks, label_key, n_neighbors, seg_source):
     if label_key is None:
         return (False, True,
                 f"No annotation for the active {tool} segmentation — run annotation first.")
+    _prov_seg = "xenium" if alt_res is None else provenance._prov_run_source(tool, alt_res)
     jobs._job_start("spatial", "Spatial analysis", spatial._run_spatial_analysis,
                args=(label_key, n_neighbors, alt_res),
-               state=core._spatial_state, lock=core._spatial_lock)
+               kwargs={"seg_source": _prov_seg},
+               state=core._spatial_state, lock=core._spatial_lock, uses_run=alt_res)
     return True, False, "Running…"
 
 

@@ -235,6 +235,47 @@ _roi_known: dict = {}
 _roi_known_lock = threading.Lock()
 
 
+_OBS_PLACEHOLDERS = frozenset({"", "nan", "<NA>"})
+
+
+def _normalize_obs_placeholders(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Convert zarr string placeholders ("", "nan", "<NA>") to pd.NA on roi_*, niche,
+    and cluster_split_10 columns (object, string, bytes, or string-categorical dtype)."""
+    if df is None:
+        return df
+    for col in [c for c in df.columns
+                if c == "cluster_split_10" or c == "niche" or str(c).startswith("roi_")]:
+        ser = df[col]
+        if pd.api.types.is_numeric_dtype(ser) or pd.api.types.is_bool_dtype(ser):
+            continue
+        if isinstance(ser.dtype, pd.CategoricalDtype):
+            cats = ser.cat.categories
+            if len(cats) and (pd.api.types.is_numeric_dtype(cats) or pd.api.types.is_bool_dtype(cats)):
+                continue
+        elif not (ser.dtype == object or pd.api.types.is_string_dtype(ser)
+                  or getattr(ser.dtype, "kind", "") in ("U", "S", "O")):
+            continue
+        na_mask = ser.isna().to_numpy(dtype=bool)
+        raw = ser.tolist()
+        has_bytes = any(isinstance(v, (bytes, bytearray)) for v in raw)
+        vals = []
+        had_placeholder = False
+        for v, is_na in zip(raw, na_mask):
+            if is_na:
+                vals.append(pd.NA)
+                continue
+            s = bytes(v).decode("utf-8", "replace") if isinstance(v, (bytes, bytearray)) else str(v)
+            if s in _OBS_PLACEHOLDERS:
+                vals.append(pd.NA)
+                had_placeholder = True
+            else:
+                vals.append(s)
+        if (col == "cluster_split_10" or had_placeholder or has_bytes
+                or (isinstance(ser.dtype, pd.CategoricalDtype) and na_mask.any())):
+            df[col] = pd.array(vals, dtype="string")
+    return df
+
+
 def _roi_forget_known() -> None:
     with _roi_known_lock:
         _roi_known.clear()
@@ -244,22 +285,22 @@ def _roi_apply_metadata_to_df(df: "pd.DataFrame", rois: list, x_offset: float = 
     """Add/update roi_{cls} columns in df based on rois list (*x_offset*: the shift the
     table's sample is drawn at; the outlines are in plot space).
 
-    Only the app's own labels are re-derived: a value is cleared when it is the name of a
-    ROI the app holds (or held) a polygon for, and set again from the current polygons. A
-    roi_* value that came with the loaded store and has no polygon here (another cache
-    directory, a store exported elsewhere) is NOT blanked: the polygons to re-derive it
-    from do not exist, and the blank column would be written back into the store."""
+    Only the app's own labels (plus empty-string / NA-string placeholders left by low-level
+    zarr obs writers) are cleared and re-derived from the current polygons. A real roi_*
+    value that came with the loaded store and has no polygon here (another cache directory,
+    a store exported elsewhere) is NOT blanked: the polygons to re-derive it from do not
+    exist, and the blank column would be written back into the store."""
     known = _roi_known_names(rois)
     for col in [c for c in df.columns if c.startswith("roi_")]:
-        names = known.get(col[4:])
-        if not names:
-            continue                       # no polygon of this class was ever held: not ours
+        names = known.get(col[4:]) or set()
+        v = df[col]
+        s = v.astype(str)
+        mine = (v.notna() & (s.isin(names) | s.isin(_OBS_PLACEHOLDERS))).fillna(False).to_numpy(dtype=bool)
+        if not mine.any():
+            continue
         if isinstance(df[col].dtype, pd.CategoricalDtype):
             df[col] = df[col].astype(object)
-        v = df[col]
-        mine = v.notna().to_numpy() & v.astype(str).isin(names).to_numpy()
-        if mine.any():
-            df.loc[mine, col] = pd.NA
+        df.loc[mine, col] = pd.NA
     # Ensure columns exist for all current classes
     for cls in {r["cls"] for r in rois}:
         col = f"roi_{cls}"

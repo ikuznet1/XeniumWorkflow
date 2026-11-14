@@ -82,6 +82,7 @@ _SESSION_VERSION = 1
 _SESSION_MAX_BYTES = 8_000_000       # largest file read (ROI outlines are the bulk of a session)
 _SESSION_TEXT_MAX = 20_000           # longest text-area value
 _SESSION_AUTOSAVE_MS = 60_000        # the page sends its control values this often
+_SESSION_INIT_MS = 500               # one-shot baseline capture right after page load
 _SESSION_PROCESS = secrets.token_hex(6)     # tells the autosave of this server run from an earlier one
 _session_lock = threading.RLock()
 _session_auto: dict = {"baseline": None, "written": None}   # signatures of the autosave (see _session_autosave)
@@ -798,37 +799,70 @@ def _session_signature(doc: dict) -> str:
     return json.dumps({"dataset": doc["dataset"], "state": doc["state"]}, sort_keys=True, default=str)
 
 
-def _session_autosave(controls, page=None) -> str:
-    """The automatic save of the "last session" of the loaded dataset (called with the
-    control values the page sends every _SESSION_AUTOSAVE_MS). *page*: the id of the page
-    load that sends them (one per browser page load; None: one unnamed page).
+def _session_default_sig() -> tuple:
+    default_controls = {cid: _session_default(cid) for cid in _session_controls()}
+    default_doc = _session_snapshot(default_controls, "auto")
+    return (default_doc["dataset"]["key"], _session_signature(default_doc))
 
-    Nothing is written while a page still shows the state of its first call - a page that
-    was only opened, reloaded or reopened sends the default control values, and must
-    replace neither the session of the run before nor what this run has already saved -
-    and nothing when the state did not change. Once a page has shown another state, all
-    its states are saved (also a return to the first one). The first write of a run keeps
-    the file of the run before as the "prev" slot. Never raises; returns what it did (""
-    for nothing)."""
+
+def _session_note_baseline(controls, page=None) -> None:
+    """Record the post-restore state of an untouched page so restoring a session does not
+    immediately trigger an automatic overwrite on the next tick."""
     try:
         if not caching._dataset_key():
-            return ""
+            return
         doc = _session_snapshot(controls, "auto")
         sig = (doc["dataset"]["key"], _session_signature(doc))
         page = str(page)[:64] if page is not None else None
         with _session_lock:
             if _session_auto["baseline"] is None or _session_auto["baseline"][0] != sig[0]:
+                _session_auto.update({"baseline": sig, "written": None, "pages": {}})
+            pages = _session_auto.setdefault("pages", {})
+            mine = pages.get(page)
+            if mine is None or not mine[1]:
+                if mine is None:
+                    while len(pages) >= _SESSION_AUTO_PAGES:
+                        pages.pop(next(iter(pages)))
+                pages[page] = [sig, False]
+    except Exception:
+        pass
+
+
+def _session_autosave(controls, page=None) -> str:
+    """The automatic save of the "last session" of the loaded dataset (called with the
+    control values the page sends at page load via ``session-init-tick`` and every
+    _SESSION_AUTOSAVE_MS). *page*: the id of the page load that sends them (one per
+    browser page load; None: one unnamed page).
+
+    Nothing is written while a page still shows its starting state - a page that was only
+    opened, reloaded or reopened sends the default control values, and must replace
+    neither the session of the run before nor what this run has already saved - and
+    nothing when the state did not change. If edits already happened before a page's first
+    tick arrived (its first seen signature already differs from server-side defaults), its
+    baseline is set to defaults and the edits are saved immediately. Once a page has shown
+    another state, all its states are saved (also a return to the first one). The first
+    write of a run keeps the file of the run before as the "prev" slot. Never raises;
+    returns what it did ("" for nothing)."""
+    try:
+        if not caching._dataset_key():
+            return ""
+        doc = _session_snapshot(controls, "auto")
+        sig = (doc["dataset"]["key"], _session_signature(doc))
+        default_sig = _session_default_sig()
+        page = str(page)[:64] if page is not None else None
+        with _session_lock:
+            if _session_auto["baseline"] is None or _session_auto["baseline"][0] != sig[0]:
                 # first call of this server run for this dataset
-                _session_auto.update({"baseline": sig, "written": None, "pages": {page: [sig, False]}})
-                return ""
-            pages = _session_auto.setdefault("pages", {None: [_session_auto["baseline"], False]})
+                _session_auto.update({"baseline": default_sig, "written": None, "pages": {}})
+            pages = _session_auto.setdefault("pages", {})
             mine = pages.get(page)
             if mine is None:
-                # a page that was just opened: what it shows now is its starting point
                 while len(pages) >= _SESSION_AUTO_PAGES:
                     pages.pop(next(iter(pages)))
-                pages[page] = [sig, False]
-                return ""
+                if sig == default_sig:
+                    pages[page] = [sig, False]
+                    return ""
+                mine = pages[page] = [default_sig, False]
             if not mine[1]:
                 if sig == mine[0]:
                     return ""                     # still as opened: nothing of this page to save
@@ -1108,8 +1142,9 @@ def _session_apply_subset(sub, report: dict) -> None:
         return
     f = dict(sub["filters"])
     if now is not None and now.get("filters") == f:
-        report["unchanged"].append("subset")
-        return
+        if not (f and any("_cells_df_original" not in r for _t, r in subsetting._loaded_reseg_results())):
+            report["unchanged"].append("subset")
+            return
     if f.get("method") and f["method"] not in (core.DATA.get("cluster_methods") or []):
         report["missing"].append(f"subset: the cluster set {_session_show(f['method'], 60)} it filters on does not exist")
         return
@@ -1183,7 +1218,8 @@ def _session_restore(doc: dict, current=None, source: str = "file", record: bool
             # 1. the segmentation everything else is read on
             seg = ctl.get("seg-source")
             if seg:
-                why = _session_seg_load(seg)
+                with provenance._prov_suppress(not persist):
+                    why = _session_seg_load(seg)
                 if why is None:
                     applied["seg-source"] = ctx["seg-source"] = seg
                     rid = core._seg_run_id(core._seg_result(seg)) if core._seg_tool(seg) != "xenium" else ""
@@ -1243,12 +1279,12 @@ def _session_restore(doc: dict, current=None, source: str = "file", record: bool
         # picker is left empty and the report says so.
         _gs_pick, _gs_text = applied.get("geneset-select"), applied.get("geneset-genes")
         if _gs_pick and isinstance(_gs_text, str):
-            _an = _session_module("analysis")
+            _an = _session_module("analysis") or analysis
             _stored = None
             if _an is not None:
                 with _an._geneset_lock:
                     _stored = _an._geneset_state["sets"].get(_gs_pick)
-            _lines = _session_gene_lines(_gs_text)
+            _lines = _an._gs_parse(_gs_text) if _an is not None else _session_gene_lines(_gs_text)
             # (an empty text is not an edit: the picker then fills it, as it does in the page)
             if _stored is not None and _lines and _lines != [str(g) for g in _stored]:
                 applied["geneset-select"] = None
@@ -1380,6 +1416,7 @@ def _session_sidebar_entry():
         dcc.Store(id="session-request", data=None),
         dcc.Store(id="session-apply", data=None),
         dcc.Store(id="session-autosave-note", data=None),
+        dcc.Interval(id="session-init-tick", interval=_SESSION_INIT_MS, n_intervals=0, max_intervals=1),
         dcc.Interval(id="session-autosave", interval=_SESSION_AUTOSAVE_MS, n_intervals=0),
     ], id="session-entry", style={"marginBottom": "10px"})
 

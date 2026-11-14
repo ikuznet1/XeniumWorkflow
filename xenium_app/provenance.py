@@ -21,6 +21,7 @@ import json
 import time as _time
 import uuid
 import hashlib
+import contextlib
 import datetime as _dt
 import threading
 
@@ -44,7 +45,26 @@ _prov_lock = threading.RLock()
 _prov_state: dict = {"version": 0, "last_id": None}
 _prov_recent: list = []            # the last records written by this process, whatever the cache directory
 _prov_once: set = set()            # (dataset, kind, identity) recorded once per session (see _prov_record)
+_prov_suppressed: int = 0          # > 0 inside _prov_suppress(): dry-run / validation loads write nothing
 _PROV_RECENT_MAX = 400
+
+
+@contextlib.contextmanager
+def _prov_suppress(active: bool = True):
+    """Suppress provenance recording (both _prov_recent and the .jsonl log, without
+    consuming _prov_once tokens) across this block and any job threads awaited inside it.
+    Thread-safe and reentrant; when *active* is False, acts as a no-op."""
+    global _prov_suppressed
+    if not active:
+        yield
+        return
+    with _prov_lock:
+        _prov_suppressed += 1
+    try:
+        yield
+    finally:
+        with _prov_lock:
+            _prov_suppressed = max(0, _prov_suppressed - 1)
 
 # Analysis kinds and their titles. Every kind a job is registered under (jobs._job_start)
 # has to be listed here or in _PROV_NOT_ANALYSES; tests/test_provenance.py checks both
@@ -520,6 +540,9 @@ def _prov_record(kind: str, title: str = None, *, seg_source=None, corrected=Non
     call with the same identity writes nothing. Never raises: a failure is printed and
     None returned, the analysis itself is not affected."""
     try:
+        with _prov_lock:
+            if _prov_suppressed > 0:
+                return None
         if once is not None:
             with _prov_lock:
                 okey = (caching._dataset_key(), kind, once)
@@ -593,10 +616,29 @@ def _prov_from_cache(cache, result, message) -> bool:
 def _prov_labels_source(labels_key) -> str:
     """Segmentation an annotation's labels belong to, from its key in the annotation
     state: "labels" -> xenium, "labels_celltypist" -> xenium,
-    "labels_baysor" / "labels_rctd_baysor" -> baysor ..."""
-    parts = str(labels_key or "labels").split("_")
+    "labels_celltypist_baysor_<md5>" / "labels_baysor" -> "baysor:<tag>" when that run is
+    loaded (else "baysor") ..."""
+    raw = str(labels_key or "labels")
+    if ":" in raw and raw.split(":", 1)[0] in ("baysor", "proseg", "imgseg"):
+        return raw
+    parts = raw.split("_")
     tools = [p for p in parts if p in ("baysor", "proseg", "imgseg")]
-    return tools[0] if tools else "xenium"
+    if not tools:
+        return "xenium"
+    tool = tools[0]
+    idx = parts.index(tool)
+    after = parts[idx + 1] if idx + 1 < len(parts) else None
+    has_hash = bool(after and re.fullmatch(r"[0-9a-f]{8}", after))
+    state, lock = core._seg_state(tool)
+    res = None
+    if state is not None and lock is not None:
+        with lock:
+            res = state.get("result")
+    if isinstance(res, dict):
+        res_hash = hashlib.md5(str(res.get("out_dir") or "").encode()).hexdigest()[:8]
+        if (has_hash and after == res_hash) or not has_hash:
+            return _prov_run_source(tool, res)
+    return tool
 
 
 def _prov_labels_summary(labels):
@@ -1575,12 +1617,17 @@ def _pm_variant(r) -> tuple:
     """Records with the same variant describe the same analysis; the newest one is written up."""
     P = r.get("params") or {}
     d = r.get("data") or {}
-    extra = {"annotation": P.get("method"), "geneset": P.get("gene_set"), "patches": r.get("title"),
+    seg_src = d.get("seg_source")
+    seg_tag = d.get("seg_tag") or (seg_src.split(":", 1)[1] if isinstance(seg_src, str) and ":" in seg_src else None)
+    annot_extra = P.get("method") if seg_tag else (P.get("method"), P.get("labels_key"))
+    spatial_extra = None if seg_tag else P.get("labels_key")
+    extra = {"annotation": annot_extra, "spatial": spatial_extra,
+             "geneset": P.get("gene_set"), "patches": r.get("title"),
              "proximity": (P.get("target"), P.get("anchor")), "contact": (P.get("target"), P.get("anchor")),
              "pseudobulk": P.get("population"), "segfree": P.get("cell_type"),
              "de": (str(P.get("group_a")), str(P.get("group_b"))),
              "composition": (P.get("proportions_of"), P.get("test"))}.get(r.get("kind"))
-    return (r.get("kind"), d.get("seg_source"), (d.get("counts") or {}).get("used"), json.dumps(extra, default=str))
+    return (r.get("kind"), seg_src, (d.get("counts") or {}).get("used"), json.dumps(extra, default=str))
 
 
 _PM_RUN_KINDS = ("baysor", "proseg", "imgseg")

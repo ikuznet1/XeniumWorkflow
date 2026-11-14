@@ -483,14 +483,17 @@ def _sl_unit_groups(inc, donors, names=None) -> dict:
     without a donor), 2 independent units after combining the samples of one donor")}."""
     inc = list(inc)
     dn = {i: str((donors[i] if donors is not None else "") or "").strip() for i in inc}
+    used_dn = {d for d in dn.values() if d}
     groups: dict = {}
     for i in inc:
         if dn[i]:
             name = dn[i]
         else:
             name = str(names[i]) if names is not None else f"\x00sample{i}"
-            if name in set(dn.values()):
+            if name in used_dn or name in groups:
                 name = f"\x00{name}"            # a sample named like a donor stays its own unit
+            while name in groups:
+                name = f"\x00{name}"
         groups.setdefault(name, []).append(i)
     n_unl = sum(1 for i in inc if not dn[i])
     n_d = len({d for d in dn.values() if d})
@@ -2016,6 +2019,8 @@ def _moran_sample(s: dict, k: int = _MORAN_K, progress=None, chunk_bytes: float 
     genes = list(s["genes"])
     if n < 3:
         raise ValueError(f"{s['label']}: fewer than 3 cells with counts.")
+    if not genes:
+        raise ValueError(f"{s['label']}: no measured genes with counts.")
     W = _knn_weights(_xy_of(s["df"])[ok], k)
     kk = int(W.indptr[1] - W.indptr[0])
     ei, var = _moran_moments(W)
@@ -2161,6 +2166,7 @@ def _run_moran(seg_source, use_corrected, k=_MORAN_K) -> None:
         corrected = bool(samples[0]["corrected"])
         res = {"table": table, "samples": infos, "k": k, "corrected": corrected,
                "n_uncorrected": analysis._an_uncorrected(samples),
+               "n_genes_uncorrected": analysis._an_uncorrected_genes(samples),
                "seg_source": seg_source or "xenium", "seconds": _time.time() - _t0}
         msg = ("Moran's I, kNN graph (k = " + str(k) + "), "
                + "; ".join(f"{i['label']}: {i['n_cells']:,} cells, {i['n_tested']:,} genes, "
@@ -2174,6 +2180,8 @@ def _run_moran(seg_source, use_corrected, k=_MORAN_K) -> None:
             msg += " Original counts were used: not every sample has SPLIT-corrected counts."
         if res["n_uncorrected"]:
             msg += " " + analysis._an_uncorrected_note(res["n_uncorrected"]) + "."
+        if res["n_genes_uncorrected"]:
+            msg += " " + analysis._an_uncorrected_genes_note(res["n_genes_uncorrected"]) + "."
         if skipped:
             msg += " Skipped: " + " ".join(skipped)
         _set("done", msg, result=res)
@@ -2341,9 +2349,12 @@ def _lr_compute(samples, labels, pairs, k: int = _MORAN_K, n_perm: int = 200, se
     info["n_pairs_on_panel"] = len(kept)
     info["lib_shared_genes"] = len(genes_all) if analysis._an_panels_differ(samples, genes_all) else None
     info["n_pairs_missing"] = len(pairs) - len(kept)
+    info["n_genes_uncorrected"] = analysis._an_uncorrected_genes(samples)
     if not kept:
+        _unc_tail = (f" ({analysis._an_uncorrected_genes_note(info['n_genes_uncorrected'])})"
+                     if info["n_genes_uncorrected"] else "")
         raise ValueError(f"None of the {len(pairs)} ligand–receptor pairs has both genes among "
-                         f"the {len(genes_all):,} measured genes of this view.")
+                         f"the {len(genes_all):,} measured genes of this view{_unc_tail}.")
     G = list(dict.fromkeys([g for pr in kept for g in pr]))
     gpos = {g: i for i, g in enumerate(G)}
     L = np.array([gpos[a] for a, _ in kept], dtype=np.int64)
@@ -2395,8 +2406,8 @@ def _lr_compute(samples, labels, pairs, k: int = _MORAN_K, n_perm: int = 200, se
     n_t = np.bincount(code, minlength=T + 1).astype(np.float64)
     # adjacent cell pairs between the types (an unordered pair counts once)
     A = sp.block_diag(adj, format="csr")
-    U = ((A + A.T) > 0).astype(np.float32)
-    H = sp.csr_matrix((np.ones(n, dtype=np.float32), (np.arange(n), code)), shape=(n, T + 1))
+    U = ((A + A.T) > 0).astype(np.float64)
+    H = sp.csr_matrix((np.ones(n, dtype=np.float64), (np.arange(n), code)), shape=(n, T + 1))
     E = np.asarray((H.T @ U @ H).todense(), dtype=np.float64)[:T, :T]
     E[np.diag_indices(T)] /= 2.0
     neigh = E >= min_edges
@@ -2491,6 +2502,7 @@ def _run_lr(pairs_text, label_kind, seg_source, method, use_corrected, k, n_perm
         corrected = bool(samples[0]["corrected"])
         res.update({"category": cat_name, "label_kind": label_kind, "corrected": corrected,
                     "n_uncorrected": analysis._an_uncorrected(samples),
+                    "n_genes_uncorrected": analysis._an_uncorrected_genes(samples),
                     "seg_source": seg_source or "xenium", "n_samples": len(samples),
                     "n_skipped_lines": n_skip, "seconds": _time.time() - _t0})
         t = res["table"]
@@ -2506,6 +2518,8 @@ def _run_lr(pairs_text, label_kind, seg_source, method, use_corrected, k, n_perm
             msg += " Original counts were used: not every sample has SPLIT-corrected counts."
         if res["n_uncorrected"]:
             msg += " " + analysis._an_uncorrected_note(res["n_uncorrected"]) + "."
+        if res["n_genes_uncorrected"]:
+            msg += " " + analysis._an_uncorrected_genes_note(res["n_genes_uncorrected"]) + "."
         if len(samples) > 1:
             msg += f" Cells of {len(samples)} samples were pooled (graph and permutations within each sample)."
         if info.get("lib_shared_genes"):

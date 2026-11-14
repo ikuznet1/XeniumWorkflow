@@ -454,6 +454,8 @@ def confirm_seg_delete(n_clicks, seg_value, baysor_ver, proseg_ver):
             print(f"  Deleted seg run: {os.path.basename(out_dir)}", flush=True)
         except Exception as e:
             print(f"  Delete failed: {e}", flush=True)
+        if not os.path.isdir(out_dir):
+            caching._seg_forget_run(out_dir)
         # Clear in-memory state if this was the loaded run
         tool = core._seg_tool(seg_value)
         if tool == "baysor":

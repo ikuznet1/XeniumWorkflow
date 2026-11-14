@@ -731,7 +731,8 @@ def _prox_compute(samples, labels, target, anchor, strata=None, source="auto", c
             "n_anchor": int(sum(r["n_anchor"] for r in rows_out if r["used"])),
             "short": int(sum(r["short"] for r in rows_out)),
             "corrected": bool(samples[0]["corrected"]),
-            "n_uncorrected": analysis._an_uncorrected(samples)}
+            "n_uncorrected": analysis._an_uncorrected(samples),
+            "n_genes_uncorrected": analysis._an_uncorrected_genes(samples)}
 
 
 _PROX_COLUMNS = [("gene", "Gene", "text"), ("log2fc", "Near − far", "num"), ("slope", "Slope", "num"),
@@ -856,6 +857,8 @@ def _run_proximity_de(target, anchor, label_kind, seg_source, method, use_correc
                     f"Benjamini-Hochberg over the sign-flip p-values.")
         if res.get("n_uncorrected"):
             msg += " " + analysis._an_uncorrected_note(res["n_uncorrected"]) + "."
+        if res.get("n_genes_uncorrected"):
+            msg += " " + analysis._an_uncorrected_genes_note(res["n_genes_uncorrected"]) + "."
         msg += f"\nUnit of the p-values: {res['units_note']}."
         if info["mode"] != "cohort":
             msg += (f"\n⚠ SINGLE-SAMPLE RESULT: {info['n_units']} independent unit(s); at least "
@@ -937,6 +940,8 @@ def _prox_csv_header(res: dict) -> str:
         lines.append(f"# {res['diff_note']}")
     if res.get("n_uncorrected"):
         lines.append(f"# {analysis._an_uncorrected_note(res['n_uncorrected'])}")
+    if res.get("n_genes_uncorrected"):
+        lines.append(f"# {analysis._an_uncorrected_genes_note(res['n_genes_uncorrected'])}")
     for r in res["samples"]:
         lines.append(f"# sample {r['label']} ({r['name']}): {r['n_target']} target cells, {r['n_anchor']} anchors, "
                      f"{r['n_near']} near, {r['n_far']} far; condition {r['cond'] or '-'}; donor {r['donor'] or '-'}"
@@ -1043,7 +1048,22 @@ def _contact_compute(samples, labels, target, anchor, strata=None, radius=_CONTA
     if len(ug["groups"]) < 2:
         raise ValueError("The testable samples all come from one donor: they are one independent unit, and "
                          "the contact test needs at least 2.")
-    block_of = {i: name.lstrip("\x00") for name, ix in ug["groups"].items() for i in ix}
+    taken_blocks = {name for name in ug["groups"] if not name.startswith("\x00")}
+    block_of = {}
+    for name, ix in ug["groups"].items():
+        if name.startswith("\x00"):
+            base = name.lstrip("\x00") or f"sample_{ix[0]}"
+            cand = base if base not in taken_blocks else f"sample_{base}"
+            k_blk = 2
+            while cand in taken_blocks:
+                cand = f"sample_{base}_{k_blk}"
+                k_blk += 1
+            taken_blocks.add(cand)
+            label = cand
+        else:
+            label = name
+        for i in ix:
+            block_of[i] = label
     blocks = list(dict.fromkeys(block_of[i] for i in test))
     unit_word = ug["word"] if by_donor else "samples"
     design = ("~ sample + group" if not by_donor else
@@ -1162,7 +1182,8 @@ def _contact_compute(samples, labels, target, anchor, strata=None, radius=_CONTA
             "n_filtered": int((~keep).sum()), "n_sig": int(sig0.sum()), "n_pass": obs,
             "n_a": int(sum(grp[i]["n_a"] for i in test)), "n_b": int(sum(grp[i]["n_c"] for i in test)),
             "corrected": bool(samples[0]["corrected"]),
-            "n_uncorrected": analysis._an_uncorrected(samples)}
+            "n_uncorrected": analysis._an_uncorrected(samples),
+            "n_genes_uncorrected": analysis._an_uncorrected_genes(samples)}
 
 
 def _run_contact_de(target, anchor, label_kind, seg_source, method, use_corrected, radius=None,
@@ -1252,6 +1273,8 @@ def _run_contact_de(target, anchor, label_kind, seg_source, method, use_correcte
                f"{res['seconds']:.1f} s).")
         if res.get("n_uncorrected"):
             msg += " " + analysis._an_uncorrected_note(res["n_uncorrected"]) + "."
+        if res.get("n_genes_uncorrected"):
+            msg += " " + analysis._an_uncorrected_genes_note(res["n_genes_uncorrected"]) + "."
         if use_corrected:
             msg += ("\nNote: the counts mode is SPLIT-corrected, but contact-group pseudobulk uses the original "
                     "integer counts (a count model is not given corrected counts), as the pseudobulk mode does.")
@@ -1332,6 +1355,8 @@ def _contact_csv_header(res: dict) -> str:
                      + (f"block {r['block']}" if r["testable"] else "not used"))
     if res.get("n_uncorrected"):
         lines.append(f"# {analysis._an_uncorrected_note(res['n_uncorrected'])}")
+    if res.get("n_genes_uncorrected"):
+        lines.append(f"# {analysis._an_uncorrected_genes_note(res['n_genes_uncorrected'])}")
     return provenance._prov_csv_stamp(res, (provenance._csv_comments(lines)))
 
 

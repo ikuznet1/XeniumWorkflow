@@ -832,6 +832,7 @@ def test_run_in_use_is_not_rerun_replaced_or_deleted(xe, D, tmp_path, monkeypatc
     assert not run_dir.exists() and out[0] is False and out[1] == "xenium"
     # the loads and the jobs that get the run from their callback are registered as well
     assert _src("cb_reseg").count("uses_run=out_dir") == 2
+    assert _src("cb_spatial").count("uses_run=") >= 3
     for name in ("cb_spatial", "cb_spage", "cb_tools"):
         assert "uses_run=" in _src(name), name
 
