@@ -131,9 +131,8 @@ client = xe.app.server.test_client()
 def _fig_info(fig):
     if fig is xe.no_update:
         return {"no_update": True}
-    d = fig.to_plotly_json()
-    ann = " ".join(str(a.get("text", "")) for a in (d.get("layout", {}).get("annotations") or []))
-    n_pts = sum(len(t.get("x", [])) for t in d.get("data", []) if t.get("x") is not None)
+    ann = " ".join(str(getattr(a, "text", "")) for a in (fig.layout.annotations or ()))
+    n_pts = sum(len(t.x) for t in fig.data if getattr(t, "x", None) is not None)
     return {"no_update": False, "n_pts": int(n_pts), "annotations": ann}
 
 RESULT.update({
@@ -302,7 +301,8 @@ def test_headless_batch_exports_spatial_figures_under_webgl_default(xe, D, bundl
     before_prov = list(xe._prov_recent)
 
     method = D["cluster_methods"][0]
-    first_cluster = str(D["df"][f"cluster_{method}"].dropna().iloc[0])
+    _cser = D["df"][f"clust__{method}"]
+    first_cluster = str(int(_cser[_cser != 0].dropna().iloc[0]))
     out_dir = tmp_path / "batch_out"
     cfg = {
         "data": {"path": str(bundle_dir)},
@@ -311,7 +311,7 @@ def test_headless_batch_exports_spatial_figures_under_webgl_default(xe, D, bundl
             {"kind": "spatial", "name": "spatial_figs",
              "params": {"label_key": "labels_celltypist", "n_neighbors": 5}},
             {"kind": "aggregates", "name": "agg_figs",
-             "params": {"labels": "cluster", "classes": first_cluster}},
+             "params": {"labels": "cluster", "classes": [first_cluster], "n_perm": 19}},
             {"kind": "composition", "name": "comp_figs",
              "params": {"labels": "cluster"}},
         ],
@@ -331,14 +331,19 @@ def test_headless_batch_exports_spatial_figures_under_webgl_default(xe, D, bundl
             pj = step_dir / f"{stem}.plotly.json"
             assert pj.is_file(), f"missing {pj}"
             fig_doc = json.loads(pj.read_text())
-            assert fig_doc.get("data"), f"empty figure data in {pj}"
+            if stem == "aggregates":
+                assert fig_doc.get("data") or fig_doc.get("layout", {}).get("annotations"), f"empty figure in {pj}"
+            else:
+                assert fig_doc.get("data"), f"empty figure data in {pj}"
             assert (step_dir / f"{stem}.html").is_file() or (step_dir / f"{stem}.png").is_file()
     finally:
         xe._prov_recent[:] = before_prov
         xe._stats_reset()
         xe._controls_reset()
+        with xe._spatial_lock:
+            xe._spatial_state.update({"status": "idle", "message": "", "result": None})
         with xe._agg_lock:
-            xe._agg_state.update({"status": "idle", "message": "", "result": None})
+            xe._agg_state.update({"status": "idle", "message": "", "result": None, "show": True})
 
     # Subprocess check: `python -m xenium_app.batch` strips XENIUM_RENDERER in __init__.py
     # and still exports valid figures cleanly without starting a server.

@@ -834,21 +834,27 @@ def test_s6_run_split_writes_coverage_and_export_cellnest_decodes_nullable_and_f
         import anndata as _ad
         import zarr as rz
         from anndata.io import write_elem
-        if hasattr(_ad, "settings"):
-            monkeypatch.setattr(_ad.settings, "allow_write_nullable_strings", True, raising=False)
-        root = rz.open_group(str(sdata_dir), mode="w")
-        tgrp = root.require_group("tables").require_group("table")
-        obs_df = pd.DataFrame(
-            {
-                "x_centroid": [0.0, 10.0, 20.0, 30.0],
-                "y_centroid": [0.0, 5.0, 10.0, 15.0],
-                "cell_type_nullable": pd.array(["T_cell", "B_cell", pd.NA, "Macro"], dtype="string"),
-            },
-            index=pd.Index(cell_ids, dtype=object),
-        )
-        write_elem(tgrp, "obs", obs_df)
-        write_elem(tgrp, "var", pd.DataFrame(index=pd.Index(panel_genes, dtype=object)))
-        write_elem(tgrp, "X", raw_X)
+        _has_ns = hasattr(_ad, "settings") and hasattr(_ad.settings, "allow_write_nullable_strings")
+        _prev_ns = getattr(_ad.settings, "allow_write_nullable_strings", False) if _has_ns else False
+        if _has_ns:
+            _ad.settings.allow_write_nullable_strings = True
+        try:
+            root = rz.open_group(str(sdata_dir), mode="w")
+            tgrp = root.require_group("tables").require_group("table")
+            obs_df = pd.DataFrame(
+                {
+                    "x_centroid": [0.0, 10.0, 20.0, 30.0],
+                    "y_centroid": [0.0, 5.0, 10.0, 15.0],
+                    "cell_type_nullable": pd.array(["T_cell", "B_cell", pd.NA, "Macro"], dtype="string"),
+                },
+                index=pd.Index(cell_ids, dtype=object),
+            )
+            write_elem(tgrp, "obs", obs_df)
+            write_elem(tgrp, "var", pd.DataFrame(index=pd.Index(panel_genes, dtype=object)))
+            write_elem(tgrp, "X", raw_X)
+        finally:
+            if _has_ns:
+                _ad.settings.allow_write_nullable_strings = _prev_ns
 
     # SPLIT kept only 3 of 4 cells (c0, c1, c2) and covered only 2 of 3 genes (G0, G1)
     corr_mat = sp.csr_matrix(np.array([
